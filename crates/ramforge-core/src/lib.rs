@@ -12,15 +12,34 @@
 //! - The parser validates magic, version, and basic structure, and returns
 //!   clear errors for invalid or truncated files.
 //! - Metadata is exposed as structured types, not raw maps, via helpers.
+//!
+//! # Milestone 2 additions
+//!
+//! - `memory`: `MemoryBudget` and human size parsing (`parse_memory_size`)
+//! - `cache`: Strict bounded LRU cache with byte-exact accounting
+//! - `datasource`: File-backed tensor access without loading entire model
+//!
+//! RAMforge-managed memory is defined as memory explicitly tracked via
+//! `MemoryBudget`. It does NOT include total process RSS or OS page cache.
 
+pub mod cache;
+pub mod datasource;
 pub mod error;
 pub mod gguf;
+pub mod memory;
 pub mod model;
+pub mod tensor;
+pub mod tokenizer;
 pub mod types;
 
-pub use error::{GgufError, Result};
+pub use cache::{BoundedCache, CacheStats};
+pub use datasource::GgufDataSource;
+pub use error::{CacheError, DataSourceError, GgufError, MemoryError, ParseSizeError, Result};
 pub use gguf::parse_gguf_file;
+pub use memory::{parse_memory_size, MemoryBudget};
 pub use model::{GgufModel, ModelInfo, TensorDescriptor};
+pub use tensor::decode_tensor_to_f32;
+pub use tokenizer::Tokenizer;
 pub use types::{GgmlType, MetadataValue};
 
 /// Convenience function to inspect a GGUF file from a path

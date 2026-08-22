@@ -2,9 +2,14 @@
 name = "ramforge-runtime"
 version = "0.1.0"
 edition = "2021"
-description = "Runtime placeholder for RAMforge"
+description = "RAMforge runtime – memory budget, cache, and CPU inference"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 ramforge-core = { path = "../ramforge-core" }
 thiserror = { workspace = true }
+rand = "0.8"
+half = "2.2"
+
+[dev-dependencies]
+tempfile = "3.8"

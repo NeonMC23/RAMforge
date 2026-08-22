@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
-use ramforge_core::{parse_gguf_file, GgufModel};
+use ramforge_core::{parse_gguf_file, parse_memory_size, GgufModel};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "ramforge", version, about = "RAMforge – hierarchical memory inference runtime (milestone 1: inspection only)")]
+#[command(name = "ramforge", version, about = "RAMforge – hierarchical memory inference runtime (milestone 3: real CPU inference)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -24,6 +24,48 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         max_tensors: usize,
     },
+    /// Plan execution with a real RAM budget and file-backed access
+    Plan {
+        /// Path to the GGUF model file
+        model: PathBuf,
+
+        /// RAM budget (e.g. 8G, 8GiB, 8192M, 512MiB)
+        #[arg(long)]
+        ram: String,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run real inference (CPU, LLaMA architecture)
+    Run {
+        /// Path to the GGUF model file
+        model: PathBuf,
+
+        /// RAM budget (e.g. 8G, 8GiB, 8192M, 512MiB)
+        #[arg(long)]
+        ram: String,
+
+        /// Prompt text
+        #[arg(long)]
+        prompt: String,
+
+        /// Maximum tokens to generate
+        #[arg(long, default_value_t = 32)]
+        max_tokens: usize,
+
+        /// Temperature (0 = greedy)
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+
+        /// Top-k sampling (optional)
+        #[arg(long)]
+        top_k: Option<usize>,
+
+        /// Top-p sampling (optional)
+        #[arg(long)]
+        top_p: Option<f32>,
+    },
 }
 
 fn main() {
@@ -40,11 +82,30 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Plan { model, ram, json } => {
+            if let Err(e) = run_plan(model, ram, json) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Run {
+            model,
+            ram,
+            prompt,
+            max_tokens,
+            temperature,
+            top_k,
+            top_p,
+        } => {
+            if let Err(e) = run_inference(model, ram, prompt, max_tokens, temperature, top_k, top_p) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
 fn run_inspect(model_path: PathBuf, json_output: bool, max_tensors: usize) -> anyhow::Result<()> {
-    // Parse file – file-backed, no tensor payload loading
     let gguf = parse_gguf_file(&model_path).map_err(|e| anyhow::anyhow!(e))?;
 
     if json_output {
@@ -52,6 +113,109 @@ fn run_inspect(model_path: PathBuf, json_output: bool, max_tensors: usize) -> an
     } else {
         output_human(&gguf, max_tensors);
     }
+
+    Ok(())
+}
+
+fn run_plan(model_path: PathBuf, ram_str: String, json_output: bool) -> anyhow::Result<()> {
+    let ram_bytes = parse_memory_size(&ram_str).map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
+
+    let gguf = parse_gguf_file(&model_path).map_err(|e| anyhow::anyhow!(e))?;
+
+    let plan = ramforge_runtime::plan::plan_model(&gguf, ram_bytes).map_err(|e| anyhow::anyhow!(e))?;
+
+    if json_output {
+        output_plan_json(&plan, &gguf)?;
+    } else {
+        output_plan_human(&plan, &gguf, &ram_str);
+    }
+
+    Ok(())
+}
+
+fn run_inference(
+    model_path: PathBuf,
+    ram_str: String,
+    prompt: String,
+    max_tokens: usize,
+    temperature: f32,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+) -> anyhow::Result<()> {
+    let ram_bytes = parse_memory_size(&ram_str).map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
+
+    // Diagnostics to stderr
+    eprintln!("RAMforge – Run (Milestone 3: Real CPU Inference)");
+    eprintln!("===============================================");
+    eprintln!("Model: {}", model_path.display());
+    eprintln!("RAM budget: {} ({} bytes)", ram_str, ram_bytes);
+    eprintln!("Prompt: {:?}", prompt);
+    eprintln!("Max tokens: {}", max_tokens);
+    eprintln!("Temperature: {}", temperature);
+    if let Some(k) = top_k {
+        eprintln!("Top-k: {}", k);
+    }
+    if let Some(p) = top_p {
+        eprintln!("Top-p: {}", p);
+    }
+    eprintln!();
+
+    // Create inference engine – uses file-backed GgufDataSource, MemoryBudget, BoundedCache
+    eprintln!("Loading model (file-backed, cache-controlled)...");
+    let mut engine = ramforge_runtime::inference::InferenceEngine::new(
+        model_path.to_str().ok_or_else(|| anyhow::anyhow!("invalid model path"))?,
+        ram_bytes,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    eprintln!("Architecture: {}", engine.config().embedding_length);
+    eprintln!("Model config: vocab={}, context={}, embedding={}, layers={}, heads={}, kv_heads={}, ffn={}, head_dim={}",
+        engine.config().vocab_size,
+        engine.config().context_length,
+        engine.config().embedding_length,
+        engine.config().block_count,
+        engine.config().head_count,
+        engine.config().head_count_kv,
+        engine.config().feed_forward_length,
+        engine.config().head_dim
+    );
+    eprintln!("Tokenizer: model={}, vocab_size={}, bos={:?}, eos={:?}",
+        engine.tokenizer.model,
+        engine.tokenizer.vocab_size(),
+        engine.tokenizer.bos_id,
+        engine.tokenizer.eos_id
+    );
+    eprintln!("Execution backend: CPU");
+    eprintln!("Memory budget: total={} used={} available={}",
+        engine.budget.total_bytes(),
+        engine.budget.used_bytes(),
+        engine.budget.available_bytes()
+    );
+    eprintln!("Cache: capacity={} current={} entries={}",
+        engine.cache.capacity_bytes(),
+        engine.cache.current_bytes(),
+        engine.cache.len()
+    );
+    eprintln!();
+
+    let sampler = ramforge_runtime::sampling::Sampler::new(temperature, top_k, top_p);
+
+    eprintln!("Generating...");
+    let (gen_tokens, gen_text) = engine
+        .generate(&prompt, max_tokens, &sampler)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    eprintln!("Generated {} tokens", gen_tokens.len());
+    eprintln!("Cache stats: hits={}, misses={}, evictions={}, current_bytes={}",
+        engine.cache.stats().hits,
+        engine.cache.stats().misses,
+        engine.cache.stats().evictions,
+        engine.cache.stats().current_bytes
+    );
+    eprintln!();
+
+    // Output generated text to stdout (programmatic)
+    println!("{}", gen_text);
 
     Ok(())
 }
@@ -75,7 +239,6 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
         println!("  Name: {}", name);
     }
     if let Some(desc) = &info.description {
-        // Truncate long descriptions
         let short = if desc.len() > 120 {
             format!("{}...", &desc[..120])
         } else {
@@ -131,7 +294,6 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
     for tensor in model.tensors.iter().take(max_tensors) {
         let shape = tensor.shape_string();
         let bytes_str = tensor.byte_length.map(|b| b.to_string()).unwrap_or_else(|| "unknown".to_string());
-        // Truncate long names
         let display_name = if tensor.name.len() > 48 {
             format!("...{}", &tensor.name[tensor.name.len()-45..])
         } else {
@@ -148,12 +310,65 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
     println!("This design enables future out-of-core access for models larger than RAM.");
 }
 
+fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufModel, ram_str: &str) {
+    let info = model.info();
+
+    println!("RAMforge – Execution Plan (Milestone 2)");
+    println!("=======================================");
+    println!();
+    println!("Model:");
+    println!("  Path: {}", model.path.display());
+    println!("  File size: {} bytes ({:.2} MB, {:.2} GiB)", plan.file_size, plan.file_size as f64 / (1024.0*1024.0), plan.file_size as f64 / (1024.0*1024.0*1024.0));
+    println!("  Architecture: {}", info.architecture.as_deref().unwrap_or("unknown"));
+    println!("  Tensor count: {}", plan.tensor_count);
+    if let Some(total) = plan.total_tensor_bytes {
+        println!("  Total tensor bytes (estimated): {} bytes ({:.2} MiB)", total, total as f64 / (1024.0*1024.0));
+    }
+    println!();
+
+    println!("RAM Budget:");
+    println!("  Requested: {} ({} bytes)", ram_str, plan.ram_requested);
+    println!("  Total budget: {} bytes", plan.budget.total_bytes());
+    println!("  Managed allocations:");
+    for (name, bytes) in plan.budget.allocations() {
+        println!("    {}: {} bytes ({:.2} MiB)", name, bytes, *bytes as f64 / (1024.0*1024.0));
+    }
+    println!("  Used: {} bytes", plan.budget.used_bytes());
+    println!("  Available: {} bytes ({:.2} MiB)", plan.available, plan.available as f64 / (1024.0*1024.0));
+    println!();
+
+    println!("Model Residency:");
+    if plan.fits_in_ram {
+        println!("  Fits entirely in RAM budget: yes");
+        println!("  File-backed needed: 0 bytes");
+    } else {
+        println!("  Fits entirely in RAM budget: no");
+        println!("  File-backed needed: {} bytes ({:.2} MiB, {:.2} GiB)", plan.file_backed_needed, plan.file_backed_needed as f64 / (1024.0*1024.0), plan.file_backed_needed as f64 / (1024.0*1024.0*1024.0));
+        println!("  Strategy: Model larger than budget – tensor data will be accessed file-backed on demand");
+    }
+    println!();
+
+    println!("Cache:");
+    println!("  Configured capacity: {} bytes ({:.2} MiB, {:.2} GiB)", plan.cache_capacity, plan.cache_capacity as f64 / (1024.0*1024.0), plan.cache_capacity as f64 / (1024.0*1024.0*1024.0));
+    println!("  Policy: LRU (least recently used eviction)");
+    println!("  Overhead reserved: {} bytes", plan.overhead_reserved);
+    println!("  Accounting: RAMforge-managed memory = memory tracked via MemoryBudget (tensor cache + overhead). Does NOT include total process RSS or OS page cache.");
+    println!();
+
+    println!("File-backed access:");
+    println!("  Data source: {}", model.path.display());
+    println!("  Tensor data location: file-backed via offsets (data_start {} + tensor.offset)", model.data_start_offset);
+    println!("  Access method: explicit read_range with validation (no full model load)");
+    println!();
+
+    println!("Note: This is Milestone 2 – memory budget and file-backed access are real and enforced. Inference is not implemented yet.");
+}
+
 fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {
     use serde_json::json;
 
     let info = model.info();
 
-    // Convert metadata to JSON-friendly map
     let mut metadata_json = serde_json::Map::new();
     for (k, v) in &model.metadata {
         let json_val = metadata_value_to_json(v);
@@ -202,6 +417,42 @@ fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {
         "tensors_truncated": model.tensors.len() > max_tensors,
         "total_tensors": model.tensors.len(),
         "metadata": metadata_json,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn output_plan_json(plan: &ramforge_runtime::plan::PlanResult, model: &GgufModel) -> anyhow::Result<()> {
+    use serde_json::json;
+
+    let allocations: std::collections::BTreeMap<String, u64> = plan.budget.allocations().clone().into_iter().collect();
+
+    let output = json!({
+        "model": {
+            "path": model.path,
+            "file_size": plan.file_size,
+            "architecture": plan.architecture,
+            "tensor_count": plan.tensor_count,
+            "total_tensor_bytes": plan.total_tensor_bytes,
+        },
+        "ram_budget": {
+            "requested_str": format!("{} bytes", plan.ram_requested),
+            "requested_bytes": plan.ram_requested,
+            "total": plan.budget.total_bytes(),
+            "used": plan.budget.used_bytes(),
+            "available": plan.available,
+            "allocations": allocations,
+        },
+        "residency": {
+            "fits_in_ram": plan.fits_in_ram,
+            "file_backed_needed": plan.file_backed_needed,
+        },
+        "cache": {
+            "capacity": plan.cache_capacity,
+            "policy": "LRU",
+            "overhead_reserved": plan.overhead_reserved,
+        }
     });
 
     println!("{}", serde_json::to_string_pretty(&output)?);
