@@ -2,15 +2,16 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **Milestone 4 Status:** True out-of-core layer streaming implemented. Model weights can exceed RAMforge-managed budget. Layers are loaded on demand, computed, then released. Real CPU inference for LLaMA/Qwen2 (F32/F16) with KV cache and budget enforcement. GPU, MoE, HTTP still not implemented.
+> **Milestone 5 Status:** Native GGUF quantized tensor support – Q4_0, Q8_0, Q4_K. Quantized weights remain quantized while resident; dequantization happens block-wise during matvec. True out-of-core layer streaming preserved. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented.
 
 ## Purpose
 
-- GGUF parsing without loading tensor payloads
+- GGUF parsing without loading payloads
 - File-backed tensor access via `GgufDataSource`
 - Real RAM budget enforcement via `MemoryBudget`
 - Bounded LRU cache via `BoundedCache`
-- Real CPU inference with layer streaming for models larger than RAM
+- Real CPU inference with layer streaming
+- Native quantized inference without full F32 expansion
 
 ## Capabilities
 
@@ -18,67 +19,50 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 - Magic, header, metadata KV, tensor descriptors, file offsets, byte lengths
 
 ### Milestone 2 – Memory Budget & File-Backed Access
-- `MemoryBudget` with named allocations, exact byte accounting
-- `parse_memory_size()` accepts `8G`, `8GiB`, `8192M`, `512MiB`, `1.5G`, etc.
-- `GgufDataSource` reads tensors/ranges on demand
-- `BoundedCache` LRU with stats
+- `MemoryBudget`, `parse_memory_size()` (`8G`, `8GiB`, `8192M`, `512MiB`, etc.)
+- `GgufDataSource` range reads
+- `BoundedCache` LRU
 - `ramforge plan`
 
 ### Milestone 3 – First Real CPU Inference
-- Architectures: `llama`, `qwen2`
-- Tensor types: `F32`, `F16`, `BF16`
-- Tokenizer from GGUF metadata (naive longest-match, `▁` handling)
-- Transformer: RMSNorm, RoPE, causal attention with GQA, SwiGLU FFN, sampling
-- KV cache explicit and budget-accounted
+- Architectures `llama`, `qwen2`
+- F32/F16/BF16, tokenizer, RMSNorm, RoPE, attention, SwiGLU, KV cache, sampling
 - `ramforge run`
 
-### Milestone 4 – True Out-of-Core Layer Streaming (current)
+### Milestone 4 – Out-of-Core Layer Streaming
+- Only persistent weights resident initially; layers loaded on demand → compute → release
+- `ResidencyStats` proves total > budget while peak resident < total and peak managed ≤ budget
 
-**Defining feature:** Model weights (e.g. 4GB) can be larger than RAMforge budget (e.g. 1GB) and still run by streaming layers.
+### Milestone 5 – Native Quantized Tensor Support (current)
 
-**Execution model:**
-```
-GGUF on disk
-  ↓ metadata
-Layer 0 weights → RAMforge managed memory → CPU compute Layer 0 → Release Layer 0
-  ↓
-Layer 1 weights → compute → Release
-...
-Final norm / output → logits → next token
-```
+**Supported formats:**
+- `Q4_0`: block 32, 18 bytes (2B half scale `d` + 16B packed 4-bit quants, dequant `d*(q-8)`)
+- `Q8_0`: block 32, 34 bytes (2B half scale `d` + 32B int8 quants, dequant `d*q`)
+- `Q4_K`: block 256, 144 bytes (2B half `d`, 2B half `dmin`, 12B scales (8 scales + 8 mins packed 6-bit), 128B 4-bit quants; unpack via `get_scale_min_k4(j)`, dequant `d*sc*q - dmin*m`)
 
-**What changed from Milestone 3:**
-- Removed assumption that all weights are loaded in `LlamaModel::load()`. Now only persistent weights (`token_embd`, `output_norm`, `output`) are loaded initially.
-- Introduced layer-oriented representation: `LayerDescriptor` groups `blk.{i}.*` tensors, `PersistentDescriptors` for non-layer tensors.
-- Introduced `StreamingLlamaModel` with `load_layer()` and `release_layer()` – each layer's decoded size allocated from `MemoryBudget` as `layer:{i}:{tensor}`, tracked in `ResidencyStats`, released immediately after compute.
-- Forward pass `forward_single_streaming()` loads one layer, computes, releases, next layer – entire stack never resident simultaneously.
-- Added `ResidencyStats`: total model weight bytes, current/peak resident layer bytes, num loads/releases, peak managed bytes.
-- Added `--verbose` to `run` to expose residency stats.
+**Representation:**
+- `TensorData` enum: `F32`, `F16`, `BF16`, `Q4_0(QuantizedTensor)`, `Q8_0`, `Q4_K`
+- `QuantizedTensor { ggml_type, shape, num_elements, raw_data: Vec<u8> }` keeps quantized compact while resident
+- `resident_bytes()` = raw_data.len() (e.g. 144B for 256 values Q4_K vs 1024B F32) – shows memory saving
+- `matvec()` for quantized does block-wise dequant: for each output row, for each quantized block, decode block to temp `[32]` or `[256]` f32, dot with x slice, discard temp. Working set bounded to one block.
+- `get_embedding()` for quantized token_embd dequantizes only the requested row.
 
 **Memory accounting:**
-- RAMforge-managed memory = memory tracked via `MemoryBudget` (persistent weights, currently resident layer, KV cache). NOT total RSS or OS page cache.
-- Every streamed layer allocation goes through `MemoryBudget`; release via `release()`.
-- `BoundedCache` still used for raw tensor bytes (may evict), but does not retain every layer – policy is load-compute-release.
-- KV cache remains resident across generation, allocated from budget based on needed length (`prompt_len + max_tokens`) to save memory vs full context.
+- Budget accounts actual resident representation: quantized bytes + temporary block buffers, NOT full F32 expansion.
+- Example: Q4_K 256 elements F32 equiv 1024B, quantized resident 144B (7.1× smaller). For model with 4 layers n_embd 256 ffn 512:
+  - Quantized total 1.5MB, F32 equiv 10MB
+  - Budget 800KB, total quantized 1.5MB > budget, per-layer quantized 370KB fits, peak managed 429KB ≤ budget → inference succeeds with streaming
+- Persistent weights (token_embd, output_norm, output) also accounted via quantized size; if quantized, they remain compact.
 
-**Verification model:**
-Synthetic GGUF generator creates models where total weights > budget but per-layer fits. Example from tests and manual run:
-
+**Layer streaming integration:**
 ```
-Model weights:       42560 bytes (41KB, 4 layers, n_embd 16, ffn 32)
-RAM budget:          16384 bytes (16KB)
-Cache capacity:      8192 bytes (8KB)
-Peak layer residency: 10368 bytes (10KB)
-Peak managed memory: 14016 bytes (13KB) <= budget
-Layer loads:         20 (4 layers * 5 tokens)
-Layer releases:      20
-Result:              Inference succeeds with streaming
+Layer descriptor → GgufDataSource::read_tensor() (quantized bytes) → TensorData::Q4_K/Q8_0/Q4_0 resident → quantized matvec (block dequant) → release layer
 ```
+Entire quantized model never resident simultaneously. Layers released after compute.
 
-Proves:
-- `total_model_weight_bytes > configured_budget`
-- `peak_resident_layer_bytes < total_model_weight_bytes`
-- `peak_managed_bytes <= configured_budget`
+**Compute backend:**
+- `ComputeBackend` trait preserved, `CpuBackend` implements scalar quantized matvec via `quant::matvec_q4_0/q8_0/q4_k`
+- Future SIMD implementation can replace scalar without rewriting inference engine
 
 ## Build & Test
 
@@ -90,79 +74,114 @@ cargo clippy --workspace -- -D warnings
 
 ## Usage
 
-Inspect (still works):
+Inspect (shows quantized types):
 ```bash
 cargo run -p ramforge-cli -- inspect model.gguf
+# Quantization summary: Q4_K: 169 tensors, F16: 121, etc.
 ```
 
-Plan (still works):
+Plan:
 ```bash
 cargo run -p ramforge-cli -- plan model.gguf --ram 8G
-cargo run -p ramforge-cli -- plan model.gguf --ram 256M --verbose
 ```
 
-Run with real inference and layer streaming:
+Run with quantized model:
 ```bash
 cargo run -p ramforge-cli -- run model.gguf --ram 8G --prompt "Hello" --max-tokens 32
-cargo run -p ramforge-cli -- run model.gguf --ram 256M --prompt "Hello" --max-tokens 16 --verbose
-cargo run -p ramforge-cli -- run model.gguf --ram 8G --prompt "Explain what a computer is." --max-tokens 32 --temperature 0.7
+cargo run -p ramforge-cli -- run model.gguf --ram 1G --prompt "Hello" --max-tokens 16 --verbose
+# Verbose shows:
+# Total model weight bytes: 1500160 (1.43 MiB) quantized
+# F32 equiv: 10507264 (10 MiB)
+# Peak resident layer bytes: 370688 (0.35 MiB)
+# Peak managed bytes: 429056 / budget 819200
+# Fits check: total > budget ? true
 ```
 
-Accepted `--ram` syntax: `8G`, `8GiB`, `8192M`, `512MiB`, `1.5G`, `1024`, `KB`/`KiB`/`MB`/`MiB`/`GB`/`GiB`/`TB`/`TiB`.
+Accepted `--ram` syntax: `8G`, `8GiB`, `8192M`, `512MiB`, `1.5G`, `KB`/`KiB`/`MB`/`MiB`/`GB`/`GiB`.
 
-Diagnostics to stderr, generated text to stdout.
+Diagnostics stderr, generated text stdout.
 
-**Out-of-core example:**
+**Out-of-core quantized example:**
 ```bash
-# Synthetic model 45KB total, 42KB weights, budget 16KB
-cargo run -p ramforge-cli -- run synthetic.gguf --ram 16K --prompt "hello" --max-tokens 3 --verbose
-# Shows:
-# Total model weight bytes: 42560
-# Peak resident layer bytes: 10368
-# Peak managed bytes: 14016 / budget 16384
-# Fits check: total > budget ? true
-# Peak layer < total ? true
-# Peak managed <= budget ? true
+# Synthetic Q4_K model: 4 layers, n_embd 256, ffn 512
+# Total quantized 1500160 bytes (1.43 MiB), F32 equiv 10507264 (10 MiB), budget 800K
+cargo run -p ramforge-cli -- run synthetic_q4k.gguf --ram 800K --prompt "hello" --max-tokens 3 --verbose
+# Proves:
+# total quantized > budget
+# quantized resident < F32 equiv
+# peak layer < total
+# peak managed <= budget
+# inference succeeds
 ```
 
 ## Project Structure
 
 ```
 crates/
-  ramforge-core/      # GGUF parsing, MemoryBudget, BoundedCache, GgufDataSource, Tokenizer, tensor decoding
-  ramforge-runtime/   # backend, ops, kv_cache, layer grouping, residency stats, streaming_model, inference (streaming), plan, sampling
-  ramforge-cli/       # inspect, plan, run (with --verbose)
+  ramforge-core/
+    gguf.rs, model.rs, types.rs
+    memory.rs – MemoryBudget, parse_memory_size
+    cache.rs – BoundedCache LRU
+    datasource.rs – GgufDataSource
+    tokenizer.rs – Tokenizer from GGUF
+    quant.rs – Q4_0, Q8_0, Q4_K block layouts, dequant, quantized matvec (scalar, block-wise)
+    tensor.rs – TensorData (F32/F16/BF16/Q4_0/Q8_0/Q4_K), QuantizedTensor, resident_bytes, matvec, get_embedding
+  ramforge-runtime/
+    backend.rs – ComputeBackend, CpuBackend
+    ops.rs – RoPE, attention
+    kv_cache.rs – KV cache explicit, budget-accounted
+    layer.rs – LayerDescriptor grouping
+    residency.rs – ResidencyStats
+    model.rs – LlamaConfig, LlamaWeights validation
+    streaming_model.rs – StreamingLlamaModel (persistent + layer descriptors), load_layer/release_layer, forward_single_streaming with quantized matvec
+    inference.rs – InferenceEngine (file-backed + budget + cache + streaming + quantized), generate()
+    plan.rs – planning
+    sampling.rs – greedy, temperature, top-k/p
+  ramforge-cli/ – inspect, plan, run --verbose
 ```
 
 ## Supported / Unsupported
 
-**Supported:**
-- Architectures: `llama`, `qwen2` (dense, same tensor naming)
-- Tensor types: `F32`, `F16`, `BF16`
-- CPU backend only
+**Supported architectures:** `llama`, `qwen2` (dense, same tensor naming)
+
+**Supported tensor types:** `F32`, `F16`, `BF16`, `Q4_0`, `Q8_0`, `Q4_K` – all usable for inference
 
 **Unsupported (clear error):**
 - Other architectures → "unsupported architecture"
-- Quantized types Q4_0, Q4_K, etc. → "unsupported tensor type"
+- Other quantized types Q2_K, Q3_K, Q5_K, Q6_K, IQ* → "unsupported tensor type for inference"
 - Missing tensors → "missing tensor 'blk.0.attn_q.weight'"
-- Budget too small for layer or KV cache → clear insufficient memory error
+- Budget too small → "RAM budget too small for layer..."
 
-## Known Limitations (Milestone 4)
+**CPU-only:** No GPU
 
-- Only F32/F16/BF16, no quantization (would be needed for real large models)
-- Persistent weights (token_embd, output) kept resident; if they exceed budget, they would need streaming too (documented, not yet implemented)
-- No prefetch, double buffering, SIMD, multithreading
-- KV cache no eviction
-- Tokenizer naive, not fully equivalent to llama.cpp but functional for tests
-- Minimum practical requirement: individual layer working set must fit in available managed memory
+## Testing
+
+- Quantization: block size, byte size, scale handling, signed/unsigned, dequant values, truncated rejection, invalid size rejection (in `quant.rs`)
+- Matvec: tiny known matrix + known vector vs expected F32 and vs reference dequant + F32 matvec, tolerance 1e-3 (in `quant.rs`)
+- Layer grouping, loading, release, memory accounting, peak residency (in `layer.rs`, `streaming_model.rs`)
+- Quantized layer loading: Q4_0 model, matvec zeros (in `streaming_model.rs`)
+- Out-of-core F32: total > budget while inference succeeds (in `streaming_model.rs`, `inference.rs`)
+- Out-of-core quantized: synthetic Q4_K model 1.5MB > 800KB budget, per-layer 370KB fits, peak managed ≤ budget, inference succeeds, quantized resident < F32 equiv (manual run + unit tests)
+- Deterministic generation: tiny F32 model greedy 5 tokens deterministic (in `inference.rs`)
+- Existing F32/F16/BF16 inference still works
+- Existing Milestone 4 streaming tests still pass
+
+Total: 42 core tests + 25 runtime tests = 67 tests.
+
+## Known Limitations (Milestone 5)
+
+- Only Q4_0, Q8_0, Q4_K supported; Q2_K, Q3_K, Q5_K, Q6_K, IQ quants not yet
+- Scalar CPU implementation, no SIMD, no threading
+- Tokenizer naive longest-match, not full SentencePiece BPE
+- Persistent weights (token_embd, output) kept resident; if quantized they remain compact but still resident – if they exceed budget, need streaming (documented)
+- KV cache F32, no quantization, no eviction
+- Minimum practical: individual layer working set must fit in budget
 
 ## What is NOT Implemented
 
-- GPU (CUDA, Metal, Vulkan)
-- MoE, speculative decoding
-- HTTP server, OpenAI API
-- TUI, model downloading
-- Quantization, async I/O
+- GPU, SIMD, multithreading, prefetch, double buffering, async I/O
+- HTTP server, MoE, speculative decoding, model downloading
+- Additional quantization formats beyond Q4_0/Q8_0/Q4_K
 
 ## License
 

@@ -28,6 +28,7 @@ pub mod error;
 pub mod gguf;
 pub mod memory;
 pub mod model;
+pub mod quant;
 pub mod tensor;
 pub mod tokenizer;
 pub mod types;
@@ -38,7 +39,8 @@ pub use error::{CacheError, DataSourceError, GgufError, MemoryError, ParseSizeEr
 pub use gguf::parse_gguf_file;
 pub use memory::{parse_memory_size, MemoryBudget};
 pub use model::{GgufModel, ModelInfo, TensorDescriptor};
-pub use tensor::decode_tensor_to_f32;
+pub use quant::{BlockQ4K, BlockQ4_0, BlockQ8_0, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q4_K, BLOCK_SIZE_Q8_0, QK4_0, QK8_0, QK_K};
+pub use tensor::{decode_tensor_to_f32, QuantizedTensor, TensorData};
 pub use tokenizer::Tokenizer;
 pub use types::{GgmlType, MetadataValue};
 
