@@ -11,3 +11,16 @@
 *.gguf
 *.bin
 *.safetensors
+*.pt
+*.pth
+*.onnx
+*.exe
+*.dll
+*.so
+*.dylib
+*.code-workspace
+*.profraw
+*.profdata
+lcov.info
+coverage/
+.env

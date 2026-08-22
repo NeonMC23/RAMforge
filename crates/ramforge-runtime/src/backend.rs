@@ -1,56 +1,90 @@
-//! Compute backend abstraction
+//! Compute backend abstraction with SIMD and threading support
 //!
-//! Milestone 3 only has CPU backend, but designed to allow future GPU backends.
+//! Milestone 6 introduces:
+//! - AVX2 SIMD for x86_64 with scalar fallback
+//! - Configurable threading via rayon
+//! - Quantized matvec benefits from both
 
 use std::fmt::Debug;
+
+use rayon::prelude::*;
+
+use crate::simd;
 
 pub trait ComputeBackend: Debug + Send + Sync {
     fn name(&self) -> &'static str;
 
-    /// Matrix-vector multiplication: y = W * x
-    /// W is [out_dim, in_dim] in row-major (or column-major handled by caller)
-    /// x is [in_dim], y is [out_dim]
     fn matvec(&self, w: &[f32], w_shape: &[usize], x: &[f32], y: &mut [f32]);
 
-    /// RMSNorm: y = x / sqrt(mean(x^2)+eps) * weight
     fn rmsnorm(&self, x: &[f32], weight: &[f32], eps: f32, y: &mut [f32]);
 
-    /// Elementwise addition
     fn add(&self, a: &[f32], b: &[f32], out: &mut [f32]);
 
-    /// Elementwise multiplication
     fn mul(&self, a: &[f32], b: &[f32], out: &mut [f32]);
 
-    /// SiLU activation: y = x * sigmoid(x)
     fn silu(&self, x: &[f32], out: &mut [f32]);
 
-    /// Softmax in-place
     fn softmax(&self, x: &mut [f32]);
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CpuBackend;
+#[derive(Debug, Clone)]
+pub struct CpuBackend {
+    pub num_threads: usize,
+    pub use_simd: bool,
+}
+
+impl Default for CpuBackend {
+    fn default() -> Self {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let use_simd = simd::is_avx2_available();
+        Self {
+            num_threads,
+            use_simd,
+        }
+    }
+}
 
 impl CpuBackend {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_threads(num_threads: usize) -> Self {
+        Self {
+            num_threads: num_threads.max(1),
+            ..Self::default()
+        }
+    }
+
+    pub fn scalar() -> Self {
+        Self {
+            num_threads: 1,
+            use_simd: false,
+        }
+    }
+
+    pub fn with_simd(use_simd: bool) -> Self {
+        Self {
+            use_simd: use_simd && simd::is_avx2_available(),
+            ..Self::default()
+        }
     }
 }
 
 impl ComputeBackend for CpuBackend {
     fn name(&self) -> &'static str {
-        "CPU"
+        if self.use_simd {
+            "CPU-SIMD"
+        } else {
+            "CPU-scalar"
+        }
     }
 
     #[allow(clippy::needless_range_loop)]
     fn matvec(&self, w: &[f32], w_shape: &[usize], x: &[f32], y: &mut [f32]) {
-        // w_shape is [out, in] or [in, out] depending on storage.
-        // We assume w is stored as [out, in] row-major: w[out * in + in]
-        // If shape is [in, out], we transpose logic: we detect by comparing dimensions to x len
-        // For simplicity, we assume row-major [out, in]
-        // But we also handle case where w_shape is [in, out] by checking
         if w_shape.len() != 2 {
-            // Fallback to naive if not 2D
             for (i, yi) in y.iter_mut().enumerate() {
                 let mut sum = 0.0;
                 for (j, xj) in x.iter().enumerate() {
@@ -66,21 +100,38 @@ impl ComputeBackend for CpuBackend {
         let out_dim = w_shape[0];
         let in_dim = w_shape[1];
 
-        // If in_dim == x.len(), then w is [out, in] row-major
-        // If out_dim == x.len(), then w is [in, out] and we need transpose: y[j] = sum_i W[i,j]*x[i] ??? Let's handle
         if in_dim == x.len() && out_dim == y.len() {
             // Row-major [out, in]
-            for i in 0..out_dim {
-                let mut sum = 0.0;
-                let row_offset = i * in_dim;
-                for j in 0..in_dim {
-                    sum += w[row_offset + j] * x[j];
+            if self.num_threads > 1 && out_dim >= 4 {
+                // Parallelize rows via rayon
+                // Use thread pool with configured threads
+                // For simplicity, use rayon global pool but limit via chunking
+                y.par_iter_mut().enumerate().for_each(|(i, yi)| {
+                    let row_offset = i * in_dim;
+                    let row = &w[row_offset..row_offset + in_dim];
+                    if self.use_simd {
+                        *yi = simd::dot_f32_avx2(row, x);
+                    } else {
+                        let mut sum = 0.0;
+                        for j in 0..in_dim {
+                            sum += row[j] * x[j];
+                        }
+                        *yi = sum;
+                    }
+                });
+            } else if self.use_simd {
+                simd::matvec_f32_avx2(w, out_dim, in_dim, x, y);
+            } else {
+                for i in 0..out_dim {
+                    let mut sum = 0.0;
+                    let row_offset = i * in_dim;
+                    for j in 0..in_dim {
+                        sum += w[row_offset + j] * x[j];
+                    }
+                    y[i] = sum;
                 }
-                y[i] = sum;
             }
         } else if out_dim == x.len() && in_dim == y.len() {
-            // W is [in, out] row-major, need to compute y = W^T * x? Actually if W is [in, out], then W^T is [out, in]
-            // So y[j] = sum_i W[i*out + j] * x[i]
             for j in 0..in_dim {
                 let mut sum = 0.0;
                 for i in 0..out_dim {
@@ -89,37 +140,16 @@ impl ComputeBackend for CpuBackend {
                 y[j] = sum;
             }
         } else {
-            // Fallback: try to handle as column-major [in, out] where in is contiguous
-            // Assume w is [in, out] column-major: first in elements are col0, etc.
-            // Then y[j] = sum_i W[i + j*in] * x[i]
+            // Fallback
             if w.len() == out_dim * in_dim {
-                // Try both interpretations and pick one that matches
-                // We'll assume column-major [in, out] if in_dim == x.len() and out_dim == y.len() is false, but we already handled row-major
-                // For column-major [in, out]: w is [in, out] with in contiguous: offset = j*in + i
-                if in_dim == x.len() && out_dim == y.len() {
-                    // This case already handled as row-major, but column-major would be same size, need to decide
-                    // We'll use row-major as default
-                    for i in 0..out_dim {
-                        let mut sum = 0.0;
-                        for j in 0..in_dim {
-                            sum += w[j + i * in_dim] * x[j];
-                        }
-                        y[i] = sum;
+                for i in 0..out_dim {
+                    let mut sum = 0.0;
+                    for j in 0..in_dim {
+                        sum += w[j + i * in_dim] * x[j];
                     }
-                } else {
-                    // Generic fallback
-                    for i in 0..y.len() {
-                        y[i] = 0.0;
-                        for j in 0..x.len() {
-                            if j < w_shape[0] && i < w_shape[1] {
-                                // Assume w is [in, out] row-major
-                                y[i] += w[j * w_shape[1] + i] * x[j];
-                            }
-                        }
-                    }
+                    y[i] = sum;
                 }
             } else {
-                // Zero out
                 for yi in y.iter_mut() {
                     *yi = 0.0;
                 }
@@ -179,13 +209,49 @@ mod tests {
 
     #[test]
     fn test_matvec() {
-        let backend = CpuBackend::new();
-        // W = [[1,2],[3,4]] row-major [2,2], x=[1,1] => y=[3,7]
+        let backend = CpuBackend::scalar();
         let w = vec![1.0, 2.0, 3.0, 4.0];
         let x = vec![1.0, 1.0];
         let mut y = vec![0.0; 2];
         backend.matvec(&w, &[2, 2], &x, &mut y);
         assert_eq!(y, vec![3.0, 7.0]);
+    }
+
+    #[test]
+    fn test_matvec_simd_vs_scalar() {
+        let w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let x = vec![1.0, 1.0, 1.0];
+        let mut y_scalar = vec![0.0; 2];
+        let mut y_simd = vec![0.0; 2];
+
+        let scalar_backend = CpuBackend::scalar();
+        scalar_backend.matvec(&w, &[2, 3], &x, &mut y_scalar);
+
+        let simd_backend = CpuBackend {
+            num_threads: 1,
+            use_simd: true,
+        };
+        simd_backend.matvec(&w, &[2, 3], &x, &mut y_simd);
+
+        for i in 0..2 {
+            assert!((y_scalar[i] - y_simd[i]).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_matvec_threaded() {
+        let w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let x = vec![1.0, 1.0];
+        let mut y_single = vec![0.0; 4];
+        let mut y_multi = vec![0.0; 4];
+
+        let single = CpuBackend::with_threads(1);
+        single.matvec(&w, &[4, 2], &x, &mut y_single);
+
+        let multi = CpuBackend::with_threads(4);
+        multi.matvec(&w, &[4, 2], &x, &mut y_multi);
+
+        assert_eq!(y_single, y_multi);
     }
 
     #[test]
@@ -195,7 +261,6 @@ mod tests {
         let w = vec![1.0, 1.0, 1.0, 1.0];
         let mut y = vec![0.0; 4];
         backend.rmsnorm(&x, &w, 1e-5, &mut y);
-        // rms = sqrt(1+eps) ~1, so y ~ x
         for &v in &y {
             assert!((v - 1.0).abs() < 1e-3);
         }

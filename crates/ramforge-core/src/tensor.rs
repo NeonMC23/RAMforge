@@ -56,6 +56,56 @@ impl QuantizedTensor {
                 }
                 (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q4_K
             }
+            GgmlType::Q5_K => {
+                if num_elements % quant::QK_K != 0 {
+                    return Err(DataSourceError::General(format!(
+                        "Q5_K elements {} not divisible by {}",
+                        num_elements,
+                        quant::QK_K
+                    )));
+                }
+                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q5_K
+            }
+            GgmlType::Q6_K => {
+                if num_elements % quant::QK_K != 0 {
+                    return Err(DataSourceError::General(format!(
+                        "Q6_K elements {} not divisible by {}",
+                        num_elements,
+                        quant::QK_K
+                    )));
+                }
+                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q6_K
+            }
+            GgmlType::Q2_K => {
+                if num_elements % quant::QK_K != 0 {
+                    return Err(DataSourceError::General(format!(
+                        "Q2_K elements {} not divisible by {}",
+                        num_elements,
+                        quant::QK_K
+                    )));
+                }
+                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q2_K
+            }
+            GgmlType::Q3_K => {
+                if num_elements % quant::QK_K != 0 {
+                    return Err(DataSourceError::General(format!(
+                        "Q3_K elements {} not divisible by {}",
+                        num_elements,
+                        quant::QK_K
+                    )));
+                }
+                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q3_K
+            }
+            GgmlType::Q8_K => {
+                if num_elements % quant::QK_K != 0 {
+                    return Err(DataSourceError::General(format!(
+                        "Q8_K elements {} not divisible by {}",
+                        num_elements,
+                        quant::QK_K
+                    )));
+                }
+                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q8_K
+            }
             _ => {
                 return Err(DataSourceError::General(format!(
                     "not a quantized type: {}",
@@ -92,6 +142,11 @@ impl QuantizedTensor {
             GgmlType::Q4_0 => quant::dequantize_row_q4_0(&self.raw_data, self.num_elements, &mut out)?,
             GgmlType::Q8_0 => quant::dequantize_row_q8_0(&self.raw_data, self.num_elements, &mut out)?,
             GgmlType::Q4_K => quant::dequantize_row_q4_k(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q5_K => quant::dequantize_row_q5_k(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q6_K => quant::dequantize_row_q6_k(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q2_K => quant::dequantize_row_q2_k(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q3_K => quant::dequantize_row_q3_k(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q8_K => quant::dequantize_row_q8_k(&self.raw_data, self.num_elements, &mut out)?,
             _ => {
                 return Err(DataSourceError::General(format!(
                     "unsupported quantized type for dequant: {}",
@@ -190,11 +245,15 @@ impl QuantizedTensor {
             (self.num_elements, 0)
         };
 
-        // Compute row_bytes based on type
         let (qk, block_size) = match self.ggml_type {
             GgmlType::Q4_0 => (quant::QK4_0, quant::BLOCK_SIZE_Q4_0),
             GgmlType::Q8_0 => (quant::QK8_0, quant::BLOCK_SIZE_Q8_0),
             GgmlType::Q4_K => (quant::QK_K, quant::BLOCK_SIZE_Q4_K),
+            GgmlType::Q5_K => (quant::QK_K, quant::BLOCK_SIZE_Q5_K),
+            GgmlType::Q6_K => (quant::QK_K, quant::BLOCK_SIZE_Q6_K),
+            GgmlType::Q2_K => (quant::QK_K, quant::BLOCK_SIZE_Q2_K),
+            GgmlType::Q3_K => (quant::QK_K, quant::BLOCK_SIZE_Q3_K),
+            GgmlType::Q8_K => (quant::QK_K, quant::BLOCK_SIZE_Q8_K),
             _ => {
                 return Err(DataSourceError::General(format!(
                     "dequantize_row not supported for type {}",
@@ -230,6 +289,11 @@ impl QuantizedTensor {
             GgmlType::Q4_0 => quant::dequantize_row_q4_0(row_slice, row_elements, &mut out)?,
             GgmlType::Q8_0 => quant::dequantize_row_q8_0(row_slice, row_elements, &mut out)?,
             GgmlType::Q4_K => quant::dequantize_row_q4_k(row_slice, row_elements, &mut out)?,
+            GgmlType::Q5_K => quant::dequantize_row_q5_k(row_slice, row_elements, &mut out)?,
+            GgmlType::Q6_K => quant::dequantize_row_q6_k(row_slice, row_elements, &mut out)?,
+            GgmlType::Q2_K => quant::dequantize_row_q2_k(row_slice, row_elements, &mut out)?,
+            GgmlType::Q3_K => quant::dequantize_row_q3_k(row_slice, row_elements, &mut out)?,
+            GgmlType::Q8_K => quant::dequantize_row_q8_k(row_slice, row_elements, &mut out)?,
             _ => unreachable!(),
         }
 
@@ -286,11 +350,15 @@ impl QuantizedTensor {
             return Ok(());
         }
 
-        // Non-transpose: W is [out, in] row-major
         match self.ggml_type {
             GgmlType::Q4_0 => quant::matvec_q4_0(&self.raw_data, &[out_dim, in_dim], x, y),
             GgmlType::Q8_0 => quant::matvec_q8_0(&self.raw_data, &[out_dim, in_dim], x, y),
             GgmlType::Q4_K => quant::matvec_q4_k(&self.raw_data, &[out_dim, in_dim], x, y),
+            GgmlType::Q5_K => quant::matvec_q5_k(&self.raw_data, &[out_dim, in_dim], x, y),
+            GgmlType::Q6_K => quant::matvec_q6_k(&self.raw_data, &[out_dim, in_dim], x, y),
+            GgmlType::Q2_K => quant::matvec_q2_k(&self.raw_data, &[out_dim, in_dim], x, y),
+            GgmlType::Q3_K => quant::matvec_q3_k(&self.raw_data, &[out_dim, in_dim], x, y),
+            GgmlType::Q8_K => quant::matvec_q8_k(&self.raw_data, &[out_dim, in_dim], x, y),
             _ => Err(DataSourceError::General(format!(
                 "unsupported quantized matvec type {}",
                 self.ggml_type.name()
@@ -320,6 +388,11 @@ pub enum TensorData {
     Q4_0(QuantizedTensor),
     Q8_0(QuantizedTensor),
     Q4_K(QuantizedTensor),
+    Q5_K(QuantizedTensor),
+    Q6_K(QuantizedTensor),
+    Q2_K(QuantizedTensor),
+    Q3_K(QuantizedTensor),
+    Q8_K(QuantizedTensor),
 }
 
 impl TensorData {
@@ -368,8 +441,28 @@ impl TensorData {
                 let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
                 Ok(Self::Q4_K(qt))
             }
+            GgmlType::Q5_K => {
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                Ok(Self::Q5_K(qt))
+            }
+            GgmlType::Q6_K => {
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                Ok(Self::Q6_K(qt))
+            }
+            GgmlType::Q2_K => {
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                Ok(Self::Q2_K(qt))
+            }
+            GgmlType::Q3_K => {
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                Ok(Self::Q3_K(qt))
+            }
+            GgmlType::Q8_K => {
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                Ok(Self::Q8_K(qt))
+            }
             _ => Err(DataSourceError::General(format!(
-                "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q8_0, Q4_K)",
+                "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K)",
                 ggml_type.name()
             ))),
         }
@@ -383,6 +476,11 @@ impl TensorData {
             Self::Q4_0(qt) => qt.resident_bytes(),
             Self::Q8_0(qt) => qt.resident_bytes(),
             Self::Q4_K(qt) => qt.resident_bytes(),
+            Self::Q5_K(qt) => qt.resident_bytes(),
+            Self::Q6_K(qt) => qt.resident_bytes(),
+            Self::Q2_K(qt) => qt.resident_bytes(),
+            Self::Q3_K(qt) => qt.resident_bytes(),
+            Self::Q8_K(qt) => qt.resident_bytes(),
         }
     }
 
@@ -394,6 +492,11 @@ impl TensorData {
             Self::Q4_0(qt) => qt.num_elements,
             Self::Q8_0(qt) => qt.num_elements,
             Self::Q4_K(qt) => qt.num_elements,
+            Self::Q5_K(qt) => qt.num_elements,
+            Self::Q6_K(qt) => qt.num_elements,
+            Self::Q2_K(qt) => qt.num_elements,
+            Self::Q3_K(qt) => qt.num_elements,
+            Self::Q8_K(qt) => qt.num_elements,
         }
     }
 
@@ -405,6 +508,11 @@ impl TensorData {
             Self::Q4_0(qt) => &qt.shape,
             Self::Q8_0(qt) => &qt.shape,
             Self::Q4_K(qt) => &qt.shape,
+            Self::Q5_K(qt) => &qt.shape,
+            Self::Q6_K(qt) => &qt.shape,
+            Self::Q2_K(qt) => &qt.shape,
+            Self::Q3_K(qt) => &qt.shape,
+            Self::Q8_K(qt) => &qt.shape,
         }
     }
 
@@ -416,11 +524,26 @@ impl TensorData {
             Self::Q4_0(qt) => qt.ggml_type,
             Self::Q8_0(qt) => qt.ggml_type,
             Self::Q4_K(qt) => qt.ggml_type,
+            Self::Q5_K(qt) => qt.ggml_type,
+            Self::Q6_K(qt) => qt.ggml_type,
+            Self::Q2_K(qt) => qt.ggml_type,
+            Self::Q3_K(qt) => qt.ggml_type,
+            Self::Q8_K(qt) => qt.ggml_type,
         }
     }
 
     pub fn is_quantized(&self) -> bool {
-        matches!(self, Self::Q4_0(_) | Self::Q8_0(_) | Self::Q4_K(_))
+        matches!(
+            self,
+            Self::Q4_0(_)
+                | Self::Q8_0(_)
+                | Self::Q4_K(_)
+                | Self::Q5_K(_)
+                | Self::Q6_K(_)
+                | Self::Q2_K(_)
+                | Self::Q3_K(_)
+                | Self::Q8_K(_)
+        )
     }
 
     /// Matvec: y = W * x
@@ -503,7 +626,14 @@ impl TensorData {
                 }
                 Ok(())
             }
-            Self::Q4_0(qt) | Self::Q8_0(qt) | Self::Q4_K(qt) => qt.matvec(x, y),
+            Self::Q4_0(qt)
+            | Self::Q8_0(qt)
+            | Self::Q4_K(qt)
+            | Self::Q5_K(qt)
+            | Self::Q6_K(qt)
+            | Self::Q2_K(qt)
+            | Self::Q3_K(qt)
+            | Self::Q8_K(qt) => qt.matvec(x, y),
         }
     }
 
@@ -535,21 +665,30 @@ impl TensorData {
                     )))
                 }
             }
-            Self::Q4_0(qt) | Self::Q8_0(qt) | Self::Q4_K(qt) => {
-                qt.dequantize_row(token_id)
-            }
+            Self::Q4_0(qt)
+            | Self::Q8_0(qt)
+            | Self::Q4_K(qt)
+            | Self::Q5_K(qt)
+            | Self::Q6_K(qt)
+            | Self::Q2_K(qt)
+            | Self::Q3_K(qt)
+            | Self::Q8_K(qt) => qt.dequantize_row(token_id),
         }
     }
 
-    /// For reference: fully dequantize to Vec<f32>
     pub fn to_f32_vec(&self) -> Result<Vec<f32>, DataSourceError> {
         match self {
             Self::F32 { data, .. } => Ok(data.clone()),
             Self::F16 { data, .. } => Ok(data.clone()),
             Self::BF16 { data, .. } => Ok(data.clone()),
-            Self::Q4_0(qt) => qt.dequantize_to_f32(),
-            Self::Q8_0(qt) => qt.dequantize_to_f32(),
-            Self::Q4_K(qt) => qt.dequantize_to_f32(),
+            Self::Q4_0(qt)
+            | Self::Q8_0(qt)
+            | Self::Q4_K(qt)
+            | Self::Q5_K(qt)
+            | Self::Q6_K(qt)
+            | Self::Q2_K(qt)
+            | Self::Q3_K(qt)
+            | Self::Q8_K(qt) => qt.dequantize_to_f32(),
         }
     }
 }
@@ -583,8 +722,33 @@ pub fn decode_tensor_to_f32(
             quant::dequantize_row_q4_k(bytes, num_elements as usize, &mut out)?;
             Ok(out)
         }
+        GgmlType::Q5_K => {
+            let mut out = vec![0.0f32; num_elements as usize];
+            quant::dequantize_row_q5_k(bytes, num_elements as usize, &mut out)?;
+            Ok(out)
+        }
+        GgmlType::Q6_K => {
+            let mut out = vec![0.0f32; num_elements as usize];
+            quant::dequantize_row_q6_k(bytes, num_elements as usize, &mut out)?;
+            Ok(out)
+        }
+        GgmlType::Q2_K => {
+            let mut out = vec![0.0f32; num_elements as usize];
+            quant::dequantize_row_q2_k(bytes, num_elements as usize, &mut out)?;
+            Ok(out)
+        }
+        GgmlType::Q3_K => {
+            let mut out = vec![0.0f32; num_elements as usize];
+            quant::dequantize_row_q3_k(bytes, num_elements as usize, &mut out)?;
+            Ok(out)
+        }
+        GgmlType::Q8_K => {
+            let mut out = vec![0.0f32; num_elements as usize];
+            quant::dequantize_row_q8_k(bytes, num_elements as usize, &mut out)?;
+            Ok(out)
+        }
         _ => Err(DataSourceError::General(format!(
-            "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q8_0, Q4_K)",
+            "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K)",
             ggml_type.name()
         ))),
     }

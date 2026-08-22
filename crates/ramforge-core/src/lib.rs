@@ -39,7 +39,11 @@ pub use error::{CacheError, DataSourceError, GgufError, MemoryError, ParseSizeEr
 pub use gguf::parse_gguf_file;
 pub use memory::{parse_memory_size, MemoryBudget};
 pub use model::{GgufModel, ModelInfo, TensorDescriptor};
-pub use quant::{BlockQ4K, BlockQ4_0, BlockQ8_0, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q4_K, BLOCK_SIZE_Q8_0, QK4_0, QK8_0, QK_K};
+pub use quant::{
+    BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8K, BlockQ8_0, BLOCK_SIZE_Q2_K,
+    BLOCK_SIZE_Q3_K, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q4_K, BLOCK_SIZE_Q5_K, BLOCK_SIZE_Q6_K,
+    BLOCK_SIZE_Q8_0, BLOCK_SIZE_Q8_K, QK4_0, QK8_0, QK_K,
+};
 pub use tensor::{decode_tensor_to_f32, QuantizedTensor, TensorData};
 pub use tokenizer::Tokenizer;
 pub use types::{GgmlType, MetadataValue};

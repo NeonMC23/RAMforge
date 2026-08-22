@@ -16,6 +16,7 @@ use crate::backend::ComputeBackend;
 use crate::kv_cache::KvCache;
 use crate::layer::{group_layers, LayerDescriptor, PersistentDescriptors};
 use crate::model::{LlamaConfig, LlamaWeights};
+use crate::persistent::{PersistentWeight, should_keep_resident};
 use crate::residency::ResidencyStats;
 
 #[derive(Debug, Clone)]
@@ -48,9 +49,9 @@ impl StreamingLayerWeights {
 #[derive(Debug)]
 pub struct StreamingLlamaModel {
     pub config: LlamaConfig,
-    pub token_embd: TensorData,
-    pub output_norm: TensorData,
-    pub output: Option<TensorData>,
+    pub token_embd: PersistentWeight,
+    pub output_norm: PersistentWeight,
+    pub output: Option<PersistentWeight>,
     pub layer_descriptors: Vec<LayerDescriptor>,
     pub persistent_descriptors: PersistentDescriptors,
     pub total_weight_bytes: u64,
@@ -58,7 +59,7 @@ pub struct StreamingLlamaModel {
 }
 
 impl StreamingLlamaModel {
-    /// Load persistent weights only, keep layer descriptors for streaming
+    /// Load persistent weights only if they fit comfortably, otherwise stream
     pub fn load(
         data_source: &GgufDataSource,
         cache: &mut BoundedCache,
@@ -78,47 +79,53 @@ impl StreamingLlamaModel {
         let quantized_weight_bytes = gguf_model
             .tensors
             .iter()
-            .filter(|t| matches!(t.ggml_type, GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K))
+            .filter(|t| matches!(t.ggml_type, GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q2_K | GgmlType::Q3_K | GgmlType::Q8_K))
             .filter_map(|t| t.byte_length)
             .sum();
 
-        // Helper to load persistent tensor as TensorData (keeps quantized compact)
-        let mut load_persistent = |name: &str| -> Result<TensorData, String> {
-            // Check cache for raw bytes
-            let raw_bytes = if let Some(cached) = cache.get(name) {
-                cached.clone()
-            } else {
-                let raw = data_source
-                    .read_tensor(name)
-                    .map_err(|e| format!("failed to read tensor '{}': {}", name, e))?;
-                let _ = cache.insert(name.to_string(), raw.clone());
-                raw
-            };
-
+        // Helper to load persistent tensor with streaming policy
+        let mut load_persistent = |name: &str| -> Result<PersistentWeight, String> {
             let desc = data_source
                 .get_descriptor(name)
-                .map_err(|e| format!("tensor '{}' not found: {}", name, e))?;
+                .map_err(|e| format!("tensor '{}' not found: {}", name, e))?
+                .clone();
 
-            let shape_u64 = desc.dimensions.clone();
-            let num_elements = desc.num_elements;
+            let tensor_bytes = desc.byte_length.unwrap_or(0);
 
-            let tensor_data = TensorData::from_bytes(
-                desc.ggml_type,
-                shape_u64,
-                num_elements,
-                raw_bytes,
-            )
-            .map_err(|e| format!("failed to create TensorData for '{}': {}", name, e))?;
+            if should_keep_resident(tensor_bytes, budget.total_bytes()) {
+                // Keep resident
+                let raw_bytes = if let Some(cached) = cache.get(name) {
+                    cached.clone()
+                } else {
+                    let raw = data_source
+                        .read_tensor(name)
+                        .map_err(|e| format!("failed to read tensor '{}': {}", name, e))?;
+                    let _ = cache.insert(name.to_string(), raw.clone());
+                    raw
+                };
 
-            let resident = tensor_data.resident_bytes() as u64;
-            let alloc_name = format!("weight:{}", name);
-            if budget.get(&alloc_name).is_none() {
-                budget
-                    .allocate(alloc_name, resident)
-                    .map_err(|e| format!("RAM budget exceeded loading '{}': {}", name, e))?;
+                let shape_u64 = desc.dimensions.clone();
+                let tensor_data = TensorData::from_bytes(
+                    desc.ggml_type,
+                    shape_u64,
+                    desc.num_elements,
+                    raw_bytes,
+                )
+                .map_err(|e| format!("failed to create TensorData for '{}': {}", name, e))?;
+
+                let resident = tensor_data.resident_bytes() as u64;
+                let alloc_name = format!("weight:{}", name);
+                if budget.get(&alloc_name).is_none() {
+                    budget
+                        .allocate(alloc_name, resident)
+                        .map_err(|e| format!("RAM budget exceeded loading '{}': {}", name, e))?;
+                }
+
+                Ok(PersistentWeight::Resident(tensor_data))
+            } else {
+                // Stream on demand – no resident allocation
+                Ok(PersistentWeight::Streamed(desc))
             }
-
-            Ok(tensor_data)
         };
 
         let token_embd = load_persistent("token_embd.weight")?;
@@ -258,11 +265,15 @@ impl StreamingLlamaModel {
         let n_heads = cfg.head_count;
         let n_kv_heads = cfg.head_count_kv;
 
-        // Embedding lookup – handles quantized via dequantize_row
-        let hidden = self
-            .token_embd
-            .get_embedding(token_id as usize, n_embd)
-            .map_err(|e| format!("embedding lookup failed: {}", e))?;
+        // Embedding lookup – handles quantized and streamed via PersistentWeight
+        let hidden = self.token_embd.get_embedding(
+            token_id as usize,
+            n_embd,
+            data_source,
+            cache,
+            budget,
+            stats,
+        )?;
 
         let mut hidden = hidden;
         let mut tmp = vec![0.0f32; n_embd];
@@ -374,7 +385,7 @@ impl StreamingLlamaModel {
 
         let output_norm_f32 = self
             .output_norm
-            .to_f32_vec()
+            .to_f32_vec(data_source)
             .map_err(|e| e.to_string())?;
         let mut final_hidden = vec![0.0f32; n_embd];
         backend.rmsnorm(&hidden, &output_norm_f32, cfg.rms_eps, &mut final_hidden);
@@ -382,26 +393,29 @@ impl StreamingLlamaModel {
         Ok(final_hidden)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn compute_logits(
         &self,
         hidden: &[f32],
-        backend: &dyn ComputeBackend,
+        _backend: &dyn ComputeBackend,
+        data_source: &GgufDataSource,
+        cache: &mut BoundedCache,
+        budget: &mut MemoryBudget,
+        stats: &mut ResidencyStats,
     ) -> Result<Vec<f32>, String> {
         let vocab_size = self.config.vocab_size;
         let mut logits = vec![0.0f32; vocab_size];
 
         if let Some(output_weight) = &self.output {
-            output_weight
-                .matvec(hidden, &mut logits)
-                .map_err(|e| format!("output matvec failed: {}", e))?;
+            let out = output_weight.compute_logits(hidden, data_source, cache, budget, stats)?;
+            logits.copy_from_slice(&out);
         } else {
-            self.token_embd
-                .matvec(hidden, &mut logits)
-                .map_err(|e| format!("token_embd matvec failed: {}", e))?;
+            let out = self
+                .token_embd
+                .compute_logits(hidden, data_source, cache, budget, stats)?;
+            logits.copy_from_slice(&out);
         }
 
-        // Silence unused backend warning – F32 path uses backend internally via TensorData? Actually TensorData matvec is independent
-        let _ = backend;
         Ok(logits)
     }
 }
