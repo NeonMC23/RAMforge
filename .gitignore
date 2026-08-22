@@ -2,3 +2,12 @@
 .git/
 .profile
 env
+.DS_Store
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+*.gguf
+*.bin
+*.safetensors
