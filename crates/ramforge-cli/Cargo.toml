@@ -1,0 +1,19 @@
+[package]
+name = "ramforge-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for RAMforge"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "ramforge"
+path = "src/main.rs"
+
+[dependencies]
+ramforge-core = { path = "../ramforge-core", features = ["serde"] }
+ramforge-runtime = { path = "../ramforge-runtime" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = "1.0"

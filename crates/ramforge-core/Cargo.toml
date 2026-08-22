@@ -1,0 +1,17 @@
+[package]
+name = "ramforge-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core GGUF parsing and model metadata for RAMforge"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+tempfile = "3.8"
