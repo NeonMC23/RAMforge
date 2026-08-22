@@ -13,10 +13,13 @@
 pub mod backend;
 pub mod inference;
 pub mod kv_cache;
+pub mod layer;
 pub mod model;
 pub mod ops;
 pub mod plan;
+pub mod residency;
 pub mod sampling;
+pub mod streaming_model;
 
 use ramforge_core::{
     cache::BoundedCache, datasource::GgufDataSource, memory::MemoryBudget, GgufModel,

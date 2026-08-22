@@ -65,6 +65,10 @@ enum Commands {
         /// Top-p sampling (optional)
         #[arg(long)]
         top_p: Option<f32>,
+
+        /// Verbose diagnostics including residency stats
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -96,8 +100,9 @@ fn main() {
             temperature,
             top_k,
             top_p,
+            verbose,
         } => {
-            if let Err(e) = run_inference(model, ram, prompt, max_tokens, temperature, top_k, top_p) {
+            if let Err(e) = run_inference(model, ram, prompt, max_tokens, temperature, top_k, top_p, verbose) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -133,6 +138,7 @@ fn run_plan(model_path: PathBuf, ram_str: String, json_output: bool) -> anyhow::
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inference(
     model_path: PathBuf,
     ram_str: String,
@@ -141,12 +147,13 @@ fn run_inference(
     temperature: f32,
     top_k: Option<usize>,
     top_p: Option<f32>,
+    verbose: bool,
 ) -> anyhow::Result<()> {
     let ram_bytes = parse_memory_size(&ram_str).map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
 
     // Diagnostics to stderr
-    eprintln!("RAMforge – Run (Milestone 3: Real CPU Inference)");
-    eprintln!("===============================================");
+    eprintln!("RAMforge – Run (Milestone 4: Out-of-Core Layer Streaming)");
+    eprintln!("========================================================");
     eprintln!("Model: {}", model_path.display());
     eprintln!("RAM budget: {} ({} bytes)", ram_str, ram_bytes);
     eprintln!("Prompt: {:?}", prompt);
@@ -158,18 +165,18 @@ fn run_inference(
     if let Some(p) = top_p {
         eprintln!("Top-p: {}", p);
     }
+    eprintln!("Execution model: Layer-wise streaming (load one layer → compute → release)");
     eprintln!();
 
     // Create inference engine – uses file-backed GgufDataSource, MemoryBudget, BoundedCache
-    eprintln!("Loading model (file-backed, cache-controlled)...");
+    eprintln!("Loading model (file-backed, persistent weights only)...");
     let mut engine = ramforge_runtime::inference::InferenceEngine::new(
         model_path.to_str().ok_or_else(|| anyhow::anyhow!("invalid model path"))?,
         ram_bytes,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    eprintln!("Architecture: {}", engine.config().embedding_length);
-    eprintln!("Model config: vocab={}, context={}, embedding={}, layers={}, heads={}, kv_heads={}, ffn={}, head_dim={}",
+    eprintln!("Model config: arch=llama/qwen2 vocab={}, context={}, embedding={}, layers={}, heads={}, kv_heads={}, ffn={}, head_dim={}",
         engine.config().vocab_size,
         engine.config().context_length,
         engine.config().embedding_length,
@@ -196,11 +203,12 @@ fn run_inference(
         engine.cache.current_bytes(),
         engine.cache.len()
     );
+    eprintln!("Total model weight bytes: {} (from descriptors)", engine.model.total_weight_bytes);
     eprintln!();
 
     let sampler = ramforge_runtime::sampling::Sampler::new(temperature, top_k, top_p);
 
-    eprintln!("Generating...");
+    eprintln!("Generating with layer streaming...");
     let (gen_tokens, gen_text) = engine
         .generate(&prompt, max_tokens, &sampler)
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -212,9 +220,25 @@ fn run_inference(
         engine.cache.stats().evictions,
         engine.cache.stats().current_bytes
     );
+
+    if verbose {
+        let stats = &engine.residency_stats;
+        eprintln!();
+        eprintln!("Residency stats (verbose):");
+        eprintln!("  Total model weight bytes: {} ({:.2} MiB)", stats.total_model_weight_bytes, stats.total_model_weight_bytes as f64 / (1024.0*1024.0));
+        eprintln!("  Current resident layer bytes: {}", stats.current_resident_layer_bytes);
+        eprintln!("  Peak resident layer bytes: {} ({:.2} MiB)", stats.peak_resident_layer_bytes, stats.peak_resident_layer_bytes as f64 / (1024.0*1024.0));
+        eprintln!("  Peak managed bytes: {} ({:.2} MiB) / budget {} ({:.2} MiB)", stats.peak_managed_bytes, stats.peak_managed_bytes as f64 / (1024.0*1024.0), ram_bytes, ram_bytes as f64 / (1024.0*1024.0));
+        eprintln!("  Layer loads: {}", stats.num_layer_loads);
+        eprintln!("  Layer releases: {}", stats.num_layer_releases);
+        eprintln!("  Fits check: total {} > budget {} ? {}", stats.total_model_weight_bytes, ram_bytes, stats.total_model_weight_bytes > ram_bytes);
+        eprintln!("  Peak layer < total ? {}", stats.peak_resident_layer_bytes < stats.total_model_weight_bytes);
+        eprintln!("  Peak managed <= budget ? {}", stats.peak_managed_bytes <= ram_bytes);
+    }
+
     eprintln!();
 
-    // Output generated text to stdout (programmatic)
+    // Output generated text to stdout
     println!("{}", gen_text);
 
     Ok(())

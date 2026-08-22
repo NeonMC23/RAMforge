@@ -2,157 +2,167 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **Milestone 3 Status:** First real CPU inference is implemented for LLaMA-compatible architecture (F32/F16). `ramforge run` performs actual transformer inference via RAMforge's own Rust code. GPU, MoE, HTTP API, and advanced out-of-core are not implemented yet.
+> **Milestone 4 Status:** True out-of-core layer streaming implemented. Model weights can exceed RAMforge-managed budget. Layers are loaded on demand, computed, then released. Real CPU inference for LLaMA/Qwen2 (F32/F16) with KV cache and budget enforcement. GPU, MoE, HTTP still not implemented.
 
 ## Purpose
 
-- Provide a correct, reusable foundation for understanding GGUF model files
-- Enable file-backed, out-of-core tensor access without loading entire models into RAM
-- Enforce a real RAM budget for RAMforge-managed allocations
-- Perform real CPU inference for supported architectures
+- GGUF parsing without loading tensor payloads
+- File-backed tensor access via `GgufDataSource`
+- Real RAM budget enforcement via `MemoryBudget`
+- Bounded LRU cache via `BoundedCache`
+- Real CPU inference with layer streaming for models larger than RAM
 
-## Current Capabilities
+## Capabilities
 
-### Milestone 1 (still functional)
-- Real GGUF parser (magic, header, metadata KV, tensor descriptors)
-- File-backed model representation: tensor payloads NOT loaded during inspection
-- Normalized helpers for architecture, context length, etc.
+### Milestone 1 – GGUF Inspection
+- Magic, header, metadata KV, tensor descriptors, file offsets, byte lengths
 
-### Milestone 2 (still functional)
-- **MemoryBudget**: exact byte accounting, named allocations with enforcement
-- **Memory size parsing**: `8G`, `8GiB`, `8192M`, `512MiB`, etc.
-- **File-backed tensor access**: `GgufDataSource` reads tensor bytes on demand
-- **Bounded LRU cache**: capacity bytes, LRU eviction, stats
-- **CLI `ramforge plan`**
+### Milestone 2 – Memory Budget & File-Backed Access
+- `MemoryBudget` with named allocations, exact byte accounting
+- `parse_memory_size()` accepts `8G`, `8GiB`, `8192M`, `512MiB`, `1.5G`, etc.
+- `GgufDataSource` reads tensors/ranges on demand
+- `BoundedCache` LRU with stats
+- `ramforge plan`
 
-### Milestone 3 (new) – Real CPU Inference
-- **Supported architectures**: `llama` and `qwen2` (both use same dense transformer layout with `blk.{i}.attn_q.weight` etc.)
-  - Documented: only `general.architecture = "llama"` or `"qwen2"` are accepted; others fail clearly
-- **Supported tensor formats**: `F32`, `F16`, `BF16` (decoded to F32). Other types (quantized Q4_0, Q4_K, etc.) produce clear error: "unsupported tensor type for inference"
-- **Tokenizer**: loads `tokenizer.ggml.model`, `tokens`, `scores`, `token_type`, `merges`, `bos_token_id`, `eos_token_id` from GGUF metadata. Implements naive longest-match encoding for `llama` (handles `▁` → space) and fallback byte handling. Detokenization concatenates tokens and replaces `▁` with space.
-- **Inference pipeline**:
-  1. tokenizer loading from GGUF
-  2. prompt tokenization (with optional BOS)
-  3. embedding lookup via `token_embd.weight`
-  4. transformer layers (for each `blk.i`):
-     - RMSNorm (`attn_norm`)
-     - Q/K/V projections (`attn_q`, `attn_k`, `attn_v`)
-     - RoPE (`rope.freq_base`, head_dim)
-     - KV cache append
-     - causal self-attention (with GQA support via `head_count_kv`)
-     - output projection (`attn_output`) + residual
-     - RMSNorm (`ffn_norm`)
-     - SwiGLU FFN: `ffn_gate` (SiLU) * `ffn_up`, then `ffn_down` + residual
-  5. final RMSNorm (`output_norm`)
-  6. output projection (`output.weight` or tied `token_embd`)
-  7. sampling (greedy when temperature=0, temperature, top-k, top-p)
-  8. detokenization
-  9. autoregressive loop with KV cache
-- **KV cache**: explicit struct per layer, stores K/V as `Vec<f32>` sized `[max_seq_len * n_kv_heads * head_dim]`, grows via `append` + `increment_seq_len`, avoids recomputing previous tokens, memory usage accounted via `MemoryBudget` (`kv_cache` allocation), fails clearly if budget too small
-- **CPU backend**: `CpuBackend` implements `ComputeBackend` trait with `matvec`, `rmsnorm`, `add`, `mul`, `silu`, `softmax`. Designed to allow future GPU backend (`ComputeBackend` → `CpuBackend` / future GPU)
-- **Memory integration**: weights accessed through `GgufDataSource::read_tensor()` (file seek, not `std::fs::read` whole file), decoded via `decode_tensor_to_f32`, allocated from `MemoryBudget` (`weight:{name}`), cached in `BoundedCache` (raw bytes). Entire model never loaded as one giant buffer.
-- **CLI `ramforge run`**: performs real inference
+### Milestone 3 – First Real CPU Inference
+- Architectures: `llama`, `qwen2`
+- Tensor types: `F32`, `F16`, `BF16`
+- Tokenizer from GGUF metadata (naive longest-match, `▁` handling)
+- Transformer: RMSNorm, RoPE, causal attention with GQA, SwiGLU FFN, sampling
+- KV cache explicit and budget-accounted
+- `ramforge run`
 
-### Design for Memory Efficiency
+### Milestone 4 – True Out-of-Core Layer Streaming (current)
 
-- Parser reads only header/metadata/descriptors
-- `GgufDataSource` reads only requested tensor bytes
-- `BoundedCache` bounds memory, LRU eviction
-- `MemoryBudget` tracks RAMforge-managed memory (tensor cache, KV cache, weights), NOT total RSS
-- Inference loads individual tensors via data source, not whole file
+**Defining feature:** Model weights (e.g. 4GB) can be larger than RAMforge budget (e.g. 1GB) and still run by streaming layers.
 
-## Build
+**Execution model:**
+```
+GGUF on disk
+  ↓ metadata
+Layer 0 weights → RAMforge managed memory → CPU compute Layer 0 → Release Layer 0
+  ↓
+Layer 1 weights → compute → Release
+...
+Final norm / output → logits → next token
+```
+
+**What changed from Milestone 3:**
+- Removed assumption that all weights are loaded in `LlamaModel::load()`. Now only persistent weights (`token_embd`, `output_norm`, `output`) are loaded initially.
+- Introduced layer-oriented representation: `LayerDescriptor` groups `blk.{i}.*` tensors, `PersistentDescriptors` for non-layer tensors.
+- Introduced `StreamingLlamaModel` with `load_layer()` and `release_layer()` – each layer's decoded size allocated from `MemoryBudget` as `layer:{i}:{tensor}`, tracked in `ResidencyStats`, released immediately after compute.
+- Forward pass `forward_single_streaming()` loads one layer, computes, releases, next layer – entire stack never resident simultaneously.
+- Added `ResidencyStats`: total model weight bytes, current/peak resident layer bytes, num loads/releases, peak managed bytes.
+- Added `--verbose` to `run` to expose residency stats.
+
+**Memory accounting:**
+- RAMforge-managed memory = memory tracked via `MemoryBudget` (persistent weights, currently resident layer, KV cache). NOT total RSS or OS page cache.
+- Every streamed layer allocation goes through `MemoryBudget`; release via `release()`.
+- `BoundedCache` still used for raw tensor bytes (may evict), but does not retain every layer – policy is load-compute-release.
+- KV cache remains resident across generation, allocated from budget based on needed length (`prompt_len + max_tokens`) to save memory vs full context.
+
+**Verification model:**
+Synthetic GGUF generator creates models where total weights > budget but per-layer fits. Example from tests and manual run:
+
+```
+Model weights:       42560 bytes (41KB, 4 layers, n_embd 16, ffn 32)
+RAM budget:          16384 bytes (16KB)
+Cache capacity:      8192 bytes (8KB)
+Peak layer residency: 10368 bytes (10KB)
+Peak managed memory: 14016 bytes (13KB) <= budget
+Layer loads:         20 (4 layers * 5 tokens)
+Layer releases:      20
+Result:              Inference succeeds with streaming
+```
+
+Proves:
+- `total_model_weight_bytes > configured_budget`
+- `peak_resident_layer_bytes < total_model_weight_bytes`
+- `peak_managed_bytes <= configured_budget`
+
+## Build & Test
 
 ```bash
 cargo build
-cargo test
+cargo test --workspace
 cargo clippy --workspace -- -D warnings
 ```
 
 ## Usage
 
-Inspect:
+Inspect (still works):
 ```bash
-cargo run -p ramforge-cli -- inspect /path/to/model.gguf
+cargo run -p ramforge-cli -- inspect model.gguf
 ```
 
-Plan:
+Plan (still works):
 ```bash
-cargo run -p ramforge-cli -- plan /path/to/model.gguf --ram 8G
+cargo run -p ramforge-cli -- plan model.gguf --ram 8G
+cargo run -p ramforge-cli -- plan model.gguf --ram 256M --verbose
 ```
 
-Run real inference (CPU, LLaMA):
+Run with real inference and layer streaming:
 ```bash
-cargo run -p ramforge-cli -- run /path/to/model.gguf --ram 8G --prompt "Hello" --max-tokens 32
-cargo run -p ramforge-cli -- run /path/to/model.gguf --ram 8G --prompt "Explain what a computer is." --max-tokens 32 --temperature 0.7
+cargo run -p ramforge-cli -- run model.gguf --ram 8G --prompt "Hello" --max-tokens 32
+cargo run -p ramforge-cli -- run model.gguf --ram 256M --prompt "Hello" --max-tokens 16 --verbose
+cargo run -p ramforge-cli -- run model.gguf --ram 8G --prompt "Explain what a computer is." --max-tokens 32 --temperature 0.7
 ```
 
-Supported `run` options:
-- `--ram <SIZE>`: RAM budget (e.g. 8G, 512MiB)
-- `--prompt <TEXT>`: prompt
-- `--max-tokens <N>`: default 32
-- `--temperature <FLOAT>`: 0 = greedy, default 0
-- `--top-k <K>`: optional
-- `--top-p <P>`: optional
+Accepted `--ram` syntax: `8G`, `8GiB`, `8192M`, `512MiB`, `1.5G`, `1024`, `KB`/`KiB`/`MB`/`MiB`/`GB`/`GiB`/`TB`/`TiB`.
 
-Diagnostics go to stderr, generated text to stdout.
+Diagnostics to stderr, generated text to stdout.
 
-Example output:
-```
-Model: /path/to/model.gguf
-RAM budget: 8G (8589934592 bytes)
-...
-Model config: vocab=32000, context=2048, embedding=4096, layers=32, ...
-Tokenizer: model=llama, vocab_size=32000, bos=Some(1), eos=Some(2)
-Execution backend: CPU
-...
-
-Generated text...
+**Out-of-core example:**
+```bash
+# Synthetic model 45KB total, 42KB weights, budget 16KB
+cargo run -p ramforge-cli -- run synthetic.gguf --ram 16K --prompt "hello" --max-tokens 3 --verbose
+# Shows:
+# Total model weight bytes: 42560
+# Peak resident layer bytes: 10368
+# Peak managed bytes: 14016 / budget 16384
+# Fits check: total > budget ? true
+# Peak layer < total ? true
+# Peak managed <= budget ? true
 ```
 
 ## Project Structure
 
 ```
 crates/
-  ramforge-core/      # GGUF parsing, MemoryBudget, BoundedCache, GgufDataSource, Tokenizer, tensor decoding (F32/F16)
-  ramforge-runtime/   # Runtime, plan, CPU backend, ops (RoPE, attention), KV cache, sampling, LLaMA model loading & inference
-  ramforge-cli/       # inspect, plan, run commands
+  ramforge-core/      # GGUF parsing, MemoryBudget, BoundedCache, GgufDataSource, Tokenizer, tensor decoding
+  ramforge-runtime/   # backend, ops, kv_cache, layer grouping, residency stats, streaming_model, inference (streaming), plan, sampling
+  ramforge-cli/       # inspect, plan, run (with --verbose)
 ```
 
 ## Supported / Unsupported
 
-**Supported architecture:** `llama`, `qwen2` (dense transformer, same tensor naming)
-
-**Supported tensor types:** `F32`, `F16`, `BF16`
+**Supported:**
+- Architectures: `llama`, `qwen2` (dense, same tensor naming)
+- Tensor types: `F32`, `F16`, `BF16`
+- CPU backend only
 
 **Unsupported (clear error):**
-- Other architectures (e.g. `bert`, `gpt2` architecture) → "unsupported architecture"
-- Quantized types (Q4_0, Q4_K, etc.) → "unsupported tensor type for inference"
+- Other architectures → "unsupported architecture"
+- Quantized types Q4_0, Q4_K, etc. → "unsupported tensor type"
 - Missing tensors → "missing tensor 'blk.0.attn_q.weight'"
+- Budget too small for layer or KV cache → clear insufficient memory error
 
-**CPU-only:** No CUDA/Metal/Vulkan
+## Known Limitations (Milestone 4)
 
-## Testing
+- Only F32/F16/BF16, no quantization (would be needed for real large models)
+- Persistent weights (token_embd, output) kept resident; if they exceed budget, they would need streaming too (documented, not yet implemented)
+- No prefetch, double buffering, SIMD, multithreading
+- KV cache no eviction
+- Tokenizer naive, not fully equivalent to llama.cpp but functional for tests
+- Minimum practical requirement: individual layer working set must fit in available managed memory
 
-- Unit tests for tokenizer, F32/F16 decoding, matvec, RMSNorm, SiLU, softmax, RoPE, attention, KV cache, sampling, memory parsing, budget enforcement, cache LRU, file-backed range reads
-- End-to-end inference test with tiny deterministic LLaMA GGUF (vocab 16, n_embd 8, 1 layer) – verifies deterministic greedy output for fixed prompt
+## What is NOT Implemented
 
-## Known Limitations
-
-- Only F32/F16/BF16 supported, no quantization
-- Only llama/qwen2 dense models, no MoE
-- KV cache allocated for needed length (prompt+max_tokens) to save memory, not full context_length
-- Simple CPU matvec, no SIMD optimization
-- Tokenizer is naive longest-match, not fully equivalent to llama.cpp SentencePiece but functional
-- Does not yet implement advanced out-of-core layer-by-layer eviction for huge models – small model must fit in cache, but architecture remains file-backed
-
-## What is NOT Implemented Yet
-
-- GPU support (CUDA, Vulkan, Metal)
-- MoE routing, speculative prefetching
+- GPU (CUDA, Metal, Vulkan)
+- MoE, speculative decoding
 - HTTP server, OpenAI API
 - TUI, model downloading
-- Advanced KV cache eviction
+- Quantization, async I/O
 
 ## License
 
