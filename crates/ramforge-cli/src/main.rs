@@ -3,7 +3,7 @@ use ramforge_core::{parse_gguf_file, parse_memory_size, GgufModel};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "ramforge", version, about = "RAMforge – hierarchical memory inference runtime (milestone 3: real CPU inference)")]
+#[command(name = "ramforge", version, about = "RAMforge – hierarchical memory inference runtime (milestone 5: quantized out-of-core CPU inference)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -152,7 +152,7 @@ fn run_inference(
     let ram_bytes = parse_memory_size(&ram_str).map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
 
     // Diagnostics to stderr
-    eprintln!("RAMforge – Run (Milestone 4: Out-of-Core Layer Streaming)");
+    eprintln!("RAMforge – Run (Milestone 5: Quantized Out-of-Core Layer Streaming)");
     eprintln!("========================================================");
     eprintln!("Model: {}", model_path.display());
     eprintln!("RAM budget: {} ({} bytes)", ram_str, ram_bytes);
@@ -337,7 +337,7 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
 fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufModel, ram_str: &str) {
     let info = model.info();
 
-    println!("RAMforge – Execution Plan (Milestone 2)");
+    println!("RAMforge – Execution Plan (Milestone 5)");
     println!("=======================================");
     println!();
     println!("Model:");
@@ -385,7 +385,7 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     println!("  Access method: explicit read_range with validation (no full model load)");
     println!();
 
-    println!("Note: This is Milestone 2 – memory budget and file-backed access are real and enforced. Inference is not implemented yet.");
+    println!("Note: This is Milestone 5 – memory budget and file-backed access are real and enforced. For inference, use 'ramforge run'.");
 }
 
 fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {

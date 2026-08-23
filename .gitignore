@@ -1,26 +1,68 @@
+# ============================================================
+# RAMforge .gitignore
+# Source code and intentional project configuration belong in Git.
+# Generated toolchains, caches, registries, models, and local
+# environment files do not.
+# ============================================================
+
+# ---------- Rust build artifacts ----------
 /target/
 **/target/
+
+# ---------- Rust toolchain & local Cargo-home artifacts ----------
+# Intentional project configuration under .cargo/ (e.g. .cargo/config.toml
+# or .cargo/config) remains trackable. Everything below is a per-machine
+# cargo/rustup artifact and must never be committed.
+.rustup/
+.cargo/bin/
+.cargo/env
+.cargo/registry/
+.cargo/git/
+.cargo/.global-cache
+.cargo/.package-cache
+.cargo/.package-cache-mutate
+!.cargo/config.toml
+!.cargo/config
+
+# Downloaded crate archives
+*.crate
+
+# ---------- Development shell environment files ----------
+# Per-machine shell setup (e.g. rustup env sourcing); not project config.
+.profile
+
+# ---------- Temporary / editor / OS files ----------
 *.tmp
 *.log
 .DS_Store
 *~
 *.swp
 *.swo
+*.rs.bk
 .idea/
 .vscode/
+*.code-workspace
+
+# ---------- Model & dataset artifacts (never commit) ----------
 *.gguf
+*.ggml
 *.bin
 *.safetensors
 *.pt
 *.pth
 *.onnx
+
+# ---------- Native binaries / shared libraries ----------
 *.exe
 *.dll
 *.so
 *.dylib
-*.code-workspace
+
+# ---------- Coverage / profiling ----------
 *.profraw
 *.profdata
 lcov.info
 coverage/
+
+# ---------- Local environment / secrets ----------
 .env

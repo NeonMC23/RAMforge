@@ -2,7 +2,7 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **Milestone 5 Status:** Native GGUF quantized tensor support – Q4_0, Q8_0, Q4_K. Quantized weights remain quantized while resident; dequantization happens block-wise during matvec. True out-of-core layer streaming preserved. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented.
+> **Milestone 5 Status (HEAD: M5.6.1):** Native GGUF quantized tensor support – Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K. Quantized weights remain quantized while resident; dequantization happens block-wise during matvec. True out-of-core layer streaming preserved. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented.
 
 ## Purpose
 
@@ -39,9 +39,10 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 - `Q4_0`: block 32, 18 bytes (2B half scale `d` + 16B packed 4-bit quants, dequant `d*(q-8)`)
 - `Q8_0`: block 32, 34 bytes (2B half scale `d` + 32B int8 quants, dequant `d*q`)
 - `Q4_K`: block 256, 144 bytes (2B half `d`, 2B half `dmin`, 12B scales (8 scales + 8 mins packed 6-bit), 128B 4-bit quants; unpack via `get_scale_min_k4(j)`, dequant `d*sc*q - dmin*m`)
+- Since M5.6.1: `Q2_K`, `Q3_K`, `Q5_K`, `Q6_K`, `Q8_K` block layouts, `dequantize_row_*`, and `matvec_*` are also implemented in `quant.rs` with the same resident-compact representation. `Q4_1`, `Q5_0`, `Q5_1`, `Q8_1`, `IQ*` remain unsupported.
 
 **Representation:**
-- `TensorData` enum: `F32`, `F16`, `BF16`, `Q4_0(QuantizedTensor)`, `Q8_0`, `Q4_K`
+- `TensorData` enum: `F32`, `F16`, `BF16`, `Q4_0(QuantizedTensor)`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K`
 - `QuantizedTensor { ggml_type, shape, num_elements, raw_data: Vec<u8> }` keeps quantized compact while resident
 - `resident_bytes()` = raw_data.len() (e.g. 144B for 256 values Q4_K vs 1024B F32) – shows memory saving
 - `matvec()` for quantized does block-wise dequant: for each output row, for each quantized block, decode block to temp `[32]` or `[256]` f32, dot with x slice, discard temp. Working set bounded to one block.
@@ -61,7 +62,7 @@ Layer descriptor → GgufDataSource::read_tensor() (quantized bytes) → TensorD
 Entire quantized model never resident simultaneously. Layers released after compute.
 
 **Compute backend:**
-- `ComputeBackend` trait preserved, `CpuBackend` implements scalar quantized matvec via `quant::matvec_q4_0/q8_0/q4_k`
+- `ComputeBackend` trait preserved, `CpuBackend` implements scalar quantized matvec via `quant::matvec_*`; F32 dot/matvec optionally use runtime-detected AVX2 (`simd.rs`) and rayon row-parallelism (`CpuBackend::with_threads`, auto-detected by `new()`)
 - Future SIMD implementation can replace scalar without rewriting inference engine
 
 ## Build & Test
@@ -124,14 +125,16 @@ crates/
     cache.rs – BoundedCache LRU
     datasource.rs – GgufDataSource
     tokenizer.rs – Tokenizer from GGUF
-    quant.rs – Q4_0, Q8_0, Q4_K block layouts, dequant, quantized matvec (scalar, block-wise)
-    tensor.rs – TensorData (F32/F16/BF16/Q4_0/Q8_0/Q4_K), QuantizedTensor, resident_bytes, matvec, get_embedding
+    quant.rs – Q4_0, Q8_0, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K block layouts, dequant, quantized matvec (scalar, block-wise)
+    tensor.rs – TensorData (F32/F16/BF16/Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K), QuantizedTensor, resident_bytes, matvec, get_embedding
   ramforge-runtime/
-    backend.rs – ComputeBackend, CpuBackend
+    backend.rs – ComputeBackend, CpuBackend (rayon threading, optional AVX2 for F32)
     ops.rs – RoPE, attention
     kv_cache.rs – KV cache explicit, budget-accounted
     layer.rs – LayerDescriptor grouping
     residency.rs – ResidencyStats
+    persistent.rs – PersistentWeight: resident if <25% of budget, else streamed on demand (M5.6.1)
+    simd.rs – AVX2/FMA F32 dot/matvec kernels, runtime detection + scalar fallback (M5.6.1)
     model.rs – LlamaConfig, LlamaWeights validation
     streaming_model.rs – StreamingLlamaModel (persistent + layer descriptors), load_layer/release_layer, forward_single_streaming with quantized matvec
     inference.rs – InferenceEngine (file-backed + budget + cache + streaming + quantized), generate()
@@ -144,11 +147,11 @@ crates/
 
 **Supported architectures:** `llama`, `qwen2` (dense, same tensor naming)
 
-**Supported tensor types:** `F32`, `F16`, `BF16`, `Q4_0`, `Q8_0`, `Q4_K` – all usable for inference
+**Supported tensor types:** `F32`, `F16`, `BF16`, `Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` – all usable for inference
 
 **Unsupported (clear error):**
 - Other architectures → "unsupported architecture"
-- Other quantized types Q2_K, Q3_K, Q5_K, Q6_K, IQ* → "unsupported tensor type for inference"
+- Other quantized types (Q4_1, Q5_0, Q5_1, Q8_1, IQ*, …) → "unsupported tensor type for inference"
 - Missing tensors → "missing tensor 'blk.0.attn_q.weight'"
 - Budget too small → "RAM budget too small for layer..."
 
@@ -166,22 +169,22 @@ crates/
 - Existing F32/F16/BF16 inference still works
 - Existing Milestone 4 streaming tests still pass
 
-Total: 42 core tests + 25 runtime tests = 67 tests.
+Total (M5.6.1): 62 core tests + 31 runtime tests = 93 tests.
 
 ## Known Limitations (Milestone 5)
 
-- Only Q4_0, Q8_0, Q4_K supported; Q2_K, Q3_K, Q5_K, Q6_K, IQ quants not yet
-- Scalar CPU implementation, no SIMD, no threading
-- Tokenizer naive longest-match, not full SentencePiece BPE
-- Persistent weights (token_embd, output) kept resident; if quantized they remain compact but still resident – if they exceed budget, need streaming (documented)
+- Quantized inference limited to Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K; Q4_1/Q5_0/Q5_1/Q8_1 and IQ* quants not supported
+- CPU-only: quantized matvec is scalar (block-wise dequant); F32 dot/matvec have optional runtime-detected AVX2 kernels and rayon row-parallelism (M5.6.1); no GPU
+- Tokenizer: SentencePiece unigram (score-based Viterbi) and BPE (gpt2/qwen2 merges); other pre-tokenizers/model families untested
+- Persistent weights (token_embd, output_norm, output): resident if under 25% of budget, otherwise streamed on demand (M5.6.1, `persistent.rs`)
 - KV cache F32, no quantization, no eviction
 - Minimum practical: individual layer working set must fit in budget
 
 ## What is NOT Implemented
 
-- GPU, SIMD, multithreading, prefetch, double buffering, async I/O
+- GPU, prefetch, double buffering, async I/O
 - HTTP server, MoE, speculative decoding, model downloading
-- Additional quantization formats beyond Q4_0/Q8_0/Q4_K
+- Additional quantization formats beyond Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K; no SIMD kernels for quantized matvec (F32 AVX2 only)
 
 ## License
 

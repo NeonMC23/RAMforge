@@ -50,7 +50,7 @@ impl LlamaConfig {
         let supported = ["llama", "qwen2"];
         if !supported.contains(&arch.as_str()) {
             return Err(format!(
-                "unsupported architecture '{}': only {:?} are supported in milestone 3 (found general.architecture = '{}')",
+                "unsupported architecture '{}': only {:?} are supported (found general.architecture = '{}')",
                 arch, supported, arch
             ));
         }
