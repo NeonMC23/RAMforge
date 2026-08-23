@@ -2,7 +2,9 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **Milestone 6 Status (HEAD: True Out-of-Core Integrity):** Every RAMforge allocation is charged to the RAM budget via RAII-style scoped guards; the cache is budget-charged per entry; matrix layout is the explicit GGML/GGUF convention (no orientation guessing, no full-F32 fallbacks); logits use a single budget-charged buffer with a budget-aware chunked streamed projection; the KV cache grows chunk-wise without prefix copies; the F32 matvec hot path uses AVX2/rayon. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented.
+> **Milestone 6.1 Status (HEAD: Correctness & Accounting Fixes):** `generate()` is cleanly repeatable on one engine (explicit KV reset + failure-proof budget); RoPE uses the correct llama/qwen2 **half-split** pair convention; F16/BF16 resident RAM is booked at its true decoded size (4 B/elem, with a 3x-file-byte load transient); qwen2 Q/K/V biases are loaded, budgeted, validated (all-or-none + exact shape), and applied after the projections. Everything below in M6 stands. Verified by 132 tests and synthetic end-to-end runs; real-model files remain untested.
+>
+> **Milestone 6 Status (True Out-of-Core Integrity):** Every RAMforge allocation is charged to the RAM budget via RAII-style scoped guards; the cache is budget-charged per entry; matrix layout is the explicit GGML/GGUF convention (no orientation guessing, no full-F32 fallbacks); logits use a single budget-charged buffer with a budget-aware chunked streamed projection; the KV cache grows chunk-wise without prefix copies; the F32 matvec hot path uses AVX2/rayon. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented.
 
 ## Purpose
 
@@ -50,6 +52,7 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 
 **Memory accounting:**
 - Budget accounts actual resident representation: quantized bytes + temporary block buffers, NOT full F32 expansion.
+- F16/BF16 weights: decoded to F32 in RAM at load time; the budget books the true decoded residency (4 B/elem), with a 3× file-byte transient during layer load (hardened in M6.1 – see below).
 - Example: Q4_K 256 elements F32 equiv 1024B, quantized resident 144B (7.1× smaller). For model with 4 layers n_embd 256 ffn 512:
   - Quantized total 1.5MB, F32 equiv 10MB
   - Budget 800KB, total quantized 1.5MB > budget, per-layer quantized 370KB fits, peak managed 429KB ≤ budget → inference succeeds with streaming
@@ -64,7 +67,14 @@ Entire quantized model never resident simultaneously. Layers released after comp
 **Compute backend:**
 - `ComputeBackend` trait F32 `matvec` now follows the explicit ggml layout and is wired into the inference hot path (`matvec_backend` in `streaming_model.rs`): resident F32 weights use runtime-detected AVX2 (`simd.rs`) + rayon row-parallelism; quantized weights keep the compact block-wise kernels from `quant.rs`
 
-### Milestone 6 – True Out-of-Core Integrity (current)
+### Milestone 6.1 – Correctness & Accounting Fixes (current)
+
+- **KV cache lifecycle:** repeated `generate()` calls on one engine work; failed generations release every charge they made (`clear_kv_cache()`); no stale `"kv_cache"` allocations
+- **RoPE:** half-split `(x[j], x[j+head_dim/2])` convention with `theta_j = pos * base^(-2j/head_dim)` — the true llama/qwen2 rotation (was interleaved/GPT-J pairs)
+- **F16/BF16 accounting:** decoded-F32 residency (4 B/elem) is what the budget books for persistent weights and settled layer charges
+- **Q/K/V biases (qwen2):** loaded + charged, all-or-none validation, bias added after projection matvec (before RoPE), released with the layer; partial sets and shape mismatches are hard errors
+
+### Milestone 6 – True Out-of-Core Integrity
 
 - **Memory accounting:** `MemoryBudget::with_temp(name, bytes, f)` is the RAII-style scoped guard for all transient working sets (`tmp:forward`, `tmp:embd_row`, `tmp:streamed_matvec`, `tmp:logits`, `tmp:sampling`) – released on success and on error. Layer tensors charge *before* reading (peak = settled prefix + per-tensor transient) and settle to exact resident bytes after construction; a failed layer load releases all its charges.
 - **Cache:** `BoundedCache::insert_budgeted` charges each cached entry to the budget (`cache:{key}`), evicting LRU entries to make budget room; if nothing can be evicted, the entry is simply not cached (streaming keeps working) instead of failing or double-counting.
@@ -178,7 +188,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-Total (M6): 79 core tests + 38 runtime tests = 117 tests.
+Total (M6.1): 81 core tests + 51 runtime tests = 132 tests.
 
 ## Known Limitations (Milestone 6)
 

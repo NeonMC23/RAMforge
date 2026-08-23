@@ -318,17 +318,14 @@ pub enum TensorData {
     F32 {
         data: Vec<f32>,
         shape: Vec<usize>,
-        raw_bytes_len: usize,
     },
     F16 {
         data: Vec<f32>,
         shape: Vec<usize>,
-        raw_bytes_len: usize,
     },
     BF16 {
         data: Vec<f32>,
         shape: Vec<usize>,
-        raw_bytes_len: usize,
     },
     Q4_0(QuantizedTensor),
     Q8_0(QuantizedTensor),
@@ -355,7 +352,6 @@ impl TensorData {
                 Ok(Self::F32 {
                     data,
                     shape: shape_usize,
-                    raw_bytes_len: raw_bytes.len(),
                 })
             }
             GgmlType::F16 => {
@@ -363,7 +359,6 @@ impl TensorData {
                 Ok(Self::F16 {
                     data,
                     shape: shape_usize,
-                    raw_bytes_len: raw_bytes.len(),
                 })
             }
             GgmlType::BF16 => {
@@ -371,7 +366,6 @@ impl TensorData {
                 Ok(Self::BF16 {
                     data,
                     shape: shape_usize,
-                    raw_bytes_len: raw_bytes.len(),
                 })
             }
             GgmlType::Q4_0 => {
@@ -415,9 +409,12 @@ impl TensorData {
 
     pub fn resident_bytes(&self) -> usize {
         match self {
-            Self::F32 { raw_bytes_len, .. } => *raw_bytes_len,
-            Self::F16 { raw_bytes_len, .. } => *raw_bytes_len,
-            Self::BF16 { raw_bytes_len, .. } => *raw_bytes_len,
+            // Float variants are held *decoded* as Vec<f32> in RAM, so the
+            // resident size is data.len() * 4 regardless of the on-disk
+            // representation (F16/BF16 files are half that size).
+            Self::F32 { data, .. } => data.len() * 4,
+            Self::F16 { data, .. } => data.len() * 4,
+            Self::BF16 { data, .. } => data.len() * 4,
             Self::Q4_0(qt) => qt.resident_bytes(),
             Self::Q8_0(qt) => qt.resident_bytes(),
             Self::Q4_K(qt) => qt.resident_bytes(),
@@ -1153,6 +1150,29 @@ mod tests {
         } else {
             panic!("expected Q4_0");
         }
+    }
+
+    #[test]
+    fn test_resident_bytes_f16_reflects_decoded_f32_storage() {
+        // F16 tensors are held decoded as Vec<f32>: residency must be
+        // 4 B/elem even though the file form is 2 B/elem (M6.1 BUG-3 fix).
+        let raw: Vec<u8> = (0..32).flat_map(|_| 0x3C00u16.to_le_bytes()).collect();
+        let td = TensorData::from_bytes(GgmlType::F16, vec![32], 32, raw).unwrap();
+        assert_eq!(td.num_elements(), 32);
+        assert_eq!(td.resident_bytes(), 32 * 4);
+    }
+
+    #[test]
+    fn test_resident_bytes_bf16_reflects_decoded_f32_storage() {
+        let one: u16 = (1.0f32.to_bits() >> 16) as u16;
+        let raw: Vec<u8> = (0..16).flat_map(|_| one.to_le_bytes()).collect();
+        let td = TensorData::from_bytes(GgmlType::BF16, vec![4, 4], 16, raw).unwrap();
+        assert_eq!(td.num_elements(), 16);
+        assert_eq!(td.resident_bytes(), 16 * 4);
+        // And the decoded values are what we put in.
+        let (data, shape) = td.as_f32_slice().unwrap();
+        assert_eq!(shape, &[4, 4]);
+        assert!(data.iter().all(|&v| v == 1.0));
     }
 
     #[test]
