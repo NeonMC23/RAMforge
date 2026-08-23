@@ -2,7 +2,7 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **Milestone 5 Status (HEAD: M5.6.1):** Native GGUF quantized tensor support – Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K. Quantized weights remain quantized while resident; dequantization happens block-wise during matvec. True out-of-core layer streaming preserved. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented.
+> **Milestone 6 Status (HEAD: True Out-of-Core Integrity):** Every RAMforge allocation is charged to the RAM budget via RAII-style scoped guards; the cache is budget-charged per entry; matrix layout is the explicit GGML/GGUF convention (no orientation guessing, no full-F32 fallbacks); logits use a single budget-charged buffer with a budget-aware chunked streamed projection; the KV cache grows chunk-wise without prefix copies; the F32 matvec hot path uses AVX2/rayon. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented.
 
 ## Purpose
 
@@ -62,8 +62,16 @@ Layer descriptor → GgufDataSource::read_tensor() (quantized bytes) → TensorD
 Entire quantized model never resident simultaneously. Layers released after compute.
 
 **Compute backend:**
-- `ComputeBackend` trait preserved, `CpuBackend` implements scalar quantized matvec via `quant::matvec_*`; F32 dot/matvec optionally use runtime-detected AVX2 (`simd.rs`) and rayon row-parallelism (`CpuBackend::with_threads`, auto-detected by `new()`)
-- Future SIMD implementation can replace scalar without rewriting inference engine
+- `ComputeBackend` trait F32 `matvec` now follows the explicit ggml layout and is wired into the inference hot path (`matvec_backend` in `streaming_model.rs`): resident F32 weights use runtime-detected AVX2 (`simd.rs`) + rayon row-parallelism; quantized weights keep the compact block-wise kernels from `quant.rs`
+
+### Milestone 6 – True Out-of-Core Integrity (current)
+
+- **Memory accounting:** `MemoryBudget::with_temp(name, bytes, f)` is the RAII-style scoped guard for all transient working sets (`tmp:forward`, `tmp:embd_row`, `tmp:streamed_matvec`, `tmp:logits`, `tmp:sampling`) – released on success and on error. Layer tensors charge *before* reading (peak = settled prefix + per-tensor transient) and settle to exact resident bytes after construction; a failed layer load releases all its charges.
+- **Cache:** `BoundedCache::insert_budgeted` charges each cached entry to the budget (`cache:{key}`), evicting LRU entries to make budget room; if nothing can be evicted, the entry is simply not cached (streaming keeps working) instead of failing or double-counting.
+- **Matrix layout:** one explicit GGML/GGUF convention everywhere: `shape = [in, out]`, buffer row-major `[out][in]`, `y[o] = Σ_i W[o·in+i]·x[i]`. No orientation heuristics, no transpose fallbacks, no full-F32 dequantization of 2D weights – arity mismatches are hard errors.
+- **Output projection:** single caller-owned logits buffer per `generate()` call; streamed (non-resident) output/embedding matrices are projected in budget-bounded row chunks (`min(16 MiB, available/4)`, ≥ 1 row) with per-row block decode.
+- **KV / attention:** attention reads the KV history in place (no per-token prefix copies); the KV cache starts at the prompt length and grows in 256-token chunks capped at prompt+max_tokens, budget-checked with rollback on failure. No KV quantization.
+- **Legacy removal:** the pre-M4 fully-resident F32 model loader (`LlamaModel`) was deleted – it violated budget integrity, guessed orientation, and duplicated the KV prefix.
 
 ## Build & Test
 
@@ -135,9 +143,9 @@ crates/
     residency.rs – ResidencyStats
     persistent.rs – PersistentWeight: resident if <25% of budget, else streamed on demand (M5.6.1)
     simd.rs – AVX2/FMA F32 dot/matvec kernels, runtime detection + scalar fallback (M5.6.1)
-    model.rs – LlamaConfig, LlamaWeights validation
-    streaming_model.rs – StreamingLlamaModel (persistent + layer descriptors), load_layer/release_layer, forward_single_streaming with quantized matvec
-    inference.rs – InferenceEngine (file-backed + budget + cache + streaming + quantized), generate()
+    model.rs – LlamaConfig, validate_required_tensors
+    streaming_model.rs – StreamingLlamaModel (persistent + layer descriptors), load_layer/release_layer, forward_single_streaming (scoped tmp:forward, backend-wired matvec)
+    inference.rs – InferenceEngine (file-backed + budget + chunk-growing KV + single logits buffer), generate()
     plan.rs – planning
     sampling.rs – greedy, temperature, top-k/p
   ramforge-cli/ – inspect, plan, run --verbose
@@ -168,17 +176,19 @@ crates/
 - Deterministic generation: tiny F32 model greedy 5 tokens deterministic (in `inference.rs`)
 - Existing F32/F16/BF16 inference still works
 - Existing Milestone 4 streaming tests still pass
+- M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-Total (M5.6.1): 62 core tests + 31 runtime tests = 93 tests.
+Total (M6): 79 core tests + 38 runtime tests = 117 tests.
 
-## Known Limitations (Milestone 5)
+## Known Limitations (Milestone 6)
 
 - Quantized inference limited to Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K; Q4_1/Q5_0/Q5_1/Q8_1 and IQ* quants not supported
-- CPU-only: quantized matvec is scalar (block-wise dequant); F32 dot/matvec have optional runtime-detected AVX2 kernels and rayon row-parallelism (M5.6.1); no GPU
+- CPU-only: quantized matvec is scalar (block-wise dequant); F32 dot/matvec have runtime-detected AVX2 kernels and rayon row-parallelism; no GPU
 - Tokenizer: SentencePiece unigram (score-based Viterbi) and BPE (gpt2/qwen2 merges); other pre-tokenizers/model families untested
-- Persistent weights (token_embd, output_norm, output): resident if under 25% of budget, otherwise streamed on demand (M5.6.1, `persistent.rs`)
-- KV cache F32, no quantization, no eviction
-- Minimum practical: individual layer working set must fit in budget
+- Persistent weights (token_embd, output_norm, output): resident if under 25% of budget, otherwise streamed on demand with budget-charged bounded temps (`persistent.rs`)
+- KV cache F32, no quantization, no eviction; grows chunk-wise up to prompt+max_tokens
+- Minimum practical: one streamed layer *plus* its charge-before-read transient (≤ 2× file bytes for float tensors) plus the forward working set must fit the budget; a single streamed output row (raw + F32 form) must fit as well
+- Not budget-tracked by design (documented as out of scope): tokenizer vocabulary table, thread stacks, allocator fragmentation, `residency_stats` bookkeeping (O(layers) counters)
 
 ## What is NOT Implemented
 

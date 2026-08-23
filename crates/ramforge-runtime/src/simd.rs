@@ -111,8 +111,8 @@ mod tests {
     fn test_matvec_scalar_vs_simd() {
         let w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
         let x = vec![1.0, 1.0, 1.0];
-        let mut y_scalar = vec![0.0; 2];
-        let mut y_simd = vec![0.0; 2];
+        let mut y_scalar = [0.0; 2];
+        let mut y_simd = [0.0; 2];
 
         // scalar
         for i in 0..2 {

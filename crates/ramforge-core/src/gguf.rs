@@ -490,7 +490,7 @@ mod tests {
         // float32
         write_string(&mut buf, "test.f32");
         write_u32(&mut buf, 6);
-        write_u32(&mut buf, f32::to_bits(3.14));
+        write_u32(&mut buf, f32::to_bits(2.5));
         // string
         write_string(&mut buf, "test.string");
         write_u32(&mut buf, 8);

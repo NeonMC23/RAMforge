@@ -1,11 +1,13 @@
-//! RAMforge Runtime – Milestone 3: First Real CPU Inference
+//! RAMforge Runtime – Milestone 6: True Out-of-Core Integrity
 //!
 //! This crate builds on `ramforge-core` to provide:
-//! - Memory budget enforcement
+//! - Memory budget enforcement (RAII-style scoped temp reservations)
 //! - File-backed tensor data source
-//! - Strict bounded LRU cache with explicit accounting
+//! - Bounded LRU cache whose contents are charged to the budget
 //! - Planning logic for `ramforge plan`
-//! - Real CPU inference for LLaMA architecture (F32/F16)
+//! - CPU inference for llama/qwen2 (F32/F16/BF16 + ggml quant formats),
+//!   out-of-core layer streaming with compact quantized residency
+//! - SIMD (AVX2) + rayon-threaded F32 matvec hot path
 //!
 //! RAMforge-managed memory is defined as memory explicitly tracked via
 //! `MemoryBudget`. It does NOT include total process RSS or OS page cache.
@@ -46,17 +48,13 @@ impl Runtime {
         ram_budget_bytes: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let data_source = GgufDataSource::open(&model_path)?;
-        let mut budget = MemoryBudget::new(ram_budget_bytes)?;
+        let budget = MemoryBudget::new(ram_budget_bytes)?;
 
+        // The cache capacity is a hard bound; its contents are charged to the
+        // budget per entry via `insert_budgeted` – no double-counted capacity
+        // pre-reservation.
         let cache_capacity = (ram_budget_bytes as f64 * 0.8) as u64;
         let cache_capacity = cache_capacity.max(1024 * 1024).min(ram_budget_bytes.saturating_sub(1024 * 1024));
-        let overhead = (ram_budget_bytes as f64 * 0.1) as u64;
-
-        budget.allocate("tensor_cache", cache_capacity)?;
-        if overhead > 0 && budget.can_allocate(overhead) {
-            budget.allocate("runtime_overhead", overhead)?;
-        }
-
         let cache = BoundedCache::new(cache_capacity)?;
 
         Ok(Self {
@@ -71,8 +69,14 @@ impl Runtime {
             return Ok(data.clone());
         }
         let data = self.data_source.read_tensor(name)?;
-        match self.cache.insert(name.to_string(), data.clone()) {
-            Ok(()) => {},
+        // Budget-charged insert: if the budget has no room even after LRU
+        // eviction, the entry is simply not cached (Ok(false)) and the
+        // caller still gets the data it asked for.
+        match self
+            .cache
+            .insert_budgeted(&mut self.budget, name.to_string(), data.clone())
+        {
+            Ok(_) => {},
             Err(ramforge_core::CacheError::TooLarge { .. }) => {},
             Err(e) => {
                 return Err(DataSourceError::General(format!("cache insert failed: {}", e)));

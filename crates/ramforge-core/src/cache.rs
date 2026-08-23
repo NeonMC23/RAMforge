@@ -7,6 +7,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::error::CacheError;
+use crate::memory::MemoryBudget;
 
 /// Statistics for cache operations
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -173,6 +174,110 @@ impl BoundedCache {
         }
     }
 
+    // ---------- Budget-charged operations ----------
+    //
+    // Every byte stored through these operations is also charged to the
+    // supplied `MemoryBudget` under the name `cache:<key>`, so cached data
+    // can never grow into an unaccounted second memory pool. The budget is
+    // the authoritative limit; `capacity` remains a secondary hard cap.
+
+    /// Budget-charged insert.
+    ///
+    /// Evicts LRU entries until both the cache capacity and the memory
+    /// budget have room (each eviction releases its budget charge).
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the entry was cached (and charged to the budget)
+    /// - `Ok(false)` if the budget cannot fit the entry even after evicting
+    ///   everything (the entry is simply not cached; callers can fall back
+    ///   to reading from disk)
+    /// - `Err(CacheError::TooLarge)` if the entry exceeds the cache capacity
+    pub fn insert_budgeted(
+        &mut self,
+        budget: &mut MemoryBudget,
+        key: String,
+        data: Vec<u8>,
+    ) -> Result<bool, CacheError> {
+        let size = data.len() as u64;
+        if size > self.capacity {
+            return Err(CacheError::TooLarge {
+                size,
+                capacity: self.capacity,
+            });
+        }
+
+        // Replacing an existing key: release its old budget charge first.
+        if let Some(old) = self.entries.remove(&key) {
+            self.used = self.used.saturating_sub(old.size);
+            self.lru.retain(|k| k != &key);
+            let _ = budget.release(&Self::budget_key(&key));
+        }
+
+        // Evict until capacity has room (releasing budget charges).
+        while self.used + size > self.capacity {
+            if !self.evict_lru_budgeted(budget) {
+                break;
+            }
+        }
+
+        // Evict further until the budget has room.
+        while !budget.can_allocate(size) {
+            if !self.evict_lru_budgeted(budget) {
+                // Nothing left to evict and budget still full: skip caching
+                // instead of failing – streaming must keep working.
+                return Ok(false);
+            }
+        }
+
+        budget
+            .allocate(Self::budget_key(&key), size)
+            .map_err(|e| CacheError::General(format!("budget charge failed: {}", e)))?;
+
+        self.lru.push_front(key.clone());
+        self.entries.insert(key, CacheEntry { data, size });
+        self.used += size;
+        self.update_stats();
+        debug_assert!(self.used <= self.capacity);
+        Ok(true)
+    }
+
+    /// Remove an entry and release its budget charge.
+    pub fn remove_budgeted(&mut self, budget: &mut MemoryBudget, key: &str) -> Option<Vec<u8>> {
+        let removed = self.remove(key);
+        if removed.is_some() {
+            let _ = budget.release(&Self::budget_key(key));
+        }
+        removed
+    }
+
+    /// Clear the cache and release all budget charges.
+    pub fn clear_budgeted(&mut self, budget: &mut MemoryBudget) {
+        let keys: Vec<String> = self.entries.keys().cloned().collect();
+        for k in keys {
+            let _ = budget.release(&Self::budget_key(&k));
+        }
+        self.clear();
+    }
+
+    fn budget_key(key: &str) -> String {
+        format!("cache:{}", key)
+    }
+
+    /// Evict the least-recently-used entry, releasing its budget charge.
+    /// Returns false if the cache was already empty.
+    fn evict_lru_budgeted(&mut self, budget: &mut MemoryBudget) -> bool {
+        if let Some(lru_key) = self.lru.pop_back() {
+            if let Some(entry) = self.entries.remove(&lru_key) {
+                self.used = self.used.saturating_sub(entry.size);
+                self.stats.evictions += 1;
+                let _ = budget.release(&Self::budget_key(&lru_key));
+                self.update_stats();
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         self.lru.clear();
@@ -268,6 +373,63 @@ mod tests {
         cache.insert("a".to_string(), vec![0u8; 20]).unwrap();
         assert_eq!(cache.current_bytes(), 20);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_budgeted_insert_charges_budget() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        let mut cache = BoundedCache::new(100).unwrap();
+        assert!(cache
+            .insert_budgeted(&mut budget, "a".to_string(), vec![0u8; 40])
+            .unwrap());
+        assert_eq!(cache.current_bytes(), 40);
+        assert_eq!(budget.used_bytes(), 40, "cached bytes must be budget-charged");
+        assert_eq!(budget.get("cache:a"), Some(40));
+        assert!(cache
+            .insert_budgeted(&mut budget, "b".to_string(), vec![0u8; 30])
+            .unwrap());
+        assert_eq!(budget.used_bytes(), 70);
+        assert!(cache.remove_budgeted(&mut budget, "a").is_some());
+        assert_eq!(budget.used_bytes(), 30, "removal must release budget charge");
+    }
+
+    #[test]
+    fn test_budgeted_eviction_releases_budget() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        let mut cache = BoundedCache::new(30).unwrap();
+        cache.insert_budgeted(&mut budget, "a".into(), vec![0u8; 15]).unwrap();
+        cache.insert_budgeted(&mut budget, "b".into(), vec![0u8; 15]).unwrap();
+        assert_eq!(budget.used_bytes(), 30);
+        // forces capacity-driven eviction of "a"
+        cache.insert_budgeted(&mut budget, "c".into(), vec![0u8; 15]).unwrap();
+        assert!(!cache.contains("a"));
+        assert_eq!(budget.used_bytes(), 30, "evicted entry must release its charge");
+        assert!(budget.get("cache:a").is_none());
+    }
+
+    #[test]
+    fn test_budgeted_insert_skips_when_budget_full() {
+        let mut budget = MemoryBudget::new(50).unwrap();
+        budget.allocate("other", 45).unwrap();
+        let mut cache = BoundedCache::new(100).unwrap();
+        let cached = cache
+            .insert_budgeted(&mut budget, "x".to_string(), vec![0u8; 10])
+            .unwrap();
+        assert!(!cached, "must skip caching when budget cannot fit the entry");
+        assert!(!cache.contains("x"));
+        assert_eq!(budget.used_bytes(), 45);
+    }
+
+    #[test]
+    fn test_clear_budgeted_releases_everything() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        let mut cache = BoundedCache::new(100).unwrap();
+        cache.insert_budgeted(&mut budget, "a".into(), vec![0u8; 10]).unwrap();
+        cache.insert_budgeted(&mut budget, "b".into(), vec![0u8; 20]).unwrap();
+        assert_eq!(budget.used_bytes(), 30);
+        cache.clear_budgeted(&mut budget);
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(cache.current_bytes(), 0);
     }
 
     #[test]

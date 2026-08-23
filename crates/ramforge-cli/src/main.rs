@@ -3,7 +3,7 @@ use ramforge_core::{parse_gguf_file, parse_memory_size, GgufModel};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "ramforge", version, about = "RAMforge – hierarchical memory inference runtime (milestone 5: quantized out-of-core CPU inference)")]
+#[command(name = "ramforge", version, about = "RAMforge – hierarchical memory inference runtime (milestone 6: true out-of-core integrity)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -37,7 +37,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Run real inference (CPU, LLaMA architecture)
+    /// Run real inference (CPU, llama/qwen2, out-of-core layer streaming)
     Run {
         /// Path to the GGUF model file
         model: PathBuf,
@@ -152,7 +152,7 @@ fn run_inference(
     let ram_bytes = parse_memory_size(&ram_str).map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
 
     // Diagnostics to stderr
-    eprintln!("RAMforge – Run (Milestone 5: Quantized Out-of-Core Layer Streaming)");
+    eprintln!("RAMforge – Run (Milestone 6: True Out-of-Core Integrity)");
     eprintln!("========================================================");
     eprintln!("Model: {}", model_path.display());
     eprintln!("RAM budget: {} ({} bytes)", ram_str, ram_bytes);
@@ -166,9 +166,10 @@ fn run_inference(
         eprintln!("Top-p: {}", p);
     }
     eprintln!("Execution model: Layer-wise streaming (load one layer → compute → release)");
+    eprintln!("Memory model: every weight/KV/temp allocation charged to the RAM budget");
     eprintln!();
 
-    // Create inference engine – uses file-backed GgufDataSource, MemoryBudget, BoundedCache
+    // Create inference engine – file-backed GgufDataSource + MemoryBudget
     eprintln!("Loading model (file-backed, persistent weights only)...");
     let mut engine = ramforge_runtime::inference::InferenceEngine::new(
         model_path.to_str().ok_or_else(|| anyhow::anyhow!("invalid model path"))?,
@@ -192,16 +193,14 @@ fn run_inference(
         engine.tokenizer.bos_id,
         engine.tokenizer.eos_id
     );
-    eprintln!("Execution backend: CPU");
-    eprintln!("Memory budget: total={} used={} available={}",
+    eprintln!(
+        "Execution backend: CPU ({} mode)",
+        ramforge_runtime::backend::ComputeBackend::name(&engine.backend)
+    );
+    eprintln!("Memory budget: total={} used={} (resident weights) available={}",
         engine.budget.total_bytes(),
         engine.budget.used_bytes(),
         engine.budget.available_bytes()
-    );
-    eprintln!("Cache: capacity={} current={} entries={}",
-        engine.cache.capacity_bytes(),
-        engine.cache.current_bytes(),
-        engine.cache.len()
     );
     eprintln!("Total model weight bytes: {} (from descriptors)", engine.model.total_weight_bytes);
     eprintln!();
@@ -214,11 +213,10 @@ fn run_inference(
         .map_err(|e| anyhow::anyhow!(e))?;
 
     eprintln!("Generated {} tokens", gen_tokens.len());
-    eprintln!("Cache stats: hits={}, misses={}, evictions={}, current_bytes={}",
-        engine.cache.stats().hits,
-        engine.cache.stats().misses,
-        engine.cache.stats().evictions,
-        engine.cache.stats().current_bytes
+    eprintln!("Budget after run: used={} available={} charges={:?}",
+        engine.budget.used_bytes(),
+        engine.budget.available_bytes(),
+        engine.budget.allocations().keys().collect::<Vec<_>>()
     );
 
     if verbose {
@@ -337,7 +335,7 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
 fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufModel, ram_str: &str) {
     let info = model.info();
 
-    println!("RAMforge – Execution Plan (Milestone 5)");
+    println!("RAMforge – Execution Plan (Milestone 6: True Out-of-Core Integrity)");
     println!("=======================================");
     println!();
     println!("Model:");
@@ -353,10 +351,7 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     println!("RAM Budget:");
     println!("  Requested: {} ({} bytes)", ram_str, plan.ram_requested);
     println!("  Total budget: {} bytes", plan.budget.total_bytes());
-    println!("  Managed allocations:");
-    for (name, bytes) in plan.budget.allocations() {
-        println!("    {}: {} bytes ({:.2} MiB)", name, bytes, *bytes as f64 / (1024.0*1024.0));
-    }
+    println!("  Pre-reserved allocations: none (runtime charges weights, one streamed layer, KV cache, and scoped temps on demand)");
     println!("  Used: {} bytes", plan.budget.used_bytes());
     println!("  Available: {} bytes ({:.2} MiB)", plan.available, plan.available as f64 / (1024.0*1024.0));
     println!();
@@ -373,10 +368,10 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     println!();
 
     println!("Cache:");
-    println!("  Configured capacity: {} bytes ({:.2} MiB, {:.2} GiB)", plan.cache_capacity, plan.cache_capacity as f64 / (1024.0*1024.0), plan.cache_capacity as f64 / (1024.0*1024.0*1024.0));
-    println!("  Policy: LRU (least recently used eviction)");
-    println!("  Overhead reserved: {} bytes", plan.overhead_reserved);
-    println!("  Accounting: RAMforge-managed memory = memory tracked via MemoryBudget (tensor cache + overhead). Does NOT include total process RSS or OS page cache.");
+    println!("  Capacity bound (informational): {} bytes ({:.2} MiB, {:.2} GiB)", plan.cache_capacity, plan.cache_capacity as f64 / (1024.0*1024.0), plan.cache_capacity as f64 / (1024.0*1024.0*1024.0));
+    println!("  Policy: LRU (least recently used eviction), contents charged to the budget per entry");
+    println!("  Static overhead pre-reservation: none (scoped temp guards charge exact lifetimes)");
+    println!("  Accounting: RAMforge-managed memory = memory tracked via MemoryBudget. Does NOT include total process RSS or OS page cache.");
     println!();
 
     println!("File-backed access:");
@@ -385,7 +380,7 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     println!("  Access method: explicit read_range with validation (no full model load)");
     println!();
 
-    println!("Note: This is Milestone 5 – memory budget and file-backed access are real and enforced. For inference, use 'ramforge run'.");
+    println!("Note: This is Milestone 6 – the RAM budget covers every RAMforge allocation (weights, KV cache, temps). For inference, use 'ramforge run'.");
 }
 
 fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {

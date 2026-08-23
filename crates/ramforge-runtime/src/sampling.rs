@@ -51,17 +51,22 @@ impl Sampler {
             *v /= self.temperature;
         }
 
-        // Apply top-k filtering if set
+        // Single reusable scratch table for top-k/top-p filtering. Peak
+        // scratch memory is exactly `scaled` + `indexed` (one vocab table);
+        // the caller budget-guards this via `tmp:sampling`.
+        let mut indexed: Vec<(usize, f32)> = Vec::new();
+
+        // Apply top-k filtering if set: keep exactly k entries.
         if let Some(k) = self.top_k {
             if k > 0 && k < scaled.len() {
-                // Find k-th largest
-                let mut indexed: Vec<(usize, f32)> = scaled.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                indexed.extend(scaled.iter().enumerate().map(|(i, &v)| (i, v)));
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let threshold = indexed[k - 1].1;
+                indexed.truncate(k);
                 for v in scaled.iter_mut() {
-                    if *v < threshold {
-                        *v = f32::NEG_INFINITY;
-                    }
+                    *v = f32::NEG_INFINITY;
+                }
+                for &(i, v) in &indexed {
+                    scaled[i] = v;
                 }
             }
         }
@@ -83,10 +88,12 @@ impl Sampler {
             }
         }
 
-        // Apply top-p (nucleus) filtering if set
+        // Apply top-p (nucleus) filtering if set: reuse the same scratch
+        // table, zero everything, then restore the kept prefix.
         if let Some(p) = self.top_p {
             if p < 1.0 && p > 0.0 {
-                let mut indexed: Vec<(usize, f32)> = scaled.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                indexed.clear();
+                indexed.extend(scaled.iter().enumerate().map(|(i, &v)| (i, v)));
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let mut cumsum = 0.0;
                 let mut cutoff = scaled.len();
@@ -97,12 +104,12 @@ impl Sampler {
                         break;
                     }
                 }
-                // Zero out beyond cutoff
-                let keep_ids: std::collections::HashSet<usize> = indexed[..cutoff].iter().map(|(id, _)| *id).collect();
-                for (i, v) in scaled.iter_mut().enumerate() {
-                    if !keep_ids.contains(&i) {
-                        *v = 0.0;
-                    }
+                indexed.truncate(cutoff);
+                for v in scaled.iter_mut() {
+                    *v = 0.0;
+                }
+                for &(i, v) in &indexed {
+                    scaled[i] = v;
                 }
                 // Renormalize
                 let sum: f32 = scaled.iter().sum();

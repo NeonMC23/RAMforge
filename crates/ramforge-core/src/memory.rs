@@ -124,6 +124,34 @@ impl MemoryBudget {
             self.total, self.used, self.available_bytes()
         )
     }
+
+    /// Execute `f` while a temporary allocation of `bytes` is charged under
+    /// `name`, releasing it afterwards no matter how `f` returns.
+    ///
+    /// This is the RAII-style guard for short-lived working buffers
+    /// (activations, logits, sampler temporaries, attention scores, streamed
+    /// chunks, ...): the reservation is always released exactly once, on both
+    /// success and error paths. The closure receives `&mut MemoryBudget` so
+    /// nested accounting (e.g. per-layer allocations) keeps working.
+    ///
+    /// A `bytes == 0` reservation is a no-op (runs `f` without accounting).
+    pub fn with_temp<T, E>(
+        &mut self,
+        name: &str,
+        bytes: u64,
+        f: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<MemoryError>,
+    {
+        if bytes == 0 {
+            return f(self);
+        }
+        self.allocate(name, bytes).map_err(E::from)?;
+        let result = f(self);
+        let _ = self.release(name);
+        result
+    }
 }
 
 /// Parse a human-friendly memory size string into exact bytes
@@ -312,5 +340,56 @@ mod tests {
             MemoryError::AlreadyExists { .. } => {}
             _ => panic!("expected AlreadyExists"),
         }
+    }
+
+    #[test]
+    fn test_with_temp_releases_on_success() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        let v = budget
+            .with_temp("scratch", 400, |b| {
+                assert_eq!(b.used_bytes(), 400);
+                Ok::<u32, MemoryError>(42u32)
+            })
+            .unwrap();
+        assert_eq!(v, 42);
+        assert_eq!(budget.used_bytes(), 0, "temp must be released after success");
+        assert!(budget.get("scratch").is_none());
+    }
+
+    #[test]
+    fn test_with_temp_releases_on_error() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        let r: Result<(), String> = budget.with_temp("scratch", 400, |b| {
+            assert_eq!(b.used_bytes(), 400);
+            // nested allocation still works while guard is active
+            b.allocate("nested", 100)?;
+            b.release("nested")?;
+            Err("inner failure".to_string())
+        });
+        assert!(r.is_err());
+        assert_eq!(budget.used_bytes(), 0, "temp must be released after error");
+        assert!(budget.get("scratch").is_none());
+        assert!(budget.get("nested").is_none());
+    }
+
+    #[test]
+    fn test_with_temp_zero_bytes_is_noop() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        let v = budget
+            .with_temp("noop", 0, |b| {
+                assert_eq!(b.used_bytes(), 0);
+                Ok::<u32, MemoryError>(7u32)
+            })
+            .unwrap();
+        assert_eq!(v, 7);
+        assert!(budget.get("noop").is_none());
+    }
+
+    #[test]
+    fn test_with_temp_insufficient_budget() {
+        let mut budget = MemoryBudget::new(100).unwrap();
+        let r: Result<(), String> = budget.with_temp("huge", 200, |_| Ok(()));
+        assert!(r.is_err());
+        assert_eq!(budget.used_bytes(), 0);
     }
 }

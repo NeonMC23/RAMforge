@@ -25,6 +25,11 @@ pub struct KvCache {
 }
 
 impl KvCache {
+    /// Growth granularity: capacity grows in chunks of this many tokens to
+    /// avoid paying a realloc per generated token, without allocating the
+    /// full possible context upfront.
+    pub const GROW_CHUNK_TOKENS: usize = 256;
+
     pub fn new(
         n_layers: usize,
         n_kv_heads: usize,
@@ -53,7 +58,47 @@ impl KvCache {
         })
     }
 
-    /// Total bytes for all layers
+    /// Current capacity in tokens
+    pub fn capacity_tokens(&self) -> usize {
+        self.max_seq_len
+    }
+
+    /// Bytes a cache with capacity `tokens` would occupy across all layers.
+    pub fn bytes_for_tokens(&self, tokens: usize) -> usize {
+        tokens * self.n_kv_heads * self.head_dim * 4 * 2 * self.n_layers
+    }
+
+    /// Smallest chunk-aligned capacity that can hold `required` tokens.
+    pub fn chunk_aligned_capacity(&self, required: usize) -> usize {
+        let chunk = Self::GROW_CHUNK_TOKENS;
+        required.div_ceil(chunk) * chunk
+    }
+
+    /// Grow the backing buffers to exactly `new_capacity` tokens.
+    ///
+    /// Chunk granularity is the caller's responsibility (see
+    /// `chunk_aligned_capacity`); exact accounting keeps the budget charge
+    /// (`bytes_for_tokens`) in lockstep with the backing buffers.
+    /// Callers must reconcile the byte delta with the memory budget BEFORE
+    /// calling this; on success, existing entries are preserved. Shrinking
+    /// is not supported.
+    pub fn grow_to(&mut self, new_capacity: usize) -> Result<(), String> {
+        if new_capacity <= self.max_seq_len {
+            return Ok(()); // no shrink / no-op
+        }
+        let elems_per_layer = new_capacity * self.n_kv_heads * self.head_dim;
+        for k in self.k_caches.iter_mut() {
+            k.resize(elems_per_layer, 0.0);
+        }
+        for v in self.v_caches.iter_mut() {
+            v.resize(elems_per_layer, 0.0);
+        }
+        self.max_seq_len = new_capacity;
+        self.bytes_per_layer = elems_per_layer * 4 * 2;
+        Ok(())
+    }
+
+    /// Total bytes for all layers (current capacity)
     pub fn total_bytes(&self) -> usize {
         self.bytes_per_layer * self.n_layers
     }
@@ -154,5 +199,41 @@ mod tests {
         cache.increment_seq_len();
         let err = cache.append(0, &[1.0, 2.0], &[3.0, 4.0]).unwrap_err();
         assert!(err.contains("full"));
+    }
+
+    #[test]
+    fn test_kv_cache_chunked_growth_preserves_data() {
+        let mut cache = KvCache::new(2, 1, 2, 1).unwrap();
+        assert_eq!(cache.capacity_tokens(), 1);
+        cache.append(0, &[1.0, 2.0], &[3.0, 4.0]).unwrap();
+        cache.append(1, &[5.0, 6.0], &[7.0, 8.0]).unwrap();
+        cache.increment_seq_len();
+
+        // Grow: the caller picks chunk-aligned granularity.
+        let target = cache.chunk_aligned_capacity(2);
+        assert_eq!(target, 256);
+        cache.grow_to(target).unwrap();
+        assert_eq!(cache.capacity_tokens(), 256);
+        // Data preserved
+        assert_eq!(cache.get_k(0), &[1.0, 2.0]);
+        assert_eq!(cache.get_k(1), &[5.0, 6.0]);
+        // Append at grown capacity works
+        cache.append(0, &[9.0, 9.0], &[8.0, 8.0]).unwrap();
+        cache.append(1, &[1.0, 1.0], &[2.0, 2.0]).unwrap();
+        cache.increment_seq_len();
+        assert_eq!(cache.seq_len(), 2);
+        assert_eq!(cache.get_k(0), &[1.0, 2.0, 9.0, 9.0]);
+        // no-op when shrinking
+        cache.grow_to(1).unwrap();
+        assert_eq!(cache.capacity_tokens(), 256);
+    }
+
+    #[test]
+    fn test_kv_cache_bytes_for_tokens() {
+        let cache = KvCache::new(2, 2, 4, 10).unwrap();
+        // 10 tokens * 2 heads * 4 dim * 4B * K&V * 2 layers = 1280
+        assert_eq!(cache.bytes_for_tokens(10), 1280);
+        assert_eq!(cache.total_bytes(), 1280);
+        assert_eq!(cache.bytes_for_tokens(256), 256 * 2 * 4 * 4 * 2 * 2);
     }
 }

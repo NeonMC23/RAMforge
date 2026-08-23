@@ -1311,7 +1311,7 @@ mod tests {
         assert!((y[0] - 32.0).abs() < 1e-3);
         let mut deq_row = vec![0.0f32; 32];
         dequantize_row_q4_0(&row_bytes, 32, &mut deq_row).unwrap();
-        let mut y_ref = vec![0.0f32; 2];
+        let mut y_ref = [0.0f32; 2];
         for i in 0..2 {
             let mut sum = 0.0;
             for j in 0..32 {
@@ -1355,7 +1355,7 @@ mod tests {
         assert!((y[0] - 256.0).abs() < 1e-3);
         let mut deq = vec![0.0f32; 256];
         dequantize_row_q4_k(&row_bytes, 256, &mut deq).unwrap();
-        let mut y_ref = vec![0.0f32; 2];
+        let mut y_ref = [0.0f32; 2];
         for i in 0..2 {
             let mut sum = 0.0;
             for j in 0..256 {

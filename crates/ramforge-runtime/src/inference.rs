@@ -1,9 +1,21 @@
-//! Inference loop for LLaMA
+//! Inference engine for RAMforge (CPU, llama/qwen2, out-of-core).
+//!
+//! Milestone 6 memory contract for `generate()`:
+//! - every allocation that lives across a step is budget-charged for its
+//!   lifetime: persistent weights (`weight:*`), streamed layers
+//!   (`layer:{i}:*`), the KV cache (`kv_cache`), the single logits buffer
+//!   plus the hidden state (`tmp:logits`, one allocation for the whole call);
+//! - short-lived working sets use scoped guards: `tmp:forward` (per-token
+//!   activations), `tmp:embd_row` (streamed embedding row),
+//!   `tmp:streamed_matvec` (chunked streamed projection), `tmp:sampling`
+//!   (sampler scratch for non-greedy sampling);
+//! - the KV cache starts at the prompt length and grows chunk-wise
+//!   (256-token chunks, capped at prompt+max_tokens) with budget checks
+//!   and deterministic rollback on failure.
 
 use ramforge_core::{
     datasource::GgufDataSource,
     memory::MemoryBudget,
-    cache::BoundedCache,
     tokenizer::Tokenizer,
 };
 
@@ -22,7 +34,6 @@ pub struct InferenceEngine {
     pub kv_cache: Option<KvCache>,
     pub backend: CpuBackend,
     pub budget: MemoryBudget,
-    pub cache: BoundedCache,
     pub ram_budget_bytes: u64,
     pub residency_stats: ResidencyStats,
 }
@@ -48,25 +59,11 @@ impl InferenceEngine {
         let mut budget = MemoryBudget::new(ram_budget_bytes)
             .map_err(|e| format!("invalid RAM budget: {}", e))?;
 
-        // Cache capacity: 80% of budget for weights (simple deterministic strategy)
-        let cache_capacity = if ram_budget_bytes < 2 * 1024 * 1024 {
-            ram_budget_bytes / 2
-        } else {
-            let cap = (ram_budget_bytes as f64 * 0.8) as u64;
-            cap.max(1024 * 1024).min(ram_budget_bytes.saturating_sub(1024 * 1024))
-        };
-        let mut cache = BoundedCache::new(cache_capacity)
-            .map_err(|e| format!("failed to create cache: {}", e))?;
-
-        // For milestone 2 compatibility, we previously allocated cache capacity from budget.
-        // For milestone 3, we allocate weights individually from budget, and cache capacity is a separate limit.
-        // To avoid double counting, we do NOT pre-allocate cache capacity, but we keep the cache as bounded.
-        // Instead, we will allocate weights as they are loaded.
-
-        // Load model weights through GgufDataSource and BoundedCache with budget accounting
-        // This demonstrates file-backed access: each persistent tensor is read via data_source.read_tensor()
-        // Only persistent weights are loaded initially; layers are streamed on demand
-        let model = StreamingLlamaModel::load(&data_source, &mut cache, &mut budget)
+        // Load persistent weights; transformer layers are streamed per
+        // forward call. Resident persistents are charged to the budget
+        // (weight:*), anything that does not fit is streamed on demand with
+        // charged, bounded temps.
+        let model = StreamingLlamaModel::load(&data_source, &mut budget)
             .map_err(|e| format!("failed to load model weights: {}", e))?;
 
         let residency_stats = ResidencyStats::new(model.total_weight_bytes);
@@ -78,7 +75,6 @@ impl InferenceEngine {
             kv_cache: None,
             backend: CpuBackend::new(),
             budget,
-            cache,
             ram_budget_bytes,
             residency_stats,
         })
@@ -105,105 +101,156 @@ impl InferenceEngine {
                 self.model.config.context_length
             ));
         }
-
-        // Create KV cache based on actual needed length (prompt + max_tokens) to save memory
         let needed_len = prompt_tokens.len() + max_tokens;
+
+        // KV cache: start at the prompt length; grow chunk-wise as tokens
+        // are generated (capped at needed_len rather than context_length).
         let mut kv_cache = KvCache::new(
             self.model.config.block_count,
             self.model.config.head_count_kv,
             self.model.config.head_dim,
-            needed_len,
+            prompt_tokens.len(),
         )
         .map_err(|e| format!("failed to create KV cache: {}", e))?;
 
         let kv_bytes = kv_cache.total_bytes() as u64;
-        if !self.budget.can_allocate(kv_bytes) {
-            return Err(format!(
-                "RAM budget too small for KV cache: need {} bytes for KV cache ({} layers, {} kv_heads, head_dim {}, needed_len {}), but only {} bytes available (total {}, used {})",
-                kv_bytes,
-                self.model.config.block_count,
-                self.model.config.head_count_kv,
-                self.model.config.head_dim,
-                needed_len,
-                self.budget.available_bytes(),
-                self.budget.total_bytes(),
-                self.budget.used_bytes()
-            ));
-        }
-        if self.budget.get("kv_cache").is_none() {
-            self.budget
-                .allocate("kv_cache", kv_bytes)
-                .map_err(|e| format!("failed to allocate KV cache: {}", e))?;
-        }
+        self.budget
+            .allocate("kv_cache", kv_bytes)
+            .map_err(|e| {
+                format!(
+                    "RAM budget too small for initial KV cache: need {} bytes ({} layers, {} kv_heads, head_dim {}, {} prompt tokens): {}",
+                    kv_bytes,
+                    self.model.config.block_count,
+                    self.model.config.head_count_kv,
+                    self.model.config.head_dim,
+                    prompt_tokens.len(),
+                    e
+                )
+            })?;
 
         // Initialize residency stats with total model weight bytes
         let mut residency_stats = ResidencyStats::new(self.model.total_weight_bytes);
         residency_stats.update_managed(self.budget.used_bytes());
 
-        // Process prompt tokens one by one to fill KV cache – streaming layers
-        let mut all_tokens = prompt_tokens.clone();
-        let mut hidden = None;
+        // Disjoin field borrows so the scoped temp closures can use them.
+        let model = &self.model;
+        let backend = &self.backend;
+        let data_source = &self.data_source;
+        let eos_id = self.tokenizer.eos_id;
+        let context_length = self.model.config.context_length;
 
-        for (pos, &token_id) in prompt_tokens.iter().enumerate() {
-            let h = self.model.forward_single_streaming(
-                token_id,
-                pos,
-                &mut kv_cache,
-                &self.backend,
-                &self.data_source,
-                &mut self.cache,
-                &mut self.budget,
-                &mut residency_stats,
-            )?;
-            hidden = Some(h);
-        }
+        let vocab = model.config.vocab_size;
+        let n_embd = model.config.embedding_length;
+        // Single logits buffer + the hidden state that lives across steps.
+        let io_bytes = ((vocab + n_embd) * 4) as u64;
+        // Sampler scratch: scaled logits + kept-index table (non-greedy only).
+        let sampler_scratch = if sampler.temperature > 0.0 {
+            (vocab * 4 * 5) as u64
+        } else {
+            0
+        };
 
-        // Generate
-        let mut generated_tokens = Vec::new();
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut hidden: Option<Vec<f32>> = None;
         let mut current_pos = prompt_tokens.len();
 
-        for _ in 0..max_tokens {
-            let hidden_state = hidden.as_ref().ok_or("no hidden state")?;
-            let logits = self.model.compute_logits(
-                hidden_state,
-                &self.backend,
-                &self.data_source,
-                &mut self.cache,
-                &mut self.budget,
-                &mut residency_stats,
-            )?;
+        let budget = &mut self.budget;
+        let run_result: Result<(), String> = budget.with_temp("tmp:logits", io_bytes, |budget| {
+            let mut logits = vec![0.0f32; vocab];
 
-            let next_token = sampler.sample(&logits);
+            // Prompt pass – fills the KV cache one token at a time.
+            for (pos, &token_id) in prompt_tokens.iter().enumerate() {
+                let h = model.forward_single_streaming(
+                    token_id,
+                    pos,
+                    &mut kv_cache,
+                    backend,
+                    data_source,
+                    budget,
+                    &mut residency_stats,
+                )?;
+                hidden = Some(h);
+            }
 
-            if let Some(eos_id) = self.tokenizer.eos_id {
-                if next_token == eos_id {
+            // Generation loop
+            for _ in 0..max_tokens {
+                let hidden_state = hidden.as_ref().ok_or("no hidden state")?;
+                model.compute_logits(
+                    hidden_state,
+                    backend,
+                    data_source,
+                    budget,
+                    &mut logits,
+                )?;
+
+                let next_token = budget.with_temp("tmp:sampling", sampler_scratch, |_b| {
+                    Ok::<u32, String>(sampler.sample(&logits))
+                })?;
+
+                if let Some(eos) = eos_id {
+                    if next_token == eos {
+                        break;
+                    }
+                }
+
+                generated_tokens.push(next_token);
+
+                // Chunk-wise KV growth with deterministic rollback: release
+                // the old charge, try the new one; if it fails, restore the
+                // old charge so the budget stays consistent.
+                if current_pos + 1 > kv_cache.capacity_tokens() {
+                    let target = kv_cache
+                        .chunk_aligned_capacity(current_pos + 1)
+                        .min(needed_len);
+                    let old_bytes = kv_cache.total_bytes() as u64;
+                    let new_bytes = kv_cache.bytes_for_tokens(target) as u64;
+                    let _ = budget.release("kv_cache");
+                    if let Err(e) = budget.allocate("kv_cache", new_bytes) {
+                        let _ = budget.allocate("kv_cache", old_bytes);
+                        return Err(format!(
+                            "RAM budget too small to grow KV cache from {} to {} tokens ({} -> {} bytes): {}",
+                            kv_cache.capacity_tokens(),
+                            target,
+                            old_bytes,
+                            new_bytes,
+                            e
+                        ));
+                    }
+                    kv_cache
+                        .grow_to(target)
+                        .map_err(|e| format!("failed to grow KV cache: {}", e))?;
+                }
+
+                let h = model.forward_single_streaming(
+                    next_token,
+                    current_pos,
+                    &mut kv_cache,
+                    backend,
+                    data_source,
+                    budget,
+                    &mut residency_stats,
+                )?;
+                hidden = Some(h);
+                current_pos += 1;
+
+                if current_pos >= context_length {
                     break;
                 }
             }
-
-            generated_tokens.push(next_token);
-            all_tokens.push(next_token);
-
-            let h = self.model.forward_single_streaming(
-                next_token,
-                current_pos,
-                &mut kv_cache,
-                &self.backend,
-                &self.data_source,
-                &mut self.cache,
-                &mut self.budget,
-                &mut residency_stats,
-            )?;
-            hidden = Some(h);
-            current_pos += 1;
-
-            if current_pos >= self.model.config.context_length {
-                break;
-            }
-        }
+            Ok(())
+        });
+        run_result?;
 
         self.kv_cache = Some(kv_cache);
         self.residency_stats = residency_stats;
+
+        // Budget integrity: after the scoped temps are gone, only the
+        // persistent charges (weights, KV cache) may remain.
+        debug_assert_eq!(
+            self.budget.allocations().keys().filter(|k| k.starts_with("tmp:")).count(),
+            0,
+            "temp charges must be released after generate()"
+        );
 
         let text = self.tokenizer.decode(&generated_tokens);
         Ok((generated_tokens, text))
@@ -219,6 +266,9 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// Boxed value-writer closure used by the GGUF test fixtures.
+    type WriteValFn<'a> = Box<dyn FnMut(&mut Vec<u8>) + 'a>;
 
     // Create a tiny deterministic LLaMA model for testing
     // Config: vocab 16, n_embd 8, n_layer 1, n_head 2, head_dim 4, ffn 16
@@ -244,7 +294,7 @@ mod tests {
         buf2.extend_from_slice(&11u64.to_le_bytes());
         buf2.extend_from_slice(&16u64.to_le_bytes());
         // re-add kvs
-        let mut add_kv = |key: &str, val_type: u32, mut write_val: Box<dyn FnMut(&mut Vec<u8>)>| {
+        let mut add_kv = |key: &str, val_type: u32, mut write_val: WriteValFn<'_>| {
             write_string(&mut buf2, key);
             write_u32(&mut buf2, val_type);
             write_val(&mut buf2);
@@ -290,9 +340,10 @@ mod tests {
             ("blk.0.attn_v.weight", vec![8, 8], 0),
             ("blk.0.attn_output.weight", vec![8, 8], 0),
             ("blk.0.ffn_norm.weight", vec![8], 0),
-            ("blk.0.ffn_gate.weight", vec![16, 8], 0),
-            ("blk.0.ffn_up.weight", vec![16, 8], 0),
-            ("blk.0.ffn_down.weight", vec![8, 16], 0),
+            // ggml layout [in, out]: gate/up map 8 -> 16, down maps 16 -> 8
+            ("blk.0.ffn_gate.weight", vec![8, 16], 0),
+            ("blk.0.ffn_up.weight", vec![8, 16], 0),
+            ("blk.0.ffn_down.weight", vec![16, 8], 0),
         ];
 
         let mut offset = 0u64;
@@ -404,7 +455,7 @@ mod tests {
         fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
         fn write_f32<W: Write>(w: &mut W, v: f32) { w.write_all(&v.to_le_bytes()).unwrap(); }
 
-        let n_layers = 4;
+        let n_layers = 8;
         let n_embd = 16;
         let ffn = 32;
 
@@ -415,7 +466,7 @@ mod tests {
         buf.extend_from_slice(&(tensor_count as u64).to_le_bytes());
         buf.extend_from_slice(&17u64.to_le_bytes());
 
-        let mut add_kv = |key: &str, val_type: u32, mut write_val: Box<dyn FnMut(&mut Vec<u8>)>| {
+        let mut add_kv = |key: &str, val_type: u32, mut write_val: WriteValFn<'_>| {
             write_string(&mut buf, key);
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
@@ -464,9 +515,10 @@ mod tests {
             defs.push((format!("blk.{}.attn_v.weight", i), vec![n_embd as u64, n_embd as u64], 0));
             defs.push((format!("blk.{}.attn_output.weight", i), vec![n_embd as u64, n_embd as u64], 0));
             defs.push((format!("blk.{}.ffn_norm.weight", i), vec![n_embd as u64], 0));
-            defs.push((format!("blk.{}.ffn_gate.weight", i), vec![ffn as u64, n_embd as u64], 0));
-            defs.push((format!("blk.{}.ffn_up.weight", i), vec![ffn as u64, n_embd as u64], 0));
-            defs.push((format!("blk.{}.ffn_down.weight", i), vec![n_embd as u64, ffn as u64], 0));
+            // ggml layout [in, out]: gate/up map n_embd -> ffn, down maps ffn -> n_embd
+            defs.push((format!("blk.{}.ffn_gate.weight", i), vec![n_embd as u64, ffn as u64], 0));
+            defs.push((format!("blk.{}.ffn_up.weight", i), vec![n_embd as u64, ffn as u64], 0));
+            defs.push((format!("blk.{}.ffn_down.weight", i), vec![ffn as u64, n_embd as u64], 0));
         }
 
         for (name, dims, ty) in &defs {
@@ -489,7 +541,7 @@ mod tests {
             }
         }
         for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); }
-        for layer in 0..n_layers {
+        for _layer in 0..n_layers {
             for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); } // attn_norm
             for i in 0..n_embd { for j in 0..n_embd { let v: f32 = if i==j {1.0} else {0.0}; buf.extend_from_slice(&v.to_le_bytes()); } } // q
             for i in 0..n_embd { for j in 0..n_embd { let v: f32 = if i==j {1.0} else {0.0}; buf.extend_from_slice(&v.to_le_bytes()); } } // k
@@ -514,9 +566,11 @@ mod tests {
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
         let total_bytes: u64 = ds.model().tensors.iter().filter_map(|t| t.byte_length).sum();
 
-        // Budget 16KB, total model 4 layers ~ 4*10368+1088=42560 bytes ~41KB? Actually for n_embd 16, ffn 32, per layer 10368, 4 layers => 41472+1088=42560 ~41KB
-        // So total 41KB > 16KB budget, but per-layer 10KB fits
-        let ram_budget = 16 * 1024; // 16KB, smaller than total model ~41KB
+        // n_embd 16 / ffn 32: per layer 10368 B (F32), persistents 1088 B.
+        // 8 layers => total 84032 B (~82 KiB) > 32 KiB budget, while one
+        // layer (with charge-before-read transient up to ~2x) plus KV cache
+        // (~5 tokens) and forward temps comfortably fits.
+        let ram_budget = 32 * 1024;
 
         // The engine should still succeed because it streams layers
         let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), ram_budget).unwrap();
@@ -540,8 +594,23 @@ mod tests {
     #[test]
     fn test_budget_too_small_failure() {
         let tmp = create_tiny_llama_gguf();
-        // Budget too small – cache capacity will be 0 or too small for persistent
-        let result = InferenceEngine::new(tmp.path().to_str().unwrap(), 1); // 1 byte
+
+        // Zero budget is rejected at engine creation.
+        let result = InferenceEngine::new(tmp.path().to_str().unwrap(), 0);
         assert!(result.is_err());
+
+        // A near-zero budget may construct the engine (persistents become
+        // streamed), but generate() must fail clearly at the first
+        // budget-checked allocation (KV cache).
+        let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), 64).unwrap();
+        let sampler = crate::sampling::Sampler::greedy();
+        let err = engine.generate("hello", 2, &sampler).unwrap_err();
+        assert!(
+            err.contains("budget") || err.contains("Budget"),
+            "expected budget-related error, got: {}",
+            err
+        );
+        // Budget must not be corrupted by the failed attempt.
+        assert!(engine.budget.used_bytes() <= engine.budget.total_bytes());
     }
 }

@@ -80,6 +80,14 @@ pub enum MemoryError {
     InvalidSize(u64),
 }
 
+/// Allow using `?` with `MemoryError` in the runtime crate, whose functions
+/// predominantly return `Result<_, String>`.
+impl From<MemoryError> for String {
+    fn from(e: MemoryError) -> Self {
+        e.to_string()
+    }
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CacheError {
     #[error("entry too large: {size} bytes exceeds cache capacity {capacity} bytes")]
