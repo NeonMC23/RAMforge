@@ -107,6 +107,51 @@ impl MemoryBudget {
         }
     }
 
+    /// Atomically resize an existing named allocation and return its old size.
+    ///
+    /// This is used to settle a conservative load-transient charge to the
+    /// exact resident size without briefly removing the charge while the
+    /// resident object is already alive. If a growth cannot fit, both the
+    /// allocation and total usage remain unchanged.
+    pub fn resize(&mut self, name: &str, new_bytes: u64) -> Result<u64, MemoryError> {
+        if new_bytes == 0 {
+            return Err(MemoryError::InvalidSize(new_bytes));
+        }
+
+        let old_bytes = self
+            .allocations
+            .get(name)
+            .copied()
+            .ok_or_else(|| MemoryError::NotFound {
+                name: name.to_string(),
+            })?;
+
+        let new_used = if new_bytes > old_bytes {
+            let additional = new_bytes - old_bytes;
+            if !self.can_allocate(additional) {
+                return Err(MemoryError::Insufficient {
+                    name: name.to_string(),
+                    requested: additional,
+                    available: self.available_bytes(),
+                    total: self.total,
+                    used: self.used,
+                });
+            }
+            self.used
+                .checked_add(additional)
+                .expect("resize overflow checked by can_allocate")
+        } else {
+            self.used - (old_bytes - new_bytes)
+        };
+
+        *self
+            .allocations
+            .get_mut(name)
+            .expect("allocation existence checked above") = new_bytes;
+        self.used = new_used;
+        Ok(old_bytes)
+    }
+
     /// Get allocation size by name
     pub fn get(&self, name: &str) -> Option<u64> {
         self.allocations.get(name).copied()
@@ -340,6 +385,25 @@ mod tests {
             MemoryError::AlreadyExists { .. } => {}
             _ => panic!("expected AlreadyExists"),
         }
+    }
+
+    #[test]
+    fn test_resize_is_atomic_for_settle_and_failure() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        budget.allocate("load", 600).unwrap();
+        budget.allocate("other", 300).unwrap();
+
+        // Settling a conservative transient charge never removes its name.
+        assert_eq!(budget.resize("load", 200).unwrap(), 600);
+        assert_eq!(budget.get("load"), Some(200));
+        assert_eq!(budget.used_bytes(), 500);
+
+        // A failed growth leaves both the charge and total exactly unchanged.
+        let before = budget.used_bytes();
+        let err = budget.resize("load", 800).unwrap_err();
+        assert!(matches!(err, MemoryError::Insufficient { .. }));
+        assert_eq!(budget.get("load"), Some(200));
+        assert_eq!(budget.used_bytes(), before);
     }
 
     #[test]

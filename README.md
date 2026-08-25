@@ -2,7 +2,9 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **Milestone 6.1 Status (HEAD: Correctness & Accounting Fixes):** `generate()` is cleanly repeatable on one engine (explicit KV reset + failure-proof budget); RoPE uses the correct llama/qwen2 **half-split** pair convention; F16/BF16 resident RAM is booked at its true decoded size (4 B/elem, with a 3x-file-byte load transient); qwen2 Q/K/V biases are loaded, budgeted, validated (all-or-none + exact shape), and applied after the projections. Everything below in M6 stands. Verified by 132 tests and synthetic end-to-end runs; real-model files remain untested.
+> **Milestone 7.1 Status (Accounting Hardening):** Resident persistent tensors now establish their full load-transient charge **before** file I/O (quantized 1× file bytes, F32 2×, F16/BF16 3×), settle atomically to the actual owned representation, and roll back all startup charges on failure. The 25% retention policy uses decoded/compact resident bytes rather than file bytes. Final hidden state is caller-owned under a lifetime-matched `tmp:hidden` charge.
+>
+> **Milestone 6.1 Baseline (Correctness & Accounting Fixes):** `generate()` is cleanly repeatable on one engine (explicit KV reset + failure-proof budget); RoPE uses the correct llama/qwen2 **half-split** pair convention; F16/BF16 resident RAM is booked at its true decoded size (4 B/elem, with a 3x-file-byte load transient); qwen2 Q/K/V biases are loaded, budgeted, validated (all-or-none + exact shape), and applied after the projections. Everything below in M6 stands. The M6.1 baseline was verified by 132 tests and synthetic end-to-end runs; real-model files remain untested.
 >
 > **Milestone 6 Status (True Out-of-Core Integrity):** Every RAMforge allocation is charged to the RAM budget via RAII-style scoped guards; the cache is budget-charged per entry; matrix layout is the explicit GGML/GGUF convention (no orientation guessing, no full-F32 fallbacks); logits use a single budget-charged buffer with a budget-aware chunked streamed projection; the KV cache grows chunk-wise without prefix copies; the F32 matvec hot path uses AVX2/rayon. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented.
 
@@ -56,7 +58,7 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 - Example: Q4_K 256 elements F32 equiv 1024B, quantized resident 144B (7.1× smaller). For model with 4 layers n_embd 256 ffn 512:
   - Quantized total 1.5MB, F32 equiv 10MB
   - Budget 800KB, total quantized 1.5MB > budget, per-layer quantized 370KB fits, peak managed 429KB ≤ budget → inference succeeds with streaming
-- Persistent weights (token_embd, output_norm, output) also accounted via quantized size; if quantized, they remain compact.
+- Persistent weights (`token_embd`, `output_norm`, `output`) use actual post-decode residency for the 25% retention policy. Resident loads charge before I/O, then settle to decoded F32 bytes or compact quantized bytes; quantized persistents remain compact.
 
 **Layer streaming integration:**
 ```
@@ -67,7 +69,14 @@ Entire quantized model never resident simultaneously. Layers released after comp
 **Compute backend:**
 - `ComputeBackend` trait F32 `matvec` now follows the explicit ggml layout and is wired into the inference hot path (`matvec_backend` in `streaming_model.rs`): resident F32 weights use runtime-detected AVX2 (`simd.rs`) + rayon row-parallelism; quantized weights keep the compact block-wise kernels from `quant.rs`
 
-### Milestone 6.1 – Correctness & Accounting Fixes (current)
+### Milestone 7.1 – Accounting Hardening (current)
+
+- **Persistent startup ordering:** resident persistent weights reserve the full raw+decoded transient before reading; F32 uses 2× file bytes, F16/BF16 3×, and compact quantized tensors 1×
+- **Atomic settlement:** `MemoryBudget::resize` settles a live transient charge to exact `TensorData::resident_bytes()` without an uncharged gap; read/decode/settlement failures remove the current charge, and model-startup failure rolls back earlier persistent charges
+- **Resident policy:** the existing 25% threshold is applied to the representation RAMforge will actually retain (decoded F32 for F32/F16/BF16, raw compact bytes for supported quants), with checked size arithmetic
+- **Hidden-state lifetime:** `forward_single_streaming` writes into a caller-owned output slice; `generate()` keeps `tmp:hidden` live for that buffer's complete lifetime instead of returning a vector past `tmp:forward`
+
+### Milestone 6.1 – Correctness & Accounting Fixes
 
 - **KV cache lifecycle:** repeated `generate()` calls on one engine work; failed generations release every charge they made (`clear_kv_cache()`); no stale `"kv_cache"` allocations
 - **RoPE:** half-split `(x[j], x[j+head_dim/2])` convention with `theta_j = pos * base^(-2j/head_dim)` — the true llama/qwen2 rotation (was interleaved/GPT-J pairs)
@@ -76,7 +85,7 @@ Entire quantized model never resident simultaneously. Layers released after comp
 
 ### Milestone 6 – True Out-of-Core Integrity
 
-- **Memory accounting:** `MemoryBudget::with_temp(name, bytes, f)` is the RAII-style scoped guard for all transient working sets (`tmp:forward`, `tmp:embd_row`, `tmp:streamed_matvec`, `tmp:logits`, `tmp:sampling`) – released on success and on error. Layer tensors charge *before* reading (peak = settled prefix + per-tensor transient) and settle to exact resident bytes after construction; a failed layer load releases all its charges.
+- **Memory accounting:** `MemoryBudget::with_temp(name, bytes, f)` is the RAII-style scoped guard for transient working sets (`tmp:hidden`, `tmp:forward`, `tmp:embd_row`, `tmp:streamed_matvec`, `tmp:logits`, `tmp:sampling`) – released on success and on error. Layer tensors charge *before* reading (peak = settled prefix + per-tensor transient) and settle to exact resident bytes after construction; a failed layer load releases all its charges.
 - **Cache:** `BoundedCache::insert_budgeted` charges each cached entry to the budget (`cache:{key}`), evicting LRU entries to make budget room; if nothing can be evicted, the entry is simply not cached (streaming keeps working) instead of failing or double-counting.
 - **Matrix layout:** one explicit GGML/GGUF convention everywhere: `shape = [in, out]`, buffer row-major `[out][in]`, `y[o] = Σ_i W[o·in+i]·x[i]`. No orientation heuristics, no transpose fallbacks, no full-F32 dequantization of 2D weights – arity mismatches are hard errors.
 - **Output projection:** single caller-owned logits buffer per `generate()` call; streamed (non-resident) output/embedding matrices are projected in budget-bounded row chunks (`min(16 MiB, available/4)`, ≥ 1 row) with per-row block decode.
@@ -151,10 +160,10 @@ crates/
     kv_cache.rs – KV cache explicit, budget-accounted
     layer.rs – LayerDescriptor grouping
     residency.rs – ResidencyStats
-    persistent.rs – PersistentWeight: resident if <25% of budget, else streamed on demand (M5.6.1)
+    persistent.rs – PersistentWeight: actual resident representation ≤25% of budget, else streamed on demand
     simd.rs – AVX2/FMA F32 dot/matvec kernels, runtime detection + scalar fallback (M5.6.1)
     model.rs – LlamaConfig, validate_required_tensors
-    streaming_model.rs – StreamingLlamaModel (persistent + layer descriptors), load_layer/release_layer, forward_single_streaming (scoped tmp:forward, backend-wired matvec)
+    streaming_model.rs – StreamingLlamaModel (charge-before-read persistents + layer descriptors), load/release layer, caller-owned final hidden + scoped tmp:forward
     inference.rs – InferenceEngine (file-backed + budget + chunk-growing KV + single logits buffer), generate()
     plan.rs – planning
     sampling.rs – greedy, temperature, top-k/p
@@ -188,16 +197,16 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-Total (M6.1): 81 core tests + 51 runtime tests = 132 tests.
+M7.1 source suite: 83 core tests + 58 runtime tests = 141 tests (including targeted persistent-transient, policy, rollback, and hidden-lifetime regressions).
 
-## Known Limitations (Milestone 6)
+## Known Limitations (Milestone 7.1)
 
 - Quantized inference limited to Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K; Q4_1/Q5_0/Q5_1/Q8_1 and IQ* quants not supported
 - CPU-only: quantized matvec is scalar (block-wise dequant); F32 dot/matvec have runtime-detected AVX2 kernels and rayon row-parallelism; no GPU
 - Tokenizer: SentencePiece unigram (score-based Viterbi) and BPE (gpt2/qwen2 merges); other pre-tokenizers/model families untested
-- Persistent weights (token_embd, output_norm, output): resident if under 25% of budget, otherwise streamed on demand with budget-charged bounded temps (`persistent.rs`)
+- Persistent weights (`token_embd`, `output_norm`, `output`): resident when their actual retained representation is at most 25% of budget, otherwise streamed on demand with budget-charged bounded temps (`persistent.rs`)
 - KV cache F32, no quantization, no eviction; grows chunk-wise up to prompt+max_tokens
-- Minimum practical: one streamed layer *plus* its charge-before-read transient (≤ 2× file bytes for float tensors) plus the forward working set must fit the budget; a single streamed output row (raw + F32 form) must fit as well
+- Minimum practical: one streamed layer plus its charge-before-read transient (quantized 1× file bytes, F32 2×, F16/BF16 3×) and the forward working set must fit the budget; a single streamed output row (raw + F32 form) must fit as well
 - Not budget-tracked by design (documented as out of scope): tokenizer vocabulary table, thread stacks, allocator fragmentation, `residency_stats` bookkeeping (O(layers) counters)
 
 ## What is NOT Implemented

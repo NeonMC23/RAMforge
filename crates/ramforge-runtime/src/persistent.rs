@@ -1,7 +1,8 @@
 //! Persistent weight streaming – token_embd, output_norm, output
 //!
-//! Policy: small persistent tensor (<25% of the total budget) is kept
-//! resident, a large one is streamed on demand.
+//! Policy: a persistent tensor whose actual resident representation consumes
+//! at most 25% of the total budget is kept resident; a larger one is streamed
+//! on demand.
 //!
 //! M6 memory contract:
 //! - streamed embedding lookup reads exactly one row and is budget-charged;
@@ -248,8 +249,11 @@ fn streamed_matvec_into(
     })
 }
 
-pub fn should_keep_resident(tensor_bytes: u64, budget_total: u64) -> bool {
-    tensor_bytes * 4 <= budget_total
+/// Keep a persistent tensor resident only when its actual in-memory
+/// representation is at most one quarter of the configured budget.
+/// Division avoids overflow while preserving the existing 25% boundary.
+pub fn should_keep_resident(resident_bytes: u64, budget_total: u64) -> bool {
+    resident_bytes <= budget_total / 4
 }
 
 #[cfg(test)]
@@ -267,9 +271,10 @@ mod tests {
     fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
 
     #[test]
-    fn test_persistent_policy() {
-        assert!(should_keep_resident(100, 1000));
-        assert!(!should_keep_resident(300, 1000));
+    fn test_persistent_policy_uses_resident_bytes_and_is_overflow_safe() {
+        assert!(should_keep_resident(250, 1000));
+        assert!(!should_keep_resident(251, 1000));
+        assert!(!should_keep_resident(u64::MAX, u64::MAX));
     }
 
     #[test]

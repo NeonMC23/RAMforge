@@ -338,6 +338,43 @@ pub enum TensorData {
 }
 
 impl TensorData {
+    /// Resident bytes for the representation produced by `from_bytes`.
+    ///
+    /// Float tensors are retained decoded as `Vec<f32>`, including F16/BF16.
+    /// Supported quantized tensors retain the exact compact file buffer. This
+    /// descriptor-level calculation lets callers make residency decisions and
+    /// establish a load charge before reading the tensor; a successful decode
+    /// must agree with `resident_bytes()`.
+    pub fn resident_bytes_for(
+        ggml_type: GgmlType,
+        num_elements: u64,
+        file_bytes: u64,
+    ) -> Result<u64, DataSourceError> {
+        match ggml_type {
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => num_elements
+                .checked_mul(std::mem::size_of::<f32>() as u64)
+                .ok_or_else(|| {
+                    DataSourceError::General(format!(
+                        "resident size overflow for {} tensor with {} elements",
+                        ggml_type.name(),
+                        num_elements
+                    ))
+                }),
+            GgmlType::Q4_0
+            | GgmlType::Q8_0
+            | GgmlType::Q4_K
+            | GgmlType::Q5_K
+            | GgmlType::Q6_K
+            | GgmlType::Q2_K
+            | GgmlType::Q3_K
+            | GgmlType::Q8_K => Ok(file_bytes),
+            _ => Err(DataSourceError::General(format!(
+                "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K)",
+                ggml_type.name()
+            ))),
+        }
+    }
+
     pub fn from_bytes(
         ggml_type: GgmlType,
         shape: Vec<u64>,
@@ -410,11 +447,11 @@ impl TensorData {
     pub fn resident_bytes(&self) -> usize {
         match self {
             // Float variants are held *decoded* as Vec<f32> in RAM, so the
-            // resident size is data.len() * 4 regardless of the on-disk
+            // resident size is the f32 slice size regardless of the on-disk
             // representation (F16/BF16 files are half that size).
-            Self::F32 { data, .. } => data.len() * 4,
-            Self::F16 { data, .. } => data.len() * 4,
-            Self::BF16 { data, .. } => data.len() * 4,
+            Self::F32 { data, .. } => std::mem::size_of_val(data.as_slice()),
+            Self::F16 { data, .. } => std::mem::size_of_val(data.as_slice()),
+            Self::BF16 { data, .. } => std::mem::size_of_val(data.as_slice()),
             Self::Q4_0(qt) => qt.resident_bytes(),
             Self::Q8_0(qt) => qt.resident_bytes(),
             Self::Q4_K(qt) => qt.resident_bytes(),
@@ -1153,6 +1190,15 @@ mod tests {
     }
 
     #[test]
+    fn test_descriptor_resident_bytes_match_owned_representations() {
+        assert_eq!(TensorData::resident_bytes_for(GgmlType::F32, 32, 128).unwrap(), 128);
+        assert_eq!(TensorData::resident_bytes_for(GgmlType::F16, 32, 64).unwrap(), 128);
+        assert_eq!(TensorData::resident_bytes_for(GgmlType::BF16, 32, 64).unwrap(), 128);
+        assert_eq!(TensorData::resident_bytes_for(GgmlType::Q4_0, 32, 18).unwrap(), 18);
+        assert!(TensorData::resident_bytes_for(GgmlType::Q4_1, 32, 20).is_err());
+    }
+
+    #[test]
     fn test_resident_bytes_f16_reflects_decoded_f32_storage() {
         // F16 tensors are held decoded as Vec<f32>: residency must be
         // 4 B/elem even though the file form is 2 B/elem (M6.1 BUG-3 fix).
@@ -1160,6 +1206,10 @@ mod tests {
         let td = TensorData::from_bytes(GgmlType::F16, vec![32], 32, raw).unwrap();
         assert_eq!(td.num_elements(), 32);
         assert_eq!(td.resident_bytes(), 32 * 4);
+        assert_eq!(
+            TensorData::resident_bytes_for(GgmlType::F16, 32, 32 * 2).unwrap(),
+            td.resident_bytes() as u64
+        );
     }
 
     #[test]

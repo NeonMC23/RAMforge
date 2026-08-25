@@ -1,10 +1,10 @@
 //! Inference engine for RAMforge (CPU, llama/qwen2, out-of-core).
 //!
-//! Milestone 6 memory contract for `generate()`:
+//! Memory contract for `generate()` (hardened in Milestone 7.1):
 //! - every allocation that lives across a step is budget-charged for its
 //!   lifetime: persistent weights (`weight:*`), streamed layers
 //!   (`layer:{i}:*`), the KV cache (`kv_cache`), the single logits buffer
-//!   plus the hidden state (`tmp:logits`, one allocation for the whole call);
+//!   (`tmp:logits`), and the caller-owned hidden state (`tmp:hidden`);
 //! - short-lived working sets use scoped guards: `tmp:forward` (per-token
 //!   activations), `tmp:embd_row` (streamed embedding row),
 //!   `tmp:streamed_matvec` (chunked streamed projection), `tmp:sampling`
@@ -175,8 +175,12 @@ impl InferenceEngine {
 
         let vocab = model.config.vocab_size;
         let n_embd = model.config.embedding_length;
-        // Single logits buffer + the hidden state that lives across steps.
-        let io_bytes = ((vocab + n_embd) * 4) as u64;
+        // Caller-owned output buffers have independent charges whose scopes
+        // exactly match their lifetimes. In particular, `tmp:hidden` remains
+        // live while every per-token forward writes and later consumers read
+        // the hidden vector returned through the caller-owned slice.
+        let logits_bytes = (vocab * 4) as u64;
+        let hidden_bytes = (n_embd * 4) as u64;
         // Sampler scratch: scaled logits + kept-index table (non-greedy only).
         let sampler_scratch = if sampler.temperature > 0.0 {
             (vocab * 4 * 5) as u64
@@ -185,94 +189,97 @@ impl InferenceEngine {
         };
 
         let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut hidden: Option<Vec<f32>> = None;
         let mut current_pos = prompt_tokens.len();
 
         let budget = &mut self.budget;
-        let run_result: Result<(), String> = budget.with_temp("tmp:logits", io_bytes, |budget| {
-            let mut logits = vec![0.0f32; vocab];
+        let run_result: Result<(), String> =
+            budget.with_temp("tmp:hidden", hidden_bytes, |budget| {
+                let mut hidden = vec![0.0f32; n_embd];
+                budget.with_temp("tmp:logits", logits_bytes, |budget| {
+                    let mut logits = vec![0.0f32; vocab];
 
-            // Prompt pass – fills the KV cache one token at a time.
-            for (pos, &token_id) in prompt_tokens.iter().enumerate() {
-                let h = model.forward_single_streaming(
-                    token_id,
-                    pos,
-                    &mut kv_cache,
-                    backend,
-                    data_source,
-                    budget,
-                    &mut residency_stats,
-                )?;
-                hidden = Some(h);
-            }
-
-            // Generation loop
-            for _ in 0..max_tokens {
-                let hidden_state = hidden.as_ref().ok_or("no hidden state")?;
-                model.compute_logits(
-                    hidden_state,
-                    backend,
-                    data_source,
-                    budget,
-                    &mut logits,
-                )?;
-
-                let next_token = budget.with_temp("tmp:sampling", sampler_scratch, |_b| {
-                    Ok::<u32, String>(sampler.sample(&logits))
-                })?;
-
-                if let Some(eos) = eos_id {
-                    if next_token == eos {
-                        break;
+                    // Prompt pass – fills the KV cache one token at a time.
+                    for (pos, &token_id) in prompt_tokens.iter().enumerate() {
+                        model.forward_single_streaming(
+                            token_id,
+                            pos,
+                            &mut kv_cache,
+                            backend,
+                            data_source,
+                            budget,
+                            &mut residency_stats,
+                            &mut hidden,
+                        )?;
                     }
-                }
 
-                generated_tokens.push(next_token);
+                    // Generation loop
+                    for _ in 0..max_tokens {
+                        model.compute_logits(
+                            &hidden,
+                            backend,
+                            data_source,
+                            budget,
+                            &mut logits,
+                        )?;
 
-                // Chunk-wise KV growth with deterministic rollback: release
-                // the old charge, try the new one; if it fails, restore the
-                // old charge so the budget stays consistent.
-                if current_pos + 1 > kv_cache.capacity_tokens() {
-                    let target = kv_cache
-                        .chunk_aligned_capacity(current_pos + 1)
-                        .min(needed_len);
-                    let old_bytes = kv_cache.total_bytes() as u64;
-                    let new_bytes = kv_cache.bytes_for_tokens(target) as u64;
-                    let _ = budget.release("kv_cache");
-                    if let Err(e) = budget.allocate("kv_cache", new_bytes) {
-                        let _ = budget.allocate("kv_cache", old_bytes);
-                        return Err(format!(
-                            "RAM budget too small to grow KV cache from {} to {} tokens ({} -> {} bytes): {}",
-                            kv_cache.capacity_tokens(),
-                            target,
-                            old_bytes,
-                            new_bytes,
-                            e
-                        ));
+                        let next_token =
+                            budget.with_temp("tmp:sampling", sampler_scratch, |_b| {
+                                Ok::<u32, String>(sampler.sample(&logits))
+                            })?;
+
+                        if let Some(eos) = eos_id {
+                            if next_token == eos {
+                                break;
+                            }
+                        }
+
+                        generated_tokens.push(next_token);
+
+                        // Chunk-wise KV growth with deterministic rollback:
+                        // release the old charge, try the new one; if it fails,
+                        // restore the old charge so the budget stays consistent.
+                        if current_pos + 1 > kv_cache.capacity_tokens() {
+                            let target = kv_cache
+                                .chunk_aligned_capacity(current_pos + 1)
+                                .min(needed_len);
+                            let old_bytes = kv_cache.total_bytes() as u64;
+                            let new_bytes = kv_cache.bytes_for_tokens(target) as u64;
+                            let _ = budget.release("kv_cache");
+                            if let Err(e) = budget.allocate("kv_cache", new_bytes) {
+                                let _ = budget.allocate("kv_cache", old_bytes);
+                                return Err(format!(
+                                    "RAM budget too small to grow KV cache from {} to {} tokens ({} -> {} bytes): {}",
+                                    kv_cache.capacity_tokens(),
+                                    target,
+                                    old_bytes,
+                                    new_bytes,
+                                    e
+                                ));
+                            }
+                            kv_cache
+                                .grow_to(target)
+                                .map_err(|e| format!("failed to grow KV cache: {}", e))?;
+                        }
+
+                        model.forward_single_streaming(
+                            next_token,
+                            current_pos,
+                            &mut kv_cache,
+                            backend,
+                            data_source,
+                            budget,
+                            &mut residency_stats,
+                            &mut hidden,
+                        )?;
+                        current_pos += 1;
+
+                        if current_pos >= context_length {
+                            break;
+                        }
                     }
-                    kv_cache
-                        .grow_to(target)
-                        .map_err(|e| format!("failed to grow KV cache: {}", e))?;
-                }
-
-                let h = model.forward_single_streaming(
-                    next_token,
-                    current_pos,
-                    &mut kv_cache,
-                    backend,
-                    data_source,
-                    budget,
-                    &mut residency_stats,
-                )?;
-                hidden = Some(h);
-                current_pos += 1;
-
-                if current_pos >= context_length {
-                    break;
-                }
-            }
-            Ok(())
-        });
+                    Ok(())
+                })
+            });
         run_result?;
 
         self.kv_cache = Some(kv_cache);
@@ -693,8 +700,8 @@ mod tests {
         let tmp = create_tiny_llama_gguf();
 
         // n_embd=8: output_norm resident 32 B; KV initial 2 tokens*64 B=128;
-        // tmp:logits (16+8)*4=96; tmp:forward workspace 664 B.
-        // 32+128+96 = 256 fits; +664 would exceed 900 -> forward fails.
+        // caller-owned logits + hidden charges total 96 B. Those startup
+        // charges fit, but the subsequent forward/layer working set does not.
         let budget_bytes = 900;
         let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), budget_bytes).unwrap();
         let used_before = engine.budget.used_bytes();
@@ -1093,35 +1100,48 @@ mod tests {
         // Two sequential tokens exercise: no KV history (pos 0) and
         // history+biases+RoPE at a non-zero position (pos 1).
         for (token, pos) in [(1usize, 0usize), (5usize, 1usize)] {
-            let hidden = model
-                .forward_single_streaming(token as u32, pos, &mut kv, backend, ds, budget, &mut stats)
-                .unwrap();
-            model
-                .compute_logits(&hidden, backend, ds, budget, &mut logits)
-                .unwrap();
+            budget
+                .with_temp("tmp:hidden", 8 * 4, |budget| {
+                    let mut hidden = vec![0.0f32; 8];
+                    model.forward_single_streaming(
+                        token as u32,
+                        pos,
+                        &mut kv,
+                        backend,
+                        ds,
+                        budget,
+                        &mut stats,
+                        &mut hidden,
+                    )?;
+                    model.compute_logits(&hidden, backend, ds, budget, &mut logits)?;
 
-            let ref_hidden = reference_forward_biased(&w, token, pos, &mut ref_k, &mut ref_v, eps);
-            for i in 0..8 {
-                assert!(
-                    (hidden[i] - ref_hidden[i]).abs() < eps_ln,
-                    "pos {} hidden[{}]: model {} vs reference {}",
-                    pos,
-                    i,
-                    hidden[i],
-                    ref_hidden[i]
-                );
-            }
-            for (o, &logit) in logits.iter().enumerate() {
-                let ref_logit: f32 = (0..8).map(|i| w.embd[o * 8 + i] * ref_hidden[i]).sum();
-                assert!(
-                    (logit - ref_logit).abs() < eps_ln,
-                    "pos {} logit[{}]: model {} vs reference {}",
-                    pos,
-                    o,
-                    logit,
-                    ref_logit
-                );
-            }
+                    let ref_hidden =
+                        reference_forward_biased(&w, token, pos, &mut ref_k, &mut ref_v, eps);
+                    for i in 0..8 {
+                        assert!(
+                            (hidden[i] - ref_hidden[i]).abs() < eps_ln,
+                            "pos {} hidden[{}]: model {} vs reference {}",
+                            pos,
+                            i,
+                            hidden[i],
+                            ref_hidden[i]
+                        );
+                    }
+                    for (o, &logit) in logits.iter().enumerate() {
+                        let ref_logit: f32 =
+                            (0..8).map(|i| w.embd[o * 8 + i] * ref_hidden[i]).sum();
+                        assert!(
+                            (logit - ref_logit).abs() < eps_ln,
+                            "pos {} logit[{}]: model {} vs reference {}",
+                            pos,
+                            o,
+                            logit,
+                            ref_logit
+                        );
+                    }
+                    Ok::<(), String>(())
+                })
+                .unwrap();
         }
 
         // A biased qwen2 engine also runs end-to-end generation cleanly and
