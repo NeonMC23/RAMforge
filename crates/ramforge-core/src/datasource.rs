@@ -4,10 +4,12 @@
 //! It provides explicit access to tensor data from the original GGUF file
 //! without loading the entire model into RAM.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::error::DataSourceError;
@@ -25,21 +27,30 @@ pub struct IoProfile {
     pub elapsed: Duration,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TensorIoProfile {
+    pub bytes_read: u64,
+    pub read_operations: u64,
+    pub read_failures: u64,
+}
+
 /// A file-backed data source for GGUF tensor data
 ///
 /// Holds the parsed model (metadata + descriptors) and provides methods to
 /// read tensor payloads on demand. The entire model is never loaded into RAM
-/// at once; only requested tensors or byte ranges are read.
+/// at once; only requested tensors or byte ranges are read. A mutex-protected
+/// file handle is reused so repeated tensor reads do not reopen the GGUF.
 #[derive(Debug)]
 pub struct GgufDataSource {
     model: GgufModel,
-    path: PathBuf,
+    file: Mutex<File>,
     file_size: u64,
     profiling_enabled: AtomicBool,
     profile_bytes_read: AtomicU64,
     profile_read_operations: AtomicU64,
     profile_read_failures: AtomicU64,
     profile_read_nanos: AtomicU64,
+    profile_tensors: Mutex<BTreeMap<String, TensorIoProfile>>,
 }
 
 impl GgufDataSource {
@@ -51,15 +62,17 @@ impl GgufDataSource {
         let path_buf = path.as_ref().to_path_buf();
         let model = parse_gguf_file(&path_buf).map_err(|e| DataSourceError::General(e.to_string()))?;
         let file_size = model.file_size;
+        let file = File::open(&path_buf)?;
         Ok(Self {
             model,
-            path: path_buf,
+            file: Mutex::new(file),
             file_size,
             profiling_enabled: AtomicBool::new(false),
             profile_bytes_read: AtomicU64::new(0),
             profile_read_operations: AtomicU64::new(0),
             profile_read_failures: AtomicU64::new(0),
             profile_read_nanos: AtomicU64::new(0),
+            profile_tensors: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -77,6 +90,9 @@ impl GgufDataSource {
         self.profile_read_operations.store(0, Ordering::Relaxed);
         self.profile_read_failures.store(0, Ordering::Relaxed);
         self.profile_read_nanos.store(0, Ordering::Relaxed);
+        if let Ok(mut tensors) = self.profile_tensors.lock() {
+            tensors.clear();
+        }
     }
 
     pub fn io_profile(&self) -> IoProfile {
@@ -85,6 +101,28 @@ impl GgufDataSource {
             read_operations: self.profile_read_operations.load(Ordering::Relaxed),
             read_failures: self.profile_read_failures.load(Ordering::Relaxed),
             elapsed: Duration::from_nanos(self.profile_read_nanos.load(Ordering::Relaxed)),
+        }
+    }
+
+    pub fn tensor_io_profile(&self) -> BTreeMap<String, TensorIoProfile> {
+        self.profile_tensors
+            .lock()
+            .map(|profiles| profiles.clone())
+            .unwrap_or_default()
+    }
+
+    fn record_tensor_read(&self, name: &str, bytes: u64, failed: bool) {
+        if !self.profiling_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut profiles) = self.profile_tensors.lock() else {
+            return;
+        };
+        let profile = profiles.entry(name.to_string()).or_default();
+        profile.bytes_read = profile.bytes_read.saturating_add(bytes);
+        profile.read_operations = profile.read_operations.saturating_add(1);
+        if failed {
+            profile.read_failures = profile.read_failures.saturating_add(1);
         }
     }
 
@@ -127,7 +165,10 @@ impl GgufDataSource {
 
         self.validate_bounds(desc, byte_length)?;
 
-        self.read_range(desc.file_offset, byte_length)
+        let result = self.read_range(desc.file_offset, byte_length);
+        let bytes = result.as_ref().map(|data| data.len() as u64).unwrap_or(0);
+        self.record_tensor_read(&desc.name, bytes, result.is_err());
+        result
     }
 
     /// Read full tensor data by name
@@ -226,7 +267,13 @@ impl GgufDataSource {
                 ))
             })?;
         self.validate_bounds_at(file_offset, range_byte_length, desc)?;
-        self.read_f32_range(file_offset, element_count)
+        let result = self.read_f32_range(file_offset, element_count);
+        let bytes = result
+            .as_ref()
+            .map(|values| std::mem::size_of_val(values.as_slice()) as u64)
+            .unwrap_or(0);
+        self.record_tensor_read(&desc.name, bytes, result.is_err());
+        result
     }
 
     /// Read a byte range within a tensor
@@ -282,7 +329,10 @@ impl GgufDataSource {
         })?;
         self.validate_bounds_at(file_offset, length, desc)?;
 
-        self.read_range(file_offset, length)
+        let result = self.read_range(file_offset, length);
+        let bytes = result.as_ref().map(|data| data.len() as u64).unwrap_or(0);
+        self.record_tensor_read(&desc.name, bytes, result.is_err());
+        result
     }
 
     fn validate_bounds(
@@ -331,7 +381,9 @@ impl GgufDataSource {
                     length
                 ))
             })?;
-            let mut file = File::open(&self.path)?;
+            let mut file = self.file.lock().map_err(|_| {
+                DataSourceError::General("GGUF file handle lock poisoned".to_string())
+            })?;
             file.seek(SeekFrom::Start(file_offset))?;
 
             // `read_to_end` appends into spare capacity rather than requiring a
@@ -345,7 +397,7 @@ impl GgufDataSource {
                     length_usize, e
                 ))
             })?;
-            let mut limited = file.take(length);
+            let mut limited = (&mut *file).take(length);
             limited.read_to_end(&mut buf)?;
             if buf.len() != length_usize {
                 return Err(DataSourceError::Io(std::io::Error::new(
@@ -407,7 +459,9 @@ impl GgufDataSource {
             ))
         })?;
 
-        let mut file = File::open(&self.path)?;
+        let mut file = self.file.lock().map_err(|_| {
+            DataSourceError::General("GGUF file handle lock poisoned".to_string())
+        })?;
         file.seek(SeekFrom::Start(file_offset))?;
         {
             let spare = &mut values.spare_capacity_mut()[..element_count];
@@ -554,6 +608,16 @@ mod tests {
         assert_eq!(f, 1.0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_datasource_reuses_open_handle_after_path_is_removed() {
+        let tmp = create_test_gguf_with_data();
+        let ds = GgufDataSource::open(tmp.path()).unwrap();
+        drop(tmp);
+        let data = ds.read_tensor("a.weight").unwrap();
+        assert_eq!(data.len(), 16);
+    }
+
     #[test]
     fn test_io_profile_counts_reads_and_bytes_when_enabled() {
         let tmp = create_test_gguf_with_data();
@@ -566,8 +630,13 @@ mod tests {
         assert_eq!(profile.bytes_read, 16);
         assert_eq!(profile.read_operations, 1);
         assert_eq!(profile.read_failures, 0);
+        let tensor_profile = ds.tensor_io_profile();
+        let tensor_profile = tensor_profile.get("a.weight").unwrap();
+        assert_eq!(tensor_profile.bytes_read, 16);
+        assert_eq!(tensor_profile.read_operations, 1);
         ds.reset_io_profile();
         assert_eq!(ds.io_profile(), IoProfile::default());
+        assert!(ds.tensor_io_profile().is_empty());
     }
 
     #[test]

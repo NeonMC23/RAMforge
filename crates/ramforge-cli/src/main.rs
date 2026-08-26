@@ -340,11 +340,33 @@ fn output_generation_profile(
     eprintln!("  GGUF bytes read: {}", format_bytes(profile.io.bytes_read));
     eprintln!("  GGUF read operations: {}", profile.io.read_operations);
     eprintln!("  GGUF read failures: {}", profile.io.read_failures);
+    eprintln!("  Prompt token forwards: {}", runtime.prompt_forwards);
+    eprintln!("  Decode token forwards: {}", runtime.decode_forwards);
+    eprintln!(
+        "  Terminal forwards skipped: {}",
+        runtime.terminal_forwards_skipped
+    );
     eprintln!("  Layer loads: {}", runtime.layer_loads);
     eprintln!("  Layer releases: {}", runtime.layer_releases);
     eprintln!("  Layer-cache hits: {}", runtime.cache_hits);
     eprintln!("  Layer-cache misses (disk loads): {}", runtime.cache_misses);
     eprintln!("  Peak RAMforge-managed memory: {}", format_bytes(profile.ramforge_peak_bytes));
+    if !profile.tensor_reads.is_empty() {
+        eprintln!("  Top tensor reads by volume:");
+        for tensor in profile.tensor_reads.iter().take(12) {
+            eprintln!(
+                "    {}: {} reads, {}{}",
+                tensor.name,
+                tensor.read_operations,
+                format_bytes(tensor.bytes_read),
+                if tensor.read_failures > 0 {
+                    " (includes failures)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
     eprintln!();
     eprintln!("Measured timings (some detailed categories are subsets of layer time):");
     eprintln!("  GGUF read path:           {}", format_duration(profile.io.elapsed));

@@ -42,10 +42,19 @@ pub struct InferenceEngine {
     pub residency_stats: ResidencyStats,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TensorReadProfile {
+    pub name: String,
+    pub bytes_read: u64,
+    pub read_operations: u64,
+    pub read_failures: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GenerationProfile {
     pub runtime: ProfileSnapshot,
     pub io: IoProfile,
+    pub tensor_reads: Vec<TensorReadProfile>,
     pub ramforge_current_bytes: u64,
     pub ramforge_peak_bytes: u64,
     pub ramforge_budget_bytes: u64,
@@ -109,9 +118,27 @@ impl InferenceEngine {
     }
 
     pub fn generation_profile(&self) -> GenerationProfile {
+        let mut tensor_reads: Vec<TensorReadProfile> = self
+            .data_source
+            .tensor_io_profile()
+            .into_iter()
+            .map(|(name, profile)| TensorReadProfile {
+                name,
+                bytes_read: profile.bytes_read,
+                read_operations: profile.read_operations,
+                read_failures: profile.read_failures,
+            })
+            .collect();
+        tensor_reads.sort_by(|left, right| {
+            right
+                .bytes_read
+                .cmp(&left.bytes_read)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         GenerationProfile {
             runtime: self.model.profiler.snapshot(),
             io: self.data_source.io_profile(),
+            tensor_reads,
             ramforge_current_bytes: self.budget.used_bytes(),
             ramforge_peak_bytes: self.budget.peak_used_bytes(),
             ramforge_budget_bytes: self.budget.total_bytes(),
@@ -287,11 +314,13 @@ impl InferenceEngine {
                             &mut residency_stats,
                             &mut hidden,
                         )?;
+                        profiler.record_prompt_forward();
                     }
                     profiler.record_since(ProfileEvent::Prompt, prompt_started);
 
-                    // Generation loop
-                    for _ in 0..max_tokens {
+                    // Generation loop. A selected final token does not need a
+                    // forward pass unless another token's logits will be read.
+                    for generation_index in 0..max_tokens {
                         let token_started = profiler.start();
                         let logits_started = profiler.start();
                         model.compute_logits(
@@ -323,6 +352,15 @@ impl InferenceEngine {
                             on_text(&decoded)?;
                             profiler.record_since(ProfileEvent::Output, output_started);
                             generated_text.push_str(&decoded);
+                        }
+
+                        let needs_next_logits = generation_index + 1 < max_tokens
+                            && current_pos + 1 < context_length;
+                        if !needs_next_logits {
+                            profiler.record_since(ProfileEvent::TokenLatency, token_started);
+                            profiler.record_token();
+                            profiler.record_terminal_forward_skipped();
+                            break;
                         }
 
                         // Chunk-wise KV growth with deterministic rollback:
@@ -362,6 +400,7 @@ impl InferenceEngine {
                             &mut hidden,
                         )?;
                         current_pos += 1;
+                        profiler.record_decode_forward();
                         profiler.record_since(ProfileEvent::TokenLatency, token_started);
                         profiler.record_token();
 
@@ -605,6 +644,8 @@ mod tests {
 
         let profile = engine.generation_profile();
         assert_eq!(profile.runtime.tokens, 3);
+        assert_eq!(profile.runtime.decode_forwards, 2);
+        assert_eq!(profile.runtime.terminal_forwards_skipped, 1);
         assert!(profile.runtime.layer_loads > 0);
         assert!(profile.io.read_operations > 0);
         assert!(profile.io.bytes_read > 0);
@@ -613,6 +654,35 @@ mod tests {
         let memory = engine.memory_report();
         assert_eq!(memory.ramforge_budget_bytes, 8 * 1024 * 1024);
         assert!(memory.ramforge_peak_bytes >= memory.ramforge_current_bytes);
+    }
+
+    #[test]
+    fn test_single_token_skips_terminal_forward_and_redundant_layer_reads() {
+        let tmp = create_tiny_llama_gguf();
+        let mut engine =
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let prompt_forwards = engine.tokenizer.encode("hello", true).len() as u64;
+        let layer_count = engine.config().block_count as u64;
+        engine.set_profiling(true);
+
+        let sampler = crate::sampling::Sampler::greedy();
+        let (tokens, _) = engine.generate("hello", 1, &sampler).unwrap();
+        assert_eq!(tokens.len(), 1);
+
+        let profile = engine.generation_profile();
+        assert_eq!(profile.runtime.prompt_forwards, prompt_forwards);
+        assert_eq!(profile.runtime.decode_forwards, 0);
+        assert_eq!(profile.runtime.terminal_forwards_skipped, 1);
+        assert_eq!(profile.runtime.layer_loads, prompt_forwards * layer_count);
+        assert_eq!(profile.runtime.layer_releases, profile.runtime.layer_loads);
+        assert_eq!(profile.io.read_operations, profile.runtime.layer_loads * 9);
+        for tensor in profile
+            .tensor_reads
+            .iter()
+            .filter(|tensor| tensor.name.starts_with("blk.0."))
+        {
+            assert_eq!(tensor.read_operations, prompt_forwards);
+        }
     }
 
     fn create_out_of_core_gguf() -> NamedTempFile {

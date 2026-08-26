@@ -41,6 +41,9 @@ struct ProfileCounters {
     max_token_latency_ns: AtomicU64,
     total_ns: AtomicU64,
     tokens: AtomicU64,
+    prompt_forwards: AtomicU64,
+    decode_forwards: AtomicU64,
+    terminal_forwards_skipped: AtomicU64,
     layer_loads: AtomicU64,
     layer_releases: AtomicU64,
     cache_hits: AtomicU64,
@@ -70,6 +73,9 @@ pub struct ProfileSnapshot {
     pub max_token_latency: Duration,
     pub total: Duration,
     pub tokens: u64,
+    pub prompt_forwards: u64,
+    pub decode_forwards: u64,
+    pub terminal_forwards_skipped: u64,
     pub layer_loads: u64,
     pub layer_releases: u64,
     pub cache_hits: u64,
@@ -103,6 +109,9 @@ impl Profiler {
             &self.counters.max_token_latency_ns,
             &self.counters.total_ns,
             &self.counters.tokens,
+            &self.counters.prompt_forwards,
+            &self.counters.decode_forwards,
+            &self.counters.terminal_forwards_skipped,
             &self.counters.layer_loads,
             &self.counters.layer_releases,
             &self.counters.cache_hits,
@@ -155,6 +164,26 @@ impl Profiler {
         }
     }
 
+    pub(crate) fn record_prompt_forward(&self) {
+        if self.is_enabled() {
+            self.counters.prompt_forwards.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_decode_forward(&self) {
+        if self.is_enabled() {
+            self.counters.decode_forwards.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_terminal_forward_skipped(&self) {
+        if self.is_enabled() {
+            self.counters
+                .terminal_forwards_skipped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn record_layer_load(&self) {
         if self.is_enabled() {
             self.counters.layer_loads.fetch_add(1, Ordering::Relaxed);
@@ -189,6 +218,12 @@ impl Profiler {
             max_token_latency: load(&self.counters.max_token_latency_ns),
             total: load(&self.counters.total_ns),
             tokens: self.counters.tokens.load(Ordering::Relaxed),
+            prompt_forwards: self.counters.prompt_forwards.load(Ordering::Relaxed),
+            decode_forwards: self.counters.decode_forwards.load(Ordering::Relaxed),
+            terminal_forwards_skipped: self
+                .counters
+                .terminal_forwards_skipped
+                .load(Ordering::Relaxed),
             layer_loads: self.counters.layer_loads.load(Ordering::Relaxed),
             layer_releases: self.counters.layer_releases.load(Ordering::Relaxed),
             cache_hits: self.counters.cache_hits.load(Ordering::Relaxed),
@@ -222,12 +257,18 @@ mod tests {
         profiler.record(ProfileEvent::LayerLoad, Duration::from_millis(5));
         profiler.record(ProfileEvent::TokenLatency, Duration::from_millis(7));
         profiler.record_token();
+        profiler.record_prompt_forward();
+        profiler.record_decode_forward();
+        profiler.record_terminal_forward_skipped();
         profiler.record_layer_load();
         let snapshot = profiler.snapshot();
         assert_eq!(snapshot.layer_load, Duration::from_millis(5));
         assert_eq!(snapshot.token_latency_total, Duration::from_millis(7));
         assert_eq!(snapshot.max_token_latency, Duration::from_millis(7));
         assert_eq!(snapshot.tokens, 1);
+        assert_eq!(snapshot.prompt_forwards, 1);
+        assert_eq!(snapshot.decode_forwards, 1);
+        assert_eq!(snapshot.terminal_forwards_skipped, 1);
         assert_eq!(snapshot.layer_loads, 1);
         assert_eq!(snapshot.cache_misses, 1);
     }

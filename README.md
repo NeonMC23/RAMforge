@@ -77,7 +77,8 @@ Entire quantized model never resident simultaneously. Layers released after comp
 ### Usable Out-of-Core Inference
 
 - **Streaming output:** generation exposes a text callback backed by a stateful tokenizer decoder; split UTF-8 byte tokens are buffered until displayable, EOS remains suppressed, and CLI diagnostics stay on stderr
-- **Real profiling:** `--profile` measures generation wall time, prompt/prefill, the GGUF read path (destination allocation plus open/seek/read), bytes read, layer loading/compute/release, tensor construction, explicit dequantization/copies, F32 and quantized matvec, allocations, logits, sampling, callback time, token latency, and layer-cache misses
+- **No unused terminal forward:** once the final requested token is selected and emitted, RAMforge does not stream all layers again unless another token's logits are required
+- **Real profiling:** `--profile` measures generation wall time, prompt/prefill, prompt/decode forward counts, per-tensor reads/bytes, the GGUF read path (destination allocation plus seek/read on a reused handle), layer loading/compute/release, tensor construction, explicit dequantization/copies, F32 and quantized matvec, allocations, logits, sampling, callback time, token latency, and layer-cache misses
 - **Memory visibility:** `--memory-report` labels RAMforge current/peak/budget separately from Linux process RSS and system memory; MemoryBudget does not claim control over RSS or page cache
 - **Capability registry:** `ramforge support` distinguishes generic GGUF inspection/planning from execution, tokenizer, and quantization support. Direct execution remains limited to `llama` and `qwen2`; Mistral is runnable only when represented by a validated llama-compatible GGUF; `qwen35` is explicitly inspect/plan-only
 
@@ -228,7 +229,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-Validated suite: 88 core tests + 68 runtime tests = 156 tests, with 0 failures and 0 ignored. Focused coverage includes incremental UTF-8 decoding, I/O counters, profiling, memory separation, streaming callbacks, capability lookup, and unsupported-architecture diagnostics.
+The last executed baseline passed 156 tests with 0 failures and 0 ignored. The current source inventory adds focused persistent-handle and terminal-forward regression tests; rerun the full suite before commit.
 
 ## Known Limitations
 
@@ -240,7 +241,7 @@ Validated suite: 88 core tests + 68 runtime tests = 156 tests, with 0 failures a
 - Persistent weights (`token_embd`, `output_norm`, `output`): resident when their actual retained representation is at most 25% of budget, otherwise streamed on demand with budget-charged bounded temps (`persistent.rs`)
 - KV cache F32, no quantization, no eviction; grows chunk-wise up to prompt+max_tokens
 - Minimum practical: one streamed layer plus its charge-before-read transient (quantized 1× file bytes, direct F32 1×, F16/BF16 3×) and the forward working set must fit the budget; one direct F32 output row, or one raw converted/quantized row plus its F32 decode buffer, must fit as well
-- Not budget-tracked by design (documented as out of scope): tokenizer vocabulary table, thread stacks, allocator fragmentation, `residency_stats` bookkeeping (O(layers) counters)
+- Not budget-tracked by design (documented as out of scope): tokenizer vocabulary table, thread stacks, allocator fragmentation, residency bookkeeping, and optional profiling metadata (including O(tensors) read counters)
 
 ## What is NOT Implemented
 
