@@ -4,8 +4,10 @@
 //! at most 25% of the total budget is kept resident; a larger one is streamed
 //! on demand.
 //!
-//! M6 memory contract:
+//! Memory contract (M7.2):
 //! - streamed embedding lookup reads exactly one row and is budget-charged;
+//!   F32 goes directly into final storage, while converted/quantized formats
+//!   retain their raw-plus-decoded workspace accounting;
 //! - streamed matvec/logits run in row chunks sized by the *available*
 //!   budget (bounded temp, no full-tensor reads, no full F32 expansions);
 //! - logits are written into a caller-provided buffer (single allocation,
@@ -53,8 +55,8 @@ impl PersistentWeight {
     /// Embedding lookup for `token_id`; returns `n_embd` f32 values.
     ///
     /// Resident tensors answer from memory. Streamed tensors read exactly one
-    /// quantized row from disk and dequantize only it; the row's raw bytes and
-    /// its F32 form are charged to the budget for the duration of the call.
+    /// row: F32 is loaded directly into the returned vector; converted or
+    /// quantized rows retain their raw-plus-decoded temporary accounting.
     pub fn get_embedding(
         &self,
         token_id: usize,
@@ -69,22 +71,47 @@ impl PersistentWeight {
                     .map_err(|e| format!("embedding lookup failed: {}", e))
             }),
             Self::Streamed(desc) => {
-                let row_bytes = row_bytes_for(desc, n_embd)? as u64;
-                let temp_bytes = row_bytes + (n_embd * 4) as u64;
-                budget.with_temp("tmp:embd_row", temp_bytes, |_b| {
-                    let raw = data_source
-                        .read_tensor_range(&desc.name, (token_id as u64) * row_bytes, row_bytes)
-                        .map_err(|e| format!("failed to read embedding row: {}", e))?;
-                    let td = TensorData::from_bytes(
-                        desc.ggml_type,
-                        vec![n_embd as u64],
-                        n_embd as u64,
-                        raw,
-                    )
-                    .map_err(|e| format!("failed to create TensorData for embedding row: {}", e))?;
-                    td.to_f32_vec()
-                        .map_err(|e| format!("failed to dequantize embedding row: {}", e))
-                })
+                let element_offset = (token_id as u64)
+                    .checked_mul(n_embd as u64)
+                    .ok_or_else(|| "embedding row element offset overflow".to_string())?;
+                if desc.ggml_type == GgmlType::F32 {
+                    // One direct final representation: no raw row plus decode
+                    // copy. The charge is exactly the returned Vec<f32> bytes.
+                    let temp_bytes = (n_embd as u64)
+                        .checked_mul(std::mem::size_of::<f32>() as u64)
+                        .ok_or_else(|| "embedding row byte size overflow".to_string())?;
+                    budget.with_temp("tmp:embd_row", temp_bytes, |_b| {
+                        data_source
+                            .read_f32_tensor_range_by_descriptor(
+                                desc,
+                                element_offset,
+                                n_embd as u64,
+                            )
+                            .map_err(|e| format!("failed to read embedding row: {}", e))
+                    })
+                } else {
+                    let row_bytes = row_bytes_for(desc, n_embd)? as u64;
+                    let byte_offset = (token_id as u64)
+                        .checked_mul(row_bytes)
+                        .ok_or_else(|| "embedding row byte offset overflow".to_string())?;
+                    let temp_bytes = row_bytes + (n_embd * 4) as u64;
+                    budget.with_temp("tmp:embd_row", temp_bytes, |_b| {
+                        let raw = data_source
+                            .read_tensor_range_by_descriptor(desc, byte_offset, row_bytes)
+                            .map_err(|e| format!("failed to read embedding row: {}", e))?;
+                        let td = TensorData::from_bytes(
+                            desc.ggml_type,
+                            vec![n_embd as u64],
+                            n_embd as u64,
+                            raw,
+                        )
+                        .map_err(|e| {
+                            format!("failed to create TensorData for embedding row: {}", e)
+                        })?;
+                        td.into_f32_vec()
+                            .map_err(|e| format!("failed to dequantize embedding row: {}", e))
+                    })
+                }
             }
         }
     }
@@ -128,17 +155,27 @@ impl PersistentWeight {
         match self {
             Self::Resident(td) => td.to_f32_vec().map_err(|e| e.to_string()),
             Self::Streamed(desc) => {
-                let raw = data_source
-                    .read_tensor(&desc.name)
-                    .map_err(|e| format!("failed to read persistent tensor '{}': {}", desc.name, e))?;
-                let td = TensorData::from_bytes(
-                    desc.ggml_type,
-                    desc.dimensions.clone(),
-                    desc.num_elements,
-                    raw,
-                )
-                .map_err(|e| format!("failed to create TensorData: {}", e))?;
-                td.to_f32_vec().map_err(|e| e.to_string())
+                if desc.ggml_type == GgmlType::F32 {
+                    data_source
+                        .read_f32_tensor_by_descriptor(desc)
+                        .map_err(|e| {
+                            format!("failed to read persistent tensor '{}': {}", desc.name, e)
+                        })
+                } else {
+                    let raw = data_source
+                        .read_tensor_by_descriptor(desc)
+                        .map_err(|e| {
+                            format!("failed to read persistent tensor '{}': {}", desc.name, e)
+                        })?;
+                    let td = TensorData::from_bytes(
+                        desc.ggml_type,
+                        desc.dimensions.clone(),
+                        desc.num_elements,
+                        raw,
+                    )
+                    .map_err(|e| format!("failed to create TensorData: {}", e))?;
+                    td.into_f32_vec().map_err(|e| e.to_string())
+                }
             }
         }
     }
@@ -171,9 +208,9 @@ pub fn row_bytes_for(desc: &TensorDescriptor, in_dim: usize) -> Result<usize, St
 /// Chunked, budget-aware streamed matvec for a non-resident 2D tensor.
 ///
 /// Layout: ggml `[in, out]`; the file stores `out` contiguous rows of `in`
-/// elements. Each iteration reads one chunk of complete rows, dequantizes
-/// one row at a time into a small reused buffer, and dots it with `x`.
-/// The chunk + row buffer are charged to the budget via `with_temp`.
+/// elements. F32 chunks are read directly into final F32 storage and dotted
+/// in place. Other formats retain a raw chunk plus one reused decoded row.
+/// The exact owned workspace is charged via `with_temp`.
 fn streamed_matvec_into(
     desc: &TensorDescriptor,
     x: &[f32],
@@ -210,43 +247,91 @@ fn streamed_matvec_into(
     let chunk_target = avail_share.min(MAX_STREAM_CHUNK_BYTES).max(row_bytes);
     let rows_per_chunk = (chunk_target / row_bytes).max(1);
     let chunk_bytes = rows_per_chunk * row_bytes;
-    let temp_bytes = chunk_bytes + row_f32_bytes;
+    let direct_f32 = desc.ggml_type == GgmlType::F32;
+    let temp_bytes = if direct_f32 {
+        chunk_bytes
+    } else {
+        chunk_bytes + row_f32_bytes
+    };
     if !budget.can_allocate(temp_bytes) {
+        let detail = if direct_f32 {
+            "direct F32 chunk"
+        } else {
+            "raw chunk + decoded row buffer"
+        };
         return Err(format!(
-            "RAM budget too small to stream tensor '{}': need {} bytes of temporary working set ({} rows x {} row bytes + row buffer), available {}",
+            "RAM budget too small to stream tensor '{}': need {} bytes of temporary working set ({}), available {}",
             desc.name,
             temp_bytes,
-            rows_per_chunk,
-            row_bytes,
+            detail,
             budget.available_bytes()
         ));
     }
 
-    budget.with_temp("tmp:streamed_matvec", temp_bytes, |_b| {
-        let mut row_buf = vec![0.0f32; in_dim];
-        let mut row_start = 0usize;
-        while row_start < out_dim {
-            let rows_this = rows_per_chunk.min((out_dim - row_start) as u64) as usize;
-            let offset = (row_start as u64) * row_bytes;
-            let len = (rows_this as u64) * row_bytes;
-            let chunk = data_source
-                .read_tensor_range(&desc.name, offset, len)
-                .map_err(|e| format!("failed to read chunk of '{}': {}", desc.name, e))?;
-            for r in 0..rows_this {
-                let row_slice =
-                    &chunk[(r as u64 * row_bytes) as usize..((r as u64 + 1) * row_bytes) as usize];
-                ramforge_core::tensor::decode_row_to_f32(desc.ggml_type, row_slice, in_dim, &mut row_buf)
-                    .map_err(|e| format!("failed to decode row of '{}': {}", desc.name, e))?;
-                let mut sum = 0.0f32;
-                for i in 0..in_dim {
-                    sum += row_buf[i] * x[i];
+    if direct_f32 {
+        budget.with_temp("tmp:streamed_matvec", temp_bytes, |_b| {
+            let mut row_start = 0usize;
+            while row_start < out_dim {
+                let rows_this = rows_per_chunk.min((out_dim - row_start) as u64) as usize;
+                let element_offset = (row_start as u64)
+                    .checked_mul(in_dim as u64)
+                    .ok_or_else(|| "streamed F32 element offset overflow".to_string())?;
+                let element_count = (rows_this as u64)
+                    .checked_mul(in_dim as u64)
+                    .ok_or_else(|| "streamed F32 element count overflow".to_string())?;
+                let chunk = data_source
+                    .read_f32_tensor_range_by_descriptor(
+                        desc,
+                        element_offset,
+                        element_count,
+                    )
+                    .map_err(|e| {
+                        format!("failed to read direct F32 chunk of '{}': {}", desc.name, e)
+                    })?;
+                for r in 0..rows_this {
+                    let row = &chunk[r * in_dim..(r + 1) * in_dim];
+                    let mut sum = 0.0f32;
+                    for i in 0..in_dim {
+                        sum += row[i] * x[i];
+                    }
+                    y[row_start + r] = sum;
                 }
-                y[row_start + r] = sum;
+                row_start += rows_this;
             }
-            row_start += rows_this;
-        }
-        Ok(())
-    })
+            Ok(())
+        })
+    } else {
+        budget.with_temp("tmp:streamed_matvec", temp_bytes, |_b| {
+            let mut row_buf = vec![0.0f32; in_dim];
+            let mut row_start = 0usize;
+            while row_start < out_dim {
+                let rows_this = rows_per_chunk.min((out_dim - row_start) as u64) as usize;
+                let offset = (row_start as u64) * row_bytes;
+                let len = (rows_this as u64) * row_bytes;
+                let chunk = data_source
+                    .read_tensor_range_by_descriptor(desc, offset, len)
+                    .map_err(|e| format!("failed to read chunk of '{}': {}", desc.name, e))?;
+                for r in 0..rows_this {
+                    let row_slice = &chunk
+                        [(r as u64 * row_bytes) as usize..((r as u64 + 1) * row_bytes) as usize];
+                    ramforge_core::tensor::decode_row_to_f32(
+                        desc.ggml_type,
+                        row_slice,
+                        in_dim,
+                        &mut row_buf,
+                    )
+                    .map_err(|e| format!("failed to decode row of '{}': {}", desc.name, e))?;
+                    let mut sum = 0.0f32;
+                    for i in 0..in_dim {
+                        sum += row_buf[i] * x[i];
+                    }
+                    y[row_start + r] = sum;
+                }
+                row_start += rows_this;
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Keep a persistent tensor resident only when its actual in-memory
@@ -358,9 +443,9 @@ mod tests {
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
         let desc = ds.get_descriptor("output.weight").unwrap().clone();
 
-        // Rows are 16 bytes; budget forces chunks of ~2-3 rows and must hold
-        // chunk+row temp only (tiny). Reserve most of a small budget so only
-        // a thin share is available for chunks.
+        // Rows are 16 bytes; budget forces chunks of ~2-3 rows. The direct
+        // F32 path owns only the final chunk (no raw chunk + decoded row).
+        // Reserve most of a small budget so only a thin share is available.
         let mut budget = ramforge_core::memory::MemoryBudget::new(1024).unwrap();
         budget.allocate("pinned", 800).unwrap(); // available = 224 -> share 56B -> 3 rows/chunk
         let streamed = PersistentWeight::Streamed(desc.clone());
@@ -415,7 +500,7 @@ mod tests {
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
         let desc = ds.get_descriptor("output.weight").unwrap().clone();
         let streamed = PersistentWeight::Streamed(desc);
-        // One row = 1024 B raw + 1024 B f32 buffer; budget far below that.
+        // One direct F32 row = 1024 B; budget is far below that.
         let mut budget = ramforge_core::memory::MemoryBudget::new(256).unwrap();
         let hidden = vec![1.0f32; 256];
         let mut logits = vec![0.0f32; 4];

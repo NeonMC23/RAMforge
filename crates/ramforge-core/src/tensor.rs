@@ -375,6 +375,41 @@ impl TensorData {
         }
     }
 
+    /// Construct F32 tensor storage from an already initialized final buffer.
+    /// This takes ownership without decoding or copying and is the endpoint of
+    /// the direct F32 datasource path.
+    pub fn from_f32_vec(
+        shape: Vec<u64>,
+        num_elements: u64,
+        data: Vec<f32>,
+    ) -> Result<Self, DataSourceError> {
+        let expected_len = usize::try_from(num_elements).map_err(|_| {
+            DataSourceError::General(format!(
+                "F32 element count {} does not fit this platform",
+                num_elements
+            ))
+        })?;
+        if data.len() != expected_len {
+            return Err(DataSourceError::General(format!(
+                "F32 data length mismatch: expected {} elements, got {}",
+                expected_len,
+                data.len()
+            )));
+        }
+        let shape = shape
+            .into_iter()
+            .map(|dimension| {
+                usize::try_from(dimension).map_err(|_| {
+                    DataSourceError::General(format!(
+                        "F32 tensor dimension {} does not fit this platform",
+                        dimension
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::F32 { data, shape })
+    }
+
     pub fn from_bytes(
         ggml_type: GgmlType,
         shape: Vec<u64>,
@@ -627,6 +662,25 @@ impl TensorData {
             | Self::Q8_K(qt) => qt.dequantize_to_f32(),
         }
     }
+
+    /// Consume a temporary tensor and return its F32 representation without
+    /// cloning already-decoded F32/F16/BF16 storage. Quantized tensors still
+    /// dequantize once while their compact bytes remain live.
+    pub fn into_f32_vec(self) -> Result<Vec<f32>, DataSourceError> {
+        match self {
+            Self::F32 { data, .. }
+            | Self::F16 { data, .. }
+            | Self::BF16 { data, .. } => Ok(data),
+            Self::Q4_0(qt)
+            | Self::Q8_0(qt)
+            | Self::Q4_K(qt)
+            | Self::Q5_K(qt)
+            | Self::Q6_K(qt)
+            | Self::Q2_K(qt)
+            | Self::Q3_K(qt)
+            | Self::Q8_K(qt) => qt.dequantize_to_f32(),
+        }
+    }
 }
 
 /// F32 matvec under the explicit GGML/GGUF layout:
@@ -807,6 +861,9 @@ pub fn decode_tensor_to_f32(
     }
 }
 
+/// Legacy/reference decoder for callers that already own a raw byte buffer.
+/// Inference tensor loading bypasses this loop via the datasource direct-F32
+/// path; keeping it provides backward compatibility and a parity oracle.
 fn decode_f32(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceError> {
     let expected = num_elements as usize * 4;
     if bytes.len() < expected {

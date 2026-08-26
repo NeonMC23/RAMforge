@@ -2,7 +2,9 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **Milestone 7.1 Status (Accounting Hardening):** Resident persistent tensors now establish their full load-transient charge **before** file I/O (quantized 1× file bytes, F32 2×, F16/BF16 3×), settle atomically to the actual owned representation, and roll back all startup charges on failure. The 25% retention policy uses decoded/compact resident bytes rather than file bytes. Final hidden state is caller-owned under a lifetime-matched `tmp:hidden` charge.
+> **Milestone 7.2 Status (Fast Float Load):** F32 tensor payloads now read directly into their final `Vec<f32>` allocation without a raw-byte intermediate, destination zero-fill, or little-endian per-element decode loop on little-endian hosts. Full tensors and streamed F32 chunks/rows use the direct path; the truthful load charge is now 1× file bytes. F16/BF16 remain decoded F32 with their 3× load transient, and quantized representations are unchanged.
+>
+> **Milestone 7.1 Baseline (Accounting Hardening):** Resident persistent tensors establish their full load-transient charge **before** file I/O, settle atomically to the actual owned representation, and roll back all startup charges on failure. At M7.1 the load factors were quantized 1×, F32 2×, and F16/BF16 3×; M7.2 supersedes only F32 with its direct 1× representation. The 25% retention policy uses decoded/compact resident bytes rather than file bytes. Final hidden state is caller-owned under a lifetime-matched `tmp:hidden` charge.
 >
 > **Milestone 6.1 Baseline (Correctness & Accounting Fixes):** `generate()` is cleanly repeatable on one engine (explicit KV reset + failure-proof budget); RoPE uses the correct llama/qwen2 **half-split** pair convention; F16/BF16 resident RAM is booked at its true decoded size (4 B/elem, with a 3x-file-byte load transient); qwen2 Q/K/V biases are loaded, budgeted, validated (all-or-none + exact shape), and applied after the projections. Everything below in M6 stands. The M6.1 baseline was verified by 132 tests and synthetic end-to-end runs; real-model files remain untested.
 >
@@ -54,6 +56,7 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 
 **Memory accounting:**
 - Budget accounts actual resident representation: quantized bytes + temporary block buffers, NOT full F32 expansion.
+- F32 payloads read directly into final F32 storage, so both load and settled residency are 1× file bytes; no raw tensor copy coexists.
 - F16/BF16 weights: decoded to F32 in RAM at load time; the budget books the true decoded residency (4 B/elem), with a 3× file-byte transient during layer load (hardened in M6.1 – see below).
 - Example: Q4_K 256 elements F32 equiv 1024B, quantized resident 144B (7.1× smaller). For model with 4 layers n_embd 256 ffn 512:
   - Quantized total 1.5MB, F32 equiv 10MB
@@ -69,9 +72,17 @@ Entire quantized model never resident simultaneously. Layers released after comp
 **Compute backend:**
 - `ComputeBackend` trait F32 `matvec` now follows the explicit ggml layout and is wired into the inference hot path (`matvec_backend` in `streaming_model.rs`): resident F32 weights use runtime-detected AVX2 (`simd.rs`) + rayon row-parallelism; quantized weights keep the compact block-wise kernels from `quant.rs`
 
-### Milestone 7.1 – Accounting Hardening (current)
+### Milestone 7.2 – Fast Float Load (current)
 
-- **Persistent startup ordering:** resident persistent weights reserve the full raw+decoded transient before reading; F32 uses 2× file bytes, F16/BF16 3×, and compact quantized tensors 1×
+- **Direct F32 I/O:** full tensors and streamed F32 ranges are read into final `Vec<f32>` storage; little-endian hosts avoid both the raw-byte intermediate and per-element decode loop
+- **No destination prefill:** raw range reads append into reserved spare capacity, while direct F32 reads initialize reserved F32 storage with exact I/O; short reads remain errors
+- **Endianness:** GGUF little-endian bits are already native on little-endian hosts; big-endian hosts perform an in-place normalization without a second tensor-sized allocation
+- **Accounting:** F32 load charge is exactly its one owned final representation (1× file bytes); F16/BF16 stay at 3× transient and 4 B/element settled; quantized loading remains 1× compact bytes
+- **Safety boundary:** the only new unsafe operations are the audited conversion of uninitialized, aligned F32 spare capacity to an exact byte destination and `set_len` after successful `read_exact`
+
+### Milestone 7.1 – Accounting Hardening
+
+- **Persistent startup ordering:** resident persistent weights reserve the full load transient before reading; M7.1 used F32 2×, F16/BF16 3×, and compact quantized tensors 1× (M7.2 reduces only F32 to 1×)
 - **Atomic settlement:** `MemoryBudget::resize` settles a live transient charge to exact `TensorData::resident_bytes()` without an uncharged gap; read/decode/settlement failures remove the current charge, and model-startup failure rolls back earlier persistent charges
 - **Resident policy:** the existing 25% threshold is applied to the representation RAMforge will actually retain (decoded F32 for F32/F16/BF16, raw compact bytes for supported quants), with checked size arithmetic
 - **Hidden-state lifetime:** `forward_single_streaming` writes into a caller-owned output slice; `generate()` keeps `tmp:hidden` live for that buffer's complete lifetime instead of returning a vector past `tmp:forward`
@@ -150,10 +161,10 @@ crates/
     gguf.rs, model.rs, types.rs
     memory.rs – MemoryBudget, parse_memory_size
     cache.rs – BoundedCache LRU
-    datasource.rs – GgufDataSource
+    datasource.rs – GgufDataSource, exact range reads, direct little-endian F32 reads into final storage
     tokenizer.rs – Tokenizer from GGUF
     quant.rs – Q4_0, Q8_0, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K block layouts, dequant, quantized matvec (scalar, block-wise)
-    tensor.rs – TensorData (F32/F16/BF16/Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K), QuantizedTensor, resident_bytes, matvec, get_embedding
+    tensor.rs – TensorData (F32/F16/BF16/Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K), direct F32 ownership, QuantizedTensor, resident_bytes, matvec, get_embedding
   ramforge-runtime/
     backend.rs – ComputeBackend, CpuBackend (rayon threading, optional AVX2 for F32)
     ops.rs – RoPE, attention
@@ -163,7 +174,7 @@ crates/
     persistent.rs – PersistentWeight: actual resident representation ≤25% of budget, else streamed on demand
     simd.rs – AVX2/FMA F32 dot/matvec kernels, runtime detection + scalar fallback (M5.6.1)
     model.rs – LlamaConfig, validate_required_tensors
-    streaming_model.rs – StreamingLlamaModel (charge-before-read persistents + layer descriptors), load/release layer, caller-owned final hidden + scoped tmp:forward
+    streaming_model.rs – StreamingLlamaModel (charge-before-read + direct F32 loads), load/release layer, caller-owned final hidden + scoped tmp:forward
     inference.rs – InferenceEngine (file-backed + budget + chunk-growing KV + single logits buffer), generate()
     plan.rs – planning
     sampling.rs – greedy, temperature, top-k/p
@@ -194,19 +205,20 @@ crates/
 - Out-of-core quantized: synthetic Q4_K model 1.5MB > 800KB budget, per-layer 370KB fits, peak managed ≤ budget, inference succeeds, quantized resident < F32 equiv (manual run + unit tests)
 - Deterministic generation: tiny F32 model greedy 5 tokens deterministic (in `inference.rs`)
 - Existing F32/F16/BF16 inference still works
+- Direct F32 loading: ordinary-value parity, exact edge bit patterns (signed zero, finite, subnormal, infinities, NaN payloads), non-square GGML layout, exact 1× accounting, and short-read rollback
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-M7.1 source suite: 83 core tests + 58 runtime tests = 141 tests (including targeted persistent-transient, policy, rollback, and hidden-lifetime regressions).
+M7.2 source suite: 86 core tests + 59 runtime tests = 145 tests (M7.1 baseline 141; four focused direct-F32 and rollback tests added).
 
-## Known Limitations (Milestone 7.1)
+## Known Limitations (Milestone 7.2)
 
 - Quantized inference limited to Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K; Q4_1/Q5_0/Q5_1/Q8_1 and IQ* quants not supported
 - CPU-only: quantized matvec is scalar (block-wise dequant); F32 dot/matvec have runtime-detected AVX2 kernels and rayon row-parallelism; no GPU
 - Tokenizer: SentencePiece unigram (score-based Viterbi) and BPE (gpt2/qwen2 merges); other pre-tokenizers/model families untested
 - Persistent weights (`token_embd`, `output_norm`, `output`): resident when their actual retained representation is at most 25% of budget, otherwise streamed on demand with budget-charged bounded temps (`persistent.rs`)
 - KV cache F32, no quantization, no eviction; grows chunk-wise up to prompt+max_tokens
-- Minimum practical: one streamed layer plus its charge-before-read transient (quantized 1× file bytes, F32 2×, F16/BF16 3×) and the forward working set must fit the budget; a single streamed output row (raw + F32 form) must fit as well
+- Minimum practical: one streamed layer plus its charge-before-read transient (quantized 1× file bytes, direct F32 1×, F16/BF16 3×) and the forward working set must fit the budget; one direct F32 output row, or one raw converted/quantized row plus its F32 decode buffer, must fit as well
 - Not budget-tracked by design (documented as out of scope): tokenizer vocabulary table, thread stacks, allocator fragmentation, `residency_stats` bookkeeping (O(layers) counters)
 
 ## What is NOT Implemented

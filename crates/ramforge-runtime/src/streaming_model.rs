@@ -163,11 +163,11 @@ impl StreamingLlamaModel {
 
     /// Load a single layer on demand, accounting actual quantized resident size
     ///
-    /// Memory integrity (M6): each tensor's file bytes are charged to the
-    /// budget BEFORE reading (covering the read buffer; float types charge an
-    /// extra byte_length to cover the raw+f32 decode spike). After
-    /// construction the charge is settled to the exact resident size. On any
-    /// failure, all charges made for this layer are released.
+    /// Memory integrity (M7.2): each tensor is charged BEFORE reading. F32
+    /// reads directly into final storage (1x file bytes); F16/BF16 retain their
+    /// raw+decoded 3x transient; quantized data remains compact at 1x. After
+    /// construction the charge is atomically settled to exact residency. On
+    /// any failure, all charges made for this layer are released.
     pub fn load_layer(
         &self,
         layer_idx: usize,
@@ -187,25 +187,14 @@ impl StreamingLlamaModel {
             for tensor_desc in &layer_desc.tensors {
                 let name = &tensor_desc.name;
                 let file_bytes = tensor_desc.byte_length.unwrap_or(0);
-                // Peak physical usage during from_bytes, charged up front.
+                // Peak owned representation during load, charged up front.
                 let charge = load_charge_bytes(tensor_desc.ggml_type, file_bytes)?.max(1);
                 let alloc_name = format!("layer:{}:{}", layer_idx, name);
                 budget
                     .allocate(alloc_name.clone(), charge)
                     .map_err(|e| format!("RAM budget too small for layer {} tensor '{}': {}", layer_idx, name, e))?;
 
-                let raw_bytes = data_source
-                    .read_tensor(name)
-                    .map_err(|e| format!("failed to read tensor '{}': {}", name, e))?;
-
-                let shape_u64 = tensor_desc.dimensions.clone();
-                let tensor_data = TensorData::from_bytes(
-                    tensor_desc.ggml_type,
-                    shape_u64,
-                    tensor_desc.num_elements,
-                    raw_bytes,
-                )
-                .map_err(|e| format!("failed to create TensorData for '{}': {}", name, e))?;
+                let tensor_data = load_tensor_data(data_source, tensor_desc)?;
 
                 let resident = tensor_data.resident_bytes() as u64;
                 total_layer_bytes += resident;
@@ -574,8 +563,37 @@ impl StreamingLlamaModel {
     }
 }
 
+/// Load one tensor into its resident representation.
+///
+/// F32 takes the direct datasource path into final `Vec<f32>` storage. F16,
+/// BF16, and quantized formats retain their M7.1 raw-byte construction paths;
+/// quantized bytes are moved into compact TensorData without expansion.
+fn load_tensor_data(
+    data_source: &GgufDataSource,
+    desc: &ramforge_core::model::TensorDescriptor,
+) -> Result<TensorData, String> {
+    if desc.ggml_type == GgmlType::F32 {
+        let data = data_source
+            .read_f32_tensor_by_descriptor(desc)
+            .map_err(|e| format!("failed to read tensor '{}': {}", desc.name, e))?;
+        TensorData::from_f32_vec(desc.dimensions.clone(), desc.num_elements, data)
+            .map_err(|e| format!("failed to create TensorData for '{}': {}", desc.name, e))
+    } else {
+        let raw_bytes = data_source
+            .read_tensor_by_descriptor(desc)
+            .map_err(|e| format!("failed to read tensor '{}': {}", desc.name, e))?;
+        TensorData::from_bytes(
+            desc.ggml_type,
+            desc.dimensions.clone(),
+            desc.num_elements,
+            raw_bytes,
+        )
+        .map_err(|e| format!("failed to create TensorData for '{}': {}", desc.name, e))
+    }
+}
+
 /// Apply the persistent residency policy and, when resident, load one tensor
-/// under a charge that covers its complete raw+decoded startup lifetime.
+/// under a charge that covers its complete I/O/construction lifetime.
 ///
 /// Returns the allocation name only for a newly resident tensor so the model
 /// loader can roll it back transactionally if a later persistent fails.
@@ -624,18 +642,10 @@ fn load_persistent_weight(
         })?;
 
     let load_result = (|| -> Result<TensorData, String> {
-        // The load charge is already live before this read allocates its raw
-        // buffer. Float decoding may then coexist with that raw buffer.
-        let raw_bytes = data_source
-            .read_tensor_by_descriptor(&desc)
-            .map_err(|e| format!("failed to read tensor '{}': {}", name, e))?;
-        let tensor_data = TensorData::from_bytes(
-            desc.ggml_type,
-            desc.dimensions.clone(),
-            desc.num_elements,
-            raw_bytes,
-        )
-        .map_err(|e| format!("failed to create TensorData for '{}': {}", name, e))?;
+        // The load charge is already live before I/O. F32 is read directly
+        // into final storage; other formats retain the raw+decode path covered
+        // by their larger transient charges.
+        let tensor_data = load_tensor_data(data_source, &desc)?;
 
         let actual_resident = tensor_data.resident_bytes() as u64;
         if actual_resident != expected_resident {
@@ -645,8 +655,9 @@ fn load_persistent_weight(
             ));
         }
 
-        // The raw float buffer has been dropped (or moved into a compact
-        // quantized TensorData), so atomically settle the conservative charge.
+        // F32 already occupies only final storage. For converted floats the
+        // raw buffer is now dropped; quantized bytes moved into TensorData.
+        // Atomically settle any conservative transient to exact residency.
         budget
             .resize(&alloc_name, actual_resident)
             .map_err(|e| format!("failed to settle resident charge for '{}': {}", name, e))?;
@@ -712,15 +723,14 @@ fn validate_qkv_bias(
 }
 
 /// Transient budget charge while loading one tensor of `file_bytes`:
-/// - quantized: raw buffer is *moved* into QuantizedTensor (1x);
-/// - F32: raw (1x) + decoded copy (1x) coexist transiently (2x);
+/// - F32: datasource reads directly into final Vec<f32> storage (1x);
+/// - quantized: raw buffer is moved into QuantizedTensor (1x);
 /// - F16/BF16: raw (1x = 2 B/elem) + decoded Vec<f32> (2x = 4 B/elem)
 ///   coexist transiently (3x total).
 ///
 /// Overflow-safe; clear error on impossible sizes.
 fn load_charge_bytes(ggml_type: GgmlType, file_bytes: u64) -> Result<u64, String> {
     let factor: u64 = match ggml_type {
-        GgmlType::F32 => 2,
         GgmlType::F16 | GgmlType::BF16 => 3,
         _ => 1,
     };
@@ -1042,26 +1052,41 @@ mod tests {
     }
 
     #[test]
-    fn test_persistent_f32_requires_transient_charge_before_read() {
+    fn test_persistent_f32_direct_load_uses_one_owned_representation() {
         let raw = vec![0u8; 8 * 4];
         let tmp = create_single_tensor_gguf("test.weight", GgmlType::F32, &[8], &raw);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
         let desc = ds.get_descriptor("test.weight").unwrap();
         assert_eq!(desc.byte_length, Some(32));
         assert_eq!(TensorData::resident_bytes_for(GgmlType::F32, 8, 32).unwrap(), 32);
-        assert_eq!(load_charge_bytes(GgmlType::F32, 32).unwrap(), 64);
+        assert_eq!(load_charge_bytes(GgmlType::F32, 32).unwrap(), 32);
 
-        // The 32-byte resident form would fit in the 48 bytes left, but the
-        // mandatory raw+decoded 64-byte startup transient does not. A valid
-        // tensor therefore fails before any read/decode allocation can occur.
+        // Exactly 32 bytes remain. The direct loader succeeds because its only
+        // owned tensor representation is the final 32-byte Vec<f32>; the old
+        // raw+decoded 64-byte path would have failed this budget.
         let mut budget = MemoryBudget::new(128).unwrap();
-        budget.allocate("existing", 80).unwrap();
-        let before = budget.used_bytes();
-        let error = load_persistent_weight(&ds, "test.weight", &mut budget).unwrap_err();
+        budget.allocate("existing", 96).unwrap();
+        let (weight, allocation) =
+            load_persistent_weight(&ds, "test.weight", &mut budget).unwrap();
+        assert!(weight.is_resident());
+        assert_eq!(weight.resident_bytes(), 32);
+        assert_eq!(allocation.as_deref(), Some("weight:test.weight"));
+        assert_eq!(budget.get("weight:test.weight"), Some(32));
+        assert_eq!(budget.used_bytes(), 128);
+        drop(weight);
+        budget.release("weight:test.weight").unwrap();
+        assert_eq!(budget.used_bytes(), 96);
+
+        // One byte less than the final representation must fail before I/O and
+        // leave the previous budget state untouched.
+        let mut tight = MemoryBudget::new(128).unwrap();
+        tight.allocate("existing", 97).unwrap();
+        let before = tight.used_bytes();
+        let error = load_persistent_weight(&ds, "test.weight", &mut tight).unwrap_err();
         assert!(error.contains("load charge"), "unexpected error: {}", error);
-        assert_eq!(budget.used_bytes(), before);
-        assert!(budget.get("weight:test.weight").is_none());
-        assert!(!budget.allocations().keys().any(|name| name.starts_with("tmp:")));
+        assert_eq!(tight.used_bytes(), before);
+        assert!(tight.get("weight:test.weight").is_none());
+        assert!(!tight.allocations().keys().any(|name| name.starts_with("tmp:")));
     }
 
     #[test]
@@ -1269,14 +1294,47 @@ mod tests {
     }
 
     #[test]
+    fn test_direct_f32_layer_short_read_releases_all_charges() {
+        let tmp = create_model_with_n_layers(1, 8, 16);
+        let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
+        let q_desc = ds.get_descriptor("blk.0.attn_q.weight").unwrap();
+        tmp.as_file()
+            .set_len(q_desc.file_offset + q_desc.byte_length.unwrap() - 1)
+            .unwrap();
+
+        // Persistent tensors precede the truncated layer payload and still
+        // load successfully. The layer's first tensor settles, then the direct
+        // F32 Q read fails short; every layer charge must roll back.
+        let mut budget = MemoryBudget::new(1024 * 1024).unwrap();
+        let model = StreamingLlamaModel::load(&ds, &mut budget).unwrap();
+        let before = budget.used_bytes();
+        let mut stats = ResidencyStats::new(model.total_weight_bytes);
+        let error = model
+            .load_layer(0, &ds, &mut budget, &mut stats)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            error.contains("blk.0.attn_q.weight") && error.contains("read"),
+            "unexpected error: {}",
+            error
+        );
+        assert_eq!(budget.used_bytes(), before);
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("layer:0:")));
+        assert!(!budget.allocations().keys().any(|name| name.starts_with("tmp:")));
+    }
+
+    #[test]
     fn test_out_of_core_model_larger_than_budget() {
         let tmp = create_model_with_n_layers(8, 32, 64);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
         let total_bytes: u64 = ds.model().tensors.iter().filter_map(|t| t.byte_length).sum();
 
-        // Per layer ~41 KiB; charge-before-read peaks at ~2x for F32 tensors,
-        // plus persistents (~2.1 KiB). 96 KiB fits one layer comfortably; the
-        // whole model (~324 KiB) never has to fit at once.
+        // Per layer ~41 KiB; direct F32 loading charges one final
+        // representation, plus persistents (~2.1 KiB). 96 KiB fits one layer
+        // comfortably; the whole model (~324 KiB) never has to fit at once.
         let ram_budget = 96 * 1024;
 
         let mut budget = ramforge_core::memory::MemoryBudget::new(ram_budget).unwrap();

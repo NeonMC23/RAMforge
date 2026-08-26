@@ -609,7 +609,7 @@ mod tests {
 
         // n_embd 16 / ffn 32: per layer 10368 B (F32), persistents 1088 B.
         // 8 layers => total 84032 B (~82 KiB) > 32 KiB budget, while one
-        // layer (with charge-before-read transient up to ~2x) plus KV cache
+        // layer (direct F32 load charge = resident bytes) plus KV cache
         // (~5 tokens) and forward temps comfortably fits.
         let ram_budget = 32 * 1024;
 
