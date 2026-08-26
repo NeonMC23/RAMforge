@@ -81,15 +81,12 @@ impl GgufModel {
     /// Normalized model information
     pub fn info(&self) -> ModelInfo {
         // Architecture is stored in general.architecture
-        let architecture = self.get_string("general.architecture").or_else(|| {
-            self.get_metadata("general.architecture")
-                .map(|v| format!("{}", v))
-        });
+        let architecture = self
+            .get_string("general.architecture")
+            .or_else(|| self.get_metadata("general.architecture").map(|v| format!("{}", v)));
 
         // Helper to try architecture-specific keys, e.g. "llama.context_length"
-        let arch = architecture
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+        let arch = architecture.clone().unwrap_or_else(|| "unknown".to_string());
 
         let try_arch_key = |suffix: &str| -> Option<u64> {
             let key = format!("{}.{}", arch, suffix);
@@ -120,10 +117,12 @@ impl GgufModel {
             .or_else(|| self.get_u64("llama.expert_count"))
             .or_else(|| try_arch_key("experts_count"));
 
-        let expert_used_count =
-            try_arch_key("expert_used_count").or_else(|| self.get_u64("llama.expert_used_count"));
+        let expert_used_count = try_arch_key("expert_used_count")
+            .or_else(|| self.get_u64("llama.expert_used_count"));
 
-        let file_type = self.get_u64("general.file_type").map(|v| v as u32);
+        let file_type = self
+            .get_u64("general.file_type")
+            .map(|v| v as u32);
 
         let tokenizer_model = self
             .get_string("tokenizer.ggml.model")

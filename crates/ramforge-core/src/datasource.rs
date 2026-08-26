@@ -7,11 +7,21 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::error::DataSourceError;
 use crate::gguf::parse_gguf_file;
 use crate::model::{GgufModel, TensorDescriptor};
 use crate::types::GgmlType;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IoProfile {
+    pub bytes_read: u64,
+    pub read_operations: u64,
+    pub read_failures: u64,
+    pub elapsed: Duration,
+}
 
 /// A file-backed data source for GGUF tensor data
 ///
@@ -23,6 +33,11 @@ pub struct GgufDataSource {
     model: GgufModel,
     path: PathBuf,
     file_size: u64,
+    profiling_enabled: AtomicBool,
+    profile_bytes_read: AtomicU64,
+    profile_read_operations: AtomicU64,
+    profile_read_failures: AtomicU64,
+    profile_read_nanos: AtomicU64,
 }
 
 impl GgufDataSource {
@@ -32,19 +47,62 @@ impl GgufDataSource {
     /// not load tensor payloads.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DataSourceError> {
         let path_buf = path.as_ref().to_path_buf();
-        let model =
-            parse_gguf_file(&path_buf).map_err(|e| DataSourceError::General(e.to_string()))?;
+        let model = parse_gguf_file(&path_buf).map_err(|e| DataSourceError::General(e.to_string()))?;
         let file_size = model.file_size;
         Ok(Self {
             model,
             path: path_buf,
             file_size,
+            profiling_enabled: AtomicBool::new(false),
+            profile_bytes_read: AtomicU64::new(0),
+            profile_read_operations: AtomicU64::new(0),
+            profile_read_failures: AtomicU64::new(0),
+            profile_read_nanos: AtomicU64::new(0),
         })
     }
 
     /// Get reference to parsed model
     pub fn model(&self) -> &GgufModel {
         &self.model
+    }
+
+    pub fn set_profiling(&self, enabled: bool) {
+        self.profiling_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn reset_io_profile(&self) {
+        self.profile_bytes_read.store(0, Ordering::Relaxed);
+        self.profile_read_operations.store(0, Ordering::Relaxed);
+        self.profile_read_failures.store(0, Ordering::Relaxed);
+        self.profile_read_nanos.store(0, Ordering::Relaxed);
+    }
+
+    pub fn io_profile(&self) -> IoProfile {
+        IoProfile {
+            bytes_read: self.profile_bytes_read.load(Ordering::Relaxed),
+            read_operations: self.profile_read_operations.load(Ordering::Relaxed),
+            read_failures: self.profile_read_failures.load(Ordering::Relaxed),
+            elapsed: Duration::from_nanos(self.profile_read_nanos.load(Ordering::Relaxed)),
+        }
+    }
+
+    fn profile_start(&self) -> Option<Instant> {
+        self.profiling_enabled
+            .load(Ordering::Relaxed)
+            .then(Instant::now)
+    }
+
+    fn record_read(&self, started: Option<Instant>, bytes: u64, failed: bool) {
+        let Some(started) = started else {
+            return;
+        };
+        self.profile_bytes_read.fetch_add(bytes, Ordering::Relaxed);
+        self.profile_read_operations.fetch_add(1, Ordering::Relaxed);
+        if failed {
+            self.profile_read_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        let nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        self.profile_read_nanos.fetch_add(nanos, Ordering::Relaxed);
     }
 
     /// Get tensor descriptor by name
@@ -263,39 +321,60 @@ impl GgufDataSource {
     }
 
     fn read_range(&self, file_offset: u64, length: u64) -> Result<Vec<u8>, DataSourceError> {
-        let length_usize = usize::try_from(length).map_err(|_| {
-            DataSourceError::InvalidRange(format!(
-                "requested byte range length {} does not fit this platform",
-                length
-            ))
-        })?;
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(file_offset))?;
+        let started = self.profile_start();
+        let result: Result<Vec<u8>, DataSourceError> = (|| {
+            let length_usize = usize::try_from(length).map_err(|_| {
+                DataSourceError::InvalidRange(format!(
+                    "requested byte range length {} does not fit this platform",
+                    length
+                ))
+            })?;
+            let mut file = File::open(&self.path)?;
+            file.seek(SeekFrom::Start(file_offset))?;
 
-        // `read_to_end` appends into spare capacity rather than requiring a
-        // zero-filled destination that `read_exact` immediately overwrites.
-        // `Take` prevents reading beyond the validated range; the explicit
-        // length check preserves exact/short-read behavior.
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(length_usize).map_err(|e| {
-            DataSourceError::General(format!(
-                "failed to reserve {}-byte read buffer: {}",
-                length_usize, e
-            ))
-        })?;
-        let mut limited = file.take(length);
-        limited.read_to_end(&mut buf)?;
-        if buf.len() != length_usize {
-            return Err(DataSourceError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "failed to fill whole buffer",
-            )));
-        }
-        Ok(buf)
+            // `read_to_end` appends into spare capacity rather than requiring a
+            // zero-filled destination that `read_exact` immediately overwrites.
+            // `Take` prevents reading beyond the validated range; the explicit
+            // length check preserves exact/short-read behavior.
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(length_usize).map_err(|e| {
+                DataSourceError::General(format!(
+                    "failed to reserve {}-byte read buffer: {}",
+                    length_usize, e
+                ))
+            })?;
+            let mut limited = file.take(length);
+            limited.read_to_end(&mut buf)?;
+            if buf.len() != length_usize {
+                return Err(DataSourceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                )));
+            }
+            Ok(buf)
+        })();
+        let bytes = result.as_ref().map(|buffer| buffer.len() as u64).unwrap_or(0);
+        self.record_read(started, bytes, result.is_err());
+        result
     }
 
     /// Read exact little-endian F32 data into uninitialized final storage.
     fn read_f32_range(
+        &self,
+        file_offset: u64,
+        element_count: u64,
+    ) -> Result<Vec<f32>, DataSourceError> {
+        let started = self.profile_start();
+        let result = self.read_f32_range_unprofiled(file_offset, element_count);
+        let bytes = result
+            .as_ref()
+            .map(|values| std::mem::size_of_val(values.as_slice()) as u64)
+            .unwrap_or(0);
+        self.record_read(started, bytes, result.is_err());
+        result
+    }
+
+    fn read_f32_range_unprofiled(
         &self,
         file_offset: u64,
         element_count: u64,
@@ -338,7 +417,10 @@ impl GgufDataSource {
             // - every possible 32-bit pattern is a valid Rust f32 value;
             // - on success every byte is initialized before `set_len` below.
             let destination = unsafe {
-                std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), byte_length)
+                std::slice::from_raw_parts_mut(
+                    spare.as_mut_ptr().cast::<u8>(),
+                    byte_length,
+                )
             };
             file.read_exact(destination)?;
         }
@@ -471,6 +553,22 @@ mod tests {
     }
 
     #[test]
+    fn test_io_profile_counts_reads_and_bytes_when_enabled() {
+        let tmp = create_test_gguf_with_data();
+        let ds = GgufDataSource::open(tmp.path()).unwrap();
+        ds.set_profiling(true);
+        ds.reset_io_profile();
+        let data = ds.read_tensor("a.weight").unwrap();
+        assert_eq!(data.len(), 16);
+        let profile = ds.io_profile();
+        assert_eq!(profile.bytes_read, 16);
+        assert_eq!(profile.read_operations, 1);
+        assert_eq!(profile.read_failures, 0);
+        ds.reset_io_profile();
+        assert_eq!(ds.io_profile(), IoProfile::default());
+    }
+
+    #[test]
     fn test_direct_f32_read_matches_logical_decode_and_layout() {
         // GGML shape [in=3, out=2], file rows [1,2,3] and [4,5,6].
         let values = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -486,10 +584,7 @@ mod tests {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(
-            direct
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
+            direct.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
             reference
                 .iter()
                 .map(|value| value.to_bits())
@@ -575,7 +670,9 @@ mod tests {
             _ => panic!("expected InvalidRange, got {:?}", err),
         }
         // Overflow must be rejected rather than wrapping into an in-bounds read.
-        let err = ds.read_tensor_range("a.weight", 1, u64::MAX).unwrap_err();
+        let err = ds
+            .read_tensor_range("a.weight", 1, u64::MAX)
+            .unwrap_err();
         assert!(matches!(err, DataSourceError::InvalidRange(_)));
     }
 

@@ -55,6 +55,115 @@ pub struct Tokenizer {
     byte_tokens: HashMap<u8, u32>,
 }
 
+/// Stateful token decoder for incremental generation output.
+///
+/// Byte-fallback tokens can split one UTF-8 scalar across several model
+/// tokens. This decoder retains incomplete bytes until they become valid (or
+/// until `finish`), so the CLI never prints a replacement character merely
+/// because a token boundary occurred in the middle of UTF-8.
+pub struct TokenDecoder<'a> {
+    tokenizer: &'a Tokenizer,
+    pending_bytes: Vec<u8>,
+    at_start: bool,
+}
+
+impl<'a> TokenDecoder<'a> {
+    fn new(tokenizer: &'a Tokenizer) -> Self {
+        Self {
+            tokenizer,
+            pending_bytes: Vec::new(),
+            at_start: true,
+        }
+    }
+
+    fn emit_text(&mut self, text: &str) -> String {
+        let emitted = if self.at_start && self.tokenizer.model == "llama" {
+            text.trim_start().to_string()
+        } else {
+            text.to_string()
+        };
+        if !emitted.is_empty() {
+            self.at_start = false;
+        }
+        emitted
+    }
+
+    fn drain_bytes(&mut self, finish: bool) -> String {
+        let mut output = String::new();
+        loop {
+            if self.pending_bytes.is_empty() {
+                break;
+            }
+            match std::str::from_utf8(&self.pending_bytes) {
+                Ok(valid) => {
+                    let valid = valid.to_string();
+                    self.pending_bytes.clear();
+                    output.push_str(&self.emit_text(&valid));
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0 {
+                        let valid = String::from_utf8(
+                            self.pending_bytes.drain(..valid_up_to).collect(),
+                        )
+                        .expect("UTF-8 valid prefix reported by from_utf8");
+                        output.push_str(&self.emit_text(&valid));
+                        continue;
+                    }
+                    if let Some(error_len) = error.error_len() {
+                        self.pending_bytes.drain(..error_len);
+                        output.push_str(&self.emit_text("�"));
+                        continue;
+                    }
+                    if finish {
+                        let lossy = String::from_utf8_lossy(&self.pending_bytes).into_owned();
+                        self.pending_bytes.clear();
+                        output.push_str(&self.emit_text(&lossy));
+                    }
+                    break;
+                }
+            }
+        }
+        output
+    }
+
+    pub fn push(&mut self, id: u32) -> String {
+        if (Some(id) == self.tokenizer.bos_id || Some(id) == self.tokenizer.eos_id)
+            && self.tokenizer.token_types.get(id as usize) == Some(&TokenType::Control)
+        {
+            return String::new();
+        }
+
+        let Some(token) = self.tokenizer.tokens.get(id as usize).cloned() else {
+            return String::new();
+        };
+
+        if token.starts_with("<0x") && token.ends_with('>') && token.len() == 6 {
+            if let Ok(byte) = u8::from_str_radix(&token[3..5], 16) {
+                self.pending_bytes.push(byte);
+                return self.drain_bytes(false);
+            }
+        }
+
+        if self.tokenizer.token_types.get(id as usize) == Some(&TokenType::Byte)
+            && token.len() == 1
+        {
+            self.pending_bytes.push(token.as_bytes()[0]);
+            return self.drain_bytes(false);
+        }
+
+        let mut output = self.drain_bytes(true);
+        let normalized = token.replace('▁', " ").replace('Ġ', " ");
+        output.push_str(&self.emit_text(&normalized));
+        output
+    }
+
+    pub fn finish(&mut self) -> String {
+        self.drain_bytes(true)
+    }
+}
+
 impl Tokenizer {
     pub fn from_gguf(gguf: &GgufModel) -> Result<Self, String> {
         let model = gguf
@@ -258,10 +367,7 @@ impl Tokenizer {
             }
         }
 
-        let mut encoded = if self.model == "gpt2"
-            || self.pre.as_deref() == Some("qwen2")
-            || self.merges.is_some()
-        {
+        let mut encoded = if self.model == "gpt2" || self.pre.as_deref() == Some("qwen2") || self.merges.is_some() {
             self.encode_bpe(text)
         } else {
             // Default to SentencePiece unigram (llama)
@@ -502,77 +608,20 @@ impl Tokenizer {
         pieces
     }
 
-    /// Decode token IDs into text
+    pub fn decoder(&self) -> TokenDecoder<'_> {
+        TokenDecoder::new(self)
+    }
+
+    /// Decode token IDs into text using the same stateful path used for
+    /// streaming generation output.
     pub fn decode(&self, ids: &[u32]) -> String {
+        let mut decoder = self.decoder();
         let mut text = String::new();
-        let mut byte_buffer: Vec<u8> = Vec::new();
-
         for &id in ids {
-            // Skip BOS/EOS for final display unless verbose? For Milestone 6, we skip control tokens that are BOS/EOS in decode
-            if Some(id) == self.bos_id || Some(id) == self.eos_id {
-                // For llama, BOS is <s>, EOS is </s> – often we want to skip in final output
-                // Check token type
-                if let Some(t) = self.token_types.get(id as usize) {
-                    if *t == TokenType::Control {
-                        continue;
-                    }
-                }
-            }
-
-            if let Some(tok) = self.tokens.get(id as usize) {
-                if tok.starts_with("<0x") && tok.ends_with('>') && tok.len() == 6 {
-                    if let Ok(byte) = u8::from_str_radix(&tok[3..5], 16) {
-                        byte_buffer.push(byte);
-                        continue;
-                    }
-                }
-
-                // If we have accumulated bytes, try to decode them as UTF-8 before handling next token
-                if !byte_buffer.is_empty() {
-                    if let Ok(s) = String::from_utf8(byte_buffer.clone()) {
-                        text.push_str(&s);
-                    } else {
-                        // Replace invalid with �
-                        text.push_str(&String::from_utf8_lossy(&byte_buffer));
-                    }
-                    byte_buffer.clear();
-                }
-
-                // Handle token type Byte: token may be single byte
-                if let Some(t) = self.token_types.get(id as usize) {
-                    if *t == TokenType::Byte {
-                        // Token string may be a single byte character
-                        if tok.len() == 1 {
-                            byte_buffer.push(tok.as_bytes()[0]);
-                            continue;
-                        }
-                    }
-                }
-
-                let mut s = tok.clone();
-                s = s.replace('▁', " ");
-                s = s.replace('Ġ', " ");
-                text.push_str(&s);
-            }
+            text.push_str(&decoder.push(id));
         }
-
-        if !byte_buffer.is_empty() {
-            if let Ok(s) = String::from_utf8(byte_buffer.clone()) {
-                text.push_str(&s);
-            } else {
-                text.push_str(&String::from_utf8_lossy(&byte_buffer));
-            }
-        }
-
-        // For gpt2/qwen2, the first token may have leading space – trim start only if not intended?
-        // For llama, trim leading space from initial ▁
-        // We'll trim only leading spaces that are from initial ▁ for llama, but for gpt2 we want to keep?
-        // Simple: trim start for llama model, keep for gpt2? We'll check model type
-        if self.model == "llama" {
-            text.trim_start().to_string()
-        } else {
-            text
-        }
+        text.push_str(&decoder.finish());
+        text
     }
 
     pub fn decode_single(&self, id: u32) -> String {
@@ -597,12 +646,8 @@ mod tests {
             w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
             w.write_all(s.as_bytes()).unwrap();
         }
-        fn write_u32<W: Write>(w: &mut W, v: u32) {
-            w.write_all(&v.to_le_bytes()).unwrap();
-        }
-        fn write_u64<W: Write>(w: &mut W, v: u64) {
-            w.write_all(&v.to_le_bytes()).unwrap();
-        }
+        fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
 
         write_string(&mut buf, "tokenizer.ggml.model");
         write_u32(&mut buf, 8);
@@ -620,17 +665,13 @@ mod tests {
         write_u32(&mut buf, 9);
         write_u32(&mut buf, 6);
         write_u64(&mut buf, 7);
-        for _ in 0..7 {
-            write_u32(&mut buf, 0f32.to_bits());
-        }
+        for _ in 0..7 { write_u32(&mut buf, 0f32.to_bits()); }
 
         write_string(&mut buf, "tokenizer.ggml.token_type");
         write_u32(&mut buf, 9);
         write_u32(&mut buf, 5);
         write_u64(&mut buf, 7);
-        for t in [2, 3, 3, 1, 1, 1, 1] {
-            write_u32(&mut buf, t as u32);
-        }
+        for t in [2, 3, 3, 1, 1, 1, 1] { write_u32(&mut buf, t as u32); }
 
         write_string(&mut buf, "tokenizer.ggml.bos_token_id");
         write_u32(&mut buf, 4);
@@ -656,12 +697,8 @@ mod tests {
             w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
             w.write_all(s.as_bytes()).unwrap();
         }
-        fn write_u32<W: Write>(w: &mut W, v: u32) {
-            w.write_all(&v.to_le_bytes()).unwrap();
-        }
-        fn write_u64<W: Write>(w: &mut W, v: u64) {
-            w.write_all(&v.to_le_bytes()).unwrap();
-        }
+        fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
 
         write_string(&mut buf, "tokenizer.ggml.model");
         write_u32(&mut buf, 8);
@@ -671,9 +708,7 @@ mod tests {
         write_u32(&mut buf, 9);
         write_u32(&mut buf, 8);
         write_u64(&mut buf, 11);
-        for tok in [
-            "<unk>", "<s>", "</s>", "h", "e", "l", "o", "he", "lo", "hel", "hello",
-        ] {
+        for tok in ["<unk>", "<s>", "</s>", "h", "e", "l", "o", "he", "lo", "hel", "hello"] {
             write_string(&mut buf, tok);
         }
 
@@ -681,17 +716,13 @@ mod tests {
         write_u32(&mut buf, 9);
         write_u32(&mut buf, 6);
         write_u64(&mut buf, 11);
-        for _ in 0..11 {
-            write_u32(&mut buf, 0f32.to_bits());
-        }
+        for _ in 0..11 { write_u32(&mut buf, 0f32.to_bits()); }
 
         write_string(&mut buf, "tokenizer.ggml.token_type");
         write_u32(&mut buf, 9);
         write_u32(&mut buf, 5);
         write_u64(&mut buf, 11);
-        for _ in 0..11 {
-            write_u32(&mut buf, 1);
-        }
+        for _ in 0..11 { write_u32(&mut buf, 1); }
 
         write_string(&mut buf, "tokenizer.ggml.merges");
         write_u32(&mut buf, 9);
@@ -715,6 +746,61 @@ mod tests {
         tmp.write_all(&buf).unwrap();
         tmp.flush().unwrap();
         tmp
+    }
+
+    fn make_byte_decoder_tokenizer() -> Tokenizer {
+        let tokens = vec![
+            "<s>".to_string(),
+            "</s>".to_string(),
+            "<0xE2>".to_string(),
+            "<0x82>".to_string(),
+            "<0xAC>".to_string(),
+            "▁hello".to_string(),
+        ];
+        let token_to_id = tokens
+            .iter()
+            .enumerate()
+            .map(|(index, token)| (token.clone(), index as u32))
+            .collect();
+        Tokenizer {
+            model: "llama".to_string(),
+            pre: None,
+            scores: vec![0.0; tokens.len()],
+            token_types: vec![
+                TokenType::Control,
+                TokenType::Control,
+                TokenType::Byte,
+                TokenType::Byte,
+                TokenType::Byte,
+                TokenType::Normal,
+            ],
+            tokens,
+            merges: None,
+            bos_id: Some(0),
+            eos_id: Some(1),
+            unk_id: None,
+            pad_id: None,
+            add_bos: true,
+            add_eos: false,
+            token_to_id,
+            merges_rank: HashMap::new(),
+            byte_tokens: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_incremental_decoder_accumulates_utf8_and_matches_batch() {
+        let tokenizer = make_byte_decoder_tokenizer();
+        let ids = [0, 2, 3, 4, 5, 1];
+        let mut decoder = tokenizer.decoder();
+        assert_eq!(decoder.push(0), "");
+        assert_eq!(decoder.push(2), "");
+        assert_eq!(decoder.push(3), "");
+        assert_eq!(decoder.push(4), "€");
+        assert_eq!(decoder.push(5), " hello");
+        assert_eq!(decoder.push(1), "");
+        assert_eq!(decoder.finish(), "");
+        assert_eq!(tokenizer.decode(&ids), "€ hello");
     }
 
     #[test]
@@ -749,11 +835,7 @@ mod tests {
         let ids = tokenizer.encode("hello", false);
         // BPE should merge h+e->he, he+l->hel, l+o->lo, hel+lo->hello
         // So should be [10]
-        assert!(
-            ids.contains(&10),
-            "BPE should produce hello token, got {:?}",
-            ids
-        );
+        assert!(ids.contains(&10), "BPE should produce hello token, got {:?}", ids);
     }
 
     #[test]

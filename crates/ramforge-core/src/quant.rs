@@ -164,12 +164,7 @@ impl BlockQ4K {
         scales.copy_from_slice(&bytes[4..16]);
         let mut qs = [0u8; 128];
         qs.copy_from_slice(&bytes[16..144]);
-        Ok(Self {
-            d,
-            dmin,
-            scales,
-            qs,
-        })
+        Ok(Self { d, dmin, scales, qs })
     }
 
     fn get_scale_min(&self, j: usize) -> (u8, u8) {
@@ -240,13 +235,7 @@ impl BlockQ5K {
         qh.copy_from_slice(&bytes[16..48]);
         let mut qs = [0u8; 128];
         qs.copy_from_slice(&bytes[48..176]);
-        Ok(Self {
-            d,
-            dmin,
-            scales,
-            qh,
-            qs,
-        })
+        Ok(Self { d, dmin, scales, qh, qs })
     }
 
     fn get_scale_min(&self, j: usize) -> (u8, u8) {
@@ -275,21 +264,13 @@ impl BlockQ5K {
 
             for l in 0..32 {
                 let q = (self.qs[q_offset + l] & 0xF) as u8;
-                let high = if (self.qh[q_offset / 4 + l / 8] & u1) != 0 {
-                    16
-                } else {
-                    0
-                };
+                let high = if (self.qh[q_offset / 4 + l / 8] & u1) != 0 { 16 } else { 0 };
                 out[y_idx + l] = d1 * ((q + high) as f32) - min1;
             }
             y_idx += 32;
             for l in 0..32 {
                 let q = (self.qs[q_offset + l] >> 4) as u8;
-                let high = if (self.qh[q_offset / 4 + l / 8] & u2) != 0 {
-                    16
-                } else {
-                    0
-                };
+                let high = if (self.qh[q_offset / 4 + l / 8] & u2) != 0 { 16 } else { 0 };
                 out[y_idx + l] = d2 * ((q + high) as f32) - min2;
             }
             y_idx += 32;
@@ -341,16 +322,10 @@ impl BlockQ6K {
         for _ in 0..QK_K / 128 {
             for l in 0..32 {
                 let is = l / 16;
-                let q1 =
-                    ((self.ql[ql_off + l] & 0xF) | ((self.qh[qh_off + l] & 3) << 4)) as i8 - 32;
-                let q2 = ((self.ql[ql_off + 32 + l] & 0xF) | ((self.qh[qh_off + l] >> 2 & 3) << 4))
-                    as i8
-                    - 32;
-                let q3 =
-                    ((self.ql[ql_off + l] >> 4) | ((self.qh[qh_off + l] >> 4 & 3) << 4)) as i8 - 32;
-                let q4 = ((self.ql[ql_off + 32 + l] >> 4) | ((self.qh[qh_off + l] >> 6 & 3) << 4))
-                    as i8
-                    - 32;
+                let q1 = ((self.ql[ql_off + l] & 0xF) | ((self.qh[qh_off + l] & 3) << 4)) as i8 - 32;
+                let q2 = ((self.ql[ql_off + 32 + l] & 0xF) | ((self.qh[qh_off + l] >> 2 & 3) << 4)) as i8 - 32;
+                let q3 = ((self.ql[ql_off + l] >> 4) | ((self.qh[qh_off + l] >> 4 & 3) << 4)) as i8 - 32;
+                let q4 = ((self.ql[ql_off + 32 + l] >> 4) | ((self.qh[qh_off + l] >> 6 & 3) << 4)) as i8 - 32;
 
                 out[y_pos + l] = self.d * (self.scales[sc_off + is] as f32) * (q1 as f32);
                 out[y_pos + l + 32] = self.d * (self.scales[sc_off + is + 2] as f32) * (q2 as f32);
@@ -389,12 +364,7 @@ impl BlockQ2K {
         qs.copy_from_slice(&bytes[16..80]);
         let d = read_f16_le(&bytes[80..82])?;
         let dmin = read_f16_le(&bytes[82..84])?;
-        Ok(Self {
-            scales,
-            qs,
-            d,
-            dmin,
-        })
+        Ok(Self { scales, qs, d, dmin })
     }
 
     pub fn dequantize(&self, out: &mut [f32; 256]) {
@@ -456,12 +426,7 @@ impl BlockQ3K {
         let mut scales = [0u8; 12];
         scales.copy_from_slice(&bytes[96..108]);
         let d = read_f16_le(&bytes[108..110])?;
-        Ok(Self {
-            hmask,
-            qs,
-            scales,
-            d,
-        })
+        Ok(Self { hmask, qs, scales, d })
     }
 
     pub fn dequantize(&self, out: &mut [f32; 256]) {
@@ -571,11 +536,7 @@ impl BlockQ8K {
 }
 
 // ---------- Row dequantization ----------
-pub fn dequantize_row_q4_0(
-    bytes: &[u8],
-    n_elements: usize,
-    out: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn dequantize_row_q4_0(bytes: &[u8], n_elements: usize, out: &mut [f32]) -> Result<(), DataSourceError> {
     if n_elements % QK4_0 != 0 {
         return Err(DataSourceError::General(format!(
             "Q4_0 row size {} not divisible by block size {}",
@@ -599,11 +560,7 @@ pub fn dequantize_row_q4_0(
     Ok(())
 }
 
-pub fn dequantize_row_q8_0(
-    bytes: &[u8],
-    n_elements: usize,
-    out: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn dequantize_row_q8_0(bytes: &[u8], n_elements: usize, out: &mut [f32]) -> Result<(), DataSourceError> {
     if n_elements % QK8_0 != 0 {
         return Err(DataSourceError::General(format!(
             "Q8_0 row size {} not divisible by block size {}",
@@ -627,11 +584,7 @@ pub fn dequantize_row_q8_0(
     Ok(())
 }
 
-pub fn dequantize_row_q4_k(
-    bytes: &[u8],
-    n_elements: usize,
-    out: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn dequantize_row_q4_k(bytes: &[u8], n_elements: usize, out: &mut [f32]) -> Result<(), DataSourceError> {
     if n_elements % QK_K != 0 {
         return Err(DataSourceError::General(format!(
             "Q4_K row size {} not divisible by block size {}",
@@ -655,11 +608,7 @@ pub fn dequantize_row_q4_k(
     Ok(())
 }
 
-pub fn dequantize_row_q5_k(
-    bytes: &[u8],
-    n_elements: usize,
-    out: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn dequantize_row_q5_k(bytes: &[u8], n_elements: usize, out: &mut [f32]) -> Result<(), DataSourceError> {
     if n_elements % QK_K != 0 {
         return Err(DataSourceError::General(format!(
             "Q5_K row size {} not divisible by block size {}",
@@ -683,11 +632,7 @@ pub fn dequantize_row_q5_k(
     Ok(())
 }
 
-pub fn dequantize_row_q6_k(
-    bytes: &[u8],
-    n_elements: usize,
-    out: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn dequantize_row_q6_k(bytes: &[u8], n_elements: usize, out: &mut [f32]) -> Result<(), DataSourceError> {
     if n_elements % QK_K != 0 {
         return Err(DataSourceError::General(format!(
             "Q6_K row size {} not divisible by block size {}",
@@ -711,11 +656,7 @@ pub fn dequantize_row_q6_k(
     Ok(())
 }
 
-pub fn dequantize_row_q2_k(
-    bytes: &[u8],
-    n_elements: usize,
-    out: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn dequantize_row_q2_k(bytes: &[u8], n_elements: usize, out: &mut [f32]) -> Result<(), DataSourceError> {
     if n_elements % QK_K != 0 {
         return Err(DataSourceError::General(format!(
             "Q2_K row size {} not divisible by block size {}",
@@ -739,11 +680,7 @@ pub fn dequantize_row_q2_k(
     Ok(())
 }
 
-pub fn dequantize_row_q3_k(
-    bytes: &[u8],
-    n_elements: usize,
-    out: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn dequantize_row_q3_k(bytes: &[u8], n_elements: usize, out: &mut [f32]) -> Result<(), DataSourceError> {
     if n_elements % QK_K != 0 {
         return Err(DataSourceError::General(format!(
             "Q3_K row size {} not divisible by block size {}",
@@ -767,11 +704,7 @@ pub fn dequantize_row_q3_k(
     Ok(())
 }
 
-pub fn dequantize_row_q8_k(
-    bytes: &[u8],
-    n_elements: usize,
-    out: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn dequantize_row_q8_k(bytes: &[u8], n_elements: usize, out: &mut [f32]) -> Result<(), DataSourceError> {
     if n_elements % QK_K != 0 {
         return Err(DataSourceError::General(format!(
             "Q8_K row size {} not divisible by block size {}",
@@ -796,16 +729,9 @@ pub fn dequantize_row_q8_k(
 }
 
 // ---------- Quantized matvec (scalar, block-wise) ----------
-pub fn matvec_q4_0(
-    w_bytes: &[u8],
-    w_shape: &[usize],
-    x: &[f32],
-    y: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn matvec_q4_0(w_bytes: &[u8], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), DataSourceError> {
     if w_shape.len() != 2 {
-        return Err(DataSourceError::General(
-            "Q4_0 matvec expects 2D weight".to_string(),
-        ));
+        return Err(DataSourceError::General("Q4_0 matvec expects 2D weight".to_string()));
     }
     let out_dim = w_shape[0];
     let in_dim = w_shape[1];
@@ -850,16 +776,9 @@ pub fn matvec_q4_0(
     Ok(())
 }
 
-pub fn matvec_q8_0(
-    w_bytes: &[u8],
-    w_shape: &[usize],
-    x: &[f32],
-    y: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn matvec_q8_0(w_bytes: &[u8], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), DataSourceError> {
     if w_shape.len() != 2 {
-        return Err(DataSourceError::General(
-            "Q8_0 matvec expects 2D weight".to_string(),
-        ));
+        return Err(DataSourceError::General("Q8_0 matvec expects 2D weight".to_string()));
     }
     let out_dim = w_shape[0];
     let in_dim = w_shape[1];
@@ -904,16 +823,9 @@ pub fn matvec_q8_0(
     Ok(())
 }
 
-pub fn matvec_q4_k(
-    w_bytes: &[u8],
-    w_shape: &[usize],
-    x: &[f32],
-    y: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn matvec_q4_k(w_bytes: &[u8], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), DataSourceError> {
     if w_shape.len() != 2 {
-        return Err(DataSourceError::General(
-            "Q4_K matvec expects 2D weight".to_string(),
-        ));
+        return Err(DataSourceError::General("Q4_K matvec expects 2D weight".to_string()));
     }
     let out_dim = w_shape[0];
     let in_dim = w_shape[1];
@@ -958,16 +870,9 @@ pub fn matvec_q4_k(
     Ok(())
 }
 
-pub fn matvec_q5_k(
-    w_bytes: &[u8],
-    w_shape: &[usize],
-    x: &[f32],
-    y: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn matvec_q5_k(w_bytes: &[u8], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), DataSourceError> {
     if w_shape.len() != 2 {
-        return Err(DataSourceError::General(
-            "Q5_K matvec expects 2D weight".to_string(),
-        ));
+        return Err(DataSourceError::General("Q5_K matvec expects 2D weight".to_string()));
     }
     let out_dim = w_shape[0];
     let in_dim = w_shape[1];
@@ -1012,16 +917,9 @@ pub fn matvec_q5_k(
     Ok(())
 }
 
-pub fn matvec_q6_k(
-    w_bytes: &[u8],
-    w_shape: &[usize],
-    x: &[f32],
-    y: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn matvec_q6_k(w_bytes: &[u8], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), DataSourceError> {
     if w_shape.len() != 2 {
-        return Err(DataSourceError::General(
-            "Q6_K matvec expects 2D weight".to_string(),
-        ));
+        return Err(DataSourceError::General("Q6_K matvec expects 2D weight".to_string()));
     }
     let out_dim = w_shape[0];
     let in_dim = w_shape[1];
@@ -1066,16 +964,9 @@ pub fn matvec_q6_k(
     Ok(())
 }
 
-pub fn matvec_q2_k(
-    w_bytes: &[u8],
-    w_shape: &[usize],
-    x: &[f32],
-    y: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn matvec_q2_k(w_bytes: &[u8], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), DataSourceError> {
     if w_shape.len() != 2 {
-        return Err(DataSourceError::General(
-            "Q2_K matvec expects 2D weight".to_string(),
-        ));
+        return Err(DataSourceError::General("Q2_K matvec expects 2D weight".to_string()));
     }
     let out_dim = w_shape[0];
     let in_dim = w_shape[1];
@@ -1120,16 +1011,9 @@ pub fn matvec_q2_k(
     Ok(())
 }
 
-pub fn matvec_q3_k(
-    w_bytes: &[u8],
-    w_shape: &[usize],
-    x: &[f32],
-    y: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn matvec_q3_k(w_bytes: &[u8], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), DataSourceError> {
     if w_shape.len() != 2 {
-        return Err(DataSourceError::General(
-            "Q3_K matvec expects 2D weight".to_string(),
-        ));
+        return Err(DataSourceError::General("Q3_K matvec expects 2D weight".to_string()));
     }
     let out_dim = w_shape[0];
     let in_dim = w_shape[1];
@@ -1174,16 +1058,9 @@ pub fn matvec_q3_k(
     Ok(())
 }
 
-pub fn matvec_q8_k(
-    w_bytes: &[u8],
-    w_shape: &[usize],
-    x: &[f32],
-    y: &mut [f32],
-) -> Result<(), DataSourceError> {
+pub fn matvec_q8_k(w_bytes: &[u8], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), DataSourceError> {
     if w_shape.len() != 2 {
-        return Err(DataSourceError::General(
-            "Q8_K matvec expects 2D weight".to_string(),
-        ));
+        return Err(DataSourceError::General("Q8_K matvec expects 2D weight".to_string()));
     }
     let out_dim = w_shape[0];
     let in_dim = w_shape[1];

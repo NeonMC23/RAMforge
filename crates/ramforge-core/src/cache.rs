@@ -147,7 +147,13 @@ impl BoundedCache {
 
         // Insert
         self.lru.push_front(key.clone());
-        self.entries.insert(key, CacheEntry { data, size });
+        self.entries.insert(
+            key,
+            CacheEntry {
+                data,
+                size,
+            },
+        );
         self.used += size;
 
         self.update_stats();
@@ -352,10 +358,7 @@ mod tests {
         let mut cache = BoundedCache::new(10).unwrap();
         let result = cache.insert("big".to_string(), vec![0u8; 20]);
         match result {
-            Err(CacheError::TooLarge {
-                size: 20,
-                capacity: 10,
-            }) => {}
+            Err(CacheError::TooLarge { size: 20, capacity: 10 }) => {}
             _ => panic!("expected TooLarge error"),
         }
         assert_eq!(cache.len(), 0);
@@ -380,45 +383,27 @@ mod tests {
             .insert_budgeted(&mut budget, "a".to_string(), vec![0u8; 40])
             .unwrap());
         assert_eq!(cache.current_bytes(), 40);
-        assert_eq!(
-            budget.used_bytes(),
-            40,
-            "cached bytes must be budget-charged"
-        );
+        assert_eq!(budget.used_bytes(), 40, "cached bytes must be budget-charged");
         assert_eq!(budget.get("cache:a"), Some(40));
         assert!(cache
             .insert_budgeted(&mut budget, "b".to_string(), vec![0u8; 30])
             .unwrap());
         assert_eq!(budget.used_bytes(), 70);
         assert!(cache.remove_budgeted(&mut budget, "a").is_some());
-        assert_eq!(
-            budget.used_bytes(),
-            30,
-            "removal must release budget charge"
-        );
+        assert_eq!(budget.used_bytes(), 30, "removal must release budget charge");
     }
 
     #[test]
     fn test_budgeted_eviction_releases_budget() {
         let mut budget = MemoryBudget::new(1000).unwrap();
         let mut cache = BoundedCache::new(30).unwrap();
-        cache
-            .insert_budgeted(&mut budget, "a".into(), vec![0u8; 15])
-            .unwrap();
-        cache
-            .insert_budgeted(&mut budget, "b".into(), vec![0u8; 15])
-            .unwrap();
+        cache.insert_budgeted(&mut budget, "a".into(), vec![0u8; 15]).unwrap();
+        cache.insert_budgeted(&mut budget, "b".into(), vec![0u8; 15]).unwrap();
         assert_eq!(budget.used_bytes(), 30);
         // forces capacity-driven eviction of "a"
-        cache
-            .insert_budgeted(&mut budget, "c".into(), vec![0u8; 15])
-            .unwrap();
+        cache.insert_budgeted(&mut budget, "c".into(), vec![0u8; 15]).unwrap();
         assert!(!cache.contains("a"));
-        assert_eq!(
-            budget.used_bytes(),
-            30,
-            "evicted entry must release its charge"
-        );
+        assert_eq!(budget.used_bytes(), 30, "evicted entry must release its charge");
         assert!(budget.get("cache:a").is_none());
     }
 
@@ -430,10 +415,7 @@ mod tests {
         let cached = cache
             .insert_budgeted(&mut budget, "x".to_string(), vec![0u8; 10])
             .unwrap();
-        assert!(
-            !cached,
-            "must skip caching when budget cannot fit the entry"
-        );
+        assert!(!cached, "must skip caching when budget cannot fit the entry");
         assert!(!cache.contains("x"));
         assert_eq!(budget.used_bytes(), 45);
     }
@@ -442,12 +424,8 @@ mod tests {
     fn test_clear_budgeted_releases_everything() {
         let mut budget = MemoryBudget::new(1000).unwrap();
         let mut cache = BoundedCache::new(100).unwrap();
-        cache
-            .insert_budgeted(&mut budget, "a".into(), vec![0u8; 10])
-            .unwrap();
-        cache
-            .insert_budgeted(&mut budget, "b".into(), vec![0u8; 20])
-            .unwrap();
+        cache.insert_budgeted(&mut budget, "a".into(), vec![0u8; 10]).unwrap();
+        cache.insert_budgeted(&mut budget, "b".into(), vec![0u8; 20]).unwrap();
         assert_eq!(budget.used_bytes(), 30);
         cache.clear_budgeted(&mut budget);
         assert_eq!(budget.used_bytes(), 0);

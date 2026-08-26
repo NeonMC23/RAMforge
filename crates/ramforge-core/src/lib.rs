@@ -40,9 +40,9 @@ pub use gguf::parse_gguf_file;
 pub use memory::{parse_memory_size, MemoryBudget};
 pub use model::{GgufModel, ModelInfo, TensorDescriptor};
 pub use quant::{
-    BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8K, BlockQ8_0,
-    BLOCK_SIZE_Q2_K, BLOCK_SIZE_Q3_K, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q4_K, BLOCK_SIZE_Q5_K,
-    BLOCK_SIZE_Q6_K, BLOCK_SIZE_Q8_0, BLOCK_SIZE_Q8_K, QK4_0, QK8_0, QK_K,
+    BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8K, BlockQ8_0, BLOCK_SIZE_Q2_K,
+    BLOCK_SIZE_Q3_K, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q4_K, BLOCK_SIZE_Q5_K, BLOCK_SIZE_Q6_K,
+    BLOCK_SIZE_Q8_0, BLOCK_SIZE_Q8_K, QK4_0, QK8_0, QK_K,
 };
 pub use tensor::{decode_tensor_to_f32, QuantizedTensor, TensorData};
 pub use tokenizer::Tokenizer;
@@ -69,7 +69,7 @@ mod integration_tests {
         buf.extend_from_slice(&3u32.to_le_bytes());
         buf.extend_from_slice(&1u64.to_le_bytes()); // tensor count
         buf.extend_from_slice(&0u64.to_le_bytes()); // kv count
-                                                    // tensor
+        // tensor
         let name = "large.weight";
         buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
         buf.extend_from_slice(name.as_bytes());
@@ -77,7 +77,7 @@ mod integration_tests {
         buf.extend_from_slice(&1_000_000u64.to_le_bytes()); // 1M elements
         buf.extend_from_slice(&0u32.to_le_bytes()); // F32
         buf.extend_from_slice(&0u64.to_le_bytes()); // offset
-                                                    // align
+        // align
         let pos = buf.len() as u64;
         let aligned = crate::model::align_offset(pos, 32);
         buf.extend(vec![0u8; (aligned - pos) as usize]);

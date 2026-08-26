@@ -284,9 +284,7 @@ pub fn parse_gguf_file<P: AsRef<Path>>(path: P) -> Result<GgufModel> {
         let num_elements = if dims.is_empty() {
             1
         } else {
-            dims.iter()
-                .try_fold(1u64, |acc, &d| acc.checked_mul(d))
-                .unwrap_or(u64::MAX)
+            dims.iter().try_fold(1u64, |acc, &d| acc.checked_mul(d)).unwrap_or(u64::MAX)
         };
 
         let byte_length = if let Some((block_size, type_size)) = ggml_type.type_info() {
@@ -376,7 +374,7 @@ mod tests {
         write_u64(&mut buf, 32000);
         write_u32(&mut buf, 0); // F32
         write_u64(&mut buf, 0); // offset
-                                // padding to alignment 32
+        // padding to alignment 32
         let pos = buf.len() as u64;
         let aligned = align_offset(pos, 32);
         let pad = (aligned - pos) as usize;
@@ -424,14 +422,7 @@ mod tests {
         assert_eq!(model.tensors[0].dimensions, vec![4]);
         assert_eq!(model.tensors[0].ggml_type, GgmlType::F32);
         assert_eq!(model.tensors[0].byte_length, Some(16));
-        assert_eq!(
-            model
-                .metadata
-                .get("general.architecture")
-                .unwrap()
-                .as_string(),
-            Some("llama")
-        );
+        assert_eq!(model.metadata.get("general.architecture").unwrap().as_string(), Some("llama"));
     }
 
     #[test]
@@ -518,20 +509,9 @@ mod tests {
         let model = parse_gguf_file(tmp.path()).unwrap();
         assert_eq!(model.metadata.len(), 5);
         assert_eq!(model.metadata.get("test.uint8").unwrap().as_u64(), Some(42));
-        assert_eq!(
-            model.metadata.get("test.bool").unwrap().as_bool(),
-            Some(true)
-        );
-        assert_eq!(
-            model.metadata.get("test.string").unwrap().as_string(),
-            Some("hello")
-        );
-        let arr = model
-            .metadata
-            .get("test.array")
-            .unwrap()
-            .as_array()
-            .unwrap();
+        assert_eq!(model.metadata.get("test.bool").unwrap().as_bool(), Some(true));
+        assert_eq!(model.metadata.get("test.string").unwrap().as_string(), Some("hello"));
+        let arr = model.metadata.get("test.array").unwrap().as_array().unwrap();
         assert_eq!(arr.values.len(), 3);
     }
 

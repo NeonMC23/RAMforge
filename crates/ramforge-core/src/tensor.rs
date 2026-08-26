@@ -21,8 +21,8 @@
 #![allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
 
 use crate::error::DataSourceError;
-use crate::quant;
 use crate::types::GgmlType;
+use crate::quant;
 
 #[derive(Debug, Clone)]
 pub struct QuantizedTensor {
@@ -154,30 +154,14 @@ impl QuantizedTensor {
     pub fn dequantize_to_f32(&self) -> Result<Vec<f32>, DataSourceError> {
         let mut out = vec![0.0f32; self.num_elements];
         match self.ggml_type {
-            GgmlType::Q4_0 => {
-                quant::dequantize_row_q4_0(&self.raw_data, self.num_elements, &mut out)?
-            }
-            GgmlType::Q8_0 => {
-                quant::dequantize_row_q8_0(&self.raw_data, self.num_elements, &mut out)?
-            }
-            GgmlType::Q4_K => {
-                quant::dequantize_row_q4_k(&self.raw_data, self.num_elements, &mut out)?
-            }
-            GgmlType::Q5_K => {
-                quant::dequantize_row_q5_k(&self.raw_data, self.num_elements, &mut out)?
-            }
-            GgmlType::Q6_K => {
-                quant::dequantize_row_q6_k(&self.raw_data, self.num_elements, &mut out)?
-            }
-            GgmlType::Q2_K => {
-                quant::dequantize_row_q2_k(&self.raw_data, self.num_elements, &mut out)?
-            }
-            GgmlType::Q3_K => {
-                quant::dequantize_row_q3_k(&self.raw_data, self.num_elements, &mut out)?
-            }
-            GgmlType::Q8_K => {
-                quant::dequantize_row_q8_k(&self.raw_data, self.num_elements, &mut out)?
-            }
+            GgmlType::Q4_0 => quant::dequantize_row_q4_0(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q8_0 => quant::dequantize_row_q8_0(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q4_K => quant::dequantize_row_q4_k(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q5_K => quant::dequantize_row_q5_k(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q6_K => quant::dequantize_row_q6_k(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q2_K => quant::dequantize_row_q2_k(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q3_K => quant::dequantize_row_q3_k(&self.raw_data, self.num_elements, &mut out)?,
+            GgmlType::Q8_K => quant::dequantize_row_q8_k(&self.raw_data, self.num_elements, &mut out)?,
             _ => {
                 return Err(DataSourceError::General(format!(
                     "unsupported quantized type for dequant: {}",
@@ -197,9 +181,7 @@ impl QuantizedTensor {
     /// `row_bytes = (shape[0] / QK) * BLOCK_SIZE`.
     pub fn dequantize_row(&self, row_idx: usize) -> Result<Vec<f32>, DataSourceError> {
         if self.shape.is_empty() {
-            return Err(DataSourceError::General(
-                "cannot get row from scalar".to_string(),
-            ));
+            return Err(DataSourceError::General("cannot get row from scalar".to_string()));
         }
 
         // For 1D tensor, row_idx must be 0
@@ -250,9 +232,7 @@ impl QuantizedTensor {
         if row_elements % qk != 0 {
             return Err(DataSourceError::General(format!(
                 "row_elements {} not divisible by block size {} for type {}",
-                row_elements,
-                qk,
-                self.ggml_type.name()
+                row_elements, qk, self.ggml_type.name()
             )));
         }
 
@@ -335,9 +315,18 @@ impl QuantizedTensor {
 #[derive(Debug, Clone)]
 #[allow(non_camel_case_types)]
 pub enum TensorData {
-    F32 { data: Vec<f32>, shape: Vec<usize> },
-    F16 { data: Vec<f32>, shape: Vec<usize> },
-    BF16 { data: Vec<f32>, shape: Vec<usize> },
+    F32 {
+        data: Vec<f32>,
+        shape: Vec<usize>,
+    },
+    F16 {
+        data: Vec<f32>,
+        shape: Vec<usize>,
+    },
+    BF16 {
+        data: Vec<f32>,
+        shape: Vec<usize>,
+    },
     Q4_0(QuantizedTensor),
     Q8_0(QuantizedTensor),
     Q4_K(QuantizedTensor),
@@ -612,11 +601,7 @@ impl TensorData {
     ///
     /// Explicit GGML convention: `token_embd` has `shape = [n_embd, vocab]`
     /// and embedding row `token_id` is contiguous (row length == `shape[0]`).
-    pub fn get_embedding(
-        &self,
-        token_id: usize,
-        n_embd: usize,
-    ) -> Result<Vec<f32>, DataSourceError> {
+    pub fn get_embedding(&self, token_id: usize, n_embd: usize) -> Result<Vec<f32>, DataSourceError> {
         // Convention check for 2D tensors: the embedding row length must be
         // the contiguous dimension `shape[0]`.
         let shape = self.shape();
@@ -683,7 +668,9 @@ impl TensorData {
     /// dequantize once while their compact bytes remain live.
     pub fn into_f32_vec(self) -> Result<Vec<f32>, DataSourceError> {
         match self {
-            Self::F32 { data, .. } | Self::F16 { data, .. } | Self::BF16 { data, .. } => Ok(data),
+            Self::F32 { data, .. }
+            | Self::F16 { data, .. }
+            | Self::BF16 { data, .. } => Ok(data),
             Self::Q4_0(qt)
             | Self::Q8_0(qt)
             | Self::Q4_K(qt)
@@ -992,7 +979,13 @@ mod tests {
         for v in &vals {
             raw.extend_from_slice(&v.to_le_bytes());
         }
-        let td = TensorData::from_bytes(crate::types::GgmlType::F32, vec![2, 2], 4, raw).unwrap();
+        let td = TensorData::from_bytes(
+            crate::types::GgmlType::F32,
+            vec![2, 2],
+            4,
+            raw,
+        )
+        .unwrap();
         assert_eq!(td.resident_bytes(), 16);
         assert!(!td.is_quantized());
     }
@@ -1004,7 +997,13 @@ mod tests {
         let mut raw = Vec::new();
         raw.extend_from_slice(&d_fp16.to_le_bytes());
         raw.extend_from_slice(&[0x88; 16]);
-        let td = TensorData::from_bytes(crate::types::GgmlType::Q4_0, vec![32], 32, raw).unwrap();
+        let td = TensorData::from_bytes(
+            crate::types::GgmlType::Q4_0,
+            vec![32],
+            32,
+            raw,
+        )
+        .unwrap();
         assert!(td.is_quantized());
         assert_eq!(td.resident_bytes(), 18);
         // F32 equivalent would be 128 bytes, so quantized is smaller
@@ -1021,12 +1020,15 @@ mod tests {
         raw.extend_from_slice(&dmin_fp16.to_le_bytes());
         raw.extend_from_slice(&[1u8; 12]);
         raw.extend_from_slice(&[0x11; 128]);
-        let td = TensorData::from_bytes(crate::types::GgmlType::Q4_K, vec![256], 256, raw).unwrap();
+        let td = TensorData::from_bytes(
+            crate::types::GgmlType::Q4_K,
+            vec![256],
+            256,
+            raw,
+        )
+        .unwrap();
         assert_eq!(td.resident_bytes(), 144);
-        assert!(
-            td.resident_bytes() < 1024,
-            "quantized should be smaller than F32"
-        );
+        assert!(td.resident_bytes() < 1024, "quantized should be smaller than F32");
     }
 
     // ---------- M6: explicit GGML layout, non-square correctness ----------
@@ -1134,8 +1136,7 @@ mod tests {
         for _ in 0..2 {
             raw.extend_from_slice(&q4_0_block(d_fp16, 0xF8));
         }
-        let td =
-            TensorData::from_bytes(crate::types::GgmlType::Q4_0, vec![64, 3], 192, raw).unwrap();
+        let td = TensorData::from_bytes(crate::types::GgmlType::Q4_0, vec![64, 3], 192, raw).unwrap();
 
         // x: first block region =1.0, second block region =2.0
         let mut x = [2.0f32; 64];
@@ -1183,8 +1184,7 @@ mod tests {
             raw.extend_from_slice(&[1u8; 12]); // scales
             raw.extend_from_slice(&[fill; 128]); // qs
         }
-        let td =
-            TensorData::from_bytes(crate::types::GgmlType::Q4_K, vec![256, 2], 512, raw).unwrap();
+        let td = TensorData::from_bytes(crate::types::GgmlType::Q4_K, vec![256, 2], 512, raw).unwrap();
         let x = [1.0f32; 256];
         let mut y = [0.0f32; 2];
         td.matvec(&x, &mut y).unwrap();
@@ -1212,8 +1212,7 @@ mod tests {
         for _ in 0..2 {
             raw.extend_from_slice(&q4_0_block(d_fp16, 0x11));
         }
-        let td =
-            TensorData::from_bytes(crate::types::GgmlType::Q4_0, vec![32, 2], 64, raw).unwrap();
+        let td = TensorData::from_bytes(crate::types::GgmlType::Q4_0, vec![32, 2], 64, raw).unwrap();
         let x = [1.0f32; 2];
         let mut y = [0.0f32; 32];
         assert!(td.matvec(&x, &mut y).is_err());
@@ -1227,8 +1226,7 @@ mod tests {
         raw.extend_from_slice(&q4_0_block(d_fp16, 0x11));
         raw.extend_from_slice(&q4_0_block(d_fp16, 0x23));
         raw.extend_from_slice(&q4_0_block(d_fp16, 0xF8));
-        let td =
-            TensorData::from_bytes(crate::types::GgmlType::Q4_0, vec![32, 3], 96, raw).unwrap();
+        let td = TensorData::from_bytes(crate::types::GgmlType::Q4_0, vec![32, 3], 96, raw).unwrap();
         if let TensorData::Q4_0(qt) = &td {
             let row0 = qt.dequantize_row(0).unwrap();
             let row1 = qt.dequantize_row(1).unwrap();
@@ -1247,22 +1245,10 @@ mod tests {
 
     #[test]
     fn test_descriptor_resident_bytes_match_owned_representations() {
-        assert_eq!(
-            TensorData::resident_bytes_for(GgmlType::F32, 32, 128).unwrap(),
-            128
-        );
-        assert_eq!(
-            TensorData::resident_bytes_for(GgmlType::F16, 32, 64).unwrap(),
-            128
-        );
-        assert_eq!(
-            TensorData::resident_bytes_for(GgmlType::BF16, 32, 64).unwrap(),
-            128
-        );
-        assert_eq!(
-            TensorData::resident_bytes_for(GgmlType::Q4_0, 32, 18).unwrap(),
-            18
-        );
+        assert_eq!(TensorData::resident_bytes_for(GgmlType::F32, 32, 128).unwrap(), 128);
+        assert_eq!(TensorData::resident_bytes_for(GgmlType::F16, 32, 64).unwrap(), 128);
+        assert_eq!(TensorData::resident_bytes_for(GgmlType::BF16, 32, 64).unwrap(), 128);
+        assert_eq!(TensorData::resident_bytes_for(GgmlType::Q4_0, 32, 18).unwrap(), 18);
         assert!(TensorData::resident_bytes_for(GgmlType::Q4_1, 32, 20).is_err());
     }
 
@@ -1300,8 +1286,7 @@ mod tests {
         let mut raw = Vec::new();
         raw.extend_from_slice(&q4_0_block(d_fp16, 0x11)); // token 0: all -7
         raw.extend_from_slice(&q4_0_block(d_fp16, 0x99)); // token 1: all +1
-        let td =
-            TensorData::from_bytes(crate::types::GgmlType::Q4_0, vec![32, 2], 64, raw).unwrap();
+        let td = TensorData::from_bytes(crate::types::GgmlType::Q4_0, vec![32, 2], 64, raw).unwrap();
         let e0 = td.get_embedding(0, 32).unwrap();
         let e1 = td.get_embedding(1, 32).unwrap();
         assert!(e0.iter().all(|&v| (v + 7.0).abs() < 1e-4));

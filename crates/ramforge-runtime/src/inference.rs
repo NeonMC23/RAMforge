@@ -13,11 +13,19 @@
 //!   (256-token chunks, capped at prompt+max_tokens) with budget checks
 //!   and deterministic rollback on failure.
 
-use ramforge_core::{datasource::GgufDataSource, memory::MemoryBudget, tokenizer::Tokenizer};
+use std::time::Duration;
+
+use ramforge_core::{
+    datasource::{GgufDataSource, IoProfile},
+    memory::MemoryBudget,
+    tokenizer::Tokenizer,
+};
 
 use crate::backend::CpuBackend;
 use crate::kv_cache::KvCache;
+use crate::memory_report::MemoryReport;
 use crate::model::LlamaConfig;
+use crate::profile::{ProfileEvent, ProfileSnapshot};
 use crate::residency::ResidencyStats;
 use crate::sampling::Sampler;
 use crate::streaming_model::StreamingLlamaModel;
@@ -34,8 +42,30 @@ pub struct InferenceEngine {
     pub residency_stats: ResidencyStats,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GenerationProfile {
+    pub runtime: ProfileSnapshot,
+    pub io: IoProfile,
+    pub ramforge_current_bytes: u64,
+    pub ramforge_peak_bytes: u64,
+    pub ramforge_budget_bytes: u64,
+}
+
+impl GenerationProfile {
+    pub fn average_token_latency(&self) -> Option<Duration> {
+        (self.runtime.tokens > 0).then(|| {
+            Duration::from_secs_f64(
+                self.runtime.total.as_secs_f64() / self.runtime.tokens as f64,
+            )
+        })
+    }
+}
+
 impl InferenceEngine {
-    pub fn new(model_path: &str, ram_budget_bytes: u64) -> Result<Self, String> {
+    pub fn new(
+        model_path: &str,
+        ram_budget_bytes: u64,
+    ) -> Result<Self, String> {
         // Parse model file-backed (does NOT load tensor payloads)
         let data_source = GgufDataSource::open(model_path)
             .map_err(|e| format!("failed to open GGUF data source: {}", e))?;
@@ -73,6 +103,25 @@ impl InferenceEngine {
         })
     }
 
+    pub fn set_profiling(&self, enabled: bool) {
+        self.model.set_profiling(enabled);
+        self.data_source.set_profiling(enabled);
+    }
+
+    pub fn generation_profile(&self) -> GenerationProfile {
+        GenerationProfile {
+            runtime: self.model.profiler.snapshot(),
+            io: self.data_source.io_profile(),
+            ramforge_current_bytes: self.budget.used_bytes(),
+            ramforge_peak_bytes: self.budget.peak_used_bytes(),
+            ramforge_budget_bytes: self.budget.total_bytes(),
+        }
+    }
+
+    pub fn memory_report(&self) -> MemoryReport {
+        MemoryReport::collect(&self.budget)
+    }
+
     /// Drop any live KV cache together with its budget charge (idempotent).
     ///
     /// Guarantees the invariant "engine has an active KV cache" <=>
@@ -95,24 +144,50 @@ impl InferenceEngine {
         max_tokens: usize,
         sampler: &Sampler,
     ) -> Result<(Vec<u32>, String), String> {
-        // Explicit reset of any previous run's KV state (charge + object).
-        self.clear_kv_cache();
-        match self.generate_impl(prompt, max_tokens, sampler) {
-            Ok(out) => Ok(out),
-            Err(e) => {
-                // Failed run: no stale KV budget state, engine stays reusable.
-                self.clear_kv_cache();
-                Err(e)
-            }
-        }
+        self.generate_with_callback(prompt, max_tokens, sampler, |_| Ok(()))
     }
 
-    fn generate_impl(
+    /// Generate while emitting newly decodable text as soon as tokens permit.
+    /// Diagnostic/profile output remains the caller's responsibility, so the
+    /// callback receives generated text only.
+    pub fn generate_with_callback<F>(
         &mut self,
         prompt: &str,
         max_tokens: usize,
         sampler: &Sampler,
-    ) -> Result<(Vec<u32>, String), String> {
+        mut on_text: F,
+    ) -> Result<(Vec<u32>, String), String>
+    where
+        F: FnMut(&str) -> Result<(), String>,
+    {
+        // Explicit reset of any previous run's KV state (charge + object).
+        self.clear_kv_cache();
+        self.model.reset_profile();
+        self.data_source.reset_io_profile();
+        let profiler = self.model.profiler.clone();
+        let total_started = profiler.start();
+        let result = self.generate_impl(prompt, max_tokens, sampler, &mut on_text);
+        profiler.record_since(ProfileEvent::Total, total_started);
+        match result {
+            Ok(out) => Ok(out),
+            Err(error) => {
+                // Failed run: no stale KV budget state, engine stays reusable.
+                self.clear_kv_cache();
+                Err(error)
+            }
+        }
+    }
+
+    fn generate_impl<F>(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        sampler: &Sampler,
+        on_text: &mut F,
+    ) -> Result<(Vec<u32>, String), String>
+    where
+        F: FnMut(&str) -> Result<(), String>,
+    {
         // Tokenize prompt
         let prompt_tokens = self.tokenizer.encode(prompt, true);
         if prompt_tokens.is_empty() {
@@ -163,8 +238,10 @@ impl InferenceEngine {
         let model = &self.model;
         let backend = &self.backend;
         let data_source = &self.data_source;
-        let eos_id = self.tokenizer.eos_id;
+        let tokenizer = &self.tokenizer;
+        let eos_id = tokenizer.eos_id;
         let context_length = self.model.config.context_length;
+        let profiler = model.profiler.clone();
 
         let vocab = model.config.vocab_size;
         let n_embd = model.config.embedding_length;
@@ -182,16 +259,23 @@ impl InferenceEngine {
         };
 
         let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut generated_text = String::new();
+        let mut decoder = tokenizer.decoder();
         let mut current_pos = prompt_tokens.len();
 
         let budget = &mut self.budget;
         let run_result: Result<(), String> =
             budget.with_temp("tmp:hidden", hidden_bytes, |budget| {
+                let allocation_started = profiler.start();
                 let mut hidden = vec![0.0f32; n_embd];
+                profiler.record_since(ProfileEvent::Allocation, allocation_started);
                 budget.with_temp("tmp:logits", logits_bytes, |budget| {
+                    let allocation_started = profiler.start();
                     let mut logits = vec![0.0f32; vocab];
+                    profiler.record_since(ProfileEvent::Allocation, allocation_started);
 
                     // Prompt pass – fills the KV cache one token at a time.
+                    let prompt_started = profiler.start();
                     for (pos, &token_id) in prompt_tokens.iter().enumerate() {
                         model.forward_single_streaming(
                             token_id,
@@ -204,9 +288,12 @@ impl InferenceEngine {
                             &mut hidden,
                         )?;
                     }
+                    profiler.record_since(ProfileEvent::Prompt, prompt_started);
 
                     // Generation loop
                     for _ in 0..max_tokens {
+                        let token_started = profiler.start();
+                        let logits_started = profiler.start();
                         model.compute_logits(
                             &hidden,
                             backend,
@@ -214,11 +301,14 @@ impl InferenceEngine {
                             budget,
                             &mut logits,
                         )?;
+                        profiler.record_since(ProfileEvent::Logits, logits_started);
 
+                        let sampling_started = profiler.start();
                         let next_token =
                             budget.with_temp("tmp:sampling", sampler_scratch, |_b| {
                                 Ok::<u32, String>(sampler.sample(&logits))
                             })?;
+                        profiler.record_since(ProfileEvent::Sampling, sampling_started);
 
                         if let Some(eos) = eos_id {
                             if next_token == eos {
@@ -227,6 +317,13 @@ impl InferenceEngine {
                         }
 
                         generated_tokens.push(next_token);
+                        let decoded = decoder.push(next_token);
+                        if !decoded.is_empty() {
+                            let output_started = profiler.start();
+                            on_text(&decoded)?;
+                            profiler.record_since(ProfileEvent::Output, output_started);
+                            generated_text.push_str(&decoded);
+                        }
 
                         // Chunk-wise KV growth with deterministic rollback:
                         // release the old charge, try the new one; if it fails,
@@ -265,6 +362,8 @@ impl InferenceEngine {
                             &mut hidden,
                         )?;
                         current_pos += 1;
+                        profiler.record_since(ProfileEvent::TokenLatency, token_started);
+                        profiler.record_token();
 
                         if current_pos >= context_length {
                             break;
@@ -275,23 +374,28 @@ impl InferenceEngine {
             });
         run_result?;
 
+        let trailing = decoder.finish();
+        if !trailing.is_empty() {
+            let output_started = profiler.start();
+            on_text(&trailing)?;
+            profiler.record_since(ProfileEvent::Output, output_started);
+            generated_text.push_str(&trailing);
+        }
+        drop(decoder);
+
         self.kv_cache = Some(kv_cache);
         self.residency_stats = residency_stats;
 
         // Budget integrity: after the scoped temps are gone, only the
         // persistent charges (weights, KV cache) may remain.
         debug_assert_eq!(
-            self.budget
-                .allocations()
-                .keys()
-                .filter(|k| k.starts_with("tmp:"))
-                .count(),
+            self.budget.allocations().keys().filter(|k| k.starts_with("tmp:")).count(),
             0,
             "temp charges must be released after generate()"
         );
 
-        let text = self.tokenizer.decode(&generated_tokens);
-        Ok((generated_tokens, text))
+        debug_assert_eq!(generated_text, self.tokenizer.decode(&generated_tokens));
+        Ok((generated_tokens, generated_text))
     }
 
     pub fn config(&self) -> &LlamaConfig {
@@ -337,91 +441,36 @@ mod tests {
             write_u32(&mut buf2, val_type);
             write_val(&mut buf2);
         };
-        add_kv(
-            "general.architecture",
-            8,
-            Box::new(|b| write_string(b, "llama")),
-        );
+        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "llama")));
         add_kv("llama.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("llama.context_length", 4, Box::new(|b| write_u32(b, 32)));
         add_kv("llama.embedding_length", 4, Box::new(|b| write_u32(b, 8)));
         add_kv("llama.block_count", 4, Box::new(|b| write_u32(b, 1)));
-        add_kv(
-            "llama.feed_forward_length",
-            4,
-            Box::new(|b| write_u32(b, 16)),
-        );
-        add_kv(
-            "llama.attention.head_count",
-            4,
-            Box::new(|b| write_u32(b, 2)),
-        );
-        add_kv(
-            "llama.attention.head_count_kv",
-            4,
-            Box::new(|b| write_u32(b, 2)),
-        );
-        add_kv(
-            "llama.attention.layer_norm_rms_epsilon",
-            6,
-            Box::new(|b| write_f32(b, 1e-5)),
-        );
-        add_kv(
-            "llama.rope.freq_base",
-            6,
-            Box::new(|b| write_f32(b, 10000.0)),
-        );
-        add_kv(
-            "tokenizer.ggml.model",
-            8,
-            Box::new(|b| write_string(b, "llama")),
-        );
-        add_kv(
-            "tokenizer.ggml.tokens",
-            9,
-            Box::new(|b| {
-                write_u32(b, 8);
-                write_u64(b, 16);
-                for tok in [
-                    "<unk>", "<s>", "</s>", "▁hello", "▁world", "hello", "world", "!", "▁", "a",
-                    "b", "c", "d", "e", "f", "g",
-                ] {
-                    write_string(b, tok);
-                }
-            }),
-        );
-        add_kv(
-            "tokenizer.ggml.scores",
-            9,
-            Box::new(|b| {
-                write_u32(b, 6);
-                write_u64(b, 16);
-                for _ in 0..16 {
-                    write_f32(b, 0.0);
-                }
-            }),
-        );
-        add_kv(
-            "tokenizer.ggml.token_type",
-            9,
-            Box::new(|b| {
-                write_u32(b, 5);
-                write_u64(b, 16);
-                for t in [2, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] {
-                    write_u32(b, t);
-                }
-            }),
-        );
-        add_kv(
-            "tokenizer.ggml.bos_token_id",
-            4,
-            Box::new(|b| write_u32(b, 1)),
-        );
-        add_kv(
-            "tokenizer.ggml.eos_token_id",
-            4,
-            Box::new(|b| write_u32(b, 2)),
-        );
+        add_kv("llama.feed_forward_length", 4, Box::new(|b| write_u32(b, 16)));
+        add_kv("llama.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
+        add_kv("llama.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
+        add_kv("llama.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
+        add_kv("llama.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
+        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv("tokenizer.ggml.tokens", 9, Box::new(|b| {
+            write_u32(b, 8);
+            write_u64(b, 16);
+            for tok in ["<unk>", "<s>", "</s>", "▁hello", "▁world", "hello", "world", "!", "▁", "a", "b", "c", "d", "e", "f", "g"] {
+                write_string(b, tok);
+            }
+        }));
+        add_kv("tokenizer.ggml.scores", 9, Box::new(|b| {
+            write_u32(b, 6);
+            write_u64(b, 16);
+            for _ in 0..16 { write_f32(b, 0.0); }
+        }));
+        add_kv("tokenizer.ggml.token_type", 9, Box::new(|b| {
+            write_u32(b, 5);
+            write_u64(b, 16);
+            for t in [2,3,3,1,1,1,1,1,1,1,1,1,1,1,1,1] { write_u32(b, t); }
+        }));
+        add_kv("tokenizer.ggml.bos_token_id", 4, Box::new(|b| write_u32(b, 1)));
+        add_kv("tokenizer.ggml.eos_token_id", 4, Box::new(|b| write_u32(b, 2)));
 
         // Now tensors
         let tensor_defs = vec![
@@ -506,15 +555,15 @@ mod tests {
             buf2.extend_from_slice(&1.0f32.to_le_bytes());
         }
         // ffn_gate: small random but deterministic: 0.1
-        for _ in 0..16 * 8 {
+        for _ in 0..16*8 {
             buf2.extend_from_slice(&0.1f32.to_le_bytes());
         }
         // ffn_up: 0.1
-        for _ in 0..16 * 8 {
+        for _ in 0..16*8 {
             buf2.extend_from_slice(&0.1f32.to_le_bytes());
         }
         // ffn_down: 0.1
-        for _ in 0..8 * 16 {
+        for _ in 0..8*16 {
             buf2.extend_from_slice(&0.1f32.to_le_bytes());
         }
 
@@ -527,16 +576,43 @@ mod tests {
     #[test]
     fn test_end_to_end_inference() {
         let tmp = create_tiny_llama_gguf();
-        let mut engine =
-            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
         let sampler = crate::sampling::Sampler::greedy();
         let (tokens, text) = engine.generate("hello", 5, &sampler).unwrap();
         assert_eq!(tokens.len(), 5);
-        let mut engine2 =
-            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let mut engine2 = InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
         let (tokens2, text2) = engine2.generate("hello", 5, &sampler).unwrap();
         assert_eq!(tokens, tokens2);
         assert_eq!(text, text2);
+    }
+
+    #[test]
+    fn test_streaming_output_profile_and_memory_report() {
+        let tmp = create_tiny_llama_gguf();
+        let mut engine =
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        engine.set_profiling(true);
+        let sampler = crate::sampling::Sampler::greedy();
+        let mut streamed = String::new();
+        let (tokens, text) = engine
+            .generate_with_callback("hello", 3, &sampler, |piece| {
+                streamed.push_str(piece);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(streamed, text);
+
+        let profile = engine.generation_profile();
+        assert_eq!(profile.runtime.tokens, 3);
+        assert!(profile.runtime.layer_loads > 0);
+        assert!(profile.io.read_operations > 0);
+        assert!(profile.io.bytes_read > 0);
+        assert!(profile.ramforge_peak_bytes <= profile.ramforge_budget_bytes);
+
+        let memory = engine.memory_report();
+        assert_eq!(memory.ramforge_budget_bytes, 8 * 1024 * 1024);
+        assert!(memory.ramforge_peak_bytes >= memory.ramforge_current_bytes);
     }
 
     fn create_out_of_core_gguf() -> NamedTempFile {
@@ -546,15 +622,9 @@ mod tests {
             w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
             w.write_all(s.as_bytes()).unwrap();
         }
-        fn write_u32<W: Write>(w: &mut W, v: u32) {
-            w.write_all(&v.to_le_bytes()).unwrap();
-        }
-        fn write_u64<W: Write>(w: &mut W, v: u64) {
-            w.write_all(&v.to_le_bytes()).unwrap();
-        }
-        fn write_f32<W: Write>(w: &mut W, v: f32) {
-            w.write_all(&v.to_le_bytes()).unwrap();
-        }
+        fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_f32<W: Write>(w: &mut W, v: f32) { w.write_all(&v.to_le_bytes()).unwrap(); }
 
         let n_layers = 8;
         let n_embd = 16;
@@ -572,161 +642,60 @@ mod tests {
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
         };
-        add_kv(
-            "general.architecture",
-            8,
-            Box::new(|b| write_string(b, "llama")),
-        );
+        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "llama")));
         add_kv("llama.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("llama.context_length", 4, Box::new(|b| write_u32(b, 64)));
-        add_kv(
-            "llama.embedding_length",
-            4,
-            Box::new(|b| write_u32(b, n_embd as u32)),
-        );
-        add_kv(
-            "llama.block_count",
-            4,
-            Box::new(|b| write_u32(b, n_layers as u32)),
-        );
-        add_kv(
-            "llama.feed_forward_length",
-            4,
-            Box::new(|b| write_u32(b, ffn as u32)),
-        );
-        add_kv(
-            "llama.attention.head_count",
-            4,
-            Box::new(|b| write_u32(b, 2)),
-        );
-        add_kv(
-            "llama.attention.head_count_kv",
-            4,
-            Box::new(|b| write_u32(b, 2)),
-        );
-        add_kv(
-            "llama.attention.layer_norm_rms_epsilon",
-            6,
-            Box::new(|b| write_f32(b, 1e-5)),
-        );
-        add_kv(
-            "llama.rope.freq_base",
-            6,
-            Box::new(|b| write_f32(b, 10000.0)),
-        );
-        add_kv(
-            "tokenizer.ggml.model",
-            8,
-            Box::new(|b| write_string(b, "llama")),
-        );
-        add_kv(
-            "tokenizer.ggml.tokens",
-            9,
-            Box::new(|b| {
-                write_u32(b, 8);
-                write_u64(b, 16);
-                for tok in [
-                    "<unk>", "<s>", "</s>", "▁hello", "▁world", "hello", "world", "!", "▁", "a",
-                    "b", "c", "d", "e", "f", "g",
-                ] {
-                    write_string(b, tok);
-                }
-            }),
-        );
-        add_kv(
-            "tokenizer.ggml.scores",
-            9,
-            Box::new(|b| {
-                write_u32(b, 6);
-                write_u64(b, 16);
-                for _ in 0..16 {
-                    write_f32(b, 0.0);
-                }
-            }),
-        );
-        add_kv(
-            "tokenizer.ggml.token_type",
-            9,
-            Box::new(|b| {
-                write_u32(b, 5);
-                write_u64(b, 16);
-                for t in [2, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] {
-                    write_u32(b, t);
-                }
-            }),
-        );
-        add_kv(
-            "tokenizer.ggml.bos_token_id",
-            4,
-            Box::new(|b| write_u32(b, 1)),
-        );
-        add_kv(
-            "tokenizer.ggml.eos_token_id",
-            4,
-            Box::new(|b| write_u32(b, 2)),
-        );
+        add_kv("llama.embedding_length", 4, Box::new(|b| write_u32(b, n_embd as u32)));
+        add_kv("llama.block_count", 4, Box::new(|b| write_u32(b, n_layers as u32)));
+        add_kv("llama.feed_forward_length", 4, Box::new(|b| write_u32(b, ffn as u32)));
+        add_kv("llama.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
+        add_kv("llama.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
+        add_kv("llama.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
+        add_kv("llama.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
+        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv("tokenizer.ggml.tokens", 9, Box::new(|b| {
+            write_u32(b, 8);
+            write_u64(b, 16);
+            for tok in ["<unk>", "<s>", "</s>", "▁hello", "▁world", "hello", "world", "!", "▁", "a", "b", "c", "d", "e", "f", "g"] {
+                write_string(b, tok);
+            }
+        }));
+        add_kv("tokenizer.ggml.scores", 9, Box::new(|b| {
+            write_u32(b, 6);
+            write_u64(b, 16);
+            for _ in 0..16 { write_f32(b, 0.0); }
+        }));
+        add_kv("tokenizer.ggml.token_type", 9, Box::new(|b| {
+            write_u32(b, 5);
+            write_u64(b, 16);
+            for t in [2,3,3,1,1,1,1,1,1,1,1,1,1,1,1,1] { write_u32(b, t); }
+        }));
+        add_kv("tokenizer.ggml.bos_token_id", 4, Box::new(|b| write_u32(b, 1)));
+        add_kv("tokenizer.ggml.eos_token_id", 4, Box::new(|b| write_u32(b, 2)));
         // add one more to make 16
-        add_kv(
-            "general.name",
-            8,
-            Box::new(|b| write_string(b, "tiny-out-of-core")),
-        );
+        add_kv("general.name", 8, Box::new(|b| write_string(b, "tiny-out-of-core")));
 
         let mut offset = 0u64;
         let mut defs: Vec<(String, Vec<u64>, u32)> = Vec::new();
         defs.push(("token_embd.weight".to_string(), vec![n_embd as u64, 16], 0));
         defs.push(("output_norm.weight".to_string(), vec![n_embd as u64], 0));
         for i in 0..n_layers {
-            defs.push((
-                format!("blk.{}.attn_norm.weight", i),
-                vec![n_embd as u64],
-                0,
-            ));
-            defs.push((
-                format!("blk.{}.attn_q.weight", i),
-                vec![n_embd as u64, n_embd as u64],
-                0,
-            ));
-            defs.push((
-                format!("blk.{}.attn_k.weight", i),
-                vec![n_embd as u64, n_embd as u64],
-                0,
-            ));
-            defs.push((
-                format!("blk.{}.attn_v.weight", i),
-                vec![n_embd as u64, n_embd as u64],
-                0,
-            ));
-            defs.push((
-                format!("blk.{}.attn_output.weight", i),
-                vec![n_embd as u64, n_embd as u64],
-                0,
-            ));
+            defs.push((format!("blk.{}.attn_norm.weight", i), vec![n_embd as u64], 0));
+            defs.push((format!("blk.{}.attn_q.weight", i), vec![n_embd as u64, n_embd as u64], 0));
+            defs.push((format!("blk.{}.attn_k.weight", i), vec![n_embd as u64, n_embd as u64], 0));
+            defs.push((format!("blk.{}.attn_v.weight", i), vec![n_embd as u64, n_embd as u64], 0));
+            defs.push((format!("blk.{}.attn_output.weight", i), vec![n_embd as u64, n_embd as u64], 0));
             defs.push((format!("blk.{}.ffn_norm.weight", i), vec![n_embd as u64], 0));
             // ggml layout [in, out]: gate/up map n_embd -> ffn, down maps ffn -> n_embd
-            defs.push((
-                format!("blk.{}.ffn_gate.weight", i),
-                vec![n_embd as u64, ffn as u64],
-                0,
-            ));
-            defs.push((
-                format!("blk.{}.ffn_up.weight", i),
-                vec![n_embd as u64, ffn as u64],
-                0,
-            ));
-            defs.push((
-                format!("blk.{}.ffn_down.weight", i),
-                vec![ffn as u64, n_embd as u64],
-                0,
-            ));
+            defs.push((format!("blk.{}.ffn_gate.weight", i), vec![n_embd as u64, ffn as u64], 0));
+            defs.push((format!("blk.{}.ffn_up.weight", i), vec![n_embd as u64, ffn as u64], 0));
+            defs.push((format!("blk.{}.ffn_down.weight", i), vec![ffn as u64, n_embd as u64], 0));
         }
 
         for (name, dims, ty) in &defs {
             write_string(&mut buf, name);
             write_u32(&mut buf, dims.len() as u32);
-            for d in dims {
-                write_u64(&mut buf, *d);
-            }
+            for d in dims { write_u64(&mut buf, *d); }
             write_u32(&mut buf, *ty);
             write_u64(&mut buf, offset);
             let elems: u64 = dims.iter().product();
@@ -742,49 +711,17 @@ mod tests {
                 buf.extend_from_slice(&(token_id as f32).to_le_bytes());
             }
         }
-        for _ in 0..n_embd {
-            buf.extend_from_slice(&1.0f32.to_le_bytes());
-        }
+        for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); }
         for _layer in 0..n_layers {
-            for _ in 0..n_embd {
-                buf.extend_from_slice(&1.0f32.to_le_bytes());
-            } // attn_norm
-            for i in 0..n_embd {
-                for j in 0..n_embd {
-                    let v: f32 = if i == j { 1.0 } else { 0.0 };
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-            } // q
-            for i in 0..n_embd {
-                for j in 0..n_embd {
-                    let v: f32 = if i == j { 1.0 } else { 0.0 };
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-            } // k
-            for i in 0..n_embd {
-                for j in 0..n_embd {
-                    let v: f32 = if i == j { 1.0 } else { 0.0 };
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-            } // v
-            for i in 0..n_embd {
-                for j in 0..n_embd {
-                    let v: f32 = if i == j { 1.0 } else { 0.0 };
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-            } // output
-            for _ in 0..n_embd {
-                buf.extend_from_slice(&1.0f32.to_le_bytes());
-            } // ffn_norm
-            for _ in 0..ffn * n_embd {
-                buf.extend_from_slice(&0.1f32.to_le_bytes());
-            } // gate
-            for _ in 0..ffn * n_embd {
-                buf.extend_from_slice(&0.1f32.to_le_bytes());
-            } // up
-            for _ in 0..n_embd * ffn {
-                buf.extend_from_slice(&0.1f32.to_le_bytes());
-            } // down
+            for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); } // attn_norm
+            for i in 0..n_embd { for j in 0..n_embd { let v: f32 = if i==j {1.0} else {0.0}; buf.extend_from_slice(&v.to_le_bytes()); } } // q
+            for i in 0..n_embd { for j in 0..n_embd { let v: f32 = if i==j {1.0} else {0.0}; buf.extend_from_slice(&v.to_le_bytes()); } } // k
+            for i in 0..n_embd { for j in 0..n_embd { let v: f32 = if i==j {1.0} else {0.0}; buf.extend_from_slice(&v.to_le_bytes()); } } // v
+            for i in 0..n_embd { for j in 0..n_embd { let v: f32 = if i==j {1.0} else {0.0}; buf.extend_from_slice(&v.to_le_bytes()); } } // output
+            for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); } // ffn_norm
+            for _ in 0..ffn*n_embd { buf.extend_from_slice(&0.1f32.to_le_bytes()); } // gate
+            for _ in 0..ffn*n_embd { buf.extend_from_slice(&0.1f32.to_le_bytes()); } // up
+            for _ in 0..n_embd*ffn { buf.extend_from_slice(&0.1f32.to_le_bytes()); } // down
         }
 
         let mut tmp = NamedTempFile::new().unwrap();
@@ -798,12 +735,7 @@ mod tests {
         // Total model size > budget, but per-layer fits
         let tmp = create_out_of_core_gguf();
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
-        let total_bytes: u64 = ds
-            .model()
-            .tensors
-            .iter()
-            .filter_map(|t| t.byte_length)
-            .sum();
+        let total_bytes: u64 = ds.model().tensors.iter().filter_map(|t| t.byte_length).sum();
 
         // n_embd 16 / ffn 32: per layer 10368 B (F32), persistents 1088 B.
         // 8 layers => total 84032 B (~82 KiB) > 32 KiB budget, while one
@@ -815,12 +747,7 @@ mod tests {
         let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), ram_budget).unwrap();
 
         // Check total > budget
-        assert!(
-            total_bytes > ram_budget,
-            "total {} should be > budget {}",
-            total_bytes,
-            ram_budget
-        );
+        assert!(total_bytes > ram_budget, "total {} should be > budget {}", total_bytes, ram_budget);
 
         let sampler = crate::sampling::Sampler::greedy();
         let (tokens, _text) = engine.generate("hello", 3, &sampler).unwrap();
@@ -830,12 +757,7 @@ mod tests {
         let stats = &engine.residency_stats;
         assert!(stats.total_model_weight_bytes > ram_budget);
         assert!(stats.peak_resident_layer_bytes < stats.total_model_weight_bytes);
-        assert!(
-            stats.peak_managed_bytes <= ram_budget,
-            "peak managed {} should be <= budget {}",
-            stats.peak_managed_bytes,
-            ram_budget
-        );
+        assert!(stats.peak_managed_bytes <= ram_budget, "peak managed {} should be <= budget {}", stats.peak_managed_bytes, ram_budget);
         assert!(stats.num_layer_loads > 0);
         assert!(stats.num_layer_releases > 0);
     }
@@ -871,8 +793,7 @@ mod tests {
     fn test_generate_twice_same_engine() {
         // Regression test for M6.1 BUG-1: sequential generate() calls.
         let tmp = create_tiny_llama_gguf();
-        let mut engine =
-            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
         let sampler = crate::sampling::Sampler::greedy();
 
         let (tokens1, text1) = engine.generate("hello", 5, &sampler).unwrap();
@@ -958,8 +879,7 @@ mod tests {
 
         // Case B: failure before any allocation (context-length check) must
         // leave the engine fully reusable for a subsequent valid call.
-        let mut healthy =
-            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let mut healthy = InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
         let err_ctx = healthy.generate("hello", 100, &sampler).unwrap_err();
         assert!(err_ctx.contains("context length"), "got: {}", err_ctx);
         assert!(healthy.budget.get("kv_cache").is_none());
@@ -970,8 +890,7 @@ mod tests {
     #[test]
     fn test_clear_kv_cache_releases_charge() {
         let tmp = create_tiny_llama_gguf();
-        let mut engine =
-            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
         let sampler = crate::sampling::Sampler::greedy();
 
         let (tokens, _) = engine.generate("hello", 3, &sampler).unwrap();
@@ -1002,10 +921,10 @@ mod tests {
     /// Deterministic weight tables for the biased qwen2 fixture.
     /// n_embd=8, heads=2, head_dim=4, kv_heads=2, ffn=16, vocab=16.
     struct Qwen2FixtureWeights {
-        embd: Vec<f32>, // [16][8] rows = token embeddings
+        embd: Vec<f32>,    // [16][8] rows = token embeddings
         output_norm: Vec<f32>,
         attn_norm: Vec<f32>,
-        attn_q: Vec<f32>, // ggml [8,8]: row o of in 8
+        attn_q: Vec<f32>,  // ggml [8,8]: row o of in 8
         attn_k: Vec<f32>,
         attn_v: Vec<f32>,
         attn_output: Vec<f32>,
@@ -1036,9 +955,7 @@ mod tests {
             attn_output: w(64, &|i| 0.03 + 0.01 * (((i / 8) + (i % 8)) % 4) as f32),
             ffn_norm: vec![1.0; 8],
             ffn_gate: w(128, &|i| 0.02 + 0.01 * (((i / 8) + (i % 8)) % 6) as f32),
-            ffn_up: w(128, &|i| {
-                0.01 + 0.015 * (((i / 8) + 2 * (i % 8)) % 5) as f32
-            }),
+            ffn_up: w(128, &|i| 0.01 + 0.015 * (((i / 8) + 2 * (i % 8)) % 5) as f32),
             ffn_down: w(128, &|i| 0.02 + 0.01 * (((i / 8) + 3 * (i % 8)) % 7) as f32),
             bias_q: w(8, &|i| 0.05 + 0.01 * i as f32),
             bias_k: w(8, &|i| 0.04 + 0.02 * i as f32),
@@ -1051,15 +968,9 @@ mod tests {
             w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
             w.write_all(s.as_bytes()).unwrap();
         }
-        fn write_u32<W: Write>(w: &mut W, v: u32) {
-            w.write_all(&v.to_le_bytes()).unwrap();
-        }
-        fn write_u64<W: Write>(w: &mut W, v: u64) {
-            w.write_all(&v.to_le_bytes()).unwrap();
-        }
-        fn write_f32<W: Write>(w: &mut W, v: f32) {
-            w.write_all(&v.to_le_bytes()).unwrap();
-        }
+        fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_f32<W: Write>(w: &mut W, v: f32) { w.write_all(&v.to_le_bytes()).unwrap(); }
 
         let w = qwen2_weights();
         let mut buf = Vec::new();
@@ -1073,91 +984,36 @@ mod tests {
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
         };
-        add_kv(
-            "general.architecture",
-            8,
-            Box::new(|b| write_string(b, "qwen2")),
-        );
+        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "qwen2")));
         add_kv("qwen2.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("qwen2.context_length", 4, Box::new(|b| write_u32(b, 64)));
         add_kv("qwen2.embedding_length", 4, Box::new(|b| write_u32(b, 8)));
         add_kv("qwen2.block_count", 4, Box::new(|b| write_u32(b, 1)));
-        add_kv(
-            "qwen2.feed_forward_length",
-            4,
-            Box::new(|b| write_u32(b, 16)),
-        );
-        add_kv(
-            "qwen2.attention.head_count",
-            4,
-            Box::new(|b| write_u32(b, 2)),
-        );
-        add_kv(
-            "qwen2.attention.head_count_kv",
-            4,
-            Box::new(|b| write_u32(b, 2)),
-        );
-        add_kv(
-            "qwen2.attention.layer_norm_rms_epsilon",
-            6,
-            Box::new(|b| write_f32(b, 1e-5)),
-        );
-        add_kv(
-            "qwen2.rope.freq_base",
-            6,
-            Box::new(|b| write_f32(b, 10000.0)),
-        );
-        add_kv(
-            "tokenizer.ggml.model",
-            8,
-            Box::new(|b| write_string(b, "llama")),
-        );
-        add_kv(
-            "tokenizer.ggml.tokens",
-            9,
-            Box::new(|b| {
-                write_u32(b, 8);
-                write_u64(b, 16);
-                for tok in [
-                    "<unk>", "<s>", "</s>", "▁hello", "▁world", "hello", "world", "!", "▁", "a",
-                    "b", "c", "d", "e", "f", "g",
-                ] {
-                    write_string(b, tok);
-                }
-            }),
-        );
-        add_kv(
-            "tokenizer.ggml.scores",
-            9,
-            Box::new(|b| {
-                write_u32(b, 6);
-                write_u64(b, 16);
-                for _ in 0..16 {
-                    write_f32(b, 0.0);
-                }
-            }),
-        );
-        add_kv(
-            "tokenizer.ggml.token_type",
-            9,
-            Box::new(|b| {
-                write_u32(b, 5);
-                write_u64(b, 16);
-                for t in [2i32, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] {
-                    write_u32(b, t as u32);
-                }
-            }),
-        );
-        add_kv(
-            "tokenizer.ggml.bos_token_id",
-            4,
-            Box::new(|b| write_u32(b, 1)),
-        );
-        add_kv(
-            "tokenizer.ggml.eos_token_id",
-            4,
-            Box::new(|b| write_u32(b, 2)),
-        );
+        add_kv("qwen2.feed_forward_length", 4, Box::new(|b| write_u32(b, 16)));
+        add_kv("qwen2.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
+        add_kv("qwen2.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
+        add_kv("qwen2.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
+        add_kv("qwen2.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
+        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv("tokenizer.ggml.tokens", 9, Box::new(|b| {
+            write_u32(b, 8);
+            write_u64(b, 16);
+            for tok in ["<unk>", "<s>", "</s>", "▁hello", "▁world", "hello", "world", "!", "▁", "a", "b", "c", "d", "e", "f", "g"] {
+                write_string(b, tok);
+            }
+        }));
+        add_kv("tokenizer.ggml.scores", 9, Box::new(|b| {
+            write_u32(b, 6);
+            write_u64(b, 16);
+            for _ in 0..16 { write_f32(b, 0.0); }
+        }));
+        add_kv("tokenizer.ggml.token_type", 9, Box::new(|b| {
+            write_u32(b, 5);
+            write_u64(b, 16);
+            for t in [2i32, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] { write_u32(b, t as u32); }
+        }));
+        add_kv("tokenizer.ggml.bos_token_id", 4, Box::new(|b| write_u32(b, 1)));
+        add_kv("tokenizer.ggml.eos_token_id", 4, Box::new(|b| write_u32(b, 2)));
 
         let mut offset = 0u64;
         let mut defs: Vec<(&str, Vec<u64>)> = vec![
@@ -1344,8 +1200,7 @@ mod tests {
     #[test]
     fn test_qwen2_biased_forward_matches_reference() {
         let tmp = create_qwen2_biased_gguf();
-        let mut engine =
-            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
         assert!(engine.model.attn_bias_present);
         assert_eq!(engine.config().head_count, 2);
         assert_eq!(engine.config().head_count_kv, 2);
@@ -1421,8 +1276,7 @@ mod tests {
 
         // A biased qwen2 engine also runs end-to-end generation cleanly and
         // deterministically.
-        let mut engine2 =
-            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let mut engine2 = InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
         let sampler = crate::sampling::Sampler::greedy();
         let (t1, _) = engine2.generate("hello", 4, &sampler).unwrap();
         let (t2, _) = engine2.generate("hello", 4, &sampler).unwrap();

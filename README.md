@@ -2,6 +2,8 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
+> **Usable Out-of-Core Inference:** `ramforge run` now streams decoded assistant text to stdout with UTF-8 byte-token accumulation. Optional `--profile` reports measured GGUF I/O, layer load/compute/release, quantized/F32 matvec, allocation, sampling, token latency, bytes read, and peak managed memory. `--memory-report` separates RAMforge-managed memory, process RSS, and system memory. `ramforge support` exposes the architecture/quantization registry; qwen35 remains inspectable/plannable but intentionally not executable.
+>
 > **Milestone 7.2 Status (Fast Float Load):** F32 tensor payloads now read directly into their final `Vec<f32>` allocation without a raw-byte intermediate, destination zero-fill, or little-endian per-element decode loop on little-endian hosts. Full tensors and streamed F32 chunks/rows use the direct path; the truthful load charge is now 1× file bytes. F16/BF16 remain decoded F32 with their 3× load transient, and quantized representations are unchanged.
 >
 > **Milestone 7.1 Baseline (Accounting Hardening):** Resident persistent tensors establish their full load-transient charge **before** file I/O, settle atomically to the actual owned representation, and roll back all startup charges on failure. At M7.1 the load factors were quantized 1×, F32 2×, and F16/BF16 3×; M7.2 supersedes only F32 with its direct 1× representation. The 25% retention policy uses decoded/compact resident bytes rather than file bytes. Final hidden state is caller-owned under a lifetime-matched `tmp:hidden` charge.
@@ -72,7 +74,14 @@ Entire quantized model never resident simultaneously. Layers released after comp
 **Compute backend:**
 - `ComputeBackend` trait F32 `matvec` now follows the explicit ggml layout and is wired into the inference hot path (`matvec_backend` in `streaming_model.rs`): resident F32 weights use runtime-detected AVX2 (`simd.rs`) + rayon row-parallelism; quantized weights keep the compact block-wise kernels from `quant.rs`
 
-### Milestone 7.2 – Fast Float Load (current)
+### Usable Out-of-Core Inference
+
+- **Streaming output:** generation exposes a text callback backed by a stateful tokenizer decoder; split UTF-8 byte tokens are buffered until displayable, EOS remains suppressed, and CLI diagnostics stay on stderr
+- **Real profiling:** `--profile` measures generation wall time, prompt/prefill, GGUF reads/bytes, layer loading/compute/release, tensor construction, explicit dequantization/copies, F32 and quantized matvec, allocations, logits, sampling, callback time, token latency, and layer-cache misses
+- **Memory visibility:** `--memory-report` labels RAMforge current/peak/budget separately from Linux process RSS and system memory; MemoryBudget does not claim control over RSS or page cache
+- **Capability registry:** `ramforge support` distinguishes generic GGUF inspection/planning from execution, tokenizer, and quantization support. Direct execution remains limited to `llama` and `qwen2`; Mistral is runnable only when represented by a validated llama-compatible GGUF; `qwen35` is explicitly inspect/plan-only
+
+### Milestone 7.2 – Fast Float Load
 
 - **Direct F32 I/O:** full tensors and streamed F32 ranges are read into final `Vec<f32>` storage; little-endian hosts avoid both the raw-byte intermediate and per-element decode loop
 - **No destination prefill:** raw range reads append into reserved spare capacity, while direct F32 reads initialize reserved F32 storage with exact I/O; short reads remain errors
@@ -128,6 +137,8 @@ Run with quantized model:
 ```bash
 cargo run -p ramforge-cli -- run model.gguf --ram 8G --prompt "Hello" --max-tokens 32
 cargo run -p ramforge-cli -- run model.gguf --ram 1G --prompt "Hello" --max-tokens 16 --verbose
+cargo run -p ramforge-cli -- run model.gguf --ram 4G --prompt "Hi" --max-tokens 1 --profile --memory-report
+cargo run -p ramforge-cli -- support
 # Verbose shows:
 # Total model weight bytes: 1500160 (1.43 MiB) quantized
 # F32 equiv: 10507264 (10 MiB)
@@ -138,7 +149,7 @@ cargo run -p ramforge-cli -- run model.gguf --ram 1G --prompt "Hello" --max-toke
 
 Accepted `--ram` syntax: `8G`, `8GiB`, `8192M`, `512MiB`, `1.5G`, `KB`/`KiB`/`MB`/`MiB`/`GB`/`GiB`.
 
-Diagnostics stderr, generated text stdout.
+Diagnostics/profile data go to stderr; `Assistant:` text streams to stdout as tokens become decodable.
 
 **Out-of-core quantized example:**
 ```bash
@@ -171,6 +182,9 @@ crates/
     kv_cache.rs – KV cache explicit, budget-accounted
     layer.rs – LayerDescriptor grouping
     residency.rs – ResidencyStats
+    profile.rs – optional generation timing/counter collector
+    memory_report.rs – managed memory, Linux RSS, and system-memory visibility
+    support.rs – architecture/tokenizer/quantization capability registry
     persistent.rs – PersistentWeight: actual resident representation ≤25% of budget, else streamed on demand
     simd.rs – AVX2/FMA F32 dot/matvec kernels, runtime detection + scalar fallback (M5.6.1)
     model.rs – LlamaConfig, validate_required_tensors
@@ -178,17 +192,17 @@ crates/
     inference.rs – InferenceEngine (file-backed + budget + chunk-growing KV + single logits buffer), generate()
     plan.rs – planning
     sampling.rs – greedy, temperature, top-k/p
-  ramforge-cli/ – inspect, plan, run --verbose
+  ramforge-cli/ – inspect, plan, support, run --verbose/--profile/--memory-report
 ```
 
 ## Supported / Unsupported
 
-**Supported architectures:** `llama`, `qwen2` (dense, same tensor naming)
+**Supported execution architectures:** `llama`, `qwen2` (dense). Mistral works only when represented by a validated llama-compatible GGUF architecture/tensor layout. `qwen3`, `qwen35`, `gemma`, and `phi` are inspect/plan-only registry entries.
 
 **Supported tensor types:** `F32`, `F16`, `BF16`, `Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` – all usable for inference
 
 **Unsupported (clear error):**
-- Other architectures → "unsupported architecture"
+- Unsupported execution architectures → capability-aware error listing detected architecture, inspect/plan status, and supported execution architectures
 - Other quantized types (Q4_1, Q5_0, Q5_1, Q8_1, IQ*, …) → "unsupported tensor type for inference"
 - Missing tensors → "missing tensor 'blk.0.attn_q.weight'"
 - Budget too small → "RAM budget too small for layer..."
@@ -209,7 +223,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-M7.2 source suite: 86 core tests + 59 runtime tests = 145 tests (M7.1 baseline 141; four focused direct-F32 and rollback tests added).
+Current source suite: 88 core tests + 68 runtime tests = 156 tests. The additional focused tests cover incremental UTF-8 decoding, I/O counters, profiling, memory separation, streaming callbacks, capability lookup, and unsupported-architecture diagnostics.
 
 ## Known Limitations (Milestone 7.2)
 

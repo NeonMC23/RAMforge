@@ -322,11 +322,6 @@ mod tests {
         for p in 0..3 {
             expected += (scores[p] / sum) * vs[p];
         }
-        assert!(
-            (out[0] - expected).abs() < 1e-5,
-            "out={} expected={}",
-            out[0],
-            expected
-        );
+        assert!((out[0] - expected).abs() < 1e-5, "out={} expected={}", out[0], expected);
     }
 }

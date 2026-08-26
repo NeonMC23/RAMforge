@@ -16,7 +16,10 @@
 #![allow(clippy::needless_range_loop)]
 
 use ramforge_core::{
-    datasource::GgufDataSource, memory::MemoryBudget, model::TensorDescriptor, tensor::TensorData,
+    datasource::GgufDataSource,
+    memory::MemoryBudget,
+    model::TensorDescriptor,
+    tensor::TensorData,
     types::GgmlType,
 };
 
@@ -159,9 +162,11 @@ impl PersistentWeight {
                             format!("failed to read persistent tensor '{}': {}", desc.name, e)
                         })
                 } else {
-                    let raw = data_source.read_tensor_by_descriptor(desc).map_err(|e| {
-                        format!("failed to read persistent tensor '{}': {}", desc.name, e)
-                    })?;
+                    let raw = data_source
+                        .read_tensor_by_descriptor(desc)
+                        .map_err(|e| {
+                            format!("failed to read persistent tensor '{}': {}", desc.name, e)
+                        })?;
                     let td = TensorData::from_bytes(
                         desc.ggml_type,
                         desc.dimensions.clone(),
@@ -275,7 +280,11 @@ fn streamed_matvec_into(
                     .checked_mul(in_dim as u64)
                     .ok_or_else(|| "streamed F32 element count overflow".to_string())?;
                 let chunk = data_source
-                    .read_f32_tensor_range_by_descriptor(desc, element_offset, element_count)
+                    .read_f32_tensor_range_by_descriptor(
+                        desc,
+                        element_offset,
+                        element_count,
+                    )
                     .map_err(|e| {
                         format!("failed to read direct F32 chunk of '{}': {}", desc.name, e)
                     })?;
@@ -343,12 +352,8 @@ mod tests {
         w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
         w.write_all(s.as_bytes()).unwrap();
     }
-    fn write_u32<W: Write>(w: &mut W, v: u32) {
-        w.write_all(&v.to_le_bytes()).unwrap();
-    }
-    fn write_u64<W: Write>(w: &mut W, v: u64) {
-        w.write_all(&v.to_le_bytes()).unwrap();
-    }
+    fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
+    fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
 
     #[test]
     fn test_persistent_policy_uses_resident_bytes_and_is_overflow_safe() {
@@ -451,25 +456,14 @@ mod tests {
             .unwrap();
         let expected = [1.0, 2.0, 3.0, 4.0, 3.0, 7.0];
         for i in 0..6 {
-            assert!(
-                (logits[i] - expected[i]).abs() < 1e-5,
-                "logit {} = {}",
-                i,
-                logits[i]
-            );
+            assert!((logits[i] - expected[i]).abs() < 1e-5, "logit {} = {}", i, logits[i]);
         }
         assert_eq!(budget.used_bytes(), 800, "no temp charge may leak");
         let _ = budget.release("pinned");
 
         // Resident path must agree with streamed path.
         let raw = ds.read_tensor("output.weight").unwrap();
-        let td = TensorData::from_bytes(
-            GgmlType::F32,
-            desc.dimensions.clone(),
-            desc.num_elements,
-            raw,
-        )
-        .unwrap();
+        let td = TensorData::from_bytes(GgmlType::F32, desc.dimensions.clone(), desc.num_elements, raw).unwrap();
         let resident = PersistentWeight::Resident(td);
         let mut logits_res = [0.0f32; 6];
         resident
@@ -513,10 +507,6 @@ mod tests {
         let err = streamed
             .compute_logits_into(&hidden, &ds, &mut budget, &mut logits)
             .unwrap_err();
-        assert!(
-            err.contains("budget too small") || err.contains("insufficient"),
-            "got: {}",
-            err
-        );
+        assert!(err.contains("budget too small") || err.contains("insufficient"), "got: {}", err);
     }
 }

@@ -16,23 +16,26 @@ pub mod backend;
 pub mod inference;
 pub mod kv_cache;
 pub mod layer;
+pub mod memory_report;
 pub mod model;
 pub mod ops;
 pub mod persistent;
 pub mod plan;
+pub mod profile;
 pub mod residency;
 pub mod sampling;
 pub mod simd;
 pub mod streaming_model;
+pub mod support;
 
 use ramforge_core::{
     cache::BoundedCache, datasource::GgufDataSource, memory::MemoryBudget, GgufModel,
 };
 
-pub use plan::{plan_model, PlanResult};
 pub use ramforge_core::{
     CacheError, CacheStats, DataSourceError, GgufError, MemoryError, ParseSizeError,
 };
+pub use plan::{plan_model, PlanResult};
 
 /// Runtime that owns a data source, budget, and cache
 #[derive(Debug)]
@@ -54,9 +57,7 @@ impl Runtime {
         // budget per entry via `insert_budgeted` – no double-counted capacity
         // pre-reservation.
         let cache_capacity = (ram_budget_bytes as f64 * 0.8) as u64;
-        let cache_capacity = cache_capacity
-            .max(1024 * 1024)
-            .min(ram_budget_bytes.saturating_sub(1024 * 1024));
+        let cache_capacity = cache_capacity.max(1024 * 1024).min(ram_budget_bytes.saturating_sub(1024 * 1024));
         let cache = BoundedCache::new(cache_capacity)?;
 
         Ok(Self {
@@ -78,13 +79,10 @@ impl Runtime {
             .cache
             .insert_budgeted(&mut self.budget, name.to_string(), data.clone())
         {
-            Ok(_) => {}
-            Err(ramforge_core::CacheError::TooLarge { .. }) => {}
+            Ok(_) => {},
+            Err(ramforge_core::CacheError::TooLarge { .. }) => {},
             Err(e) => {
-                return Err(DataSourceError::General(format!(
-                    "cache insert failed: {}",
-                    e
-                )));
+                return Err(DataSourceError::General(format!("cache insert failed: {}", e)));
             }
         }
         Ok(data)
