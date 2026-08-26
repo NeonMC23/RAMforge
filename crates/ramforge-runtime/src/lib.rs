@@ -1,4 +1,4 @@
-//! RAMforge Runtime – Milestone 6: True Out-of-Core Integrity
+//! RAMforge runtime for budgeted, profiled out-of-core inference.
 //!
 //! This crate builds on `ramforge-core` to provide:
 //! - Memory budget enforcement (RAII-style scoped temp reservations)

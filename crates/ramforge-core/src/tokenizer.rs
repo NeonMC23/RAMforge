@@ -1,4 +1,4 @@
-//! Tokenizer loading from GGUF metadata – Milestone 6
+//! Tokenizer loading and incremental decoding from GGUF metadata.
 //!
 //! Proper GGUF tokenizer based on actual metadata:
 //! - Supports SentencePiece unigram (llama) using scores with Viterbi best path
@@ -154,7 +154,7 @@ impl<'a> TokenDecoder<'a> {
         }
 
         let mut output = self.drain_bytes(true);
-        let normalized = token.replace('▁', " ").replace('Ġ', " ");
+        let normalized = token.replace(['▁', 'Ġ'], " ");
         output.push_str(&self.emit_text(&normalized));
         output
     }

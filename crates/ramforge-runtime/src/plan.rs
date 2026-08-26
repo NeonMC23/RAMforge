@@ -1,6 +1,6 @@
 //! Planning logic for `ramforge plan` command
 //!
-//! Milestone 6 reporting: the plan distinguishes *file size vs budget*
+//! The plan distinguishes *file size vs budget*
 //! (out-of-core viability) from what the runtime actually charges. The
 //! runtime no longer pre-reserves a fake "tensor_cache capacity +
 //! runtime overhead" inside the budget; it charges real allocations

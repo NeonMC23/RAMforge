@@ -8,7 +8,7 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 >
 > **Milestone 7.1 Baseline (Accounting Hardening):** Resident persistent tensors establish their full load-transient charge **before** file I/O, settle atomically to the actual owned representation, and roll back all startup charges on failure. At M7.1 the load factors were quantized 1×, F32 2×, and F16/BF16 3×; M7.2 supersedes only F32 with its direct 1× representation. The 25% retention policy uses decoded/compact resident bytes rather than file bytes. Final hidden state is caller-owned under a lifetime-matched `tmp:hidden` charge.
 >
-> **Milestone 6.1 Baseline (Correctness & Accounting Fixes):** `generate()` is cleanly repeatable on one engine (explicit KV reset + failure-proof budget); RoPE uses the correct llama/qwen2 **half-split** pair convention; F16/BF16 resident RAM is booked at its true decoded size (4 B/elem, with a 3x-file-byte load transient); qwen2 Q/K/V biases are loaded, budgeted, validated (all-or-none + exact shape), and applied after the projections. Everything below in M6 stands. The M6.1 baseline was verified by 132 tests and synthetic end-to-end runs; real-model files remain untested.
+> **Milestone 6.1 Baseline (Correctness & Accounting Fixes):** `generate()` is cleanly repeatable on one engine (explicit KV reset + failure-proof budget); RoPE uses the correct llama/qwen2 **half-split** pair convention; F16/BF16 resident RAM is booked at its true decoded size (4 B/elem, with a 3×-file-byte load transient); qwen2 Q/K/V biases are loaded, budgeted, validated (all-or-none + exact shape), and applied after the projections. The historical M6.1 baseline was verified by 132 synthetic tests; current validation is summarized below.
 >
 > **Milestone 6 Status (True Out-of-Core Integrity):** Every RAMforge allocation is charged to the RAM budget via RAII-style scoped guards; the cache is budget-charged per entry; matrix layout is the explicit GGML/GGUF convention (no orientation guessing, no full-F32 fallbacks); logits use a single budget-charged buffer with a budget-aware chunked streamed projection; the KV cache grows chunk-wise without prefix copies; the F32 matvec hot path uses AVX2/rayon. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented.
 
@@ -41,7 +41,7 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 - Only persistent weights resident initially; layers loaded on demand → compute → release
 - `ResidencyStats` proves total > budget while peak resident < total and peak managed ≤ budget
 
-### Milestone 5 – Native Quantized Tensor Support (current)
+### Milestone 5 – Native Quantized Tensor Support
 
 **Supported formats:**
 - `Q4_0`: block 32, 18 bytes (2B half scale `d` + 16B packed 4-bit quants, dequant `d*(q-8)`)
@@ -77,9 +77,13 @@ Entire quantized model never resident simultaneously. Layers released after comp
 ### Usable Out-of-Core Inference
 
 - **Streaming output:** generation exposes a text callback backed by a stateful tokenizer decoder; split UTF-8 byte tokens are buffered until displayable, EOS remains suppressed, and CLI diagnostics stay on stderr
-- **Real profiling:** `--profile` measures generation wall time, prompt/prefill, GGUF reads/bytes, layer loading/compute/release, tensor construction, explicit dequantization/copies, F32 and quantized matvec, allocations, logits, sampling, callback time, token latency, and layer-cache misses
+- **Real profiling:** `--profile` measures generation wall time, prompt/prefill, the GGUF read path (destination allocation plus open/seek/read), bytes read, layer loading/compute/release, tensor construction, explicit dequantization/copies, F32 and quantized matvec, allocations, logits, sampling, callback time, token latency, and layer-cache misses
 - **Memory visibility:** `--memory-report` labels RAMforge current/peak/budget separately from Linux process RSS and system memory; MemoryBudget does not claim control over RSS or page cache
 - **Capability registry:** `ramforge support` distinguishes generic GGUF inspection/planning from execution, tokenizer, and quantization support. Direct execution remains limited to `llama` and `qwen2`; Mistral is runnable only when represented by a validated llama-compatible GGUF; `qwen35` is explicitly inspect/plan-only
+
+### Real-model reference validation
+
+A Mistral 7B Q4_K_M GGUF (about 4.37 GB of weights, represented as llama-compatible GGUF) completed a one-token out-of-core run with a 4 GiB RAMforge budget. This is a single environment-specific diagnostic result, not a performance guarantee: generation took about 409 s, read 11.70 GiB over 864 GGUF reads, loaded/released 96 layers, spent about 125 s in the GGUF read path and 282 s in layer compute, and peaked near 306.6 MiB of RAMforge-managed memory (about 189 MiB process RSS at report time). Prompt/prefill took about 272 s. The emitted text was `ikt`; execution and streaming output are validated, but model-output quality is not yet validated. Profile categories include documented overlapping subsets and must not be summed as an exclusive breakdown.
 
 ### Milestone 7.2 – Fast Float Load
 
@@ -115,9 +119,10 @@ Entire quantized model never resident simultaneously. Layers released after comp
 ## Build & Test
 
 ```bash
-cargo build
+cargo fmt --all -- --check
+cargo check --workspace
 cargo test --workspace
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 ## Usage
@@ -223,10 +228,12 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-Current source suite: 88 core tests + 68 runtime tests = 156 tests. The additional focused tests cover incremental UTF-8 decoding, I/O counters, profiling, memory separation, streaming callbacks, capability lookup, and unsupported-architecture diagnostics.
+Validated suite: 88 core tests + 68 runtime tests = 156 tests, with 0 failures and 0 ignored. Focused coverage includes incremental UTF-8 decoding, I/O counters, profiling, memory separation, streaming callbacks, capability lookup, and unsupported-architecture diagnostics.
 
-## Known Limitations (Milestone 7.2)
+## Known Limitations
 
+- Current Q4_K_M CPU inference is functional but extremely slow in the measured NAS-backed Mistral run; profiling identifies both GGUF reads and scalar quantized matvec/dequantization as major costs. Performance optimization is intentionally deferred to a separate measured milestone.
+- Real-model execution and streaming are validated, but generated-text quality is not yet validated.
 - Quantized inference limited to Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K; Q4_1/Q5_0/Q5_1/Q8_1 and IQ* quants not supported
 - CPU-only: quantized matvec is scalar (block-wise dequant); F32 dot/matvec have runtime-detected AVX2 kernels and rayon row-parallelism; no GPU
 - Tokenizer: SentencePiece unigram (score-based Viterbi) and BPE (gpt2/qwen2 merges); other pre-tokenizers/model families untested

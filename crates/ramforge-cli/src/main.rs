@@ -259,13 +259,14 @@ fn run_inference(
     let (gen_tokens, _gen_text) = generation.map_err(|e| anyhow::anyhow!(e))?;
 
     eprintln!("Generated {} tokens", gen_tokens.len());
-    eprintln!("Budget after run: used={} available={} charges={:?}",
-        engine.budget.used_bytes(),
-        engine.budget.available_bytes(),
-        engine.budget.allocations().keys().collect::<Vec<_>>()
-    );
 
     if verbose {
+        eprintln!(
+            "Budget after run: used={} available={} charges={:?}",
+            engine.budget.used_bytes(),
+            engine.budget.available_bytes(),
+            engine.budget.allocations().keys().collect::<Vec<_>>()
+        );
         let stats = &engine.residency_stats;
         eprintln!();
         eprintln!("Residency stats (verbose):");
@@ -346,7 +347,7 @@ fn output_generation_profile(
     eprintln!("  Peak RAMforge-managed memory: {}", format_bytes(profile.ramforge_peak_bytes));
     eprintln!();
     eprintln!("Measured timings (some detailed categories are subsets of layer time):");
-    eprintln!("  File I/O:                 {}", format_duration(profile.io.elapsed));
+    eprintln!("  GGUF read path:           {}", format_duration(profile.io.elapsed));
     eprintln!("  Prompt/prefill:           {}", format_duration(runtime.prompt));
     eprintln!("  Layer loading:            {}", format_duration(runtime.layer_load));
     eprintln!("  Layer compute:            {}", format_duration(runtime.layer_compute));
@@ -524,7 +525,7 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
 fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufModel, ram_str: &str) {
     let info = model.info();
 
-    println!("RAMforge – Execution Plan (Milestone 6: True Out-of-Core Integrity)");
+    println!("RAMforge – Out-of-Core Execution Plan");
     println!("=======================================");
     println!();
     println!("Model:");
@@ -574,7 +575,7 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     println!("  Access method: explicit read_range with validation (no full model load)");
     println!();
 
-    println!("Note: This is Milestone 6 – the RAM budget covers every RAMforge allocation (weights, KV cache, temps). For inference, use 'ramforge run'.");
+    println!("Note: the RAMforge budget covers tracked weights, KV cache, and temporary runtime allocations. For inference, use 'ramforge run'.");
 }
 
 fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {

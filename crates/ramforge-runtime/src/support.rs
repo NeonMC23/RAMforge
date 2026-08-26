@@ -21,7 +21,7 @@ impl RunSupport {
         }
     }
 
-    pub fn is_directly_supported(self) -> bool {
+    fn is_directly_supported(self) -> bool {
         self == Self::Supported
     }
 }

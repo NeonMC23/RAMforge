@@ -15,6 +15,8 @@ use crate::gguf::parse_gguf_file;
 use crate::model::{GgufModel, TensorDescriptor};
 use crate::types::GgmlType;
 
+/// Optional datasource read-path counters. `elapsed` includes destination
+/// allocation plus file open/seek/read, not just kernel read syscall time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IoProfile {
     pub bytes_read: u64,

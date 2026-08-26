@@ -187,8 +187,6 @@ pub fn validate_required_tensors(model: &GgufModel, config: &LlamaConfig) -> Res
     Ok(())
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
