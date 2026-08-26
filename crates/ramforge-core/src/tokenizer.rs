@@ -154,7 +154,7 @@ impl<'a> TokenDecoder<'a> {
         }
 
         let mut output = self.drain_bytes(true);
-        let normalized = token.replace('▁', " ").replace('Ġ', " ");
+        let normalized = token.replace(['▁', 'Ġ'], " ");
         output.push_str(&self.emit_text(&normalized));
         output
     }
