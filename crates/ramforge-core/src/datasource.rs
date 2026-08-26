@@ -32,7 +32,8 @@ impl GgufDataSource {
     /// not load tensor payloads.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DataSourceError> {
         let path_buf = path.as_ref().to_path_buf();
-        let model = parse_gguf_file(&path_buf).map_err(|e| DataSourceError::General(e.to_string()))?;
+        let model =
+            parse_gguf_file(&path_buf).map_err(|e| DataSourceError::General(e.to_string()))?;
         let file_size = model.file_size;
         Ok(Self {
             model,
@@ -337,10 +338,7 @@ impl GgufDataSource {
             // - every possible 32-bit pattern is a valid Rust f32 value;
             // - on success every byte is initialized before `set_len` below.
             let destination = unsafe {
-                std::slice::from_raw_parts_mut(
-                    spare.as_mut_ptr().cast::<u8>(),
-                    byte_length,
-                )
+                std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), byte_length)
             };
             file.read_exact(destination)?;
         }
@@ -488,7 +486,10 @@ mod tests {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(
-            direct.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            direct
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
             reference
                 .iter()
                 .map(|value| value.to_bits())
@@ -574,9 +575,7 @@ mod tests {
             _ => panic!("expected InvalidRange, got {:?}", err),
         }
         // Overflow must be rejected rather than wrapping into an in-bounds read.
-        let err = ds
-            .read_tensor_range("a.weight", 1, u64::MAX)
-            .unwrap_err();
+        let err = ds.read_tensor_range("a.weight", 1, u64::MAX).unwrap_err();
         assert!(matches!(err, DataSourceError::InvalidRange(_)));
     }
 

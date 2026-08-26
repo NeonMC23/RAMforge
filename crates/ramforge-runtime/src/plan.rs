@@ -36,7 +36,9 @@ pub fn plan_model(model: &GgufModel, ram_budget_bytes: u64) -> Result<PlanResult
     let cache_capacity = if ram_budget_bytes < 2 * 1024 * 1024 {
         ram_budget_bytes / 2
     } else {
-        cache_capacity.max(1024 * 1024).min(ram_budget_bytes.saturating_sub(1024 * 1024))
+        cache_capacity
+            .max(1024 * 1024)
+            .min(ram_budget_bytes.saturating_sub(1024 * 1024))
     };
 
     // No static overhead pre-reservation: scoped `tmp:*` guards charge

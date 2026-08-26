@@ -5,17 +5,14 @@
 //! Quantized tensors remain quantized while resident; dequantization happens block-wise during matvec.
 
 use ramforge_core::{
-    datasource::GgufDataSource,
-    memory::MemoryBudget,
-    tensor::TensorData,
-    types::GgmlType,
+    datasource::GgufDataSource, memory::MemoryBudget, tensor::TensorData, types::GgmlType,
 };
 
 use crate::backend::ComputeBackend;
 use crate::kv_cache::KvCache;
 use crate::layer::{group_layers, LayerDescriptor, PersistentDescriptors};
 use crate::model::{validate_required_tensors, LlamaConfig};
-use crate::persistent::{PersistentWeight, should_keep_resident};
+use crate::persistent::{should_keep_resident, PersistentWeight};
 use crate::residency::ResidencyStats;
 
 #[derive(Debug, Clone)]
@@ -74,10 +71,7 @@ pub struct StreamingLlamaModel {
 
 impl StreamingLlamaModel {
     /// Load persistent weights only if they fit comfortably, otherwise stream
-    pub fn load(
-        data_source: &GgufDataSource,
-        budget: &mut MemoryBudget,
-    ) -> Result<Self, String> {
+    pub fn load(data_source: &GgufDataSource, budget: &mut MemoryBudget) -> Result<Self, String> {
         let gguf_model = data_source.model();
         let config = LlamaConfig::from_gguf(gguf_model)?;
 
@@ -92,7 +86,19 @@ impl StreamingLlamaModel {
         let quantized_weight_bytes = gguf_model
             .tensors
             .iter()
-            .filter(|t| matches!(t.ggml_type, GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q2_K | GgmlType::Q3_K | GgmlType::Q8_K))
+            .filter(|t| {
+                matches!(
+                    t.ggml_type,
+                    GgmlType::Q4_0
+                        | GgmlType::Q8_0
+                        | GgmlType::Q4_K
+                        | GgmlType::Q5_K
+                        | GgmlType::Q6_K
+                        | GgmlType::Q2_K
+                        | GgmlType::Q3_K
+                        | GgmlType::Q8_K
+                )
+            })
             .filter_map(|t| t.byte_length)
             .sum();
 
@@ -190,9 +196,12 @@ impl StreamingLlamaModel {
                 // Peak owned representation during load, charged up front.
                 let charge = load_charge_bytes(tensor_desc.ggml_type, file_bytes)?.max(1);
                 let alloc_name = format!("layer:{}:{}", layer_idx, name);
-                budget
-                    .allocate(alloc_name.clone(), charge)
-                    .map_err(|e| format!("RAM budget too small for layer {} tensor '{}': {}", layer_idx, name, e))?;
+                budget.allocate(alloc_name.clone(), charge).map_err(|e| {
+                    format!(
+                        "RAM budget too small for layer {} tensor '{}': {}",
+                        layer_idx, name, e
+                    )
+                })?;
 
                 let tensor_data = load_tensor_data(data_source, tensor_desc)?;
 
@@ -202,9 +211,12 @@ impl StreamingLlamaModel {
                 // Atomically settle the charge to the exact resident size;
                 // the allocation name remains live while TensorData exists.
                 if resident.max(1) != charge {
-                    budget
-                        .resize(&alloc_name, resident.max(1))
-                        .map_err(|e| format!("RAM budget error settling layer {} tensor '{}': {}", layer_idx, name, e))?;
+                    budget.resize(&alloc_name, resident.max(1)).map_err(|e| {
+                        format!(
+                            "RAM budget error settling layer {} tensor '{}': {}",
+                            layer_idx, name, e
+                        )
+                    })?;
                 }
 
                 loaded.push((name.clone(), tensor_data));
@@ -231,8 +243,9 @@ impl StreamingLlamaModel {
         let extract_result = (|map: &mut std::collections::HashMap<String, TensorData>| {
             let mut get = |suffix: &str| -> Result<TensorData, String> {
                 let full = format!("blk.{}.{}", layer_idx, suffix);
-                map.remove(&full)
-                    .ok_or_else(|| format!("missing tensor '{}' in loaded layer {}", full, layer_idx))
+                map.remove(&full).ok_or_else(|| {
+                    format!("missing tensor '{}' in loaded layer {}", full, layer_idx)
+                })
             };
 
             let weights = StreamingLayerWeights {
@@ -448,15 +461,15 @@ impl StreamingLlamaModel {
         match (&layer.attn_q_bias, &layer.attn_k_bias, &layer.attn_v_bias) {
             (None, None, None) => {}
             (Some(bq), Some(bk), Some(bv)) => {
-                let bq = bq
-                    .to_f32_vec()
-                    .map_err(|e| format!("failed to decode attn_q.bias of layer {}: {}", layer_idx, e))?;
-                let bk = bk
-                    .to_f32_vec()
-                    .map_err(|e| format!("failed to decode attn_k.bias of layer {}: {}", layer_idx, e))?;
-                let bv = bv
-                    .to_f32_vec()
-                    .map_err(|e| format!("failed to decode attn_v.bias of layer {}: {}", layer_idx, e))?;
+                let bq = bq.to_f32_vec().map_err(|e| {
+                    format!("failed to decode attn_q.bias of layer {}: {}", layer_idx, e)
+                })?;
+                let bk = bk.to_f32_vec().map_err(|e| {
+                    format!("failed to decode attn_k.bias of layer {}: {}", layer_idx, e)
+                })?;
+                let bv = bv.to_f32_vec().map_err(|e| {
+                    format!("failed to decode attn_v.bias of layer {}: {}", layer_idx, e)
+                })?;
                 for (x, b) in q_tmp.iter_mut().zip(bq.iter()) {
                     *x += *b;
                 }
@@ -613,12 +626,9 @@ fn load_persistent_weight(
             desc.ggml_type.name()
         )
     })?;
-    let expected_resident = TensorData::resident_bytes_for(
-        desc.ggml_type,
-        desc.num_elements,
-        file_bytes,
-    )
-    .map_err(|e| format!("failed to determine resident size for '{}': {}", name, e))?;
+    let expected_resident =
+        TensorData::resident_bytes_for(desc.ggml_type, desc.num_elements, file_bytes)
+            .map_err(|e| format!("failed to determine resident size for '{}': {}", name, e))?;
 
     if !should_keep_resident(expected_resident, budget.total_bytes()) {
         return Ok((PersistentWeight::Streamed(desc), None));
@@ -775,9 +785,15 @@ mod tests {
         w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
         w.write_all(s.as_bytes()).unwrap();
     }
-    fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
-    fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
-    fn write_f32<W: Write>(w: &mut W, v: f32) { w.write_all(&v.to_le_bytes()).unwrap(); }
+    fn write_u32<W: Write>(w: &mut W, v: u32) {
+        w.write_all(&v.to_le_bytes()).unwrap();
+    }
+    fn write_u64<W: Write>(w: &mut W, v: u64) {
+        w.write_all(&v.to_le_bytes()).unwrap();
+    }
+    fn write_f32<W: Write>(w: &mut W, v: f32) {
+        w.write_all(&v.to_le_bytes()).unwrap();
+    }
 
     /// Minimal one-tensor GGUF used to exercise persistent loading directly.
     fn create_single_tensor_gguf(
@@ -824,39 +840,109 @@ mod tests {
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
         };
-        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "general.architecture",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
         add_kv("llama.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("llama.context_length", 4, Box::new(|b| write_u32(b, 64)));
-        add_kv("llama.embedding_length", 4, Box::new(|b| write_u32(b, n_embd as u32)));
-        add_kv("llama.block_count", 4, Box::new(|b| write_u32(b, n_layers as u32)));
-        add_kv("llama.feed_forward_length", 4, Box::new(|b| write_u32(b, ffn as u32)));
-        add_kv("llama.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
-        add_kv("llama.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
-        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "llama.embedding_length",
+            4,
+            Box::new(|b| write_u32(b, n_embd as u32)),
+        );
+        add_kv(
+            "llama.block_count",
+            4,
+            Box::new(|b| write_u32(b, n_layers as u32)),
+        );
+        add_kv(
+            "llama.feed_forward_length",
+            4,
+            Box::new(|b| write_u32(b, ffn as u32)),
+        );
+        add_kv(
+            "llama.attention.head_count",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.head_count_kv",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.layer_norm_rms_epsilon",
+            6,
+            Box::new(|b| write_f32(b, 1e-5)),
+        );
+        add_kv(
+            "llama.rope.freq_base",
+            6,
+            Box::new(|b| write_f32(b, 10000.0)),
+        );
+        add_kv(
+            "tokenizer.ggml.model",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
 
         let mut offset = 0u64;
         let mut defs: Vec<(String, Vec<u64>, u32)> = Vec::new();
         defs.push(("token_embd.weight".to_string(), vec![n_embd as u64, 16], 0));
         defs.push(("output_norm.weight".to_string(), vec![n_embd as u64], 0));
         for i in 0..n_layers {
-            defs.push((format!("blk.{}.attn_norm.weight", i), vec![n_embd as u64], 0));
-            defs.push((format!("blk.{}.attn_q.weight", i), vec![n_embd as u64, n_embd as u64], 0));
-            defs.push((format!("blk.{}.attn_k.weight", i), vec![n_embd as u64, n_embd as u64], 0));
-            defs.push((format!("blk.{}.attn_v.weight", i), vec![n_embd as u64, n_embd as u64], 0));
-            defs.push((format!("blk.{}.attn_output.weight", i), vec![n_embd as u64, n_embd as u64], 0));
+            defs.push((
+                format!("blk.{}.attn_norm.weight", i),
+                vec![n_embd as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.attn_q.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.attn_k.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.attn_v.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.attn_output.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                0,
+            ));
             defs.push((format!("blk.{}.ffn_norm.weight", i), vec![n_embd as u64], 0));
             // ggml layout [in, out]: gate/up map n_embd -> ffn, down maps ffn -> n_embd
-            defs.push((format!("blk.{}.ffn_gate.weight", i), vec![n_embd as u64, ffn as u64], 0));
-            defs.push((format!("blk.{}.ffn_up.weight", i), vec![n_embd as u64, ffn as u64], 0));
-            defs.push((format!("blk.{}.ffn_down.weight", i), vec![ffn as u64, n_embd as u64], 0));
+            defs.push((
+                format!("blk.{}.ffn_gate.weight", i),
+                vec![n_embd as u64, ffn as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.ffn_up.weight", i),
+                vec![n_embd as u64, ffn as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.ffn_down.weight", i),
+                vec![ffn as u64, n_embd as u64],
+                0,
+            ));
         }
 
         for (name, dims, ty) in &defs {
             write_string(&mut buf, name);
             write_u32(&mut buf, dims.len() as u32);
-            for d in dims { write_u64(&mut buf, *d); }
+            for d in dims {
+                write_u64(&mut buf, *d);
+            }
             write_u32(&mut buf, *ty);
             write_u64(&mut buf, offset);
             let elems: u64 = dims.iter().product();
@@ -889,17 +975,45 @@ mod tests {
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
         };
-        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "general.architecture",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
         add_kv("llama.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("llama.context_length", 4, Box::new(|b| write_u32(b, 64)));
         add_kv("llama.embedding_length", 4, Box::new(|b| write_u32(b, 8)));
         add_kv("llama.block_count", 4, Box::new(|b| write_u32(b, 1)));
-        add_kv("llama.feed_forward_length", 4, Box::new(|b| write_u32(b, 16)));
-        add_kv("llama.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
-        add_kv("llama.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
-        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "llama.feed_forward_length",
+            4,
+            Box::new(|b| write_u32(b, 16)),
+        );
+        add_kv(
+            "llama.attention.head_count",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.head_count_kv",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.layer_norm_rms_epsilon",
+            6,
+            Box::new(|b| write_f32(b, 1e-5)),
+        );
+        add_kv(
+            "llama.rope.freq_base",
+            6,
+            Box::new(|b| write_f32(b, 10000.0)),
+        );
+        add_kv(
+            "tokenizer.ggml.model",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
 
         // (name, dims, ggml type id, bytes per element)
         let n_embd: u64 = 8;
@@ -912,7 +1026,12 @@ mod tests {
         defs.push(("blk.0.attn_q.weight".into(), vec![n_embd, n_embd], 1, 2)); // F16
         defs.push(("blk.0.attn_k.weight".into(), vec![n_embd, n_embd], 30, 2)); // BF16
         defs.push(("blk.0.attn_v.weight".into(), vec![n_embd, n_embd], 0, 4));
-        defs.push(("blk.0.attn_output.weight".into(), vec![n_embd, n_embd], 0, 4));
+        defs.push((
+            "blk.0.attn_output.weight".into(),
+            vec![n_embd, n_embd],
+            0,
+            4,
+        ));
         defs.push(("blk.0.ffn_norm.weight".into(), vec![n_embd], 0, 4));
         defs.push(("blk.0.ffn_gate.weight".into(), vec![n_embd, ffn], 0, 4));
         defs.push(("blk.0.ffn_up.weight".into(), vec![n_embd, ffn], 0, 4));
@@ -1016,17 +1135,45 @@ mod tests {
             write_val(&mut buf);
         };
         // qwen2 arch + qwen2.* metadata keys (same tensor naming as llama)
-        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "qwen2")));
+        add_kv(
+            "general.architecture",
+            8,
+            Box::new(|b| write_string(b, "qwen2")),
+        );
         add_kv("qwen2.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("qwen2.context_length", 4, Box::new(|b| write_u32(b, 64)));
         add_kv("qwen2.embedding_length", 4, Box::new(|b| write_u32(b, 8)));
         add_kv("qwen2.block_count", 4, Box::new(|b| write_u32(b, 1)));
-        add_kv("qwen2.feed_forward_length", 4, Box::new(|b| write_u32(b, 16)));
-        add_kv("qwen2.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("qwen2.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("qwen2.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
-        add_kv("qwen2.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
-        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "qwen2.feed_forward_length",
+            4,
+            Box::new(|b| write_u32(b, 16)),
+        );
+        add_kv(
+            "qwen2.attention.head_count",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "qwen2.attention.head_count_kv",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "qwen2.attention.layer_norm_rms_epsilon",
+            6,
+            Box::new(|b| write_f32(b, 1e-5)),
+        );
+        add_kv(
+            "qwen2.rope.freq_base",
+            6,
+            Box::new(|b| write_f32(b, 10000.0)),
+        );
+        add_kv(
+            "tokenizer.ggml.model",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
 
         let mut offset = 0u64;
         for (name, dims) in &defs {
@@ -1058,7 +1205,10 @@ mod tests {
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
         let desc = ds.get_descriptor("test.weight").unwrap();
         assert_eq!(desc.byte_length, Some(32));
-        assert_eq!(TensorData::resident_bytes_for(GgmlType::F32, 8, 32).unwrap(), 32);
+        assert_eq!(
+            TensorData::resident_bytes_for(GgmlType::F32, 8, 32).unwrap(),
+            32
+        );
         assert_eq!(load_charge_bytes(GgmlType::F32, 32).unwrap(), 32);
 
         // Exactly 32 bytes remain. The direct loader succeeds because its only
@@ -1066,8 +1216,7 @@ mod tests {
         // raw+decoded 64-byte path would have failed this budget.
         let mut budget = MemoryBudget::new(128).unwrap();
         budget.allocate("existing", 96).unwrap();
-        let (weight, allocation) =
-            load_persistent_weight(&ds, "test.weight", &mut budget).unwrap();
+        let (weight, allocation) = load_persistent_weight(&ds, "test.weight", &mut budget).unwrap();
         assert!(weight.is_resident());
         assert_eq!(weight.resident_bytes(), 32);
         assert_eq!(allocation.as_deref(), Some("weight:test.weight"));
@@ -1086,7 +1235,10 @@ mod tests {
         assert!(error.contains("load charge"), "unexpected error: {}", error);
         assert_eq!(tight.used_bytes(), before);
         assert!(tight.get("weight:test.weight").is_none());
-        assert!(!tight.allocations().keys().any(|name| name.starts_with("tmp:")));
+        assert!(!tight
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("tmp:")));
     }
 
     #[test]
@@ -1094,14 +1246,23 @@ mod tests {
         let raw: Vec<u8> = (0..8).flat_map(|_| 0x3C00u16.to_le_bytes()).collect();
         let tmp = create_single_tensor_gguf("test.weight", GgmlType::F16, &[8], &raw);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
-        let file_bytes = ds.get_descriptor("test.weight").unwrap().byte_length.unwrap();
+        let file_bytes = ds
+            .get_descriptor("test.weight")
+            .unwrap()
+            .byte_length
+            .unwrap();
         assert_eq!(file_bytes, 8 * 2);
-        assert_eq!(load_charge_bytes(GgmlType::F16, file_bytes).unwrap(), 3 * file_bytes);
-        assert_eq!(TensorData::resident_bytes_for(GgmlType::F16, 8, file_bytes).unwrap(), 8 * 4);
+        assert_eq!(
+            load_charge_bytes(GgmlType::F16, file_bytes).unwrap(),
+            3 * file_bytes
+        );
+        assert_eq!(
+            TensorData::resident_bytes_for(GgmlType::F16, 8, file_bytes).unwrap(),
+            8 * 4
+        );
 
         let mut budget = MemoryBudget::new(128).unwrap();
-        let (weight, allocation) =
-            load_persistent_weight(&ds, "test.weight", &mut budget).unwrap();
+        let (weight, allocation) = load_persistent_weight(&ds, "test.weight", &mut budget).unwrap();
         assert!(weight.is_resident());
         assert_eq!(weight.resident_bytes(), 8 * 4);
         assert_eq!(allocation.as_deref(), Some("weight:test.weight"));
@@ -1119,14 +1280,23 @@ mod tests {
         let raw: Vec<u8> = (0..8).flat_map(|_| one.to_le_bytes()).collect();
         let tmp = create_single_tensor_gguf("test.weight", GgmlType::BF16, &[8], &raw);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
-        let file_bytes = ds.get_descriptor("test.weight").unwrap().byte_length.unwrap();
+        let file_bytes = ds
+            .get_descriptor("test.weight")
+            .unwrap()
+            .byte_length
+            .unwrap();
         assert_eq!(file_bytes, 8 * 2);
-        assert_eq!(load_charge_bytes(GgmlType::BF16, file_bytes).unwrap(), 3 * file_bytes);
-        assert_eq!(TensorData::resident_bytes_for(GgmlType::BF16, 8, file_bytes).unwrap(), 8 * 4);
+        assert_eq!(
+            load_charge_bytes(GgmlType::BF16, file_bytes).unwrap(),
+            3 * file_bytes
+        );
+        assert_eq!(
+            TensorData::resident_bytes_for(GgmlType::BF16, 8, file_bytes).unwrap(),
+            8 * 4
+        );
 
         let mut budget = MemoryBudget::new(128).unwrap();
-        let (weight, allocation) =
-            load_persistent_weight(&ds, "test.weight", &mut budget).unwrap();
+        let (weight, allocation) = load_persistent_weight(&ds, "test.weight", &mut budget).unwrap();
         assert!(weight.is_resident());
         assert_eq!(weight.resident_bytes(), 8 * 4);
         assert_eq!(allocation.as_deref(), Some("weight:test.weight"));
@@ -1145,19 +1315,30 @@ mod tests {
         raw.extend_from_slice(&[0x88; 16]);
         let tmp = create_single_tensor_gguf("test.weight", GgmlType::Q4_0, &[32], &raw);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
-        let file_bytes = ds.get_descriptor("test.weight").unwrap().byte_length.unwrap();
+        let file_bytes = ds
+            .get_descriptor("test.weight")
+            .unwrap()
+            .byte_length
+            .unwrap();
         assert_eq!(file_bytes, 18);
-        assert_eq!(load_charge_bytes(GgmlType::Q4_0, file_bytes).unwrap(), file_bytes);
-        assert_eq!(TensorData::resident_bytes_for(GgmlType::Q4_0, 32, file_bytes).unwrap(), file_bytes);
+        assert_eq!(
+            load_charge_bytes(GgmlType::Q4_0, file_bytes).unwrap(),
+            file_bytes
+        );
+        assert_eq!(
+            TensorData::resident_bytes_for(GgmlType::Q4_0, 32, file_bytes).unwrap(),
+            file_bytes
+        );
 
         let mut budget = MemoryBudget::new(72).unwrap();
-        let (weight, allocation) =
-            load_persistent_weight(&ds, "test.weight", &mut budget).unwrap();
+        let (weight, allocation) = load_persistent_weight(&ds, "test.weight", &mut budget).unwrap();
         assert!(weight.is_resident());
         assert_eq!(weight.resident_bytes(), 18);
         match &weight {
             PersistentWeight::Resident(tensor) => assert!(tensor.is_quantized()),
-            PersistentWeight::Streamed(_) => panic!("Q4_0 tensor should fit at the policy boundary"),
+            PersistentWeight::Streamed(_) => {
+                panic!("Q4_0 tensor should fit at the policy boundary")
+            }
         }
         assert_eq!(allocation.as_deref(), Some("weight:test.weight"));
         assert_eq!(budget.get("weight:test.weight"), Some(18));
@@ -1171,10 +1352,8 @@ mod tests {
     fn test_persistent_policy_uses_decoded_resident_size() {
         // F32: 32 resident bytes fit exactly at the 25% boundary.
         let f32_raw = vec![0u8; 8 * 4];
-        let f32_tmp =
-            create_single_tensor_gguf("test.weight", GgmlType::F32, &[8], &f32_raw);
-        let f32_ds =
-            ramforge_core::datasource::GgufDataSource::open(f32_tmp.path()).unwrap();
+        let f32_tmp = create_single_tensor_gguf("test.weight", GgmlType::F32, &[8], &f32_raw);
+        let f32_ds = ramforge_core::datasource::GgufDataSource::open(f32_tmp.path()).unwrap();
         let mut f32_budget = MemoryBudget::new(128).unwrap();
         let (f32_weight, f32_allocation) =
             load_persistent_weight(&f32_ds, "test.weight", &mut f32_budget).unwrap();
@@ -1194,7 +1373,11 @@ mod tests {
             let mut budget = MemoryBudget::new(96).unwrap();
             let (weight, allocation) =
                 load_persistent_weight(&ds, "test.weight", &mut budget).unwrap();
-            assert!(weight.is_streamed(), "{} should be streamed", ggml_type.name());
+            assert!(
+                weight.is_streamed(),
+                "{} should be streamed",
+                ggml_type.name()
+            );
             assert!(allocation.is_none());
             assert_eq!(budget.used_bytes(), 0);
             assert!(budget.get("weight:test.weight").is_none());
@@ -1223,8 +1406,14 @@ mod tests {
         );
         assert_eq!(budget.used_bytes(), before);
         assert_eq!(budget.get("existing"), Some(17));
-        assert!(!budget.allocations().keys().any(|name| name.starts_with("weight:")));
-        assert!(!budget.allocations().keys().any(|name| name.starts_with("tmp:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("weight:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("tmp:")));
     }
 
     #[test]
@@ -1270,7 +1459,10 @@ mod tests {
 
         assert_eq!(budget.used_bytes(), persistent_used);
         assert!(budget.get("tmp:hidden").is_none());
-        assert!(!budget.allocations().keys().any(|name| name.starts_with("tmp:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("tmp:")));
     }
 
     #[test]
@@ -1323,14 +1515,22 @@ mod tests {
             .allocations()
             .keys()
             .any(|name| name.starts_with("layer:0:")));
-        assert!(!budget.allocations().keys().any(|name| name.starts_with("tmp:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("tmp:")));
     }
 
     #[test]
     fn test_out_of_core_model_larger_than_budget() {
         let tmp = create_model_with_n_layers(8, 32, 64);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
-        let total_bytes: u64 = ds.model().tensors.iter().filter_map(|t| t.byte_length).sum();
+        let total_bytes: u64 = ds
+            .model()
+            .tensors
+            .iter()
+            .filter_map(|t| t.byte_length)
+            .sum();
 
         // Per layer ~41 KiB; direct F32 loading charges one final
         // representation, plus persistents (~2.1 KiB). 96 KiB fits one layer
@@ -1375,17 +1575,53 @@ mod tests {
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
         };
-        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "general.architecture",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
         add_kv("llama.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("llama.context_length", 4, Box::new(|b| write_u32(b, 64)));
-        add_kv("llama.embedding_length", 4, Box::new(|b| write_u32(b, n_embd as u32)));
-        add_kv("llama.block_count", 4, Box::new(|b| write_u32(b, n_layers as u32)));
-        add_kv("llama.feed_forward_length", 4, Box::new(|b| write_u32(b, ffn as u32)));
-        add_kv("llama.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
-        add_kv("llama.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
-        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "llama.embedding_length",
+            4,
+            Box::new(|b| write_u32(b, n_embd as u32)),
+        );
+        add_kv(
+            "llama.block_count",
+            4,
+            Box::new(|b| write_u32(b, n_layers as u32)),
+        );
+        add_kv(
+            "llama.feed_forward_length",
+            4,
+            Box::new(|b| write_u32(b, ffn as u32)),
+        );
+        add_kv(
+            "llama.attention.head_count",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.head_count_kv",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.layer_norm_rms_epsilon",
+            6,
+            Box::new(|b| write_f32(b, 1e-5)),
+        );
+        add_kv(
+            "llama.rope.freq_base",
+            6,
+            Box::new(|b| write_f32(b, 10000.0)),
+        );
+        add_kv(
+            "tokenizer.ggml.model",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
 
         let mut offset = 0u64;
         let mut defs: Vec<(String, Vec<u64>, u32)> = Vec::new();
@@ -1393,22 +1629,56 @@ mod tests {
         defs.push(("token_embd.weight".to_string(), vec![n_embd as u64, 16], 0)); // F32 for simplicity
         defs.push(("output_norm.weight".to_string(), vec![n_embd as u64], 0));
         for i in 0..n_layers {
-            defs.push((format!("blk.{}.attn_norm.weight", i), vec![n_embd as u64], 0));
-            defs.push((format!("blk.{}.attn_q.weight", i), vec![n_embd as u64, n_embd as u64], 2)); // Q4_0
-            defs.push((format!("blk.{}.attn_k.weight", i), vec![n_embd as u64, n_embd as u64], 2));
-            defs.push((format!("blk.{}.attn_v.weight", i), vec![n_embd as u64, n_embd as u64], 2));
-            defs.push((format!("blk.{}.attn_output.weight", i), vec![n_embd as u64, n_embd as u64], 2));
+            defs.push((
+                format!("blk.{}.attn_norm.weight", i),
+                vec![n_embd as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.attn_q.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                2,
+            )); // Q4_0
+            defs.push((
+                format!("blk.{}.attn_k.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                2,
+            ));
+            defs.push((
+                format!("blk.{}.attn_v.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                2,
+            ));
+            defs.push((
+                format!("blk.{}.attn_output.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                2,
+            ));
             defs.push((format!("blk.{}.ffn_norm.weight", i), vec![n_embd as u64], 0));
             // ggml layout [in, out]: gate/up map n_embd -> ffn, down maps ffn -> n_embd
-            defs.push((format!("blk.{}.ffn_gate.weight", i), vec![n_embd as u64, ffn as u64], 2));
-            defs.push((format!("blk.{}.ffn_up.weight", i), vec![n_embd as u64, ffn as u64], 2));
-            defs.push((format!("blk.{}.ffn_down.weight", i), vec![ffn as u64, n_embd as u64], 2));
+            defs.push((
+                format!("blk.{}.ffn_gate.weight", i),
+                vec![n_embd as u64, ffn as u64],
+                2,
+            ));
+            defs.push((
+                format!("blk.{}.ffn_up.weight", i),
+                vec![n_embd as u64, ffn as u64],
+                2,
+            ));
+            defs.push((
+                format!("blk.{}.ffn_down.weight", i),
+                vec![ffn as u64, n_embd as u64],
+                2,
+            ));
         }
 
         for (name, dims, ty) in &defs {
             write_string(&mut buf, name);
             write_u32(&mut buf, dims.len() as u32);
-            for d in dims { write_u64(&mut buf, *d); }
+            for d in dims {
+                write_u64(&mut buf, *d);
+            }
             write_u32(&mut buf, *ty);
             write_u64(&mut buf, offset);
             let elems: u64 = dims.iter().product();
@@ -1425,16 +1695,23 @@ mod tests {
 
         // Write dummy data: for F32 tensors 1.0, for Q4_0: d=1.0, qs=0x88 (0)
         // token_embd F32
-        for _ in 0..16*n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); }
+        for _ in 0..16 * n_embd {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
         // output_norm
-        for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); }
+        for _ in 0..n_embd {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
         for _ in 0..n_layers {
             // attn_norm F32
-            for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); }
+            for _ in 0..n_embd {
+                buf.extend_from_slice(&1.0f32.to_le_bytes());
+            }
             // Q4_0 tensors: each 32 elements => 18 bytes per block
             // n_embd 32 => 1 block per row? For [32,32] => 32 rows * 18 =576 bytes per tensor
             // We'll write zeros for simplicity: d=1.0, qs=0x88 (dequant 0)
-            for _ in 0..4 { // 4 tensors * 576?
+            for _ in 0..4 {
+                // 4 tensors * 576?
                 for _ in 0..n_embd {
                     let d_fp16: u16 = 0x3C00;
                     buf.extend_from_slice(&d_fp16.to_le_bytes());
@@ -1442,7 +1719,9 @@ mod tests {
                 }
             }
             // ffn_norm
-            for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); }
+            for _ in 0..n_embd {
+                buf.extend_from_slice(&1.0f32.to_le_bytes());
+            }
             // ffn_gate, up, down Q4_0
             // ffn 64, n_embd 32: [64,32] => 64 rows, each row 32 elements => 1 block per row => 64*18=1152 per tensor
             for _ in 0..2 {
@@ -1516,7 +1795,10 @@ mod tests {
         model.release_layer(0, &mut budget, &mut stats);
         assert_eq!(budget.used_bytes(), persistents_used);
         drop(layer);
-        assert!(!budget.allocations().keys().any(|k| k.starts_with("layer:0:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|k| k.starts_with("layer:0:")));
     }
 
     #[test]
@@ -1547,7 +1829,10 @@ mod tests {
         );
         // The failed load must leave no partial layer charges behind.
         assert_eq!(budget.used_bytes(), before);
-        assert!(!budget.allocations().keys().any(|k| k.starts_with("layer:0:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|k| k.starts_with("layer:0:")));
     }
 
     #[test]
@@ -1599,7 +1884,10 @@ mod tests {
         );
         // Rejection must not leak the layer's charges.
         assert_eq!(budget.used_bytes(), before);
-        assert!(!budget.allocations().keys().any(|k| k.starts_with("layer:0:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|k| k.starts_with("layer:0:")));
     }
 
     #[test]

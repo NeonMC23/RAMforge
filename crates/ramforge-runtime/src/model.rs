@@ -17,7 +17,6 @@
 
 use ramforge_core::model::GgufModel;
 
-
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
     pub vocab_size: usize,
@@ -35,7 +34,11 @@ pub struct LlamaConfig {
 impl LlamaConfig {
     pub fn from_gguf(model: &GgufModel) -> Result<Self, String> {
         let info = model.info();
-        let arch = info.architecture.as_deref().unwrap_or("unknown").to_string();
+        let arch = info
+            .architecture
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string();
 
         // Supported architectures: llama and qwen2 (both use same dense transformer layout)
         let supported = ["llama", "qwen2"];
@@ -93,17 +96,26 @@ impl LlamaConfig {
         };
 
         let vocab_size = get_u64_arch("vocab_size")
-            .or_else(|| model.get_metadata("tokenizer.ggml.tokens").and_then(|v| v.as_array()).map(|a| a.values.len() as u64))
-            .ok_or_else(|| format!("missing vocab_size (tried {}.vocab_size)", arch))? as usize;
+            .or_else(|| {
+                model
+                    .get_metadata("tokenizer.ggml.tokens")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.values.len() as u64)
+            })
+            .ok_or_else(|| format!("missing vocab_size (tried {}.vocab_size)", arch))?
+            as usize;
 
         let context_length = get_u64_arch("context_length")
-            .ok_or_else(|| format!("missing {}.context_length", arch))? as usize;
+            .ok_or_else(|| format!("missing {}.context_length", arch))?
+            as usize;
 
         let embedding_length = get_u64_arch("embedding_length")
-            .ok_or_else(|| format!("missing {}.embedding_length", arch))? as usize;
+            .ok_or_else(|| format!("missing {}.embedding_length", arch))?
+            as usize;
 
         let block_count = get_u64_arch("block_count")
-            .ok_or_else(|| format!("missing {}.block_count", arch))? as usize;
+            .ok_or_else(|| format!("missing {}.block_count", arch))?
+            as usize;
 
         let feed_forward_length = get_u64_arch("feed_forward_length")
             .or_else(|| get_u64_arch("intermediate_size"))
@@ -113,13 +125,15 @@ impl LlamaConfig {
                     .get_metadata("llama.feed_forward_length")
                     .and_then(|v| v.as_u64())
             })
-            .ok_or_else(|| format!("missing {}.feed_forward_length", arch))? as usize;
+            .ok_or_else(|| format!("missing {}.feed_forward_length", arch))?
+            as usize;
 
         let head_count = get_u64_arch("attention.head_count")
-            .ok_or_else(|| format!("missing {}.attention.head_count", arch))? as usize;
+            .ok_or_else(|| format!("missing {}.attention.head_count", arch))?
+            as usize;
 
-        let head_count_kv = get_u64_arch("attention.head_count_kv")
-            .unwrap_or(head_count as u64) as usize;
+        let head_count_kv =
+            get_u64_arch("attention.head_count_kv").unwrap_or(head_count as u64) as usize;
 
         let rms_eps = get_f32_arch("attention.layer_norm_rms_epsilon")
             .or_else(|| get_f32_arch("attention.layer_norm_epsilon"))
@@ -191,8 +205,6 @@ pub fn validate_required_tensors(model: &GgufModel, config: &LlamaConfig) -> Res
 
     Ok(())
 }
-
-
 
 #[cfg(test)]
 mod tests {

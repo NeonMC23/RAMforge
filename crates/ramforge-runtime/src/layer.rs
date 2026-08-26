@@ -30,7 +30,11 @@ impl LayerDescriptor {
                     break;
                 }
             }
-            if all_known { Some(sum) } else { None }
+            if all_known {
+                Some(sum)
+            } else {
+                None
+            }
         };
 
         Self {
@@ -76,9 +80,21 @@ pub struct PersistentDescriptors {
 
 impl PersistentDescriptors {
     pub fn from_model(model: &GgufModel) -> Self {
-        let token_embd = model.tensors.iter().find(|t| t.name == "token_embd.weight").cloned();
-        let output_norm = model.tensors.iter().find(|t| t.name == "output_norm.weight").cloned();
-        let output = model.tensors.iter().find(|t| t.name == "output.weight").cloned();
+        let token_embd = model
+            .tensors
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .cloned();
+        let output_norm = model
+            .tensors
+            .iter()
+            .find(|t| t.name == "output_norm.weight")
+            .cloned();
+        let output = model
+            .tensors
+            .iter()
+            .find(|t| t.name == "output.weight")
+            .cloned();
         Self {
             token_embd,
             output_norm,
@@ -104,7 +120,11 @@ impl PersistentDescriptors {
                 break;
             }
         }
-        if all_known { Some(sum) } else { None }
+        if all_known {
+            Some(sum)
+        } else {
+            None
+        }
     }
 }
 
@@ -119,8 +139,12 @@ mod tests {
         w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
         w.write_all(s.as_bytes()).unwrap();
     }
-    fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
-    fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
+    fn write_u32<W: Write>(w: &mut W, v: u32) {
+        w.write_all(&v.to_le_bytes()).unwrap();
+    }
+    fn write_u64<W: Write>(w: &mut W, v: u64) {
+        w.write_all(&v.to_le_bytes()).unwrap();
+    }
 
     fn make_model_with_layers(n_layers: usize) -> GgufModel {
         let mut buf = Vec::new();

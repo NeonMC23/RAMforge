@@ -22,13 +22,7 @@ pub trait ComputeBackend: Debug + Send + Sync {
     fn name(&self) -> &'static str;
 
     /// F32 matvec in explicit ggml layout; errors on arity mismatch.
-    fn matvec(
-        &self,
-        w: &[f32],
-        w_shape: &[usize],
-        x: &[f32],
-        y: &mut [f32],
-    ) -> Result<(), String>;
+    fn matvec(&self, w: &[f32], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), String>;
 
     fn rmsnorm(&self, x: &[f32], weight: &[f32], eps: f32, y: &mut [f32]);
 
@@ -97,13 +91,7 @@ impl ComputeBackend for CpuBackend {
     }
 
     #[allow(clippy::needless_range_loop)]
-    fn matvec(
-        &self,
-        w: &[f32],
-        w_shape: &[usize],
-        x: &[f32],
-        y: &mut [f32],
-    ) -> Result<(), String> {
+    fn matvec(&self, w: &[f32], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), String> {
         if w_shape.len() != 2 {
             return Err(format!(
                 "backend matvec expects 2D w_shape [in, out] (ggml layout), got {:?}",
@@ -244,7 +232,9 @@ mod tests {
         let mut y_simd = vec![0.0; 2];
 
         let scalar_backend = CpuBackend::scalar();
-        scalar_backend.matvec(&w, &[3, 2], &x, &mut y_scalar).unwrap();
+        scalar_backend
+            .matvec(&w, &[3, 2], &x, &mut y_scalar)
+            .unwrap();
 
         let simd_backend = CpuBackend {
             num_threads: 1,
