@@ -128,10 +128,7 @@ pub fn architecture_capability(name: &str) -> Option<&'static ArchitectureCapabi
     let normalized = name.to_ascii_lowercase();
     ARCHITECTURES.iter().find(|capability| {
         capability.name == normalized.as_str()
-            || capability
-                .aliases
-                .iter()
-                .any(|alias| *alias == normalized.as_str())
+            || capability.aliases.contains(&normalized.as_str())
     })
 }
 
