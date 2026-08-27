@@ -10,8 +10,10 @@ pub struct ResidencyStats {
     pub peak_resident_layer_bytes: u64,
     /// Number of layer loads
     pub num_layer_loads: u64,
-    /// Number of layer releases/evictions
+    /// Number of active streamed layers whose charges were released.
     pub num_layer_releases: u64,
+    /// Number of active layers transitioned into cache residency.
+    pub num_layer_cached: u64,
     /// Peak RAMforge-managed bytes (budget used)
     pub peak_managed_bytes: u64,
     /// Current managed bytes
@@ -40,6 +42,16 @@ impl ResidencyStats {
 
     pub fn on_layer_release(&mut self, current_managed: u64) {
         self.num_layer_releases += 1;
+        self.on_layer_inactive(current_managed);
+    }
+
+    /// The active layer became cache-resident rather than being released.
+    pub fn on_layer_cached(&mut self, current_managed: u64) {
+        self.num_layer_cached += 1;
+        self.on_layer_inactive(current_managed);
+    }
+
+    fn on_layer_inactive(&mut self, current_managed: u64) {
         self.current_resident_layer_bytes = 0;
         self.current_managed_bytes = current_managed;
         if current_managed > self.peak_managed_bytes {
@@ -72,6 +84,8 @@ mod tests {
         stats.on_layer_release(400);
         assert_eq!(stats.current_resident_layer_bytes, 0);
         assert_eq!(stats.num_layer_releases, 1);
+        stats.on_layer_cached(550);
+        assert_eq!(stats.num_layer_cached, 1);
         assert_eq!(stats.peak_managed_bytes, 600);
     }
 }

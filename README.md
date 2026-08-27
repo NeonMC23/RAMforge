@@ -78,10 +78,11 @@ Entire quantized model never resident simultaneously. Layers released after comp
 
 - **Streaming output:** generation exposes a text callback backed by a stateful tokenizer decoder; split UTF-8 byte tokens are buffered until displayable, EOS remains suppressed, and CLI diagnostics stay on stderr
 - **No unused terminal forward:** once the final requested token is selected and emitted, RAMforge does not stream all layers again unless another token's logits are required
-- **Real profiling:** `--profile` measures generation wall time, prompt/prefill, prompt/decode forward counts, per-tensor reads/bytes, the GGUF read path (destination allocation plus seek/read on a reused handle), layer loading/compute/release, tensor construction, explicit dequantization/copies, F32 and quantized matvec, allocations, logits, sampling, callback time, token latency, and layer-cache misses
+- **Real profiling:** `--profile` measures generation wall time, prompt/prefill, prompt/decode forward counts, per-tensor reads/bytes, the GGUF read path (destination allocation plus seek/read on a reused handle), layer loading/compute/release, tensor construction, explicit dequantization/copies, F32 and quantized matvec, allocations, logits, sampling, callback time, token latency, and layer-cache hits/misses/evictions/current/peak residency
 - **Memory visibility:** `--memory-report` labels RAMforge current/peak/budget separately from Linux process RSS and system memory; MemoryBudget does not claim control over RSS or page cache
 - **Capability registry:** `ramforge support` distinguishes generic GGUF inspection/planning from execution, tokenizer, and quantization support. Direct execution remains limited to `llama` and `qwen2`; Mistral is runnable only when represented by a validated llama-compatible GGUF; `qwen35` is explicitly inspect/plan-only
 - **Execution memory preflight:** for runnable architectures, `ramforge plan` applies the runtime’s persistent-retention, decoded-residency, and per-tensor load-transient rules to report the largest layer and a necessary managed-memory lower bound. It explicitly excludes prompt-dependent KV and activation workspaces, so it is not presented as a sufficient runtime guarantee.
+- **Bounded streamed-layer cache:** recently used decoded layer representations may remain resident under an explicit byte capacity derived from the selected budget and largest-layer headroom. Every cache entry keeps its MemoryBudget charge, LRU eviction releases it exactly, and mandatory KV/activation/output workspaces can force safe eviction. Hits avoid GGUF rereads; planner capacity is an estimate and does not guarantee hits.
 
 ### Real-model reference validation
 
@@ -189,6 +190,7 @@ crates/
     ops.rs – RoPE, attention
     kv_cache.rs – KV cache explicit, budget-accounted
     layer.rs – LayerDescriptor grouping
+    layer_cache.rs – bounded, budget-charged LRU cache for decoded streamed layers
     residency.rs – ResidencyStats
     profile.rs – optional generation timing/counter collector
     memory_report.rs – managed memory, Linux RSS, and system-memory visibility
@@ -231,11 +233,12 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The last executed baseline passed 158 tests with 0 failures and 0 ignored. The current source inventory is 162 tests after adding shared-accounting and execution-preflight regressions; rerun the full suite before commit.
+The last executed baseline passed 158 tests with 0 failures and 0 ignored. The current source inventory is 169 tests after adding shared-accounting, execution-preflight, and bounded layer-cache regressions; rerun the full suite before commit.
 
 ## Known Limitations
 
-- Current Q4_K_M CPU inference is functional but extremely slow in the measured NAS-backed Mistral run; profiling identifies both GGUF reads and scalar quantized matvec/dequantization as major costs. Performance optimization is intentionally deferred to a separate measured milestone.
+- Current Q4_K_M CPU inference is functional but extremely slow in the measured NAS-backed Mistral run; profiling identifies both GGUF reads and scalar quantized matvec/dequantization as major costs. Performance optimization remains measurement-driven.
+- The layer cache is generation-local and strict LRU. If its complete-layer capacity is smaller than a sequential full-model working set, scan-pattern thrashing can produce few or no hits; planner capacity never guarantees hit rate.
 - Real-model execution and streaming are validated, but generated-text quality is not yet validated.
 - Quantized inference limited to Q4_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K; Q4_1/Q5_0/Q5_1/Q8_1 and IQ* quants not supported
 - CPU-only: quantized matvec is scalar (block-wise dequant); F32 dot/matvec have runtime-detected AVX2 kernels and rayon row-parallelism; no GPU

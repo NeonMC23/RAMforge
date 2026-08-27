@@ -3,7 +3,15 @@
 //! Planning and execution must use the same load-transient rules. These
 //! helpers calculate charges only; they never allocate or read tensor data.
 
+use ramforge_core::model::TensorDescriptor;
+use ramforge_core::tensor::TensorData;
 use ramforge_core::types::GgmlType;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LayerMemoryEstimate {
+    pub resident_bytes: u64,
+    pub load_peak_bytes: u64,
+}
 
 /// Peak managed charge while constructing one tensor from `file_bytes`.
 ///
@@ -24,6 +32,35 @@ pub(crate) fn tensor_load_charge_bytes(
             factor,
             ggml_type.name()
         )
+    })
+}
+
+pub(crate) fn estimate_layer_memory(
+    tensors: &[TensorDescriptor],
+) -> Result<LayerMemoryEstimate, String> {
+    let mut settled = 0u64;
+    let mut load_peak = 0u64;
+    for descriptor in tensors {
+        let file_bytes = descriptor.byte_length.ok_or_else(|| {
+            format!("tensor '{}' byte length is unknown", descriptor.name)
+        })?;
+        let load_charge = tensor_load_charge_bytes(descriptor.ggml_type, file_bytes)?.max(1);
+        load_peak = load_peak.max(settled.checked_add(load_charge).ok_or_else(|| {
+            format!("layer load peak overflow at tensor '{}'", descriptor.name)
+        })?);
+        let resident = TensorData::resident_bytes_for(
+            descriptor.ggml_type,
+            descriptor.num_elements,
+            file_bytes,
+        )
+        .map_err(|error| format!("tensor '{}': {}", descriptor.name, error))?;
+        settled = settled.checked_add(resident.max(1)).ok_or_else(|| {
+            format!("layer resident size overflow at tensor '{}'", descriptor.name)
+        })?;
+    }
+    Ok(LayerMemoryEstimate {
+        resident_bytes: settled,
+        load_peak_bytes: load_peak,
     })
 }
 

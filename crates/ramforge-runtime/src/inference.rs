@@ -55,6 +55,7 @@ pub struct GenerationProfile {
     pub runtime: ProfileSnapshot,
     pub io: IoProfile,
     pub tensor_reads: Vec<TensorReadProfile>,
+    pub layer_cache_capacity_bytes: u64,
     pub ramforge_current_bytes: u64,
     pub ramforge_peak_bytes: u64,
     pub ramforge_budget_bytes: u64,
@@ -139,6 +140,7 @@ impl InferenceEngine {
             runtime: self.model.profiler.snapshot(),
             io: self.data_source.io_profile(),
             tensor_reads,
+            layer_cache_capacity_bytes: self.model.layer_cache_capacity_bytes(),
             ramforge_current_bytes: self.budget.used_bytes(),
             ramforge_peak_bytes: self.budget.peak_used_bytes(),
             ramforge_budget_bytes: self.budget.total_bytes(),
@@ -187,14 +189,24 @@ impl InferenceEngine {
     where
         F: FnMut(&str) -> Result<(), String>,
     {
-        // Explicit reset of any previous run's KV state (charge + object).
+        // Explicit reset of any previous run's KV and cached-layer state.
         self.clear_kv_cache();
+        self.model.clear_layer_cache(&mut self.budget)?;
         self.model.reset_profile();
         self.data_source.reset_io_profile();
         let profiler = self.model.profiler.clone();
         let total_started = profiler.start();
         let result = self.generate_impl(prompt, max_tokens, sampler, &mut on_text);
+        let cache_clear_result = self.model.clear_layer_cache(&mut self.budget);
+        if cache_clear_result.is_ok() {
+            self.residency_stats.update_managed(self.budget.used_bytes());
+        }
         profiler.record_since(ProfileEvent::Total, total_started);
+        let result = match (result, cache_clear_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        };
         match result {
             Ok(out) => Ok(out),
             Err(error) => {
@@ -333,6 +345,7 @@ impl InferenceEngine {
                         profiler.record_since(ProfileEvent::Logits, logits_started);
 
                         let sampling_started = profiler.start();
+                        model.ensure_layer_cache_headroom(budget, sampler_scratch)?;
                         let next_token =
                             budget.with_temp("tmp:sampling", sampler_scratch, |_b| {
                                 Ok::<u32, String>(sampler.sample(&logits))
@@ -373,6 +386,12 @@ impl InferenceEngine {
                             let old_bytes = kv_cache.total_bytes() as u64;
                             let new_bytes = kv_cache.bytes_for_tokens(target) as u64;
                             let _ = budget.release("kv_cache");
+                            if let Err(error) =
+                                model.ensure_layer_cache_headroom(budget, new_bytes)
+                            {
+                                let _ = budget.allocate("kv_cache", old_bytes);
+                                return Err(error);
+                            }
                             if let Err(e) = budget.allocate("kv_cache", new_bytes) {
                                 let _ = budget.allocate("kv_cache", old_bytes);
                                 return Err(format!(
@@ -647,6 +666,8 @@ mod tests {
         assert_eq!(profile.runtime.decode_forwards, 2);
         assert_eq!(profile.runtime.terminal_forwards_skipped, 1);
         assert!(profile.runtime.layer_loads > 0);
+        assert!(profile.runtime.cache_hits > 0);
+        assert!(profile.runtime.layer_loads < profile.runtime.prompt_forwards + 2);
         assert!(profile.io.read_operations > 0);
         assert!(profile.io.bytes_read > 0);
         assert!(profile.ramforge_peak_bytes <= profile.ramforge_budget_bytes);
@@ -673,15 +694,19 @@ mod tests {
         assert_eq!(profile.runtime.prompt_forwards, prompt_forwards);
         assert_eq!(profile.runtime.decode_forwards, 0);
         assert_eq!(profile.runtime.terminal_forwards_skipped, 1);
-        assert_eq!(profile.runtime.layer_loads, prompt_forwards * layer_count);
-        assert_eq!(profile.runtime.layer_releases, profile.runtime.layer_loads);
-        assert_eq!(profile.io.read_operations, profile.runtime.layer_loads * 9);
+        assert_eq!(profile.runtime.layer_loads, layer_count);
+        assert_eq!(profile.runtime.cache_misses, layer_count);
+        assert_eq!(
+            profile.runtime.cache_hits,
+            (prompt_forwards - 1) * layer_count
+        );
+        assert_eq!(profile.io.read_operations, layer_count * 9);
         for tensor in profile
             .tensor_reads
             .iter()
             .filter(|tensor| tensor.name.starts_with("blk.0."))
         {
-            assert_eq!(tensor.read_operations, prompt_forwards);
+            assert_eq!(tensor.read_operations, 1);
         }
     }
 
@@ -829,7 +854,7 @@ mod tests {
         assert!(stats.peak_resident_layer_bytes < stats.total_model_weight_bytes);
         assert!(stats.peak_managed_bytes <= ram_budget, "peak managed {} should be <= budget {}", stats.peak_managed_bytes, ram_budget);
         assert!(stats.num_layer_loads > 0);
-        assert!(stats.num_layer_releases > 0);
+        assert!(stats.num_layer_releases + stats.num_layer_cached > 0);
     }
 
     #[test]
@@ -857,6 +882,21 @@ mod tests {
         // (the engine constructor loaded only persistent weights).
         assert!(engine.budget.get("kv_cache").is_none());
         assert!(engine.kv_cache.is_none());
+    }
+
+    #[test]
+    fn test_layer_cache_hits_preserve_generation_numerics() {
+        let tmp = create_tiny_llama_gguf();
+        let sampler = crate::sampling::Sampler::greedy();
+        let mut cached =
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let mut uncached = InferenceEngine::new(tmp.path().to_str().unwrap(), 5_000).unwrap();
+        assert!(cached.model.layer_cache_capacity_bytes() > 2624);
+        assert!(uncached.model.layer_cache_capacity_bytes() < 2624);
+
+        let cached_output = cached.generate("hello", 3, &sampler).unwrap();
+        let uncached_output = uncached.generate("hello", 3, &sampler).unwrap();
+        assert_eq!(cached_output, uncached_output);
     }
 
     #[test]

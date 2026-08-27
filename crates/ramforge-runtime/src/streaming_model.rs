@@ -4,6 +4,8 @@
 //! Transformer layers are loaded on demand, one at a time, and released after use.
 //! Quantized tensors remain quantized while resident; dequantization happens block-wise during matvec.
 
+use std::sync::Mutex;
+
 use ramforge_core::{
     datasource::GgufDataSource,
     memory::MemoryBudget,
@@ -11,12 +13,13 @@ use ramforge_core::{
     types::GgmlType,
 };
 
-use crate::accounting::tensor_load_charge_bytes;
+use crate::accounting::{estimate_layer_memory, tensor_load_charge_bytes, LayerMemoryEstimate};
 use crate::backend::ComputeBackend;
 use crate::kv_cache::KvCache;
+use crate::layer_cache::{InsertOutcome, LayerCache};
 use crate::layer::{group_layers, LayerDescriptor, PersistentDescriptors};
 use crate::model::{validate_required_tensors, LlamaConfig};
-use crate::persistent::{PersistentWeight, should_keep_resident};
+use crate::persistent::{row_bytes_for, PersistentWeight, should_keep_resident};
 use crate::profile::{ProfileEvent, Profiler};
 use crate::residency::ResidencyStats;
 
@@ -72,6 +75,8 @@ pub struct StreamingLlamaModel {
     /// True when the model carries qwen2-style Q/K/V bias tensors
     /// (`blk.{i}.attn_{q,k,v}.bias`). Used to size the forward workspace.
     pub attn_bias_present: bool,
+    layer_memory_estimates: Vec<LayerMemoryEstimate>,
+    layer_cache: Mutex<LayerCache<StreamingLayerWeights>>,
     pub(crate) profiler: Profiler,
 }
 
@@ -99,6 +104,20 @@ impl StreamingLlamaModel {
             .filter(|t| matches!(t.ggml_type, GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q2_K | GgmlType::Q3_K | GgmlType::Q8_K))
             .filter_map(|t| t.byte_length)
             .sum();
+        let layer_descriptors = group_layers(gguf_model, config.block_count);
+        let layer_memory_estimates = layer_descriptors
+            .iter()
+            .map(|layer| {
+                estimate_layer_memory(&layer.tensors)
+                    .map_err(|error| format!("failed to estimate layer {} memory: {}", layer.layer_idx, error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let max_layer_load_peak = layer_memory_estimates
+            .iter()
+            .map(|estimate| estimate.load_peak_bytes)
+            .max()
+            .unwrap_or(0);
+        let persistent_descriptors = PersistentDescriptors::from_model(gguf_model);
 
         // Persistent startup is transactional. Each resident tensor first
         // establishes its conservative load charge, then reads/decodes and
@@ -145,8 +164,15 @@ impl StreamingLlamaModel {
             }
         };
 
-        let layer_descriptors = group_layers(gguf_model, config.block_count);
-        let persistent_descriptors = PersistentDescriptors::from_model(gguf_model);
+        // Match the planner's necessary lower bound: retain neither startup
+        // peak nor largest-layer headroom as cache capacity. Additional
+        // mandatory workspaces dynamically evict cache entries.
+        let layer_lower_bound = budget
+            .used_bytes()
+            .checked_add(max_layer_load_peak)
+            .ok_or_else(|| "layer cache lower-bound overflow".to_string())?;
+        let managed_lower_bound = budget.peak_used_bytes().max(layer_lower_bound);
+        let layer_cache_capacity = budget.total_bytes().saturating_sub(managed_lower_bound);
         let attn_bias_present = gguf_model
             .tensors
             .iter()
@@ -162,6 +188,8 @@ impl StreamingLlamaModel {
             total_weight_bytes,
             quantized_weight_bytes,
             attn_bias_present,
+            layer_memory_estimates,
+            layer_cache: Mutex::new(LayerCache::new(layer_cache_capacity)),
             profiler,
         })
     }
@@ -172,6 +200,40 @@ impl StreamingLlamaModel {
 
     pub(crate) fn reset_profile(&self) {
         self.profiler.reset();
+    }
+
+    pub fn layer_cache_capacity_bytes(&self) -> u64 {
+        self.layer_cache
+            .lock()
+            .map(|cache| cache.capacity_bytes())
+            .unwrap_or(0)
+    }
+
+    pub fn clear_layer_cache(&self, budget: &mut MemoryBudget) -> Result<(), String> {
+        let mut cache = self
+            .layer_cache
+            .lock()
+            .map_err(|_| "layer cache lock poisoned".to_string())?;
+        cache.clear(budget)?;
+        self.profiler
+            .record_cache_state(cache.entry_count(), cache.used_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn ensure_layer_cache_headroom(
+        &self,
+        budget: &mut MemoryBudget,
+        required_bytes: u64,
+    ) -> Result<(), String> {
+        let mut cache = self
+            .layer_cache
+            .lock()
+            .map_err(|_| "layer cache lock poisoned".to_string())?;
+        let evictions = cache.evict_until_available(budget, required_bytes)?;
+        self.profiler.record_cache_evictions(evictions);
+        self.profiler
+            .record_cache_state(cache.entry_count(), cache.used_bytes());
+        Ok(())
     }
 
     /// Load a single layer on demand, accounting actual quantized resident size
@@ -294,6 +356,24 @@ impl StreamingLlamaModel {
         stats.on_layer_release(budget.used_bytes());
     }
 
+    fn embedding_workspace_bytes(&self, n_embd: usize) -> Result<u64, String> {
+        let decoded_bytes = (n_embd as u64)
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .ok_or_else(|| "embedding workspace size overflow".to_string())?;
+        match &self.token_embd {
+            PersistentWeight::Resident(_) => Ok(decoded_bytes),
+            PersistentWeight::Streamed(descriptor) if descriptor.ggml_type == GgmlType::F32 => {
+                Ok(decoded_bytes)
+            }
+            PersistentWeight::Streamed(descriptor) => {
+                let raw_bytes = row_bytes_for(descriptor, n_embd)? as u64;
+                raw_bytes
+                    .checked_add(decoded_bytes)
+                    .ok_or_else(|| "embedding workspace size overflow".to_string())
+            }
+        }
+    }
+
     /// Forward pass for one token with out-of-core layer streaming.
     ///
     /// M7.1 memory contract:
@@ -356,9 +436,14 @@ impl StreamingLlamaModel {
             7 * n_embd + 2 * q_dim + 2 * kv_dim + 4 * ffn_dim + n_heads * seq + bias_floats;
         let act_bytes = (act_floats * 4) as u64;
 
+        self.ensure_layer_cache_headroom(budget, act_bytes)?;
         budget.with_temp("tmp:forward", act_bytes, |budget| {
             // Embedding lookup (streams one row if non-resident; charges its
             // own `tmp:embd_row` inside this scope).
+            self.ensure_layer_cache_headroom(
+                budget,
+                self.embedding_workspace_bytes(n_embd)?,
+            )?;
             let mut hidden = self.token_embd.get_embedding(
                 token_id as usize,
                 n_embd,
@@ -382,6 +467,51 @@ impl StreamingLlamaModel {
                 .record_since(ProfileEvent::Allocation, allocation_started);
 
             for layer_idx in 0..cfg.block_count {
+                let compute_started = self.profiler.start();
+                let cached_result = {
+                    let mut cache = self
+                        .layer_cache
+                        .lock()
+                        .map_err(|_| "layer cache lock poisoned".to_string())?;
+                    let result = cache.with_entry(layer_idx, |layer| {
+                        Self::forward_layer(
+                            layer,
+                            layer_idx,
+                            pos,
+                            kv_cache,
+                            backend,
+                            cfg,
+                            &self.profiler,
+                            &mut hidden,
+                            &mut tmp,
+                            &mut q_tmp,
+                            &mut k_tmp,
+                            &mut v_tmp,
+                            &mut attn_proj,
+                            &mut gate,
+                            &mut up,
+                            &mut gate_silu,
+                            &mut gate_up,
+                            &mut ffn_out,
+                        )
+                    });
+                    if result.is_some() {
+                        self.profiler
+                            .record_cache_state(cache.entry_count(), cache.used_bytes());
+                    }
+                    result
+                };
+                if let Some(result) = cached_result {
+                    self.profiler.record_cache_hit();
+                    self.profiler
+                        .record_since(ProfileEvent::LayerCompute, compute_started);
+                    result?;
+                    continue;
+                }
+
+                self.profiler.record_cache_miss();
+                let required_load_bytes = self.layer_memory_estimates[layer_idx].load_peak_bytes;
+                self.ensure_layer_cache_headroom(budget, required_load_bytes)?;
                 let load_started = self.profiler.start();
                 let layer_result = self.load_layer(layer_idx, data_source, budget, stats);
                 self.profiler
@@ -389,7 +519,6 @@ impl StreamingLlamaModel {
                 let layer = layer_result?;
                 self.profiler.record_layer_load();
 
-                // The layer always gets released – also on the error path.
                 let compute_started = self.profiler.start();
                 let layer_result = Self::forward_layer(
                     &layer,
@@ -413,12 +542,55 @@ impl StreamingLlamaModel {
                 );
                 self.profiler
                     .record_since(ProfileEvent::LayerCompute, compute_started);
-                let release_started = self.profiler.start();
-                self.release_layer(layer_idx, budget, stats);
-                self.profiler
-                    .record_since(ProfileEvent::LayerRelease, release_started);
-                self.profiler.record_layer_release();
-                layer_result?;
+                if let Err(error) = layer_result {
+                    let release_started = self.profiler.start();
+                    self.release_layer(layer_idx, budget, stats);
+                    self.profiler
+                        .record_since(ProfileEvent::LayerRelease, release_started);
+                    self.profiler.record_layer_release();
+                    return Err(error);
+                }
+
+                let layer_bytes = layer.total_resident_bytes();
+                let insert_result = {
+                    let mut cache = match self.layer_cache.lock() {
+                        Ok(cache) => cache,
+                        Err(_) => {
+                            self.release_layer(layer_idx, budget, stats);
+                            return Err("layer cache lock poisoned".to_string());
+                        }
+                    };
+                    let result = cache.insert_loaded(layer_idx, layer, layer_bytes, budget);
+                    match &result {
+                        Ok(InsertOutcome::Cached { evictions }) => {
+                            self.profiler.record_cache_evictions(*evictions)
+                        }
+                        Ok(InsertOutcome::Skipped { evictions, .. }) => {
+                            self.profiler.record_cache_evictions(*evictions)
+                        }
+                        Err(_) => {}
+                    }
+                    self.profiler
+                        .record_cache_state(cache.entry_count(), cache.used_bytes());
+                    result
+                };
+                match insert_result {
+                    Ok(InsertOutcome::Cached { .. }) => {
+                        stats.on_layer_cached(budget.used_bytes());
+                    }
+                    Ok(InsertOutcome::Skipped { value: layer, .. }) => {
+                        let release_started = self.profiler.start();
+                        self.release_layer(layer_idx, budget, stats);
+                        drop(layer);
+                        self.profiler
+                            .record_since(ProfileEvent::LayerRelease, release_started);
+                        self.profiler.record_layer_release();
+                    }
+                    Err(error) => {
+                        self.release_layer(layer_idx, budget, stats);
+                        return Err(error);
+                    }
+                }
             }
 
             kv_cache.increment_seq_len();
@@ -568,6 +740,21 @@ impl StreamingLlamaModel {
         Ok(())
     }
 
+    fn logits_workspace_min_bytes(&self) -> Result<u64, String> {
+        let weight = self.output.as_ref().unwrap_or(&self.token_embd);
+        let PersistentWeight::Streamed(descriptor) = weight else {
+            return Ok(0);
+        };
+        let row_bytes = row_bytes_for(descriptor, self.config.embedding_length)? as u64;
+        if descriptor.ggml_type == GgmlType::F32 {
+            Ok(row_bytes)
+        } else {
+            row_bytes
+                .checked_add((self.config.embedding_length * 4) as u64)
+                .ok_or_else(|| "logits workspace size overflow".to_string())
+        }
+    }
+
     /// Output projection into the caller-provided logits buffer (single
     /// allocation owned by the engine – no duplicate vocab-sized copies).
     ///
@@ -592,6 +779,7 @@ impl StreamingLlamaModel {
             ));
         }
 
+        self.ensure_layer_cache_headroom(budget, self.logits_workspace_min_bytes()?)?;
         let weight = self.output.as_ref().unwrap_or(&self.token_embd);
         match weight {
             PersistentWeight::Resident(td) => {
@@ -1316,6 +1504,7 @@ mod tests {
             })
             .unwrap();
 
+        model.clear_layer_cache(&mut budget).unwrap();
         assert_eq!(budget.used_bytes(), persistent_used);
         assert!(budget.get("tmp:hidden").is_none());
         assert!(!budget.allocations().keys().any(|name| name.starts_with("tmp:")));
@@ -1568,6 +1757,44 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_layer_load_preserves_existing_cache_and_accounting() {
+        let tmp = create_model_with_n_layers(2, 8, 16);
+        let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
+        let mut budget = MemoryBudget::new(1024 * 1024).unwrap();
+        let model = StreamingLlamaModel::load(&ds, &mut budget).unwrap();
+        let mut stats = ResidencyStats::new(model.total_weight_bytes);
+
+        let layer0 = model.load_layer(0, &ds, &mut budget, &mut stats).unwrap();
+        let layer0_bytes = layer0.total_resident_bytes();
+        {
+            let mut cache = model.layer_cache.lock().unwrap();
+            assert!(matches!(
+                cache
+                    .insert_loaded(0, layer0, layer0_bytes, &mut budget)
+                    .unwrap(),
+                InsertOutcome::Cached { .. }
+            ));
+        }
+        let before = budget.used_bytes();
+        let layer1_q = ds.get_descriptor("blk.1.attn_q.weight").unwrap();
+        tmp.as_file()
+            .set_len(layer1_q.file_offset + layer1_q.byte_length.unwrap() - 1)
+            .unwrap();
+
+        let error = model
+            .load_layer(1, &ds, &mut budget, &mut stats)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.contains("blk.1.attn_q.weight"));
+        assert_eq!(budget.used_bytes(), before);
+        let cache = model.layer_cache.lock().unwrap();
+        assert!(cache.contains(0));
+        assert_eq!(cache.entry_count(), 1);
+        drop(cache);
+        model.clear_layer_cache(&mut budget).unwrap();
+    }
+
+    #[test]
     fn test_layer_load_failure_cleans_budget() {
         let tmp = create_f16_bf16_model();
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
@@ -1593,9 +1820,12 @@ mod tests {
             "expected budget error, got: {}",
             err
         );
-        // The failed load must leave no partial layer charges behind.
+        // The failed load must leave no partial layer or cache charges behind.
         assert_eq!(budget.used_bytes(), before);
         assert!(!budget.allocations().keys().any(|k| k.starts_with("layer:0:")));
+        let cache = model.layer_cache.lock().unwrap();
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.used_bytes(), 0);
     }
 
     #[test]

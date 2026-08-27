@@ -161,6 +161,50 @@ impl MemoryBudget {
         Ok(old_bytes)
     }
 
+    /// Atomically rename every allocation whose name starts with `old_prefix`.
+    /// Byte totals and peak usage are unchanged. All destination names are
+    /// validated before any mutation occurs.
+    pub fn rename_prefix(
+        &mut self,
+        old_prefix: &str,
+        new_prefix: &str,
+    ) -> Result<Vec<String>, MemoryError> {
+        let renames: Vec<(String, String)> = self
+            .allocations
+            .keys()
+            .filter(|name| name.starts_with(old_prefix))
+            .map(|old_name| {
+                (
+                    old_name.clone(),
+                    format!("{}{}", new_prefix, &old_name[old_prefix.len()..]),
+                )
+            })
+            .collect();
+        if renames.is_empty() {
+            return Err(MemoryError::NotFound {
+                name: old_prefix.to_string(),
+            });
+        }
+        for (_, new_name) in &renames {
+            if self.allocations.contains_key(new_name) {
+                return Err(MemoryError::AlreadyExists {
+                    name: new_name.clone(),
+                });
+            }
+        }
+
+        let mut new_names = Vec::with_capacity(renames.len());
+        for (old_name, new_name) in renames {
+            let bytes = self
+                .allocations
+                .remove(&old_name)
+                .expect("rename source validated above");
+            self.allocations.insert(new_name.clone(), bytes);
+            new_names.push(new_name);
+        }
+        Ok(new_names)
+    }
+
     /// Get allocation size by name
     pub fn get(&self, name: &str) -> Option<u64> {
         self.allocations.get(name).copied()
@@ -414,6 +458,32 @@ mod tests {
         assert!(matches!(err, MemoryError::Insufficient { .. }));
         assert_eq!(budget.get("load"), Some(200));
         assert_eq!(budget.used_bytes(), before);
+    }
+
+    #[test]
+    fn test_rename_prefix_preserves_exact_accounting() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        budget.allocate("layer:2:a", 100).unwrap();
+        budget.allocate("layer:2:b", 200).unwrap();
+        budget.allocate("other", 50).unwrap();
+        let before = budget.used_bytes();
+
+        let mut names = budget
+            .rename_prefix("layer:2:", "cache:layer:2:")
+            .unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "cache:layer:2:a".to_string(),
+                "cache:layer:2:b".to_string(),
+            ]
+        );
+        assert_eq!(budget.used_bytes(), before);
+        assert_eq!(budget.get("cache:layer:2:a"), Some(100));
+        assert_eq!(budget.get("cache:layer:2:b"), Some(200));
+        assert!(budget.get("layer:2:a").is_none());
+        assert_eq!(budget.get("other"), Some(50));
     }
 
     #[test]

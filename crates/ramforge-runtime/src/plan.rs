@@ -8,7 +8,7 @@
 
 use ramforge_core::{memory::MemoryBudget, tensor::TensorData, GgufModel};
 
-use crate::accounting::tensor_load_charge_bytes;
+use crate::accounting::{estimate_layer_memory, tensor_load_charge_bytes};
 use crate::layer::{group_layers, PersistentDescriptors};
 use crate::model::{validate_required_tensors, LlamaConfig};
 use crate::persistent::should_keep_resident;
@@ -27,6 +27,11 @@ pub struct ExecutionMemoryPlan {
     /// Necessary managed-memory lower bound for startup or loading the largest
     /// layer alongside policy-resident persistent weights.
     pub managed_lower_bound_bytes: u64,
+    /// Remaining budget after the necessary layer-streaming lower bound. The
+    /// runtime uses the same value as its hard layer-cache byte capacity.
+    pub layer_cache_capacity_bytes: u64,
+    pub max_complete_cached_layers: usize,
+    pub min_layer_resident_bytes: u64,
     /// Necessary but not sufficient: forward activations, KV, logits, and
     /// streamed persistent workspaces are intentionally not included.
     pub layer_streaming_lower_bound_fits: bool,
@@ -163,42 +168,18 @@ fn plan_execution_memory(
     let mut largest_layer_tensor_count = 0usize;
     let mut largest_layer_resident_bytes = 0u64;
     let mut largest_layer_load_peak_bytes = 0u64;
+    let mut layer_resident_sizes = Vec::with_capacity(layers.len());
 
     for layer in &layers {
-        let mut settled = 0u64;
-        let mut load_peak = 0u64;
-        for descriptor in &layer.tensors {
-            let file_bytes = descriptor.byte_length.ok_or_else(|| {
-                format!(
-                    "cannot preflight layer {} tensor '{}': byte length is unknown",
-                    layer.layer_idx, descriptor.name
-                )
-            })?;
-            let load_charge = tensor_load_charge_bytes(descriptor.ggml_type, file_bytes)?.max(1);
-            load_peak = load_peak.max(checked_add(
-                settled,
-                load_charge,
-                "layer load peak",
-            )?);
-            let resident_bytes = TensorData::resident_bytes_for(
-                descriptor.ggml_type,
-                descriptor.num_elements,
-                file_bytes,
-            )
-            .map_err(|error| {
-                format!(
-                    "cannot preflight layer {} tensor '{}': {}",
-                    layer.layer_idx, descriptor.name, error
-                )
-            })?;
-            settled = checked_add(settled, resident_bytes.max(1), "layer resident bytes")?;
-        }
-
-        if load_peak > largest_layer_load_peak_bytes {
+        let estimate = estimate_layer_memory(&layer.tensors).map_err(|error| {
+            format!("cannot preflight layer {}: {}", layer.layer_idx, error)
+        })?;
+        layer_resident_sizes.push(estimate.resident_bytes);
+        if estimate.load_peak_bytes > largest_layer_load_peak_bytes {
             largest_layer_index = layer.layer_idx;
             largest_layer_tensor_count = layer.tensors.len();
-            largest_layer_resident_bytes = settled;
-            largest_layer_load_peak_bytes = load_peak;
+            largest_layer_resident_bytes = estimate.resident_bytes;
+            largest_layer_load_peak_bytes = estimate.load_peak_bytes;
         }
     }
 
@@ -208,6 +189,11 @@ fn plan_execution_memory(
         "persistent plus largest layer lower bound",
     )?;
     let managed_lower_bound_bytes = persistent_startup_peak_bytes.max(layer_with_persistents);
+    let layer_cache_capacity_bytes = ram_budget_bytes.saturating_sub(managed_lower_bound_bytes);
+    layer_resident_sizes.sort_unstable();
+    let min_layer_resident_bytes = layer_resident_sizes.first().copied().unwrap_or(0);
+    let max_complete_cached_layers =
+        max_complete_layers_for_capacity(&layer_resident_sizes, layer_cache_capacity_bytes);
 
     Ok(ExecutionMemoryPlan {
         block_count: config.block_count,
@@ -220,8 +206,27 @@ fn plan_execution_memory(
         largest_layer_resident_bytes,
         largest_layer_load_peak_bytes,
         managed_lower_bound_bytes,
+        layer_cache_capacity_bytes,
+        max_complete_cached_layers,
+        min_layer_resident_bytes,
         layer_streaming_lower_bound_fits: managed_lower_bound_bytes <= ram_budget_bytes,
     })
+}
+
+fn max_complete_layers_for_capacity(sorted_layer_bytes: &[u64], capacity: u64) -> usize {
+    let mut used = 0u64;
+    let mut count = 0usize;
+    for &layer_bytes in sorted_layer_bytes {
+        let Some(next) = used.checked_add(layer_bytes) else {
+            break;
+        };
+        if next > capacity {
+            break;
+        }
+        used = next;
+        count += 1;
+    }
+    count
 }
 
 fn checked_add(left: u64, right: u64, label: &str) -> Result<u64, String> {
@@ -349,7 +354,17 @@ mod tests {
         assert_eq!(execution.largest_layer_resident_bytes, 2624);
         assert_eq!(execution.largest_layer_load_peak_bytes, 2624);
         assert_eq!(execution.managed_lower_bound_bytes, 3168);
+        assert_eq!(execution.layer_cache_capacity_bytes, 6832);
+        assert_eq!(execution.max_complete_cached_layers, 1);
+        assert_eq!(execution.min_layer_resident_bytes, 2624);
         assert!(execution.layer_streaming_lower_bound_fits);
+    }
+
+    #[test]
+    fn test_planner_reports_maximum_complete_layer_capacity() {
+        assert_eq!(max_complete_layers_for_capacity(&[100, 200, 300], 99), 0);
+        assert_eq!(max_complete_layers_for_capacity(&[100, 200, 300], 300), 2);
+        assert_eq!(max_complete_layers_for_capacity(&[100, 200, 300], 600), 3);
     }
 
     #[test]
@@ -358,6 +373,8 @@ mod tests {
         let plan = plan_model(&model, 3_000).unwrap();
         let execution = plan.execution_memory.unwrap();
         assert_eq!(execution.managed_lower_bound_bytes, 3168);
+        assert_eq!(execution.layer_cache_capacity_bytes, 0);
+        assert_eq!(execution.max_complete_cached_layers, 0);
         assert!(!execution.layer_streaming_lower_bound_fits);
     }
 }

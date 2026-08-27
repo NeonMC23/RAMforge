@@ -276,6 +276,7 @@ fn run_inference(
         eprintln!("  Peak managed bytes: {} ({:.2} MiB) / budget {} ({:.2} MiB)", stats.peak_managed_bytes, stats.peak_managed_bytes as f64 / (1024.0*1024.0), ram_bytes, ram_bytes as f64 / (1024.0*1024.0));
         eprintln!("  Layer loads: {}", stats.num_layer_loads);
         eprintln!("  Layer releases: {}", stats.num_layer_releases);
+        eprintln!("  Layers retained in cache: {}", stats.num_layer_cached);
         eprintln!("  Fits check: total {} > budget {} ? {}", stats.total_model_weight_bytes, ram_bytes, stats.total_model_weight_bytes > ram_bytes);
         eprintln!("  Peak layer < total ? {}", stats.peak_resident_layer_bytes < stats.total_model_weight_bytes);
         eprintln!("  Peak managed <= budget ? {}", stats.peak_managed_bytes <= ram_bytes);
@@ -350,6 +351,17 @@ fn output_generation_profile(
     eprintln!("  Layer releases: {}", runtime.layer_releases);
     eprintln!("  Layer-cache hits: {}", runtime.cache_hits);
     eprintln!("  Layer-cache misses (disk loads): {}", runtime.cache_misses);
+    eprintln!("  Layer-cache evictions: {}", runtime.cache_evictions);
+    eprintln!(
+        "  Cached layers: current={} peak={}",
+        runtime.cached_layer_count, runtime.peak_cached_layer_count
+    );
+    eprintln!(
+        "  Layer-cache bytes: current={} peak={} capacity={}",
+        format_bytes(runtime.cache_bytes),
+        format_bytes(runtime.peak_cache_bytes),
+        format_bytes(profile.layer_cache_capacity_bytes)
+    );
     eprintln!("  Peak RAMforge-managed memory: {}", format_bytes(profile.ramforge_peak_bytes));
     if !profile.tensor_reads.is_empty() {
         eprintln!("  Top tensor reads by volume:");
@@ -614,6 +626,16 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
             "  Lower bound fits requested budget: {}",
             yes_no(execution.layer_streaming_lower_bound_fits)
         );
+        println!(
+            "  Layer-cache byte capacity: {}",
+            format_bytes(execution.layer_cache_capacity_bytes)
+        );
+        println!(
+            "  Estimated maximum complete cached layers: {} (smallest layer {})",
+            execution.max_complete_cached_layers,
+            format_bytes(execution.min_layer_resident_bytes)
+        );
+        println!("  Cache capacity does not guarantee hits; execution order and mandatory workspaces can force eviction");
         println!("  Scope: necessary but not sufficient; excludes forward activations, KV cache, logits, and streamed-persistent workspaces");
     } else {
         println!(
@@ -625,7 +647,7 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     }
     println!();
 
-    println!("Cache:");
+    println!("Generic byte-cache bound (informational):");
     println!("  Capacity bound (informational): {} bytes ({:.2} MiB, {:.2} GiB)", plan.cache_capacity, plan.cache_capacity as f64 / (1024.0*1024.0), plan.cache_capacity as f64 / (1024.0*1024.0*1024.0));
     println!("  Policy: LRU (least recently used eviction), contents charged to the budget per entry");
     println!("  Static overhead pre-reservation: none (scoped temp guards charge exact lifetimes)");
@@ -718,6 +740,10 @@ fn output_plan_json(plan: &ramforge_runtime::plan::PlanResult, model: &GgufModel
             "largest_layer_load_peak_bytes": execution.largest_layer_load_peak_bytes,
             "managed_lower_bound_bytes": execution.managed_lower_bound_bytes,
             "layer_streaming_lower_bound_fits": execution.layer_streaming_lower_bound_fits,
+            "layer_cache_capacity_bytes": execution.layer_cache_capacity_bytes,
+            "max_complete_cached_layers": execution.max_complete_cached_layers,
+            "min_layer_resident_bytes": execution.min_layer_resident_bytes,
+            "cache_scope": "capacity estimate only; execution order and mandatory workspaces determine actual retention and hits",
             "scope": "necessary but not sufficient; excludes activations, KV cache, logits, and streamed-persistent workspaces",
         })
     } else {

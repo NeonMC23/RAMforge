@@ -17,6 +17,7 @@ pub mod backend;
 pub mod inference;
 pub mod kv_cache;
 pub mod layer;
+pub(crate) mod layer_cache;
 pub mod memory_report;
 pub mod model;
 pub mod ops;

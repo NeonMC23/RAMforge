@@ -48,6 +48,11 @@ struct ProfileCounters {
     layer_releases: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    cache_evictions: AtomicU64,
+    cached_layer_count: AtomicU64,
+    peak_cached_layer_count: AtomicU64,
+    cache_bytes: AtomicU64,
+    peak_cache_bytes: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,6 +85,11 @@ pub struct ProfileSnapshot {
     pub layer_releases: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    pub cache_evictions: u64,
+    pub cached_layer_count: u64,
+    pub peak_cached_layer_count: u64,
+    pub cache_bytes: u64,
+    pub peak_cache_bytes: u64,
 }
 
 impl Profiler {
@@ -116,6 +126,11 @@ impl Profiler {
             &self.counters.layer_releases,
             &self.counters.cache_hits,
             &self.counters.cache_misses,
+            &self.counters.cache_evictions,
+            &self.counters.cached_layer_count,
+            &self.counters.peak_cached_layer_count,
+            &self.counters.cache_bytes,
+            &self.counters.peak_cache_bytes,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -187,10 +202,40 @@ impl Profiler {
     pub(crate) fn record_layer_load(&self) {
         if self.is_enabled() {
             self.counters.layer_loads.fetch_add(1, Ordering::Relaxed);
-            // There is currently no layer-weight cache in the inference path;
-            // every disk-backed layer load is therefore an explicit miss.
+        }
+    }
+
+    pub(crate) fn record_cache_hit(&self) {
+        if self.is_enabled() {
+            self.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_cache_miss(&self) {
+        if self.is_enabled() {
             self.counters.cache_misses.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn record_cache_evictions(&self, count: usize) {
+        if self.is_enabled() && count > 0 {
+            self.counters
+                .cache_evictions
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_cache_state(&self, entries: usize, bytes: u64) {
+        if !self.is_enabled() {
+            return;
+        }
+        let entries = entries as u64;
+        self.counters
+            .cached_layer_count
+            .store(entries, Ordering::Relaxed);
+        self.counters.cache_bytes.store(bytes, Ordering::Relaxed);
+        update_max(&self.counters.peak_cached_layer_count, entries);
+        update_max(&self.counters.peak_cache_bytes, bytes);
     }
 
     pub(crate) fn record_layer_release(&self) {
@@ -228,6 +273,14 @@ impl Profiler {
             layer_releases: self.counters.layer_releases.load(Ordering::Relaxed),
             cache_hits: self.counters.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.counters.cache_misses.load(Ordering::Relaxed),
+            cache_evictions: self.counters.cache_evictions.load(Ordering::Relaxed),
+            cached_layer_count: self.counters.cached_layer_count.load(Ordering::Relaxed),
+            peak_cached_layer_count: self
+                .counters
+                .peak_cached_layer_count
+                .load(Ordering::Relaxed),
+            cache_bytes: self.counters.cache_bytes.load(Ordering::Relaxed),
+            peak_cache_bytes: self.counters.peak_cache_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -261,6 +314,10 @@ mod tests {
         profiler.record_decode_forward();
         profiler.record_terminal_forward_skipped();
         profiler.record_layer_load();
+        profiler.record_cache_hit();
+        profiler.record_cache_miss();
+        profiler.record_cache_evictions(2);
+        profiler.record_cache_state(3, 400);
         let snapshot = profiler.snapshot();
         assert_eq!(snapshot.layer_load, Duration::from_millis(5));
         assert_eq!(snapshot.token_latency_total, Duration::from_millis(7));
@@ -270,6 +327,12 @@ mod tests {
         assert_eq!(snapshot.decode_forwards, 1);
         assert_eq!(snapshot.terminal_forwards_skipped, 1);
         assert_eq!(snapshot.layer_loads, 1);
+        assert_eq!(snapshot.cache_hits, 1);
         assert_eq!(snapshot.cache_misses, 1);
+        assert_eq!(snapshot.cache_evictions, 2);
+        assert_eq!(snapshot.cached_layer_count, 3);
+        assert_eq!(snapshot.peak_cached_layer_count, 3);
+        assert_eq!(snapshot.cache_bytes, 400);
+        assert_eq!(snapshot.peak_cache_bytes, 400);
     }
 }
