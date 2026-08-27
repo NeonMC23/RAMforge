@@ -19,7 +19,7 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 - Real RAM budget enforcement via `MemoryBudget`
 - Bounded LRU cache via `BoundedCache`
 - Real CPU inference with layer streaming
-- Native quantized inference without full F32 expansion.
+- Native quantized inference without full F32 expansion
 
 ## Capabilities
 
