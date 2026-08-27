@@ -30,7 +30,7 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 - `MemoryBudget`, `parse_memory_size()` (`8G`, `8GiB`, `8192M`, `512MiB`, etc.)
 - `GgufDataSource` range reads
 - `BoundedCache` LRU
-- `ramforge plan`
+- `ramforge plan` with runtime-aligned persistent/largest-layer memory preflight for executable architectures
 
 ### Milestone 3 – First Real CPU Inference
 - Architectures `llama`, `qwen2`
@@ -81,6 +81,7 @@ Entire quantized model never resident simultaneously. Layers released after comp
 - **Real profiling:** `--profile` measures generation wall time, prompt/prefill, prompt/decode forward counts, per-tensor reads/bytes, the GGUF read path (destination allocation plus seek/read on a reused handle), layer loading/compute/release, tensor construction, explicit dequantization/copies, F32 and quantized matvec, allocations, logits, sampling, callback time, token latency, and layer-cache misses
 - **Memory visibility:** `--memory-report` labels RAMforge current/peak/budget separately from Linux process RSS and system memory; MemoryBudget does not claim control over RSS or page cache
 - **Capability registry:** `ramforge support` distinguishes generic GGUF inspection/planning from execution, tokenizer, and quantization support. Direct execution remains limited to `llama` and `qwen2`; Mistral is runnable only when represented by a validated llama-compatible GGUF; `qwen35` is explicitly inspect/plan-only
+- **Execution memory preflight:** for runnable architectures, `ramforge plan` applies the runtime’s persistent-retention, decoded-residency, and per-tensor load-transient rules to report the largest layer and a necessary managed-memory lower bound. It explicitly excludes prompt-dependent KV and activation workspaces, so it is not presented as a sufficient runtime guarantee.
 
 ### Real-model reference validation
 
@@ -183,6 +184,7 @@ crates/
     quant.rs – Q4_0, Q8_0, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K block layouts, dequant, quantized matvec (scalar, block-wise)
     tensor.rs – TensorData (F32/F16/BF16/Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K), direct F32 ownership, QuantizedTensor, resident_bytes, matvec, get_embedding
   ramforge-runtime/
+    accounting.rs – shared tensor load-transient formulas used by execution and planning
     backend.rs – ComputeBackend, CpuBackend (rayon threading, optional AVX2 for F32)
     ops.rs – RoPE, attention
     kv_cache.rs – KV cache explicit, budget-accounted
@@ -196,7 +198,7 @@ crates/
     model.rs – LlamaConfig, validate_required_tensors
     streaming_model.rs – StreamingLlamaModel (charge-before-read + direct F32 loads), load/release layer, caller-owned final hidden + scoped tmp:forward
     inference.rs – InferenceEngine (file-backed + budget + chunk-growing KV + single logits buffer), generate()
-    plan.rs – planning
+    plan.rs – file-size planning plus executable-architecture layer-memory preflight
     sampling.rs – greedy, temperature, top-k/p
   ramforge-cli/ – inspect, plan, support, run --verbose/--profile/--memory-report
 ```
@@ -229,7 +231,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The last executed baseline passed 156 tests with 0 failures and 0 ignored. The current source inventory adds focused persistent-handle and terminal-forward regression tests; rerun the full suite before commit.
+The last executed baseline passed 158 tests with 0 failures and 0 ignored. The current source inventory is 162 tests after adding shared-accounting and execution-preflight regressions; rerun the full suite before commit.
 
 ## Known Limitations
 

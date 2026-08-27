@@ -12,6 +12,7 @@
 //! RAMforge-managed memory is defined as memory explicitly tracked via
 //! `MemoryBudget`. It does NOT include total process RSS or OS page cache.
 
+pub(crate) mod accounting;
 pub mod backend;
 pub mod inference;
 pub mod kv_cache;

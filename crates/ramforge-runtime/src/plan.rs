@@ -1,13 +1,36 @@
 //! Planning logic for `ramforge plan` command
 //!
-//! The plan distinguishes *file size vs budget*
-//! (out-of-core viability) from what the runtime actually charges. The
-//! runtime no longer pre-reserves a fake "tensor_cache capacity +
-//! runtime overhead" inside the budget; it charges real allocations
-//! (resident weights, one layer at a time, KV cache, scoped temps).
-//! The cache capacity reported here is an informational bound only.
+//! The plan distinguishes *file size vs budget* (out-of-core viability) from
+//! what the runtime actually charges. For directly executable architectures it
+//! also computes a runtime-aligned lower bound for resident persistent weights
+//! plus the largest streamed layer load. This lower bound deliberately excludes
+//! prompt-dependent KV, activations, logits, and streamed-persistent workspaces.
 
-use ramforge_core::{memory::MemoryBudget, GgufModel};
+use ramforge_core::{memory::MemoryBudget, tensor::TensorData, GgufModel};
+
+use crate::accounting::tensor_load_charge_bytes;
+use crate::layer::{group_layers, PersistentDescriptors};
+use crate::model::{validate_required_tensors, LlamaConfig};
+use crate::persistent::should_keep_resident;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionMemoryPlan {
+    pub block_count: usize,
+    pub resident_persistent_count: usize,
+    pub streamed_persistent_count: usize,
+    pub persistent_resident_bytes: u64,
+    pub persistent_startup_peak_bytes: u64,
+    pub largest_layer_index: usize,
+    pub largest_layer_tensor_count: usize,
+    pub largest_layer_resident_bytes: u64,
+    pub largest_layer_load_peak_bytes: u64,
+    /// Necessary managed-memory lower bound for startup or loading the largest
+    /// layer alongside policy-resident persistent weights.
+    pub managed_lower_bound_bytes: u64,
+    /// Necessary but not sufficient: forward activations, KV, logits, and
+    /// streamed persistent workspaces are intentionally not included.
+    pub layer_streaming_lower_bound_fits: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct PlanResult {
@@ -24,6 +47,8 @@ pub struct PlanResult {
     pub fits_in_ram: bool,
     pub file_backed_needed: u64,
     pub total_tensor_bytes: Option<u64>,
+    pub execution_memory: Option<ExecutionMemoryPlan>,
+    pub execution_preflight_error: Option<String>,
     pub budget: MemoryBudget,
 }
 
@@ -36,11 +61,13 @@ pub fn plan_model(model: &GgufModel, ram_budget_bytes: u64) -> Result<PlanResult
     let cache_capacity = if ram_budget_bytes < 2 * 1024 * 1024 {
         ram_budget_bytes / 2
     } else {
-        cache_capacity.max(1024 * 1024).min(ram_budget_bytes.saturating_sub(1024 * 1024))
+        cache_capacity
+            .max(1024 * 1024)
+            .min(ram_budget_bytes.saturating_sub(1024 * 1024))
     };
 
-    // No static overhead pre-reservation: scoped `tmp:*` guards charge
-    // exact temps at runtime for exactly their lifetimes.
+    // No static overhead pre-reservation: scoped `tmp:*` guards charge exact
+    // temps at runtime for exactly their lifetimes.
     let overhead_reserved = 0;
 
     let file_size = model.file_size;
@@ -55,6 +82,11 @@ pub fn plan_model(model: &GgufModel, ram_budget_bytes: u64) -> Result<PlanResult
     let tensor_count = model.tensors.len();
     let total_tensor_bytes = model.total_tensor_bytes();
     let available = budget.available_bytes();
+    let (execution_memory, execution_preflight_error) =
+        match plan_execution_memory(model, ram_budget_bytes) {
+            Ok(memory) => (Some(memory), None),
+            Err(error) => (None, Some(error)),
+        };
 
     Ok(PlanResult {
         file_size,
@@ -67,14 +99,141 @@ pub fn plan_model(model: &GgufModel, ram_budget_bytes: u64) -> Result<PlanResult
         fits_in_ram,
         file_backed_needed,
         total_tensor_bytes,
+        execution_memory,
+        execution_preflight_error,
         budget,
     })
+}
+
+fn plan_execution_memory(
+    model: &GgufModel,
+    ram_budget_bytes: u64,
+) -> Result<ExecutionMemoryPlan, String> {
+    let config = LlamaConfig::from_gguf(model)?;
+    validate_required_tensors(model, &config)?;
+
+    let persistent = PersistentDescriptors::from_model(model);
+    let mut persistent_resident_bytes = 0u64;
+    let mut persistent_startup_peak_bytes = 0u64;
+    let mut resident_persistent_count = 0usize;
+    let mut streamed_persistent_count = 0usize;
+
+    for descriptor in [&persistent.token_embd, &persistent.output_norm, &persistent.output]
+        .into_iter()
+        .flatten()
+    {
+        let file_bytes = descriptor.byte_length.ok_or_else(|| {
+            format!(
+                "cannot preflight persistent tensor '{}': byte length is unknown",
+                descriptor.name
+            )
+        })?;
+        let resident_bytes = TensorData::resident_bytes_for(
+            descriptor.ggml_type,
+            descriptor.num_elements,
+            file_bytes,
+        )
+        .map_err(|error| {
+            format!(
+                "cannot preflight persistent tensor '{}': {}",
+                descriptor.name, error
+            )
+        })?;
+        if should_keep_resident(resident_bytes, ram_budget_bytes) {
+            resident_persistent_count += 1;
+            let load_charge = tensor_load_charge_bytes(descriptor.ggml_type, file_bytes)?.max(1);
+            let startup_peak = checked_add(
+                persistent_resident_bytes,
+                load_charge,
+                "persistent startup peak",
+            )?;
+            persistent_startup_peak_bytes = persistent_startup_peak_bytes.max(startup_peak);
+            persistent_resident_bytes = checked_add(
+                persistent_resident_bytes,
+                resident_bytes.max(1),
+                "persistent resident bytes",
+            )?;
+        } else {
+            streamed_persistent_count += 1;
+        }
+    }
+
+    let layers = group_layers(model, config.block_count);
+    let mut largest_layer_index = 0usize;
+    let mut largest_layer_tensor_count = 0usize;
+    let mut largest_layer_resident_bytes = 0u64;
+    let mut largest_layer_load_peak_bytes = 0u64;
+
+    for layer in &layers {
+        let mut settled = 0u64;
+        let mut load_peak = 0u64;
+        for descriptor in &layer.tensors {
+            let file_bytes = descriptor.byte_length.ok_or_else(|| {
+                format!(
+                    "cannot preflight layer {} tensor '{}': byte length is unknown",
+                    layer.layer_idx, descriptor.name
+                )
+            })?;
+            let load_charge = tensor_load_charge_bytes(descriptor.ggml_type, file_bytes)?.max(1);
+            load_peak = load_peak.max(checked_add(
+                settled,
+                load_charge,
+                "layer load peak",
+            )?);
+            let resident_bytes = TensorData::resident_bytes_for(
+                descriptor.ggml_type,
+                descriptor.num_elements,
+                file_bytes,
+            )
+            .map_err(|error| {
+                format!(
+                    "cannot preflight layer {} tensor '{}': {}",
+                    layer.layer_idx, descriptor.name, error
+                )
+            })?;
+            settled = checked_add(settled, resident_bytes.max(1), "layer resident bytes")?;
+        }
+
+        if load_peak > largest_layer_load_peak_bytes {
+            largest_layer_index = layer.layer_idx;
+            largest_layer_tensor_count = layer.tensors.len();
+            largest_layer_resident_bytes = settled;
+            largest_layer_load_peak_bytes = load_peak;
+        }
+    }
+
+    let layer_with_persistents = checked_add(
+        persistent_resident_bytes,
+        largest_layer_load_peak_bytes,
+        "persistent plus largest layer lower bound",
+    )?;
+    let managed_lower_bound_bytes = persistent_startup_peak_bytes.max(layer_with_persistents);
+
+    Ok(ExecutionMemoryPlan {
+        block_count: config.block_count,
+        resident_persistent_count,
+        streamed_persistent_count,
+        persistent_resident_bytes,
+        persistent_startup_peak_bytes,
+        largest_layer_index,
+        largest_layer_tensor_count,
+        largest_layer_resident_bytes,
+        largest_layer_load_peak_bytes,
+        managed_lower_bound_bytes,
+        layer_streaming_lower_bound_fits: managed_lower_bound_bytes <= ram_budget_bytes,
+    })
+}
+
+fn checked_add(left: u64, right: u64, label: &str) -> Result<u64, String> {
+    left.checked_add(right)
+        .ok_or_else(|| format!("{} overflow: {} + {}", label, left, right))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ramforge_core::model::GgufModel;
+    use ramforge_core::model::{GgufModel, TensorDescriptor};
+    use ramforge_core::{GgmlType, MetadataValue};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -90,6 +249,71 @@ mod tests {
         }
     }
 
+    fn supported_tiny_model() -> GgufModel {
+        let mut metadata = BTreeMap::new();
+        for (key, value) in [
+            ("llama.vocab_size", 16),
+            ("llama.context_length", 64),
+            ("llama.embedding_length", 8),
+            ("llama.block_count", 1),
+            ("llama.feed_forward_length", 16),
+            ("llama.attention.head_count", 2),
+            ("llama.attention.head_count_kv", 2),
+        ] {
+            metadata.insert(key.to_string(), MetadataValue::UInt32(value));
+        }
+        metadata.insert(
+            "general.architecture".to_string(),
+            MetadataValue::String("llama".to_string()),
+        );
+
+        let definitions = [
+            ("token_embd.weight", vec![8, 16]),
+            ("output_norm.weight", vec![8]),
+            ("blk.0.attn_norm.weight", vec![8]),
+            ("blk.0.attn_q.weight", vec![8, 8]),
+            ("blk.0.attn_k.weight", vec![8, 8]),
+            ("blk.0.attn_v.weight", vec![8, 8]),
+            ("blk.0.attn_output.weight", vec![8, 8]),
+            ("blk.0.ffn_norm.weight", vec![8]),
+            ("blk.0.ffn_gate.weight", vec![8, 16]),
+            ("blk.0.ffn_up.weight", vec![8, 16]),
+            ("blk.0.ffn_down.weight", vec![16, 8]),
+        ];
+        let tensors = definitions
+            .into_iter()
+            .scan(0u64, |offset, (name, dimensions)| {
+                let num_elements = dimensions.iter().product::<u64>();
+                let byte_length = num_elements * 4;
+                let descriptor = TensorDescriptor {
+                    name: name.to_string(),
+                    dimensions,
+                    ggml_type: GgmlType::F32,
+                    offset: *offset,
+                    file_offset: *offset,
+                    byte_length: Some(byte_length),
+                    num_elements,
+                };
+                *offset += byte_length;
+                Some(descriptor)
+            })
+            .collect::<Vec<_>>();
+        let file_size = tensors
+            .iter()
+            .filter_map(|tensor| tensor.byte_length)
+            .sum();
+
+        GgufModel {
+            path: PathBuf::from("/tmp/supported-tiny.gguf"),
+            file_size,
+            version: 3,
+            metadata,
+            tensors,
+            alignment: 32,
+            data_start_offset: 0,
+        }
+    }
+
     #[test]
     fn test_plan_fits() {
         let model = dummy_model(1_000_000);
@@ -98,6 +322,8 @@ mod tests {
         assert_eq!(plan.file_backed_needed, 0);
         assert!(plan.cache_capacity > 0);
         assert!(plan.cache_capacity <= plan.ram_requested);
+        assert!(plan.execution_memory.is_none());
+        assert!(plan.execution_preflight_error.is_some());
     }
 
     #[test]
@@ -106,5 +332,32 @@ mod tests {
         let plan = plan_model(&model, 8 * 1024 * 1024 * 1024).unwrap();
         assert!(!plan.fits_in_ram);
         assert_eq!(plan.file_backed_needed, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_execution_preflight_matches_runtime_layer_accounting() {
+        let model = supported_tiny_model();
+        let plan = plan_model(&model, 10_000).unwrap();
+        let execution = plan.execution_memory.unwrap();
+        assert_eq!(execution.block_count, 1);
+        assert_eq!(execution.resident_persistent_count, 2);
+        assert_eq!(execution.streamed_persistent_count, 0);
+        assert_eq!(execution.persistent_resident_bytes, 544);
+        assert_eq!(execution.persistent_startup_peak_bytes, 544);
+        assert_eq!(execution.largest_layer_index, 0);
+        assert_eq!(execution.largest_layer_tensor_count, 9);
+        assert_eq!(execution.largest_layer_resident_bytes, 2624);
+        assert_eq!(execution.largest_layer_load_peak_bytes, 2624);
+        assert_eq!(execution.managed_lower_bound_bytes, 3168);
+        assert!(execution.layer_streaming_lower_bound_fits);
+    }
+
+    #[test]
+    fn test_execution_preflight_flags_too_small_layer_lower_bound() {
+        let model = supported_tiny_model();
+        let plan = plan_model(&model, 3_000).unwrap();
+        let execution = plan.execution_memory.unwrap();
+        assert_eq!(execution.managed_lower_bound_bytes, 3168);
+        assert!(!execution.layer_streaming_lower_bound_fits);
     }
 }

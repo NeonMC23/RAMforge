@@ -584,6 +584,47 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     }
     println!();
 
+    println!("Execution memory preflight:");
+    if let Some(execution) = &plan.execution_memory {
+        println!(
+            "  Policy-resident persistent weights: {} across {} tensors",
+            format_bytes(execution.persistent_resident_bytes),
+            execution.resident_persistent_count
+        );
+        println!(
+            "  Streamed persistent tensors: {}",
+            execution.streamed_persistent_count
+        );
+        println!(
+            "  Persistent startup peak: {}",
+            format_bytes(execution.persistent_startup_peak_bytes)
+        );
+        println!(
+            "  Largest layer: {} ({} tensors, resident {}, load peak {})",
+            execution.largest_layer_index,
+            execution.largest_layer_tensor_count,
+            format_bytes(execution.largest_layer_resident_bytes),
+            format_bytes(execution.largest_layer_load_peak_bytes)
+        );
+        println!(
+            "  Managed layer-streaming lower bound: {}",
+            format_bytes(execution.managed_lower_bound_bytes)
+        );
+        println!(
+            "  Lower bound fits requested budget: {}",
+            yes_no(execution.layer_streaming_lower_bound_fits)
+        );
+        println!("  Scope: necessary but not sufficient; excludes forward activations, KV cache, logits, and streamed-persistent workspaces");
+    } else {
+        println!(
+            "  Unavailable: {}",
+            plan.execution_preflight_error
+                .as_deref()
+                .unwrap_or("execution preflight unavailable")
+        );
+    }
+    println!();
+
     println!("Cache:");
     println!("  Capacity bound (informational): {} bytes ({:.2} MiB, {:.2} GiB)", plan.cache_capacity, plan.cache_capacity as f64 / (1024.0*1024.0), plan.cache_capacity as f64 / (1024.0*1024.0*1024.0));
     println!("  Policy: LRU (least recently used eviction), contents charged to the budget per entry");
@@ -663,6 +704,28 @@ fn output_plan_json(plan: &ramforge_runtime::plan::PlanResult, model: &GgufModel
     use serde_json::json;
 
     let allocations: std::collections::BTreeMap<String, u64> = plan.budget.allocations().clone().into_iter().collect();
+    let execution_preflight = if let Some(execution) = &plan.execution_memory {
+        json!({
+            "available": true,
+            "block_count": execution.block_count,
+            "resident_persistent_count": execution.resident_persistent_count,
+            "streamed_persistent_count": execution.streamed_persistent_count,
+            "persistent_resident_bytes": execution.persistent_resident_bytes,
+            "persistent_startup_peak_bytes": execution.persistent_startup_peak_bytes,
+            "largest_layer_index": execution.largest_layer_index,
+            "largest_layer_tensor_count": execution.largest_layer_tensor_count,
+            "largest_layer_resident_bytes": execution.largest_layer_resident_bytes,
+            "largest_layer_load_peak_bytes": execution.largest_layer_load_peak_bytes,
+            "managed_lower_bound_bytes": execution.managed_lower_bound_bytes,
+            "layer_streaming_lower_bound_fits": execution.layer_streaming_lower_bound_fits,
+            "scope": "necessary but not sufficient; excludes activations, KV cache, logits, and streamed-persistent workspaces",
+        })
+    } else {
+        json!({
+            "available": false,
+            "reason": plan.execution_preflight_error.as_deref(),
+        })
+    };
 
     let output = json!({
         "model": {
@@ -684,6 +747,7 @@ fn output_plan_json(plan: &ramforge_runtime::plan::PlanResult, model: &GgufModel
             "fits_in_ram": plan.fits_in_ram,
             "file_backed_needed": plan.file_backed_needed,
         },
+        "execution_preflight": execution_preflight,
         "cache": {
             "capacity": plan.cache_capacity,
             "policy": "LRU",

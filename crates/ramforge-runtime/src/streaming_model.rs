@@ -11,6 +11,7 @@ use ramforge_core::{
     types::GgmlType,
 };
 
+use crate::accounting::tensor_load_charge_bytes;
 use crate::backend::ComputeBackend;
 use crate::kv_cache::KvCache;
 use crate::layer::{group_layers, LayerDescriptor, PersistentDescriptors};
@@ -200,7 +201,7 @@ impl StreamingLlamaModel {
                 let name = &tensor_desc.name;
                 let file_bytes = tensor_desc.byte_length.unwrap_or(0);
                 // Peak owned representation during load, charged up front.
-                let charge = load_charge_bytes(tensor_desc.ggml_type, file_bytes)?.max(1);
+                let charge = tensor_load_charge_bytes(tensor_desc.ggml_type, file_bytes)?.max(1);
                 let alloc_name = format!("layer:{}:{}", layer_idx, name);
                 budget
                     .allocate(alloc_name.clone(), charge)
@@ -686,7 +687,7 @@ fn load_persistent_weight(
         return Ok((PersistentWeight::Streamed(desc), None));
     }
 
-    let transient_charge = load_charge_bytes(desc.ggml_type, file_bytes)?;
+    let transient_charge = tensor_load_charge_bytes(desc.ggml_type, file_bytes)?;
     if transient_charge < expected_resident {
         return Err(format!(
             "persistent tensor '{}' load charge {} is smaller than predicted resident size {}",
@@ -782,28 +783,6 @@ fn validate_qkv_bias(
         }
     }
     Ok(())
-}
-
-/// Transient budget charge while loading one tensor of `file_bytes`:
-/// - F32: datasource reads directly into final Vec<f32> storage (1x);
-/// - quantized: raw buffer is moved into QuantizedTensor (1x);
-/// - F16/BF16: raw (1x = 2 B/elem) + decoded Vec<f32> (2x = 4 B/elem)
-///   coexist transiently (3x total).
-///
-/// Overflow-safe; clear error on impossible sizes.
-fn load_charge_bytes(ggml_type: GgmlType, file_bytes: u64) -> Result<u64, String> {
-    let factor: u64 = match ggml_type {
-        GgmlType::F16 | GgmlType::BF16 => 3,
-        _ => 1,
-    };
-    file_bytes.checked_mul(factor).ok_or_else(|| {
-        format!(
-            "tensor size overflow computing load charge ({} bytes x {} for {})",
-            file_bytes,
-            factor,
-            ggml_type.name()
-        )
-    })
 }
 
 /// Matvec dispatch under the single explicit ggml layout (`shape = [in, out]`):
@@ -1128,7 +1107,7 @@ mod tests {
         let desc = ds.get_descriptor("test.weight").unwrap();
         assert_eq!(desc.byte_length, Some(32));
         assert_eq!(TensorData::resident_bytes_for(GgmlType::F32, 8, 32).unwrap(), 32);
-        assert_eq!(load_charge_bytes(GgmlType::F32, 32).unwrap(), 32);
+        assert_eq!(tensor_load_charge_bytes(GgmlType::F32, 32).unwrap(), 32);
 
         // Exactly 32 bytes remain. The direct loader succeeds because its only
         // owned tensor representation is the final 32-byte Vec<f32>; the old
@@ -1165,7 +1144,7 @@ mod tests {
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
         let file_bytes = ds.get_descriptor("test.weight").unwrap().byte_length.unwrap();
         assert_eq!(file_bytes, 8 * 2);
-        assert_eq!(load_charge_bytes(GgmlType::F16, file_bytes).unwrap(), 3 * file_bytes);
+        assert_eq!(tensor_load_charge_bytes(GgmlType::F16, file_bytes).unwrap(), 3 * file_bytes);
         assert_eq!(TensorData::resident_bytes_for(GgmlType::F16, 8, file_bytes).unwrap(), 8 * 4);
 
         let mut budget = MemoryBudget::new(128).unwrap();
@@ -1190,7 +1169,7 @@ mod tests {
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
         let file_bytes = ds.get_descriptor("test.weight").unwrap().byte_length.unwrap();
         assert_eq!(file_bytes, 8 * 2);
-        assert_eq!(load_charge_bytes(GgmlType::BF16, file_bytes).unwrap(), 3 * file_bytes);
+        assert_eq!(tensor_load_charge_bytes(GgmlType::BF16, file_bytes).unwrap(), 3 * file_bytes);
         assert_eq!(TensorData::resident_bytes_for(GgmlType::BF16, 8, file_bytes).unwrap(), 8 * 4);
 
         let mut budget = MemoryBudget::new(128).unwrap();
@@ -1216,7 +1195,7 @@ mod tests {
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
         let file_bytes = ds.get_descriptor("test.weight").unwrap().byte_length.unwrap();
         assert_eq!(file_bytes, 18);
-        assert_eq!(load_charge_bytes(GgmlType::Q4_0, file_bytes).unwrap(), file_bytes);
+        assert_eq!(tensor_load_charge_bytes(GgmlType::Q4_0, file_bytes).unwrap(), file_bytes);
         assert_eq!(TensorData::resident_bytes_for(GgmlType::Q4_0, 32, file_bytes).unwrap(), file_bytes);
 
         let mut budget = MemoryBudget::new(72).unwrap();
