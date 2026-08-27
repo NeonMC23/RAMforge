@@ -383,15 +383,34 @@ impl TensorData {
         num_elements: u64,
         data: Vec<f32>,
     ) -> Result<Self, DataSourceError> {
+        Self::from_decoded_float_vec(GgmlType::F32, shape, num_elements, data)
+    }
+
+    /// Construct an already-decoded float tensor without another raw-byte
+    /// allocation. Used when a bounded grouped read owns the source bytes.
+    pub fn from_decoded_float_vec(
+        ggml_type: GgmlType,
+        shape: Vec<u64>,
+        num_elements: u64,
+        data: Vec<f32>,
+    ) -> Result<Self, DataSourceError> {
+        if !matches!(ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+            return Err(DataSourceError::General(format!(
+                "decoded float construction does not support {}",
+                ggml_type.name()
+            )));
+        }
         let expected_len = usize::try_from(num_elements).map_err(|_| {
             DataSourceError::General(format!(
-                "F32 element count {} does not fit this platform",
+                "{} element count {} does not fit this platform",
+                ggml_type.name(),
                 num_elements
             ))
         })?;
         if data.len() != expected_len {
             return Err(DataSourceError::General(format!(
-                "F32 data length mismatch: expected {} elements, got {}",
+                "{} data length mismatch: expected {} elements, got {}",
+                ggml_type.name(),
                 expected_len,
                 data.len()
             )));
@@ -401,13 +420,19 @@ impl TensorData {
             .map(|dimension| {
                 usize::try_from(dimension).map_err(|_| {
                     DataSourceError::General(format!(
-                        "F32 tensor dimension {} does not fit this platform",
+                        "{} tensor dimension {} does not fit this platform",
+                        ggml_type.name(),
                         dimension
                     ))
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::F32 { data, shape })
+        match ggml_type {
+            GgmlType::F32 => Ok(Self::F32 { data, shape }),
+            GgmlType::F16 => Ok(Self::F16 { data, shape }),
+            GgmlType::BF16 => Ok(Self::BF16 { data, shape }),
+            _ => unreachable!("float type validated above"),
+        }
     }
 
     pub fn from_bytes(

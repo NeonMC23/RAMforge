@@ -7,6 +7,8 @@ use ramforge_core::model::TensorDescriptor;
 use ramforge_core::tensor::TensorData;
 use ramforge_core::types::GgmlType;
 
+use crate::layer_read::LayerReadPlan;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct LayerMemoryEstimate {
     pub resident_bytes: u64,
@@ -57,6 +59,64 @@ pub(crate) fn estimate_layer_memory(
         settled = settled.checked_add(resident.max(1)).ok_or_else(|| {
             format!("layer resident size overflow at tensor '{}'", descriptor.name)
         })?;
+    }
+    Ok(LayerMemoryEstimate {
+        resident_bytes: settled,
+        load_peak_bytes: load_peak,
+    })
+}
+
+pub(crate) fn estimate_grouped_layer_memory(
+    tensors: &[TensorDescriptor],
+    plan: &LayerReadPlan,
+) -> Result<LayerMemoryEstimate, String> {
+    let mut settled = 0u64;
+    let mut load_peak = 0u64;
+    for range in &plan.ranges {
+        if range.tensors.len() == 1 {
+            let descriptor = &tensors[range.tensors[0].descriptor_index];
+            let file_bytes = descriptor.byte_length.ok_or_else(|| {
+                format!("tensor '{}' byte length is unknown", descriptor.name)
+            })?;
+            let charge = tensor_load_charge_bytes(descriptor.ggml_type, file_bytes)?.max(1);
+            load_peak = load_peak.max(settled.checked_add(charge).ok_or_else(|| {
+                format!("layer load peak overflow at tensor '{}'", descriptor.name)
+            })?);
+            let resident = TensorData::resident_bytes_for(
+                descriptor.ggml_type,
+                descriptor.num_elements,
+                file_bytes,
+            )
+            .map_err(|error| format!("tensor '{}': {}", descriptor.name, error))?;
+            settled = settled.checked_add(resident.max(1)).ok_or_else(|| {
+                format!("layer resident size overflow at tensor '{}'", descriptor.name)
+            })?;
+            continue;
+        }
+
+        let range_resident = range.tensors.iter().try_fold(0u64, |total, tensor| {
+            let descriptor = &tensors[tensor.descriptor_index];
+            let file_bytes = descriptor.byte_length.ok_or_else(|| {
+                format!("tensor '{}' byte length is unknown", descriptor.name)
+            })?;
+            let resident = TensorData::resident_bytes_for(
+                descriptor.ggml_type,
+                descriptor.num_elements,
+                file_bytes,
+            )
+            .map_err(|error| format!("tensor '{}': {}", descriptor.name, error))?;
+            total
+                .checked_add(resident.max(1))
+                .ok_or_else(|| "coalesced range resident size overflow".to_string())
+        })?;
+        let grouped_peak = settled
+            .checked_add(range.byte_length)
+            .and_then(|value| value.checked_add(range_resident))
+            .ok_or_else(|| "coalesced layer load peak overflow".to_string())?;
+        load_peak = load_peak.max(grouped_peak);
+        settled = settled
+            .checked_add(range_resident)
+            .ok_or_else(|| "layer resident size overflow".to_string())?;
     }
     Ok(LayerMemoryEstimate {
         resident_bytes: settled,

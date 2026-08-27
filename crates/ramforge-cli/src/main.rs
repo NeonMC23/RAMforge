@@ -338,9 +338,19 @@ fn output_generation_profile(
         eprintln!("  Average per generated token: {}", format_duration(average));
     }
     eprintln!("  Maximum token loop: {}", format_duration(runtime.max_token_latency));
-    eprintln!("  GGUF bytes read: {}", format_bytes(profile.io.bytes_read));
-    eprintln!("  GGUF read operations: {}", profile.io.read_operations);
+    eprintln!("  Logical tensor reads: {}", profile.io.logical_tensor_reads);
+    eprintln!(
+        "  Logical tensor bytes: {}",
+        format_bytes(profile.io.logical_tensor_bytes)
+    );
+    eprintln!("  Physical GGUF reads: {}", profile.io.read_operations);
+    eprintln!("  Physical GGUF bytes: {}", format_bytes(profile.io.bytes_read));
     eprintln!("  GGUF read failures: {}", profile.io.read_failures);
+    eprintln!("  Coalesced physical ranges: {}", profile.io.coalesced_ranges);
+    eprintln!(
+        "  Coalesced gap overhead: {}",
+        format_bytes(profile.io.coalesced_gap_bytes)
+    );
     eprintln!("  Prompt token forwards: {}", runtime.prompt_forwards);
     eprintln!("  Decode token forwards: {}", runtime.decode_forwards);
     eprintln!(
@@ -636,6 +646,18 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
             format_bytes(execution.min_layer_resident_bytes)
         );
         println!("  Cache capacity does not guarantee hits; execution order and mandatory workspaces can force eviction");
+        println!(
+            "  Layer reads per full forward: {} logical tensors -> {} estimated physical ranges",
+            execution.logical_tensor_reads_per_forward,
+            execution.estimated_physical_reads_per_forward
+        );
+        println!(
+            "  Estimated read bytes per full forward: logical {} physical {} (gap overhead {})",
+            format_bytes(execution.logical_tensor_bytes_per_forward),
+            format_bytes(execution.estimated_physical_bytes_per_forward),
+            format_bytes(execution.estimated_gap_bytes_per_forward)
+        );
+        println!("  Read estimate is descriptor-only; runtime falls back to individual reads when grouped-buffer headroom is unavailable");
         println!("  Scope: necessary but not sufficient; excludes forward activations, KV cache, logits, and streamed-persistent workspaces");
     } else {
         println!(
@@ -743,6 +765,12 @@ fn output_plan_json(plan: &ramforge_runtime::plan::PlanResult, model: &GgufModel
             "layer_cache_capacity_bytes": execution.layer_cache_capacity_bytes,
             "max_complete_cached_layers": execution.max_complete_cached_layers,
             "min_layer_resident_bytes": execution.min_layer_resident_bytes,
+            "logical_tensor_reads_per_forward": execution.logical_tensor_reads_per_forward,
+            "estimated_physical_reads_per_forward": execution.estimated_physical_reads_per_forward,
+            "logical_tensor_bytes_per_forward": execution.logical_tensor_bytes_per_forward,
+            "estimated_physical_bytes_per_forward": execution.estimated_physical_bytes_per_forward,
+            "estimated_gap_bytes_per_forward": execution.estimated_gap_bytes_per_forward,
+            "read_estimate_scope": "descriptor-only; runtime may fall back to individual reads when grouped-buffer headroom is unavailable",
             "cache_scope": "capacity estimate only; execution order and mandatory workspaces determine actual retention and hits",
             "scope": "necessary but not sufficient; excludes activations, KV cache, logits, and streamed-persistent workspaces",
         })

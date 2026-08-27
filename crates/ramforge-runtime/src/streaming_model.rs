@@ -9,14 +9,18 @@ use std::sync::Mutex;
 use ramforge_core::{
     datasource::GgufDataSource,
     memory::MemoryBudget,
-    tensor::TensorData,
+    tensor::{decode_tensor_to_f32, TensorData},
     types::GgmlType,
 };
 
-use crate::accounting::{estimate_layer_memory, tensor_load_charge_bytes, LayerMemoryEstimate};
+use crate::accounting::{
+    estimate_grouped_layer_memory, estimate_layer_memory, tensor_load_charge_bytes,
+    LayerMemoryEstimate,
+};
 use crate::backend::ComputeBackend;
 use crate::kv_cache::KvCache;
 use crate::layer_cache::{InsertOutcome, LayerCache};
+use crate::layer_read::{build_layer_read_plan, LayerReadPlan};
 use crate::layer::{group_layers, LayerDescriptor, PersistentDescriptors};
 use crate::model::{validate_required_tensors, LlamaConfig};
 use crate::persistent::{row_bytes_for, PersistentWeight, should_keep_resident};
@@ -76,6 +80,8 @@ pub struct StreamingLlamaModel {
     /// (`blk.{i}.attn_{q,k,v}.bias`). Used to size the forward workspace.
     pub attn_bias_present: bool,
     layer_memory_estimates: Vec<LayerMemoryEstimate>,
+    grouped_layer_memory_estimates: Vec<LayerMemoryEstimate>,
+    layer_read_plans: Vec<LayerReadPlan>,
     layer_cache: Mutex<LayerCache<StreamingLayerWeights>>,
     pub(crate) profiler: Profiler,
 }
@@ -105,11 +111,27 @@ impl StreamingLlamaModel {
             .filter_map(|t| t.byte_length)
             .sum();
         let layer_descriptors = group_layers(gguf_model, config.block_count);
+        let layer_read_plans = layer_descriptors
+            .iter()
+            .map(|layer| {
+                build_layer_read_plan(&layer.tensors)
+                    .map_err(|error| format!("failed to plan layer {} reads: {}", layer.layer_idx, error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let layer_memory_estimates = layer_descriptors
             .iter()
             .map(|layer| {
                 estimate_layer_memory(&layer.tensors)
                     .map_err(|error| format!("failed to estimate layer {} memory: {}", layer.layer_idx, error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let grouped_layer_memory_estimates = layer_descriptors
+            .iter()
+            .zip(&layer_read_plans)
+            .map(|(layer, read_plan)| {
+                estimate_grouped_layer_memory(&layer.tensors, read_plan).map_err(|error| {
+                    format!("failed to estimate grouped layer {} memory: {}", layer.layer_idx, error)
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let max_layer_load_peak = layer_memory_estimates
@@ -189,6 +211,8 @@ impl StreamingLlamaModel {
             quantized_weight_bytes,
             attn_bias_present,
             layer_memory_estimates,
+            grouped_layer_memory_estimates,
+            layer_read_plans,
             layer_cache: Mutex::new(LayerCache::new(layer_cache_capacity)),
             profiler,
         })
@@ -258,31 +282,164 @@ impl StreamingLlamaModel {
         let mut loaded: Vec<(String, TensorData)> = Vec::new();
         let mut total_layer_bytes = 0u64;
 
+        let read_plan = &self.layer_read_plans[layer_idx];
+        let use_grouped_reads = read_plan.ranges.iter().any(|range| range.tensors.len() > 1)
+            && budget.can_allocate(
+                self.grouped_layer_memory_estimates[layer_idx].load_peak_bytes,
+            );
         let result = (|budget: &mut MemoryBudget| -> Result<(), String> {
-            for tensor_desc in &layer_desc.tensors {
-                let name = &tensor_desc.name;
-                let file_bytes = tensor_desc.byte_length.unwrap_or(0);
-                // Peak owned representation during load, charged up front.
-                let charge = tensor_load_charge_bytes(tensor_desc.ggml_type, file_bytes)?.max(1);
-                let alloc_name = format!("layer:{}:{}", layer_idx, name);
-                budget
-                    .allocate(alloc_name.clone(), charge)
-                    .map_err(|e| format!("RAM budget too small for layer {} tensor '{}': {}", layer_idx, name, e))?;
-
-                let tensor_data = load_tensor_data(data_source, tensor_desc, &self.profiler)?;
-
-                let resident = tensor_data.resident_bytes() as u64;
-                total_layer_bytes += resident;
-
-                // Atomically settle the charge to the exact resident size;
-                // the allocation name remains live while TensorData exists.
-                if resident.max(1) != charge {
+            if !use_grouped_reads {
+                for tensor_desc in &layer_desc.tensors {
+                    let name = &tensor_desc.name;
+                    let file_bytes = tensor_desc.byte_length.unwrap_or(0);
+                    let charge =
+                        tensor_load_charge_bytes(tensor_desc.ggml_type, file_bytes)?.max(1);
+                    let alloc_name = format!("layer:{}:{}", layer_idx, name);
                     budget
-                        .resize(&alloc_name, resident.max(1))
-                        .map_err(|e| format!("RAM budget error settling layer {} tensor '{}': {}", layer_idx, name, e))?;
+                        .allocate(alloc_name.clone(), charge)
+                        .map_err(|error| {
+                            format!(
+                                "RAM budget too small for layer {} tensor '{}': {}",
+                                layer_idx, name, error
+                            )
+                        })?;
+                    let tensor_data = load_tensor_data(data_source, tensor_desc, &self.profiler)?;
+                    let resident = tensor_data.resident_bytes() as u64;
+                    total_layer_bytes = total_layer_bytes
+                        .checked_add(resident)
+                        .ok_or_else(|| "layer resident byte total overflow".to_string())?;
+                    if resident.max(1) != charge {
+                        budget
+                            .resize(&alloc_name, resident.max(1))
+                            .map_err(|error| {
+                                format!(
+                                    "RAM budget error settling layer {} tensor '{}': {}",
+                                    layer_idx, name, error
+                                )
+                            })?;
+                    }
+                    loaded.push((name.clone(), tensor_data));
+                }
+                return Ok(());
+            }
+
+            for (range_index, range) in read_plan.ranges.iter().enumerate() {
+                if range.tensors.len() > 1 {
+                    for tensor in &range.tensors {
+                        let descriptor = &layer_desc.tensors[tensor.descriptor_index];
+                        let file_bytes = descriptor.byte_length.ok_or_else(|| {
+                            format!("tensor '{}' byte length is unknown", descriptor.name)
+                        })?;
+                        let resident = TensorData::resident_bytes_for(
+                            descriptor.ggml_type,
+                            descriptor.num_elements,
+                            file_bytes,
+                        )
+                        .map_err(|error| {
+                            format!("failed to size tensor '{}': {}", descriptor.name, error)
+                        })?
+                        .max(1);
+                        budget
+                            .allocate(
+                                format!("layer:{}:{}", layer_idx, descriptor.name),
+                                resident,
+                            )
+                            .map_err(|error| {
+                                format!(
+                                    "RAM budget too small for grouped layer {} tensor '{}': {}",
+                                    layer_idx, descriptor.name, error
+                                )
+                            })?;
+                    }
+
+                    let temp_name = format!("tmp:layer_read:{}:{}", layer_idx, range_index);
+                    budget.with_temp(&temp_name, range.byte_length, |budget| {
+                        let descriptors: Vec<&ramforge_core::model::TensorDescriptor> = range
+                            .tensors
+                            .iter()
+                            .map(|tensor| &layer_desc.tensors[tensor.descriptor_index])
+                            .collect();
+                        let tensor_names = descriptors
+                            .iter()
+                            .map(|descriptor| descriptor.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let bytes = data_source
+                            .read_coalesced_tensor_range(
+                                &descriptors,
+                                range.file_offset,
+                                range.byte_length,
+                            )
+                            .map_err(|error| {
+                                format!(
+                                    "failed grouped read for layer {} range {} tensors [{}]: {}",
+                                    layer_idx, range_index, tensor_names, error
+                                )
+                            })?;
+                        for tensor in &range.tensors {
+                            let descriptor = &layer_desc.tensors[tensor.descriptor_index];
+                            let tensor_bytes = descriptor.byte_length.unwrap_or(0);
+                            let start = usize::try_from(tensor.offset_in_range).map_err(|_| {
+                                format!("tensor '{}' grouped offset is too large", descriptor.name)
+                            })?;
+                            let length = usize::try_from(tensor_bytes).map_err(|_| {
+                                format!("tensor '{}' byte length is too large", descriptor.name)
+                            })?;
+                            let end = start.checked_add(length).ok_or_else(|| {
+                                format!("tensor '{}' grouped slice overflows", descriptor.name)
+                            })?;
+                            let slice = bytes.get(start..end).ok_or_else(|| {
+                                format!("tensor '{}' is outside grouped read buffer", descriptor.name)
+                            })?;
+                            let tensor_data = load_tensor_data_from_borrowed_bytes(
+                                descriptor,
+                                slice,
+                                &self.profiler,
+                            )?;
+                            let resident = tensor_data.resident_bytes() as u64;
+                            let charge_name = format!("layer:{}:{}", layer_idx, descriptor.name);
+                            if budget.get(&charge_name) != Some(resident.max(1)) {
+                                return Err(format!(
+                                    "grouped tensor '{}' resident charge mismatch",
+                                    descriptor.name
+                                ));
+                            }
+                            total_layer_bytes = total_layer_bytes
+                                .checked_add(resident)
+                                .ok_or_else(|| "layer resident byte total overflow".to_string())?;
+                            loaded.push((descriptor.name.clone(), tensor_data));
+                        }
+                        Ok::<(), String>(())
+                    })?;
+                    continue;
                 }
 
-                loaded.push((name.clone(), tensor_data));
+                for tensor in &range.tensors {
+                    let tensor_desc = &layer_desc.tensors[tensor.descriptor_index];
+                    let name = &tensor_desc.name;
+                    let file_bytes = tensor_desc.byte_length.unwrap_or(0);
+                    // Peak owned representation during an individual load.
+                    let charge =
+                        tensor_load_charge_bytes(tensor_desc.ggml_type, file_bytes)?.max(1);
+                    let alloc_name = format!("layer:{}:{}", layer_idx, name);
+                    budget
+                        .allocate(alloc_name.clone(), charge)
+                        .map_err(|e| format!("RAM budget too small for layer {} tensor '{}': {}", layer_idx, name, e))?;
+
+                    let tensor_data = load_tensor_data(data_source, tensor_desc, &self.profiler)?;
+                    let resident = tensor_data.resident_bytes() as u64;
+                    total_layer_bytes = total_layer_bytes
+                        .checked_add(resident)
+                        .ok_or_else(|| "layer resident byte total overflow".to_string())?;
+
+                    // Atomically settle the charge to exact resident size.
+                    if resident.max(1) != charge {
+                        budget
+                            .resize(&alloc_name, resident.max(1))
+                            .map_err(|e| format!("RAM budget error settling layer {} tensor '{}': {}", layer_idx, name, e))?;
+                    }
+                    loaded.push((name.clone(), tensor_data));
+                }
             }
             Ok(())
         })(budget);
@@ -840,6 +997,41 @@ fn load_tensor_data(
         }
         result
     }
+}
+
+fn load_tensor_data_from_borrowed_bytes(
+    desc: &ramforge_core::model::TensorDescriptor,
+    bytes: &[u8],
+    profiler: &Profiler,
+) -> Result<TensorData, String> {
+    let started = profiler.start();
+    let result = if matches!(desc.ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+        let decoded = decode_tensor_to_f32(bytes, desc.ggml_type, desc.num_elements)
+            .map_err(|error| format!("failed to decode tensor '{}': {}", desc.name, error))?;
+        TensorData::from_decoded_float_vec(
+            desc.ggml_type,
+            desc.dimensions.clone(),
+            desc.num_elements,
+            decoded,
+        )
+        .map_err(|error| format!("failed to create TensorData for '{}': {}", desc.name, error))
+    } else {
+        TensorData::from_bytes(
+            desc.ggml_type,
+            desc.dimensions.clone(),
+            desc.num_elements,
+            bytes.to_vec(),
+        )
+        .map_err(|error| format!("failed to create TensorData for '{}': {}", desc.name, error))
+    };
+    let elapsed = started.map(|instant| instant.elapsed());
+    if let Some(elapsed) = elapsed {
+        profiler.record(ProfileEvent::TensorConstruction, elapsed);
+        if matches!(desc.ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+            profiler.record(ProfileEvent::Dequantization, elapsed);
+        }
+    }
+    result
 }
 
 /// Apply the persistent residency policy and, when resident, load one tensor

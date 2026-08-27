@@ -700,7 +700,9 @@ mod tests {
             profile.runtime.cache_hits,
             (prompt_forwards - 1) * layer_count
         );
-        assert_eq!(profile.io.read_operations, layer_count * 9);
+        assert_eq!(profile.io.logical_tensor_reads, layer_count * 9);
+        assert_eq!(profile.io.read_operations, layer_count);
+        assert!(profile.io.read_operations < profile.io.logical_tensor_reads);
         for tensor in profile
             .tensor_reads
             .iter()
@@ -893,10 +895,18 @@ mod tests {
         let mut uncached = InferenceEngine::new(tmp.path().to_str().unwrap(), 5_000).unwrap();
         assert!(cached.model.layer_cache_capacity_bytes() > 2624);
         assert!(uncached.model.layer_cache_capacity_bytes() < 2624);
+        uncached.set_profiling(true);
 
         let cached_output = cached.generate("hello", 3, &sampler).unwrap();
         let uncached_output = uncached.generate("hello", 3, &sampler).unwrap();
         assert_eq!(cached_output, uncached_output);
+        let uncached_profile = uncached.generation_profile();
+        assert_eq!(uncached_profile.io.coalesced_ranges, 0);
+        assert_eq!(
+            uncached_profile.io.read_operations,
+            uncached_profile.io.logical_tensor_reads
+        );
+        assert!(uncached_profile.ramforge_peak_bytes <= uncached_profile.ramforge_budget_bytes);
     }
 
     #[test]

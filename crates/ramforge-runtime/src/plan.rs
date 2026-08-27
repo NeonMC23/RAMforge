@@ -10,6 +10,7 @@ use ramforge_core::{memory::MemoryBudget, tensor::TensorData, GgufModel};
 
 use crate::accounting::{estimate_layer_memory, tensor_load_charge_bytes};
 use crate::layer::{group_layers, PersistentDescriptors};
+use crate::layer_read::build_layer_read_plan;
 use crate::model::{validate_required_tensors, LlamaConfig};
 use crate::persistent::should_keep_resident;
 
@@ -32,6 +33,11 @@ pub struct ExecutionMemoryPlan {
     pub layer_cache_capacity_bytes: u64,
     pub max_complete_cached_layers: usize,
     pub min_layer_resident_bytes: u64,
+    pub logical_tensor_reads_per_forward: usize,
+    pub estimated_physical_reads_per_forward: usize,
+    pub logical_tensor_bytes_per_forward: u64,
+    pub estimated_physical_bytes_per_forward: u64,
+    pub estimated_gap_bytes_per_forward: u64,
     /// Necessary but not sufficient: forward activations, KV, logits, and
     /// streamed persistent workspaces are intentionally not included.
     pub layer_streaming_lower_bound_fits: bool,
@@ -169,11 +175,40 @@ fn plan_execution_memory(
     let mut largest_layer_resident_bytes = 0u64;
     let mut largest_layer_load_peak_bytes = 0u64;
     let mut layer_resident_sizes = Vec::with_capacity(layers.len());
+    let mut logical_tensor_reads_per_forward = 0usize;
+    let mut estimated_physical_reads_per_forward = 0usize;
+    let mut logical_tensor_bytes_per_forward = 0u64;
+    let mut estimated_physical_bytes_per_forward = 0u64;
+    let mut estimated_gap_bytes_per_forward = 0u64;
 
     for layer in &layers {
+        let read_plan = build_layer_read_plan(&layer.tensors).map_err(|error| {
+            format!("cannot plan layer {} reads: {}", layer.layer_idx, error)
+        })?;
         let estimate = estimate_layer_memory(&layer.tensors).map_err(|error| {
             format!("cannot preflight layer {}: {}", layer.layer_idx, error)
         })?;
+        logical_tensor_reads_per_forward = logical_tensor_reads_per_forward
+            .checked_add(read_plan.logical_tensor_count)
+            .ok_or_else(|| "logical tensor read count overflow".to_string())?;
+        estimated_physical_reads_per_forward = estimated_physical_reads_per_forward
+            .checked_add(read_plan.ranges.len())
+            .ok_or_else(|| "physical read count overflow".to_string())?;
+        logical_tensor_bytes_per_forward = checked_add(
+            logical_tensor_bytes_per_forward,
+            read_plan.logical_bytes,
+            "logical tensor bytes per forward",
+        )?;
+        estimated_physical_bytes_per_forward = checked_add(
+            estimated_physical_bytes_per_forward,
+            read_plan.physical_bytes,
+            "physical bytes per forward",
+        )?;
+        estimated_gap_bytes_per_forward = checked_add(
+            estimated_gap_bytes_per_forward,
+            read_plan.gap_bytes,
+            "coalesced gap bytes per forward",
+        )?;
         layer_resident_sizes.push(estimate.resident_bytes);
         if estimate.load_peak_bytes > largest_layer_load_peak_bytes {
             largest_layer_index = layer.layer_idx;
@@ -209,6 +244,11 @@ fn plan_execution_memory(
         layer_cache_capacity_bytes,
         max_complete_cached_layers,
         min_layer_resident_bytes,
+        logical_tensor_reads_per_forward,
+        estimated_physical_reads_per_forward,
+        logical_tensor_bytes_per_forward,
+        estimated_physical_bytes_per_forward,
+        estimated_gap_bytes_per_forward,
         layer_streaming_lower_bound_fits: managed_lower_bound_bytes <= ram_budget_bytes,
     })
 }
@@ -357,6 +397,11 @@ mod tests {
         assert_eq!(execution.layer_cache_capacity_bytes, 6832);
         assert_eq!(execution.max_complete_cached_layers, 1);
         assert_eq!(execution.min_layer_resident_bytes, 2624);
+        assert_eq!(execution.logical_tensor_reads_per_forward, 9);
+        assert_eq!(execution.estimated_physical_reads_per_forward, 1);
+        assert_eq!(execution.logical_tensor_bytes_per_forward, 2624);
+        assert_eq!(execution.estimated_physical_bytes_per_forward, 2624);
+        assert_eq!(execution.estimated_gap_bytes_per_forward, 0);
         assert!(execution.layer_streaming_lower_bound_fits);
     }
 

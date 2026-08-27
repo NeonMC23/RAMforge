@@ -18,12 +18,18 @@ use crate::model::{GgufModel, TensorDescriptor};
 use crate::types::GgmlType;
 
 /// Optional datasource read-path counters. `elapsed` includes destination
-/// allocation plus file open/seek/read, not just kernel read syscall time.
+/// allocation plus synchronized seek/read, not just kernel read syscall time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IoProfile {
+    /// Physical bytes returned by bounded file reads, including coalesced gaps.
     pub bytes_read: u64,
+    /// Physical seek/read requests against the retained file handle.
     pub read_operations: u64,
     pub read_failures: u64,
+    pub logical_tensor_reads: u64,
+    pub logical_tensor_bytes: u64,
+    pub coalesced_ranges: u64,
+    pub coalesced_gap_bytes: u64,
     pub elapsed: Duration,
 }
 
@@ -50,6 +56,10 @@ pub struct GgufDataSource {
     profile_read_operations: AtomicU64,
     profile_read_failures: AtomicU64,
     profile_read_nanos: AtomicU64,
+    profile_logical_tensor_reads: AtomicU64,
+    profile_logical_tensor_bytes: AtomicU64,
+    profile_coalesced_ranges: AtomicU64,
+    profile_coalesced_gap_bytes: AtomicU64,
     profile_tensors: Mutex<BTreeMap<String, TensorIoProfile>>,
 }
 
@@ -72,6 +82,10 @@ impl GgufDataSource {
             profile_read_operations: AtomicU64::new(0),
             profile_read_failures: AtomicU64::new(0),
             profile_read_nanos: AtomicU64::new(0),
+            profile_logical_tensor_reads: AtomicU64::new(0),
+            profile_logical_tensor_bytes: AtomicU64::new(0),
+            profile_coalesced_ranges: AtomicU64::new(0),
+            profile_coalesced_gap_bytes: AtomicU64::new(0),
             profile_tensors: Mutex::new(BTreeMap::new()),
         })
     }
@@ -90,6 +104,10 @@ impl GgufDataSource {
         self.profile_read_operations.store(0, Ordering::Relaxed);
         self.profile_read_failures.store(0, Ordering::Relaxed);
         self.profile_read_nanos.store(0, Ordering::Relaxed);
+        self.profile_logical_tensor_reads.store(0, Ordering::Relaxed);
+        self.profile_logical_tensor_bytes.store(0, Ordering::Relaxed);
+        self.profile_coalesced_ranges.store(0, Ordering::Relaxed);
+        self.profile_coalesced_gap_bytes.store(0, Ordering::Relaxed);
         if let Ok(mut tensors) = self.profile_tensors.lock() {
             tensors.clear();
         }
@@ -100,6 +118,10 @@ impl GgufDataSource {
             bytes_read: self.profile_bytes_read.load(Ordering::Relaxed),
             read_operations: self.profile_read_operations.load(Ordering::Relaxed),
             read_failures: self.profile_read_failures.load(Ordering::Relaxed),
+            logical_tensor_reads: self.profile_logical_tensor_reads.load(Ordering::Relaxed),
+            logical_tensor_bytes: self.profile_logical_tensor_bytes.load(Ordering::Relaxed),
+            coalesced_ranges: self.profile_coalesced_ranges.load(Ordering::Relaxed),
+            coalesced_gap_bytes: self.profile_coalesced_gap_bytes.load(Ordering::Relaxed),
             elapsed: Duration::from_nanos(self.profile_read_nanos.load(Ordering::Relaxed)),
         }
     }
@@ -115,6 +137,8 @@ impl GgufDataSource {
         if !self.profiling_enabled.load(Ordering::Relaxed) {
             return;
         }
+        self.profile_logical_tensor_reads.fetch_add(1, Ordering::Relaxed);
+        self.profile_logical_tensor_bytes.fetch_add(bytes, Ordering::Relaxed);
         let Ok(mut profiles) = self.profile_tensors.lock() else {
             return;
         };
@@ -124,6 +148,15 @@ impl GgufDataSource {
         if failed {
             profile.read_failures = profile.read_failures.saturating_add(1);
         }
+    }
+
+    fn record_coalesced_range(&self, gap_bytes: u64) {
+        if !self.profiling_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.profile_coalesced_ranges.fetch_add(1, Ordering::Relaxed);
+        self.profile_coalesced_gap_bytes
+            .fetch_add(gap_bytes, Ordering::Relaxed);
     }
 
     fn profile_start(&self) -> Option<Instant> {
@@ -273,6 +306,75 @@ impl GgufDataSource {
             .map(|values| std::mem::size_of_val(values.as_slice()) as u64)
             .unwrap_or(0);
         self.record_tensor_read(&desc.name, bytes, result.is_err());
+        result
+    }
+
+    /// Read one validated physical range containing explicit tensor requests.
+    /// Tensor boundaries remain descriptor-derived; bytes between requests are
+    /// profiling-visible gap overhead and are never treated as tensor data.
+    pub fn read_coalesced_tensor_range(
+        &self,
+        descriptors: &[&TensorDescriptor],
+        file_offset: u64,
+        byte_length: u64,
+    ) -> Result<Vec<u8>, DataSourceError> {
+        let first = descriptors.first().ok_or_else(|| {
+            DataSourceError::InvalidRange("coalesced tensor read is empty".to_string())
+        })?;
+        let range_end = file_offset.checked_add(byte_length).ok_or_else(|| {
+            DataSourceError::InvalidRange("coalesced tensor range overflows".to_string())
+        })?;
+        self.validate_bounds_at(file_offset, byte_length, first)?;
+
+        let mut logical_bytes = 0u64;
+        for descriptor in descriptors {
+            let tensor_bytes = descriptor.byte_length.ok_or_else(|| {
+                DataSourceError::UnknownByteLength(
+                    descriptor.name.clone(),
+                    descriptor.ggml_type.name(),
+                )
+            })?;
+            self.validate_bounds(descriptor, tensor_bytes)?;
+            let tensor_end = descriptor
+                .file_offset
+                .checked_add(tensor_bytes)
+                .ok_or_else(|| {
+                    DataSourceError::InvalidRange(format!(
+                        "tensor '{}' range overflows",
+                        descriptor.name
+                    ))
+                })?;
+            if descriptor.file_offset < file_offset || tensor_end > range_end {
+                return Err(DataSourceError::InvalidRange(format!(
+                    "tensor '{}' is outside coalesced range {}..{}",
+                    descriptor.name, file_offset, range_end
+                )));
+            }
+            logical_bytes = logical_bytes.checked_add(tensor_bytes).ok_or_else(|| {
+                DataSourceError::InvalidRange(
+                    "coalesced logical tensor byte count overflows".to_string(),
+                )
+            })?;
+        }
+        if logical_bytes > byte_length {
+            return Err(DataSourceError::InvalidRange(
+                "coalesced tensors overlap or exceed the physical range".to_string(),
+            ));
+        }
+
+        let result = self.read_range(file_offset, byte_length);
+        let failed = result.is_err();
+        for descriptor in descriptors {
+            let bytes = if failed {
+                0
+            } else {
+                descriptor.byte_length.unwrap_or(0)
+            };
+            self.record_tensor_read(&descriptor.name, bytes, failed);
+        }
+        if !failed && descriptors.len() > 1 {
+            self.record_coalesced_range(byte_length - logical_bytes);
+        }
         result
     }
 
@@ -551,6 +653,35 @@ mod tests {
         tmp
     }
 
+    fn create_test_gguf_with_gap(gap: usize) -> NamedTempFile {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        write_u32(&mut buf, 3);
+        write_u64(&mut buf, 2);
+        write_u64(&mut buf, 0);
+        for (name, offset) in [("a.weight", 0u64), ("b.weight", 8 + gap as u64)] {
+            write_string(&mut buf, name);
+            write_u32(&mut buf, 1);
+            write_u64(&mut buf, 2);
+            write_u32(&mut buf, 0);
+            write_u64(&mut buf, offset);
+        }
+        let pos = buf.len() as u64;
+        let aligned = align_offset(pos, 32);
+        buf.extend(vec![0u8; (aligned - pos) as usize]);
+        for value in [1.0f32, 2.0] {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        buf.extend(vec![0xA5; gap]);
+        for value in [3.0f32, 4.0] {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&buf).unwrap();
+        tmp.flush().unwrap();
+        tmp
+    }
+
     fn create_test_gguf_with_data() -> NamedTempFile {
         let mut buf = Vec::new();
         // magic
@@ -630,6 +761,9 @@ mod tests {
         assert_eq!(profile.bytes_read, 16);
         assert_eq!(profile.read_operations, 1);
         assert_eq!(profile.read_failures, 0);
+        assert_eq!(profile.logical_tensor_reads, 1);
+        assert_eq!(profile.logical_tensor_bytes, 16);
+        assert_eq!(profile.coalesced_ranges, 0);
         let tensor_profile = ds.tensor_io_profile();
         let tensor_profile = tensor_profile.get("a.weight").unwrap();
         assert_eq!(tensor_profile.bytes_read, 16);
@@ -637,6 +771,55 @@ mod tests {
         ds.reset_io_profile();
         assert_eq!(ds.io_profile(), IoProfile::default());
         assert!(ds.tensor_io_profile().is_empty());
+    }
+
+    #[test]
+    fn test_coalesced_read_separates_logical_and_physical_profile_counts() {
+        let tmp = create_test_gguf_with_data();
+        let ds = GgufDataSource::open(tmp.path()).unwrap();
+        ds.set_profiling(true);
+        ds.reset_io_profile();
+        let a = ds.get_descriptor("a.weight").unwrap();
+        let b = ds.get_descriptor("b.weight").unwrap();
+        let bytes = ds
+            .read_coalesced_tensor_range(&[a, b], a.file_offset, 48)
+            .unwrap();
+        assert_eq!(bytes.len(), 48);
+        let profile = ds.io_profile();
+        assert_eq!(profile.logical_tensor_reads, 2);
+        assert_eq!(profile.logical_tensor_bytes, 48);
+        assert_eq!(profile.read_operations, 1);
+        assert_eq!(profile.bytes_read, 48);
+        assert_eq!(profile.coalesced_ranges, 1);
+        assert_eq!(profile.coalesced_gap_bytes, 0);
+    }
+
+    #[test]
+    fn test_coalesced_small_gap_preserves_explicit_tensor_slices() {
+        let gap = 16usize;
+        let tmp = create_test_gguf_with_gap(gap);
+        let ds = GgufDataSource::open(tmp.path()).unwrap();
+        ds.set_profiling(true);
+        let a = ds.get_descriptor("a.weight").unwrap();
+        let b = ds.get_descriptor("b.weight").unwrap();
+        let span = 8 + gap as u64 + 8;
+        let bytes = ds
+            .read_coalesced_tensor_range(&[a, b], a.file_offset, span)
+            .unwrap();
+        assert_eq!(
+            f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            1.0
+        );
+        let b_start = 8 + gap;
+        assert_eq!(
+            f32::from_le_bytes(bytes[b_start..b_start + 4].try_into().unwrap()),
+            3.0
+        );
+        assert!(bytes[8..b_start].iter().all(|byte| *byte == 0xA5));
+        let profile = ds.io_profile();
+        assert_eq!(profile.logical_tensor_bytes, 16);
+        assert_eq!(profile.bytes_read, span);
+        assert_eq!(profile.coalesced_gap_bytes, gap as u64);
     }
 
     #[test]
