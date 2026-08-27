@@ -345,6 +345,8 @@ fn output_generation_profile(
     );
     eprintln!("  Physical GGUF reads: {}", profile.io.read_operations);
     eprintln!("  Physical GGUF bytes: {}", format_bytes(profile.io.bytes_read));
+    eprintln!("  Physical seeks: {}", profile.io.seek_operations);
+    eprintln!("  Seeks safely avoided: {}", profile.io.seeks_avoided);
     eprintln!("  GGUF read failures: {}", profile.io.read_failures);
     eprintln!("  Coalesced physical ranges: {}", profile.io.coalesced_ranges);
     eprintln!(

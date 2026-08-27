@@ -23,9 +23,11 @@ use crate::types::GgmlType;
 pub struct IoProfile {
     /// Physical bytes returned by bounded file reads, including coalesced gaps.
     pub bytes_read: u64,
-    /// Physical seek/read requests against the retained file handle.
+    /// Physical read requests against the retained file handle.
     pub read_operations: u64,
     pub read_failures: u64,
+    pub seek_operations: u64,
+    pub seeks_avoided: u64,
     pub logical_tensor_reads: u64,
     pub logical_tensor_bytes: u64,
     pub coalesced_ranges: u64,
@@ -40,6 +42,13 @@ pub struct TensorIoProfile {
     pub read_failures: u64,
 }
 
+#[derive(Debug)]
+struct FileState {
+    file: File,
+    /// Known absolute cursor position. `None` forces the next read to seek.
+    position: Option<u64>,
+}
+
 /// A file-backed data source for GGUF tensor data
 ///
 /// Holds the parsed model (metadata + descriptors) and provides methods to
@@ -49,13 +58,15 @@ pub struct TensorIoProfile {
 #[derive(Debug)]
 pub struct GgufDataSource {
     model: GgufModel,
-    file: Mutex<File>,
+    file: Mutex<FileState>,
     file_size: u64,
     profiling_enabled: AtomicBool,
     profile_bytes_read: AtomicU64,
     profile_read_operations: AtomicU64,
     profile_read_failures: AtomicU64,
     profile_read_nanos: AtomicU64,
+    profile_seek_operations: AtomicU64,
+    profile_seeks_avoided: AtomicU64,
     profile_logical_tensor_reads: AtomicU64,
     profile_logical_tensor_bytes: AtomicU64,
     profile_coalesced_ranges: AtomicU64,
@@ -75,13 +86,18 @@ impl GgufDataSource {
         let file = File::open(&path_buf)?;
         Ok(Self {
             model,
-            file: Mutex::new(file),
+            file: Mutex::new(FileState {
+                file,
+                position: Some(0),
+            }),
             file_size,
             profiling_enabled: AtomicBool::new(false),
             profile_bytes_read: AtomicU64::new(0),
             profile_read_operations: AtomicU64::new(0),
             profile_read_failures: AtomicU64::new(0),
             profile_read_nanos: AtomicU64::new(0),
+            profile_seek_operations: AtomicU64::new(0),
+            profile_seeks_avoided: AtomicU64::new(0),
             profile_logical_tensor_reads: AtomicU64::new(0),
             profile_logical_tensor_bytes: AtomicU64::new(0),
             profile_coalesced_ranges: AtomicU64::new(0),
@@ -104,6 +120,8 @@ impl GgufDataSource {
         self.profile_read_operations.store(0, Ordering::Relaxed);
         self.profile_read_failures.store(0, Ordering::Relaxed);
         self.profile_read_nanos.store(0, Ordering::Relaxed);
+        self.profile_seek_operations.store(0, Ordering::Relaxed);
+        self.profile_seeks_avoided.store(0, Ordering::Relaxed);
         self.profile_logical_tensor_reads.store(0, Ordering::Relaxed);
         self.profile_logical_tensor_bytes.store(0, Ordering::Relaxed);
         self.profile_coalesced_ranges.store(0, Ordering::Relaxed);
@@ -118,6 +136,8 @@ impl GgufDataSource {
             bytes_read: self.profile_bytes_read.load(Ordering::Relaxed),
             read_operations: self.profile_read_operations.load(Ordering::Relaxed),
             read_failures: self.profile_read_failures.load(Ordering::Relaxed),
+            seek_operations: self.profile_seek_operations.load(Ordering::Relaxed),
+            seeks_avoided: self.profile_seeks_avoided.load(Ordering::Relaxed),
             logical_tensor_reads: self.profile_logical_tensor_reads.load(Ordering::Relaxed),
             logical_tensor_bytes: self.profile_logical_tensor_bytes.load(Ordering::Relaxed),
             coalesced_ranges: self.profile_coalesced_ranges.load(Ordering::Relaxed),
@@ -157,6 +177,32 @@ impl GgufDataSource {
         self.profile_coalesced_ranges.fetch_add(1, Ordering::Relaxed);
         self.profile_coalesced_gap_bytes
             .fetch_add(gap_bytes, Ordering::Relaxed);
+    }
+
+    fn ensure_file_position(
+        &self,
+        state: &mut FileState,
+        file_offset: u64,
+    ) -> Result<(), DataSourceError> {
+        if state.position == Some(file_offset) {
+            if self.profiling_enabled.load(Ordering::Relaxed) {
+                self.profile_seeks_avoided.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        if self.profiling_enabled.load(Ordering::Relaxed) {
+            self.profile_seek_operations.fetch_add(1, Ordering::Relaxed);
+        }
+        match state.file.seek(SeekFrom::Start(file_offset)) {
+            Ok(position) => {
+                state.position = Some(position);
+                Ok(())
+            }
+            Err(error) => {
+                state.position = None;
+                Err(DataSourceError::Io(error))
+            }
+        }
     }
 
     fn profile_start(&self) -> Option<Instant> {
@@ -483,10 +529,10 @@ impl GgufDataSource {
                     length
                 ))
             })?;
-            let mut file = self.file.lock().map_err(|_| {
+            let mut state = self.file.lock().map_err(|_| {
                 DataSourceError::General("GGUF file handle lock poisoned".to_string())
             })?;
-            file.seek(SeekFrom::Start(file_offset))?;
+            self.ensure_file_position(&mut state, file_offset)?;
 
             // `read_to_end` appends into spare capacity rather than requiring a
             // zero-filled destination that `read_exact` immediately overwrites.
@@ -499,14 +545,22 @@ impl GgufDataSource {
                     length_usize, e
                 ))
             })?;
-            let mut limited = (&mut *file).take(length);
-            limited.read_to_end(&mut buf)?;
+            let read_result = {
+                let mut limited = (&mut state.file).take(length);
+                limited.read_to_end(&mut buf)
+            };
+            if let Err(error) = read_result {
+                state.position = None;
+                return Err(DataSourceError::Io(error));
+            }
             if buf.len() != length_usize {
+                state.position = None;
                 return Err(DataSourceError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "failed to fill whole buffer",
                 )));
             }
+            state.position = file_offset.checked_add(length);
             Ok(buf)
         })();
         let bytes = result.as_ref().map(|buffer| buffer.len() as u64).unwrap_or(0);
@@ -561,11 +615,11 @@ impl GgufDataSource {
             ))
         })?;
 
-        let mut file = self.file.lock().map_err(|_| {
+        let mut state = self.file.lock().map_err(|_| {
             DataSourceError::General("GGUF file handle lock poisoned".to_string())
         })?;
-        file.seek(SeekFrom::Start(file_offset))?;
-        {
+        self.ensure_file_position(&mut state, file_offset)?;
+        let read_result = {
             let spare = &mut values.spare_capacity_mut()[..element_count];
             // SAFETY:
             // - `spare` refers to `element_count` properly aligned f32 slots;
@@ -580,8 +634,13 @@ impl GgufDataSource {
                     byte_length,
                 )
             };
-            file.read_exact(destination)?;
+            state.file.read_exact(destination)
+        };
+        if let Err(error) = read_result {
+            state.position = None;
+            return Err(DataSourceError::Io(error));
         }
+        state.position = file_offset.checked_add(byte_length as u64);
 
         // SAFETY: `read_exact` above initialized every byte of every reserved
         // f32 slot, and all f32 bit patterns are valid.
@@ -761,6 +820,8 @@ mod tests {
         assert_eq!(profile.bytes_read, 16);
         assert_eq!(profile.read_operations, 1);
         assert_eq!(profile.read_failures, 0);
+        assert_eq!(profile.seek_operations, 1);
+        assert_eq!(profile.seeks_avoided, 0);
         assert_eq!(profile.logical_tensor_reads, 1);
         assert_eq!(profile.logical_tensor_bytes, 16);
         assert_eq!(profile.coalesced_ranges, 0);
@@ -771,6 +832,25 @@ mod tests {
         ds.reset_io_profile();
         assert_eq!(ds.io_profile(), IoProfile::default());
         assert!(ds.tensor_io_profile().is_empty());
+    }
+
+    #[test]
+    fn test_cursor_avoids_seek_for_adjacent_physical_reads() {
+        let tmp = create_test_gguf_with_data();
+        let ds = GgufDataSource::open(tmp.path()).unwrap();
+        ds.set_profiling(true);
+        ds.reset_io_profile();
+        ds.read_tensor("a.weight").unwrap();
+        ds.read_tensor("b.weight").unwrap();
+        let profile = ds.io_profile();
+        assert_eq!(profile.read_operations, 2);
+        assert_eq!(profile.seek_operations, 1);
+        assert_eq!(profile.seeks_avoided, 1);
+
+        ds.read_tensor("a.weight").unwrap();
+        let profile = ds.io_profile();
+        assert_eq!(profile.seek_operations, 2);
+        assert_eq!(profile.seeks_avoided, 1);
     }
 
     #[test]

@@ -78,12 +78,13 @@ Entire quantized model never resident simultaneously. Layers released after comp
 
 - **Streaming output:** generation exposes a text callback backed by a stateful tokenizer decoder; split UTF-8 byte tokens are buffered until displayable, EOS remains suppressed, and CLI diagnostics stay on stderr
 - **No unused terminal forward:** once the final requested token is selected and emitted, RAMforge does not stream all layers again unless another token's logits are required
-- **Real profiling:** `--profile` measures generation wall time, prompt/prefill, prompt/decode forward counts, logical per-tensor reads/bytes, physical GGUF reads/bytes, coalesced ranges/gap overhead, the GGUF read path (destination allocation plus seek/read on a reused handle), layer loading/compute/release, tensor construction, explicit dequantization/copies, F32 and quantized matvec, allocations, logits, sampling, callback time, token latency, and layer-cache hits/misses/evictions/current/peak residency
+- **Real profiling:** `--profile` measures generation wall time, prompt/prefill, prompt/decode forward counts, logical per-tensor reads/bytes, physical GGUF reads/bytes, actual/avoided seeks, coalesced ranges/gap overhead, the GGUF read path, layer loading/compute/release, tensor construction, explicit dequantization/copies, F32 and quantized matvec, allocations, logits, sampling, callback time, token latency, and layer-cache hits/misses/evictions/current/peak residency
 - **Memory visibility:** `--memory-report` labels RAMforge current/peak/budget separately from Linux process RSS and system memory; MemoryBudget does not claim control over RSS or page cache
 - **Capability registry:** `ramforge support` distinguishes generic GGUF inspection/planning from execution, tokenizer, and quantization support. Direct execution remains limited to `llama` and `qwen2`; Mistral is runnable only when represented by a validated llama-compatible GGUF; `qwen35` is explicitly inspect/plan-only
 - **Execution memory preflight:** for runnable architectures, `ramforge plan` applies the runtime’s persistent-retention, decoded-residency, and per-tensor load-transient rules to report the largest layer and a necessary managed-memory lower bound. It explicitly excludes prompt-dependent KV and activation workspaces, so it is not presented as a sufficient runtime guarantee.
 - **Bounded streamed-layer cache:** recently used decoded layer representations may remain resident under an explicit byte capacity derived from the selected budget and largest-layer headroom. Every cache entry keeps its MemoryBudget charge, LRU eviction releases it exactly, and mandatory KV/activation/output workspaces can force safe eviction. Hits avoid GGUF rereads; planner capacity is an estimate and does not guarantee hits.
 - **Bounded streamed-layer read coalescing:** descriptor-sorted tensors that are adjacent or separated by at most 4 KiB may share a physical read only while the full span stays at or below 64 MiB and its grouped raw-plus-resident workspace fits MemoryBudget. Arbitrary ordering and explicit tensor boundaries remain authoritative; large gaps/spans and low-headroom cases use the original individual read path. No mmap or persistent raw payload is involved.
+- **Cursor-aware retained handle:** physical reads reuse the synchronized GGUF handle’s known absolute cursor. A seek is skipped only when the preceding successful read ended exactly at the next requested offset; failures invalidate the cursor and force the next seek.
 
 ### Real-model reference validation
 
@@ -235,7 +236,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The last executed baseline passed 158 tests with 0 failures and 0 ignored. The current source inventory is 174 tests after adding shared-accounting, execution-preflight, bounded layer-cache, and bounded coalesced-read regressions; rerun the full suite before commit.
+The last executed baseline passed 158 tests with 0 failures and 0 ignored. The current source inventory is 175 tests after adding shared-accounting, execution-preflight, bounded layer-cache, bounded coalesced-read, and cursor-reuse regressions; rerun the full suite before commit.
 
 ## Known Limitations
 
