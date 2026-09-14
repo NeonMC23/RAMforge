@@ -4,6 +4,7 @@
 //! Transformer layers are loaded on demand, one at a time, and released after use.
 //! Quantized tensors remain quantized while resident; dequantization happens block-wise during matvec.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 
 use ramforge_core::{
@@ -597,13 +598,13 @@ impl StreamingLlamaModel {
         let seq = pos + 1; // history + current token (attention work)
 
         // Worst-case transient floats for this forward pass:
-        //   hidden + tmp + 2 norm-weight copies: 4 * n_embd
-        //   q_tmp + attention output:            2 * q_dim
-        //   k_tmp + v_tmp:                       2 * kv_dim
-        //   attn_proj + ffn_out + output_norm copy: 3 * n_embd
-        //   gate + up + gate_silu + gate_up:     4 * ffn_dim
-        //   attention scores (per head):         n_heads * seq
-        //   decoded qwen2 Q/K/V bias vectors (per layer, if present)
+        //   hidden + tmp + 2 norm decode/copy fallbacks: 4 * n_embd
+        //   q_tmp + attention output:                   2 * q_dim
+        //   k_tmp + v_tmp:                              2 * kv_dim
+        //   attn_proj + ffn_out + output norm fallback: 3 * n_embd
+        //   gate + up + gate_silu + gate_up:            4 * ffn_dim
+        //   attention scores (per head):                n_heads * seq
+        //   decoded qwen2 Q/K/V bias fallbacks (per layer, if present)
         let bias_floats = if self.attn_bias_present {
             q_dim + 2 * kv_dim
         } else {
@@ -773,13 +774,15 @@ impl StreamingLlamaModel {
             kv_cache.increment_seq_len();
 
             let dequant_started = self.profiler.start();
-            let output_norm_f32 = self
-                .output_norm
-                .to_f32_vec(data_source)
-                .map_err(|e| e.to_string())?;
+            let output_norm_f32 = persistent_f32_view(&self.output_norm, data_source)?;
             self.profiler
                 .record_since(ProfileEvent::Dequantization, dequant_started);
-            backend.rmsnorm(&hidden, &output_norm_f32, cfg.rms_eps, final_hidden);
+            backend.rmsnorm(
+                &hidden,
+                output_norm_f32.as_ref(),
+                cfg.rms_eps,
+                final_hidden,
+            );
 
             Ok(())
         })
@@ -815,12 +818,10 @@ impl StreamingLlamaModel {
 
         // attn_norm
         let dequant_started = profiler.start();
-        let attn_norm_f32 = layer
-            .attn_norm
-            .to_f32_vec()
+        let attn_norm_f32 = tensor_f32_view(&layer.attn_norm)
             .map_err(|e| format!("failed to decode attn_norm of layer {}: {}", layer_idx, e))?;
         profiler.record_since(ProfileEvent::Dequantization, dequant_started);
-        backend.rmsnorm(hidden, &attn_norm_f32, cfg.rms_eps, tmp);
+        backend.rmsnorm(hidden, attn_norm_f32.as_ref(), cfg.rms_eps, tmp);
 
         matvec_backend(backend, profiler, &layer.attn_q, tmp, q_tmp)?;
         matvec_backend(backend, profiler, &layer.attn_k, tmp, k_tmp)?;
@@ -833,14 +834,11 @@ impl StreamingLlamaModel {
             (None, None, None) => {}
             (Some(bq), Some(bk), Some(bv)) => {
                 let dequant_started = profiler.start();
-                let bq = bq
-                    .to_f32_vec()
+                let bq = tensor_f32_view(bq)
                     .map_err(|e| format!("failed to decode attn_q.bias of layer {}: {}", layer_idx, e))?;
-                let bk = bk
-                    .to_f32_vec()
+                let bk = tensor_f32_view(bk)
                     .map_err(|e| format!("failed to decode attn_k.bias of layer {}: {}", layer_idx, e))?;
-                let bv = bv
-                    .to_f32_vec()
+                let bv = tensor_f32_view(bv)
                     .map_err(|e| format!("failed to decode attn_v.bias of layer {}: {}", layer_idx, e))?;
                 profiler.record_since(ProfileEvent::Dequantization, dequant_started);
                 for (x, b) in q_tmp.iter_mut().zip(bq.iter()) {
@@ -896,12 +894,10 @@ impl StreamingLlamaModel {
 
         // ffn_norm
         let dequant_started = profiler.start();
-        let ffn_norm_f32 = layer
-            .ffn_norm
-            .to_f32_vec()
+        let ffn_norm_f32 = tensor_f32_view(&layer.ffn_norm)
             .map_err(|e| format!("failed to decode ffn_norm of layer {}: {}", layer_idx, e))?;
         profiler.record_since(ProfileEvent::Dequantization, dequant_started);
-        backend.rmsnorm(hidden, &ffn_norm_f32, cfg.rms_eps, tmp);
+        backend.rmsnorm(hidden, ffn_norm_f32.as_ref(), cfg.rms_eps, tmp);
 
         matvec_backend(backend, profiler, &layer.ffn_gate, tmp, gate)?;
         matvec_backend(backend, profiler, &layer.ffn_up, tmp, up)?;
@@ -1260,6 +1256,31 @@ fn validate_qkv_bias(
         }
     }
     Ok(())
+}
+
+/// Borrow already-decoded float storage and allocate only when a compact
+/// quantized tensor must be expanded for a non-matvec operation.
+fn tensor_f32_view(tensor: &TensorData) -> Result<Cow<'_, [f32]>, String> {
+    if let Some((data, _)) = tensor.as_f32_slice() {
+        Ok(Cow::Borrowed(data))
+    } else {
+        tensor
+            .to_f32_vec()
+            .map(Cow::Owned)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Persistent streamed weights necessarily produce owned decoded storage;
+/// resident decoded floats can be borrowed for the duration of the operation.
+fn persistent_f32_view<'a>(
+    weight: &'a PersistentWeight,
+    data_source: &GgufDataSource,
+) -> Result<Cow<'a, [f32]>, String> {
+    match weight {
+        PersistentWeight::Resident(tensor) => tensor_f32_view(tensor),
+        PersistentWeight::Streamed(_) => weight.to_f32_vec(data_source).map(Cow::Owned),
+    }
 }
 
 /// Matvec dispatch under the single explicit ggml layout (`shape = [in, out]`):
@@ -1745,6 +1766,73 @@ mod tests {
             load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
         assert!(tensor.is_quantized());
         assert_eq!(profiler.snapshot(), crate::profile::ProfileSnapshot::default());
+    }
+
+    #[test]
+    fn test_tensor_f32_view_borrows_float_storage_and_owns_quantized_fallback() {
+        for ggml_type in [GgmlType::F32, GgmlType::F16, GgmlType::BF16] {
+            let tensor = TensorData::from_decoded_float_vec(
+                ggml_type,
+                vec![4],
+                4,
+                vec![1.0, 2.0, 3.0, 4.0],
+            )
+            .unwrap();
+            let resident = tensor.as_f32_slice().unwrap().0;
+            let resident_ptr = resident.as_ptr();
+            match tensor_f32_view(&tensor).unwrap() {
+                std::borrow::Cow::Borrowed(view) => {
+                    assert_eq!(view.as_ptr(), resident_ptr);
+                    assert_eq!(view, &[1.0, 2.0, 3.0, 4.0]);
+                }
+                std::borrow::Cow::Owned(_) => {
+                    panic!("{} decoded storage must be borrowed", ggml_type.name())
+                }
+            }
+        }
+
+        let mut raw = Vec::with_capacity(ramforge_core::quant::BLOCK_SIZE_Q4_0);
+        raw.extend_from_slice(&0x3c00u16.to_le_bytes());
+        raw.extend_from_slice(&[0x88; 16]);
+        let tensor = TensorData::from_bytes(GgmlType::Q4_0, vec![32], 32, raw).unwrap();
+        match tensor_f32_view(&tensor).unwrap() {
+            std::borrow::Cow::Owned(view) => {
+                assert_eq!(view.len(), 32);
+                assert!(view.iter().all(|value| *value == 0.0));
+            }
+            std::borrow::Cow::Borrowed(_) => panic!("quantized storage must be decoded"),
+        }
+    }
+
+    #[test]
+    fn test_persistent_f32_view_borrows_resident_and_owns_streamed_storage() {
+        let mut raw = Vec::with_capacity(2 * std::mem::size_of::<f32>());
+        for value in [1.0f32, 2.0] {
+            raw.extend_from_slice(&value.to_le_bytes());
+        }
+        let tmp = create_single_tensor_gguf("test.weight", GgmlType::F32, &[2], &raw);
+        let data_source = GgufDataSource::open(tmp.path()).unwrap();
+
+        let resident_tensor =
+            TensorData::from_f32_vec(vec![2], 2, vec![1.0, 2.0]).unwrap();
+        let resident_ptr = resident_tensor.as_f32_slice().unwrap().0.as_ptr();
+        let resident_weight = PersistentWeight::Resident(resident_tensor);
+        match persistent_f32_view(&resident_weight, &data_source).unwrap() {
+            std::borrow::Cow::Borrowed(view) => {
+                assert_eq!(view.as_ptr(), resident_ptr);
+                assert_eq!(view, &[1.0, 2.0]);
+            }
+            std::borrow::Cow::Owned(_) => panic!("resident F32 storage must be borrowed"),
+        }
+
+        let descriptor = data_source.get_descriptor("test.weight").unwrap().clone();
+        let streamed_weight = PersistentWeight::Streamed(descriptor);
+        match persistent_f32_view(&streamed_weight, &data_source).unwrap() {
+            std::borrow::Cow::Owned(view) => assert_eq!(view.as_slice(), &[1.0, 2.0]),
+            std::borrow::Cow::Borrowed(_) => {
+                panic!("streamed storage must remain owned for the operation")
+            }
+        }
     }
 
     #[test]
