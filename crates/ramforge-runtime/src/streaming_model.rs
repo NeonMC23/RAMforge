@@ -20,7 +20,7 @@ use crate::accounting::{
 use crate::backend::ComputeBackend;
 use crate::kv_cache::KvCache;
 use crate::layer_cache::{InsertOutcome, LayerCache};
-use crate::layer_read::{build_layer_read_plan, LayerReadPlan};
+use crate::layer_read::{build_layer_read_plan, LayerReadPlan, PlannedReadRange};
 use crate::layer::{group_layers, LayerDescriptor, PersistentDescriptors};
 use crate::model::{validate_required_tensors, LlamaConfig};
 use crate::persistent::{row_bytes_for, PersistentWeight, should_keep_resident};
@@ -287,6 +287,14 @@ impl StreamingLlamaModel {
             && budget.can_allocate(
                 self.grouped_layer_memory_estimates[layer_idx].load_peak_bytes,
             );
+        let reusable_buffer_bytes = read_plan.reusable_group_buffer_bytes();
+        let reusable_peak = reusable_buffer_bytes.and_then(|scratch_bytes| {
+            scratch_bytes.checked_add(
+                self.grouped_layer_memory_estimates[layer_idx].resident_bytes,
+            )
+        });
+        let use_reusable_buffer = use_grouped_reads
+            && reusable_peak.is_some_and(|required| budget.can_allocate(required));
         let result = (|budget: &mut MemoryBudget| -> Result<(), String> {
             if !use_grouped_reads {
                 for tensor_desc in &layer_desc.tensors {
@@ -323,6 +331,61 @@ impl StreamingLlamaModel {
                 return Ok(());
             }
 
+            if use_reusable_buffer {
+                for range in &read_plan.ranges {
+                    for tensor in &range.tensors {
+                        let descriptor = &layer_desc.tensors[tensor.descriptor_index];
+                        let file_bytes = descriptor.byte_length.ok_or_else(|| {
+                            format!("tensor '{}' byte length is unknown", descriptor.name)
+                        })?;
+                        let resident = TensorData::resident_bytes_for(
+                            descriptor.ggml_type,
+                            descriptor.num_elements,
+                            file_bytes,
+                        )
+                        .map_err(|error| {
+                            format!("failed to size tensor '{}': {}", descriptor.name, error)
+                        })?
+                        .max(1);
+                        budget
+                            .allocate(
+                                format!("layer:{}:{}", layer_idx, descriptor.name),
+                                resident,
+                            )
+                            .map_err(|error| {
+                                format!(
+                                    "RAM budget too small for reusable grouped layer {} tensor '{}': {}",
+                                    layer_idx, descriptor.name, error
+                                )
+                            })?;
+                    }
+                }
+
+                let scratch_bytes = reusable_buffer_bytes.unwrap_or(0);
+                let scratch_capacity = usize::try_from(scratch_bytes)
+                    .map_err(|_| "reusable grouped read buffer is too large".to_string())?;
+                let temp_name = format!("tmp:layer_read:{}:reused", layer_idx);
+                budget.with_temp(&temp_name, scratch_bytes, |budget| {
+                    let mut buffer = Vec::with_capacity(scratch_capacity);
+                    for (range_index, range) in read_plan.ranges.iter().enumerate() {
+                        read_and_decode_grouped_range(
+                            data_source,
+                            layer_desc,
+                            range,
+                            layer_idx,
+                            range_index,
+                            budget,
+                            &self.profiler,
+                            &mut buffer,
+                            &mut loaded,
+                            &mut total_layer_bytes,
+                        )?;
+                    }
+                    Ok::<(), String>(())
+                })?;
+                return Ok(());
+            }
+
             for (range_index, range) in read_plan.ranges.iter().enumerate() {
                 if range.tensors.len() > 1 {
                     for tensor in &range.tensors {
@@ -354,62 +417,19 @@ impl StreamingLlamaModel {
 
                     let temp_name = format!("tmp:layer_read:{}:{}", layer_idx, range_index);
                     budget.with_temp(&temp_name, range.byte_length, |budget| {
-                        let descriptors: Vec<&ramforge_core::model::TensorDescriptor> = range
-                            .tensors
-                            .iter()
-                            .map(|tensor| &layer_desc.tensors[tensor.descriptor_index])
-                            .collect();
-                        let tensor_names = descriptors
-                            .iter()
-                            .map(|descriptor| descriptor.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let bytes = data_source
-                            .read_coalesced_tensor_range(
-                                &descriptors,
-                                range.file_offset,
-                                range.byte_length,
-                            )
-                            .map_err(|error| {
-                                format!(
-                                    "failed grouped read for layer {} range {} tensors [{}]: {}",
-                                    layer_idx, range_index, tensor_names, error
-                                )
-                            })?;
-                        for tensor in &range.tensors {
-                            let descriptor = &layer_desc.tensors[tensor.descriptor_index];
-                            let tensor_bytes = descriptor.byte_length.unwrap_or(0);
-                            let start = usize::try_from(tensor.offset_in_range).map_err(|_| {
-                                format!("tensor '{}' grouped offset is too large", descriptor.name)
-                            })?;
-                            let length = usize::try_from(tensor_bytes).map_err(|_| {
-                                format!("tensor '{}' byte length is too large", descriptor.name)
-                            })?;
-                            let end = start.checked_add(length).ok_or_else(|| {
-                                format!("tensor '{}' grouped slice overflows", descriptor.name)
-                            })?;
-                            let slice = bytes.get(start..end).ok_or_else(|| {
-                                format!("tensor '{}' is outside grouped read buffer", descriptor.name)
-                            })?;
-                            let tensor_data = load_tensor_data_from_borrowed_bytes(
-                                descriptor,
-                                slice,
-                                &self.profiler,
-                            )?;
-                            let resident = tensor_data.resident_bytes() as u64;
-                            let charge_name = format!("layer:{}:{}", layer_idx, descriptor.name);
-                            if budget.get(&charge_name) != Some(resident.max(1)) {
-                                return Err(format!(
-                                    "grouped tensor '{}' resident charge mismatch",
-                                    descriptor.name
-                                ));
-                            }
-                            total_layer_bytes = total_layer_bytes
-                                .checked_add(resident)
-                                .ok_or_else(|| "layer resident byte total overflow".to_string())?;
-                            loaded.push((descriptor.name.clone(), tensor_data));
-                        }
-                        Ok::<(), String>(())
+                        let mut buffer = Vec::new();
+                        read_and_decode_grouped_range(
+                            data_source,
+                            layer_desc,
+                            range,
+                            layer_idx,
+                            range_index,
+                            budget,
+                            &self.profiler,
+                            &mut buffer,
+                            &mut loaded,
+                            &mut total_layer_bytes,
+                        )
                     })?;
                     continue;
                 }
@@ -957,6 +977,73 @@ impl StreamingLlamaModel {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn read_and_decode_grouped_range(
+    data_source: &GgufDataSource,
+    layer: &LayerDescriptor,
+    range: &PlannedReadRange,
+    layer_index: usize,
+    range_index: usize,
+    budget: &MemoryBudget,
+    profiler: &Profiler,
+    buffer: &mut Vec<u8>,
+    loaded: &mut Vec<(String, TensorData)>,
+    total_layer_bytes: &mut u64,
+) -> Result<(), String> {
+    let descriptors: Vec<&ramforge_core::model::TensorDescriptor> = range
+        .tensors
+        .iter()
+        .map(|tensor| &layer.tensors[tensor.descriptor_index])
+        .collect();
+    data_source
+        .read_coalesced_tensor_range_into(
+            &descriptors,
+            range.file_offset,
+            range.byte_length,
+            buffer,
+        )
+        .map_err(|error| {
+            let tensor_names = descriptors
+                .iter()
+                .map(|descriptor| descriptor.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "failed grouped read for layer {} range {} tensors [{}]: {}",
+                layer_index, range_index, tensor_names, error
+            )
+        })?;
+
+    for tensor in &range.tensors {
+        let descriptor = &layer.tensors[tensor.descriptor_index];
+        let tensor_bytes = descriptor.byte_length.unwrap_or(0);
+        let start = usize::try_from(tensor.offset_in_range)
+            .map_err(|_| format!("tensor '{}' grouped offset is too large", descriptor.name))?;
+        let length = usize::try_from(tensor_bytes)
+            .map_err(|_| format!("tensor '{}' byte length is too large", descriptor.name))?;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| format!("tensor '{}' grouped slice overflows", descriptor.name))?;
+        let slice = buffer
+            .get(start..end)
+            .ok_or_else(|| format!("tensor '{}' is outside grouped read buffer", descriptor.name))?;
+        let tensor_data = load_tensor_data_from_borrowed_bytes(descriptor, slice, profiler)?;
+        let resident = tensor_data.resident_bytes() as u64;
+        let charge_name = format!("layer:{}:{}", layer_index, descriptor.name);
+        if budget.get(&charge_name) != Some(resident.max(1)) {
+            return Err(format!(
+                "grouped tensor '{}' resident charge mismatch",
+                descriptor.name
+            ));
+        }
+        *total_layer_bytes = (*total_layer_bytes)
+            .checked_add(resident)
+            .ok_or_else(|| "layer resident byte total overflow".to_string())?;
+        loaded.push((descriptor.name.clone(), tensor_data));
+    }
+    Ok(())
+}
+
 /// Load one tensor into its resident representation.
 ///
 /// F32 takes the direct datasource path into final `Vec<f32>` storage. F16,
@@ -1016,11 +1103,21 @@ fn load_tensor_data_from_borrowed_bytes(
         )
         .map_err(|error| format!("failed to create TensorData for '{}': {}", desc.name, error))
     } else {
+        let owned_bytes = if started.is_some() {
+            // Keep the timed interval limited to the authoritative payload copy.
+            let copy_started = std::time::Instant::now();
+            let owned_bytes = bytes.to_vec();
+            let copy_elapsed = copy_started.elapsed();
+            profiler.record_grouped_quantized_copy(bytes.len() as u64, copy_elapsed);
+            owned_bytes
+        } else {
+            bytes.to_vec()
+        };
         TensorData::from_bytes(
             desc.ggml_type,
             desc.dimensions.clone(),
             desc.num_elements,
-            bytes.to_vec(),
+            owned_bytes,
         )
         .map_err(|error| format!("failed to create TensorData for '{}': {}", desc.name, error))
     };
@@ -1192,7 +1289,7 @@ fn matvec_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ramforge_core::model::align_offset;
+    use ramforge_core::model::{align_offset, TensorDescriptor};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -1239,7 +1336,52 @@ mod tests {
         tmp
     }
 
+    fn test_descriptor(
+        name: &str,
+        ggml_type: GgmlType,
+        dimensions: &[u64],
+        byte_length: u64,
+    ) -> TensorDescriptor {
+        TensorDescriptor {
+            name: name.to_string(),
+            dimensions: dimensions.to_vec(),
+            ggml_type,
+            offset: 0,
+            file_offset: 0,
+            byte_length: Some(byte_length),
+            num_elements: dimensions.iter().product(),
+        }
+    }
+
+    fn assert_grouped_float_copy_not_profiled(ggml_type: GgmlType, bytes: Vec<u8>) {
+        let descriptor = test_descriptor(
+            "blk.0.test.weight",
+            ggml_type,
+            &[2],
+            bytes.len() as u64,
+        );
+        let profiler = Profiler::default();
+        profiler.set_enabled(true);
+
+        let tensor =
+            load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
+        assert!(!tensor.is_quantized(), "{} must decode as float", ggml_type.name());
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.grouped_quantized_copy_count, 0);
+        assert_eq!(snapshot.grouped_quantized_copy_bytes, 0);
+        assert_eq!(snapshot.grouped_quantized_copy_time, std::time::Duration::ZERO);
+    }
+
     fn create_model_with_n_layers(n_layers: usize, n_embd: usize, ffn: usize) -> NamedTempFile {
+        create_model_with_optional_gap(n_layers, n_embd, ffn, None)
+    }
+
+    fn create_model_with_optional_gap(
+        n_layers: usize,
+        n_embd: usize,
+        ffn: usize,
+        gap_before_definition: Option<(usize, u64)>,
+    ) -> NamedTempFile {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes());
@@ -1281,7 +1423,12 @@ mod tests {
             defs.push((format!("blk.{}.ffn_down.weight", i), vec![ffn as u64, n_embd as u64], 0));
         }
 
-        for (name, dims, ty) in &defs {
+        for (definition_index, (name, dims, ty)) in defs.iter().enumerate() {
+            if let Some((gap_index, gap_bytes)) = gap_before_definition {
+                if definition_index == gap_index {
+                    offset += gap_bytes;
+                }
+            }
             write_string(&mut buf, name);
             write_u32(&mut buf, dims.len() as u32);
             for d in dims { write_u64(&mut buf, *d); }
@@ -1477,6 +1624,127 @@ mod tests {
         tmp.write_all(&buf).unwrap();
         tmp.flush().unwrap();
         tmp
+    }
+
+    #[test]
+    fn test_grouped_quantized_copy_profiles_one_exact_payload() {
+        let descriptor = test_descriptor(
+            "blk.0.attn_q.weight",
+            GgmlType::Q4_K,
+            &[ramforge_core::quant::QK_K as u64],
+            ramforge_core::quant::BLOCK_SIZE_Q4_K as u64,
+        );
+        let bytes = vec![0x5a; ramforge_core::quant::BLOCK_SIZE_Q4_K];
+        let profiler = Profiler::default();
+        profiler.set_enabled(true);
+
+        let tensor =
+            load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
+        match tensor {
+            TensorData::Q4_K(quantized) => assert_eq!(quantized.raw_data, bytes),
+            other => panic!("expected Q4_K tensor, got {:?}", other),
+        }
+
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.grouped_quantized_copy_count, 1);
+        assert_eq!(
+            snapshot.grouped_quantized_copy_bytes,
+            descriptor.byte_length.unwrap()
+        );
+        assert!(snapshot.grouped_quantized_copy_time <= snapshot.tensor_construction);
+    }
+
+    #[test]
+    fn test_grouped_quantized_copy_profiles_multiple_payloads_exactly() {
+        let q4_k = test_descriptor(
+            "blk.0.attn_q.weight",
+            GgmlType::Q4_K,
+            &[ramforge_core::quant::QK_K as u64],
+            ramforge_core::quant::BLOCK_SIZE_Q4_K as u64,
+        );
+        let q4_0 = test_descriptor(
+            "blk.0.attn_k.weight",
+            GgmlType::Q4_0,
+            &[ramforge_core::quant::QK4_0 as u64],
+            ramforge_core::quant::BLOCK_SIZE_Q4_0 as u64,
+        );
+        let profiler = Profiler::default();
+        profiler.set_enabled(true);
+
+        load_tensor_data_from_borrowed_bytes(
+            &q4_k,
+            &[0; ramforge_core::quant::BLOCK_SIZE_Q4_K],
+            &profiler,
+        )
+        .unwrap();
+        load_tensor_data_from_borrowed_bytes(
+            &q4_0,
+            &[0; ramforge_core::quant::BLOCK_SIZE_Q4_0],
+            &profiler,
+        )
+        .unwrap();
+
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.grouped_quantized_copy_count, 2);
+        assert_eq!(
+            snapshot.grouped_quantized_copy_bytes,
+            q4_k.byte_length.unwrap() + q4_0.byte_length.unwrap()
+        );
+    }
+
+    #[test]
+    fn test_individual_quantized_load_does_not_profile_grouped_copy() {
+        let bytes = vec![0; ramforge_core::quant::BLOCK_SIZE_Q4_K];
+        let tmp = create_single_tensor_gguf(
+            "test.weight",
+            GgmlType::Q4_K,
+            &[ramforge_core::quant::QK_K as u64],
+            &bytes,
+        );
+        let data_source = GgufDataSource::open(tmp.path()).unwrap();
+        let descriptor = data_source.get_descriptor("test.weight").unwrap();
+        let profiler = Profiler::default();
+        profiler.set_enabled(true);
+
+        let tensor = load_tensor_data(&data_source, descriptor, &profiler).unwrap();
+        assert!(tensor.is_quantized());
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.grouped_quantized_copy_count, 0);
+        assert_eq!(snapshot.grouped_quantized_copy_bytes, 0);
+        assert_eq!(snapshot.grouped_quantized_copy_time, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn test_grouped_f32_does_not_profile_quantized_copy() {
+        assert_grouped_float_copy_not_profiled(GgmlType::F32, 1.0f32.to_le_bytes().repeat(2));
+    }
+
+    #[test]
+    fn test_grouped_f16_does_not_profile_quantized_copy() {
+        assert_grouped_float_copy_not_profiled(GgmlType::F16, 0x3c00u16.to_le_bytes().repeat(2));
+    }
+
+    #[test]
+    fn test_grouped_bf16_does_not_profile_quantized_copy() {
+        let one = ((1.0f32.to_bits() >> 16) as u16).to_le_bytes();
+        assert_grouped_float_copy_not_profiled(GgmlType::BF16, one.repeat(2));
+    }
+
+    #[test]
+    fn test_grouped_quantized_copy_profiling_disabled_is_noop() {
+        let descriptor = test_descriptor(
+            "blk.0.attn_q.weight",
+            GgmlType::Q4_K,
+            &[ramforge_core::quant::QK_K as u64],
+            ramforge_core::quant::BLOCK_SIZE_Q4_K as u64,
+        );
+        let bytes = vec![0; ramforge_core::quant::BLOCK_SIZE_Q4_K];
+        let profiler = Profiler::default();
+
+        let tensor =
+            load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
+        assert!(tensor.is_quantized());
+        assert_eq!(profiler.snapshot(), crate::profile::ProfileSnapshot::default());
     }
 
     #[test]
@@ -1703,6 +1971,63 @@ mod tests {
     }
 
     #[test]
+    fn test_layer_load_reuses_one_buffer_across_grouped_ranges() {
+        let gap = crate::layer_read::MAX_COALESCED_GAP_BYTES + 1;
+        let tmp = create_model_with_optional_gap(1, 8, 16, Some((6, gap)));
+        let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
+        let mut budget = MemoryBudget::new(1024 * 1024).unwrap();
+        let model = StreamingLlamaModel::load(&ds, &mut budget).unwrap();
+        assert_eq!(model.layer_read_plans[0].ranges.len(), 2);
+        assert!(model.layer_read_plans[0]
+            .reusable_group_buffer_bytes()
+            .is_some());
+
+        ds.set_profiling(true);
+        ds.reset_io_profile();
+        let before = budget.used_bytes();
+        let mut stats = ResidencyStats::new(model.total_weight_bytes);
+        let layer = model.load_layer(0, &ds, &mut budget, &mut stats).unwrap();
+        let profile = ds.io_profile();
+        assert_eq!(profile.logical_tensor_reads, 9);
+        assert_eq!(profile.read_operations, 2);
+        assert_eq!(profile.read_buffer_reuses, 2);
+        assert_eq!(profile.read_buffer_growths, 0);
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("tmp:layer_read:")));
+        model.release_layer(0, &mut budget, &mut stats);
+        drop(layer);
+        assert_eq!(budget.used_bytes(), before);
+    }
+
+    #[test]
+    fn test_reusable_buffer_peak_falls_back_to_per_range_buffers() {
+        let gap = crate::layer_read::MAX_COALESCED_GAP_BYTES + 1;
+        let tmp = create_model_with_optional_gap(1, 8, 16, Some((9, gap)));
+        let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
+        let mut budget = MemoryBudget::new(4_500).unwrap();
+        let model = StreamingLlamaModel::load(&ds, &mut budget).unwrap();
+        assert!(model.layer_read_plans[0]
+            .reusable_group_buffer_bytes()
+            .is_some());
+
+        ds.set_profiling(true);
+        ds.reset_io_profile();
+        let before = budget.used_bytes();
+        let mut stats = ResidencyStats::new(model.total_weight_bytes);
+        let layer = model.load_layer(0, &ds, &mut budget, &mut stats).unwrap();
+        let profile = ds.io_profile();
+        assert_eq!(profile.read_operations, 2);
+        assert_eq!(profile.coalesced_ranges, 2);
+        assert_eq!(profile.read_buffer_reuses, 0);
+        assert_eq!(profile.read_buffer_growths, 2);
+        model.release_layer(0, &mut budget, &mut stats);
+        drop(layer);
+        assert_eq!(budget.used_bytes(), before);
+    }
+
+    #[test]
     fn test_layer_grouping_and_streaming() {
         let tmp = create_model_with_n_layers(4, 8, 16);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
@@ -1913,6 +2238,52 @@ mod tests {
         for &v in &y {
             assert!(v.abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn test_quantized_cache_hit_does_not_repeat_grouped_copy() {
+        let descriptor = test_descriptor(
+            "blk.0.attn_q.weight",
+            GgmlType::Q4_K,
+            &[ramforge_core::quant::QK_K as u64],
+            ramforge_core::quant::BLOCK_SIZE_Q4_K as u64,
+        );
+        let bytes = vec![0; ramforge_core::quant::BLOCK_SIZE_Q4_K];
+        let profiler = Profiler::default();
+        profiler.set_enabled(true);
+        let tensor =
+            load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
+        let after_load = profiler.snapshot();
+        assert_eq!(after_load.grouped_quantized_copy_count, 1);
+
+        let resident_bytes = tensor.resident_bytes() as u64;
+        let mut budget = MemoryBudget::new(resident_bytes).unwrap();
+        budget.allocate("layer:0:attn_q.weight", resident_bytes).unwrap();
+        let mut cache = crate::layer_cache::LayerCache::new(resident_bytes);
+        assert!(matches!(
+            cache
+                .insert_loaded(0, tensor, resident_bytes, &mut budget)
+                .unwrap(),
+            InsertOutcome::Cached { evictions: 0 }
+        ));
+        assert_eq!(cache.with_entry(0, TensorData::is_quantized), Some(true));
+
+        let after_hit = profiler.snapshot();
+        assert_eq!(
+            after_hit.grouped_quantized_copy_count,
+            after_load.grouped_quantized_copy_count
+        );
+        assert_eq!(
+            after_hit.grouped_quantized_copy_bytes,
+            after_load.grouped_quantized_copy_bytes
+        );
+        assert_eq!(
+            after_hit.grouped_quantized_copy_time,
+            after_load.grouped_quantized_copy_time
+        );
+        assert_eq!(cache.clear(&mut budget).unwrap(), 1);
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(budget.allocations().is_empty());
     }
 
     #[test]

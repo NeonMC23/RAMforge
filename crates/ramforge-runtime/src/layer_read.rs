@@ -31,6 +31,23 @@ pub(crate) struct LayerReadPlan {
     pub ranges: Vec<PlannedReadRange>,
 }
 
+impl LayerReadPlan {
+    /// Scratch capacity worth retaining across this layer's grouped reads.
+    /// Mixed singleton plans keep the existing per-range allocation path.
+    pub(crate) fn reusable_group_buffer_bytes(&self) -> Option<u64> {
+        (self.ranges.len() > 1
+            && self.ranges.iter().all(|range| range.tensors.len() > 1))
+        .then(|| {
+            self.ranges
+                .iter()
+                .map(|range| range.byte_length)
+                .max()
+                .unwrap_or(0)
+        })
+        .filter(|bytes| *bytes > 0)
+    }
+}
+
 pub(crate) fn build_layer_read_plan(
     descriptors: &[TensorDescriptor],
 ) -> Result<LayerReadPlan, String> {
@@ -162,6 +179,24 @@ mod tests {
         assert_eq!(plan.physical_bytes, 24);
         assert_eq!(plan.gap_bytes, 8);
         assert_eq!(plan.ranges[0].tensors[1].offset_in_range, 16);
+    }
+
+    #[test]
+    fn test_reusable_buffer_requires_multiple_fully_grouped_ranges() {
+        let gap = MAX_COALESCED_GAP_BYTES + 1;
+        let descriptors = vec![
+            descriptor("a", 0, 4),
+            descriptor("b", 4, 4),
+            descriptor("c", 8 + gap, 4),
+            descriptor("d", 12 + gap, 4),
+        ];
+        let plan = build_layer_read_plan(&descriptors).unwrap();
+        assert_eq!(plan.ranges.len(), 2);
+        assert_eq!(plan.reusable_group_buffer_bytes(), Some(8));
+
+        let descriptors = vec![descriptor("a", 0, 4), descriptor("b", gap, 4)];
+        let plan = build_layer_read_plan(&descriptors).unwrap();
+        assert_eq!(plan.reusable_group_buffer_bytes(), None);
     }
 
     #[test]

@@ -30,6 +30,9 @@ struct ProfileCounters {
     layer_compute_ns: AtomicU64,
     layer_release_ns: AtomicU64,
     tensor_construction_ns: AtomicU64,
+    grouped_quantized_copy_ns: AtomicU64,
+    grouped_quantized_copy_count: AtomicU64,
+    grouped_quantized_copy_bytes: AtomicU64,
     dequantization_ns: AtomicU64,
     float_matvec_ns: AtomicU64,
     quantized_matvec_ns: AtomicU64,
@@ -67,6 +70,9 @@ pub struct ProfileSnapshot {
     pub layer_compute: Duration,
     pub layer_release: Duration,
     pub tensor_construction: Duration,
+    pub grouped_quantized_copy_time: Duration,
+    pub grouped_quantized_copy_count: u64,
+    pub grouped_quantized_copy_bytes: u64,
     pub dequantization: Duration,
     pub float_matvec: Duration,
     pub quantized_matvec: Duration,
@@ -108,6 +114,9 @@ impl Profiler {
             &self.counters.layer_compute_ns,
             &self.counters.layer_release_ns,
             &self.counters.tensor_construction_ns,
+            &self.counters.grouped_quantized_copy_ns,
+            &self.counters.grouped_quantized_copy_count,
+            &self.counters.grouped_quantized_copy_bytes,
             &self.counters.dequantization_ns,
             &self.counters.float_matvec_ns,
             &self.counters.quantized_matvec_ns,
@@ -171,6 +180,22 @@ impl Profiler {
             ProfileEvent::Total => &self.counters.total_ns,
         };
         target.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_grouped_quantized_copy(&self, bytes: u64, elapsed: Duration) {
+        if !self.is_enabled() {
+            return;
+        }
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.counters
+            .grouped_quantized_copy_ns
+            .fetch_add(nanos, Ordering::Relaxed);
+        self.counters
+            .grouped_quantized_copy_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.counters
+            .grouped_quantized_copy_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_token(&self) {
@@ -252,6 +277,15 @@ impl Profiler {
             layer_compute: load(&self.counters.layer_compute_ns),
             layer_release: load(&self.counters.layer_release_ns),
             tensor_construction: load(&self.counters.tensor_construction_ns),
+            grouped_quantized_copy_time: load(&self.counters.grouped_quantized_copy_ns),
+            grouped_quantized_copy_count: self
+                .counters
+                .grouped_quantized_copy_count
+                .load(Ordering::Relaxed),
+            grouped_quantized_copy_bytes: self
+                .counters
+                .grouped_quantized_copy_bytes
+                .load(Ordering::Relaxed),
             dequantization: load(&self.counters.dequantization_ns),
             float_matvec: load(&self.counters.float_matvec_ns),
             quantized_matvec: load(&self.counters.quantized_matvec_ns),
@@ -303,12 +337,14 @@ mod tests {
     fn test_profiler_disabled_is_noop_and_enabled_counts() {
         let profiler = Profiler::default();
         profiler.record(ProfileEvent::LayerLoad, Duration::from_millis(5));
+        profiler.record_grouped_quantized_copy(144, Duration::from_millis(3));
         assert_eq!(profiler.snapshot(), ProfileSnapshot::default());
 
         profiler.set_enabled(true);
         profiler.reset();
         profiler.record(ProfileEvent::LayerLoad, Duration::from_millis(5));
         profiler.record(ProfileEvent::TokenLatency, Duration::from_millis(7));
+        profiler.record_grouped_quantized_copy(144, Duration::from_millis(3));
         profiler.record_token();
         profiler.record_prompt_forward();
         profiler.record_decode_forward();
@@ -322,6 +358,12 @@ mod tests {
         assert_eq!(snapshot.layer_load, Duration::from_millis(5));
         assert_eq!(snapshot.token_latency_total, Duration::from_millis(7));
         assert_eq!(snapshot.max_token_latency, Duration::from_millis(7));
+        assert_eq!(
+            snapshot.grouped_quantized_copy_time,
+            Duration::from_millis(3)
+        );
+        assert_eq!(snapshot.grouped_quantized_copy_count, 1);
+        assert_eq!(snapshot.grouped_quantized_copy_bytes, 144);
         assert_eq!(snapshot.tokens, 1);
         assert_eq!(snapshot.prompt_forwards, 1);
         assert_eq!(snapshot.decode_forwards, 1);
@@ -334,5 +376,8 @@ mod tests {
         assert_eq!(snapshot.peak_cached_layer_count, 3);
         assert_eq!(snapshot.cache_bytes, 400);
         assert_eq!(snapshot.peak_cache_bytes, 400);
+
+        profiler.reset();
+        assert_eq!(profiler.snapshot(), ProfileSnapshot::default());
     }
 }

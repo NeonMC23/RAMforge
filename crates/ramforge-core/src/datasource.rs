@@ -32,6 +32,8 @@ pub struct IoProfile {
     pub logical_tensor_bytes: u64,
     pub coalesced_ranges: u64,
     pub coalesced_gap_bytes: u64,
+    pub read_buffer_reuses: u64,
+    pub read_buffer_growths: u64,
     pub elapsed: Duration,
 }
 
@@ -71,6 +73,8 @@ pub struct GgufDataSource {
     profile_logical_tensor_bytes: AtomicU64,
     profile_coalesced_ranges: AtomicU64,
     profile_coalesced_gap_bytes: AtomicU64,
+    profile_read_buffer_reuses: AtomicU64,
+    profile_read_buffer_growths: AtomicU64,
     profile_tensors: Mutex<BTreeMap<String, TensorIoProfile>>,
 }
 
@@ -102,6 +106,8 @@ impl GgufDataSource {
             profile_logical_tensor_bytes: AtomicU64::new(0),
             profile_coalesced_ranges: AtomicU64::new(0),
             profile_coalesced_gap_bytes: AtomicU64::new(0),
+            profile_read_buffer_reuses: AtomicU64::new(0),
+            profile_read_buffer_growths: AtomicU64::new(0),
             profile_tensors: Mutex::new(BTreeMap::new()),
         })
     }
@@ -126,6 +132,8 @@ impl GgufDataSource {
         self.profile_logical_tensor_bytes.store(0, Ordering::Relaxed);
         self.profile_coalesced_ranges.store(0, Ordering::Relaxed);
         self.profile_coalesced_gap_bytes.store(0, Ordering::Relaxed);
+        self.profile_read_buffer_reuses.store(0, Ordering::Relaxed);
+        self.profile_read_buffer_growths.store(0, Ordering::Relaxed);
         if let Ok(mut tensors) = self.profile_tensors.lock() {
             tensors.clear();
         }
@@ -142,6 +150,8 @@ impl GgufDataSource {
             logical_tensor_bytes: self.profile_logical_tensor_bytes.load(Ordering::Relaxed),
             coalesced_ranges: self.profile_coalesced_ranges.load(Ordering::Relaxed),
             coalesced_gap_bytes: self.profile_coalesced_gap_bytes.load(Ordering::Relaxed),
+            read_buffer_reuses: self.profile_read_buffer_reuses.load(Ordering::Relaxed),
+            read_buffer_growths: self.profile_read_buffer_growths.load(Ordering::Relaxed),
             elapsed: Duration::from_nanos(self.profile_read_nanos.load(Ordering::Relaxed)),
         }
     }
@@ -364,6 +374,25 @@ impl GgufDataSource {
         file_offset: u64,
         byte_length: u64,
     ) -> Result<Vec<u8>, DataSourceError> {
+        let mut buffer = Vec::new();
+        self.read_coalesced_tensor_range_into(
+            descriptors,
+            file_offset,
+            byte_length,
+            &mut buffer,
+        )?;
+        Ok(buffer)
+    }
+
+    /// Variant of `read_coalesced_tensor_range` that reuses caller-owned
+    /// capacity. The caller remains responsible for accounting that capacity.
+    pub fn read_coalesced_tensor_range_into(
+        &self,
+        descriptors: &[&TensorDescriptor],
+        file_offset: u64,
+        byte_length: u64,
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), DataSourceError> {
         let first = descriptors.first().ok_or_else(|| {
             DataSourceError::InvalidRange("coalesced tensor read is empty".to_string())
         })?;
@@ -408,7 +437,7 @@ impl GgufDataSource {
             ));
         }
 
-        let result = self.read_range(file_offset, byte_length);
+        let result = self.read_range_into(file_offset, byte_length, buffer);
         let failed = result.is_err();
         for descriptor in descriptors {
             let bytes = if failed {
@@ -521,39 +550,47 @@ impl GgufDataSource {
     }
 
     fn read_range(&self, file_offset: u64, length: u64) -> Result<Vec<u8>, DataSourceError> {
+        let mut buffer = Vec::new();
+        self.read_range_into(file_offset, length, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    fn read_range_into(
+        &self,
+        file_offset: u64,
+        length: u64,
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), DataSourceError> {
         let started = self.profile_start();
-        let result: Result<Vec<u8>, DataSourceError> = (|| {
+        let capacity_before = buffer.capacity();
+        let result: Result<(), DataSourceError> = (|| {
             let length_usize = usize::try_from(length).map_err(|_| {
                 DataSourceError::InvalidRange(format!(
                     "requested byte range length {} does not fit this platform",
                     length
                 ))
             })?;
-            let mut state = self.file.lock().map_err(|_| {
-                DataSourceError::General("GGUF file handle lock poisoned".to_string())
-            })?;
-            self.ensure_file_position(&mut state, file_offset)?;
-
-            // `read_to_end` appends into spare capacity rather than requiring a
-            // zero-filled destination that `read_exact` immediately overwrites.
-            // `Take` prevents reading beyond the validated range; the explicit
-            // length check preserves exact/short-read behavior.
-            let mut buf = Vec::new();
-            buf.try_reserve_exact(length_usize).map_err(|e| {
+            buffer.clear();
+            buffer.try_reserve_exact(length_usize).map_err(|e| {
                 DataSourceError::General(format!(
                     "failed to reserve {}-byte read buffer: {}",
                     length_usize, e
                 ))
             })?;
+
+            let mut state = self.file.lock().map_err(|_| {
+                DataSourceError::General("GGUF file handle lock poisoned".to_string())
+            })?;
+            self.ensure_file_position(&mut state, file_offset)?;
             let read_result = {
                 let mut limited = (&mut state.file).take(length);
-                limited.read_to_end(&mut buf)
+                limited.read_to_end(buffer)
             };
             if let Err(error) = read_result {
                 state.position = None;
                 return Err(DataSourceError::Io(error));
             }
-            if buf.len() != length_usize {
+            if buffer.len() != length_usize {
                 state.position = None;
                 return Err(DataSourceError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -561,9 +598,26 @@ impl GgufDataSource {
                 )));
             }
             state.position = file_offset.checked_add(length);
-            Ok(buf)
+            Ok(())
         })();
-        let bytes = result.as_ref().map(|buffer| buffer.len() as u64).unwrap_or(0);
+        let bytes = if result.is_ok() {
+            buffer.len() as u64
+        } else {
+            0
+        };
+        if result.is_ok() && self.profiling_enabled.load(Ordering::Relaxed) {
+            if usize::try_from(length)
+                .ok()
+                .is_some_and(|required| required > 0 && capacity_before >= required)
+            {
+                self.profile_read_buffer_reuses
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if buffer.capacity() > capacity_before {
+                self.profile_read_buffer_growths
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.record_read(started, bytes, result.is_err());
         result
     }
@@ -872,6 +926,24 @@ mod tests {
         assert_eq!(profile.bytes_read, 48);
         assert_eq!(profile.coalesced_ranges, 1);
         assert_eq!(profile.coalesced_gap_bytes, 0);
+    }
+
+    #[test]
+    fn test_coalesced_reads_reuse_caller_buffer_capacity() {
+        let tmp = create_test_gguf_with_data();
+        let ds = GgufDataSource::open(tmp.path()).unwrap();
+        ds.set_profiling(true);
+        let a = ds.get_descriptor("a.weight").unwrap();
+        let b = ds.get_descriptor("b.weight").unwrap();
+        let mut buffer = Vec::with_capacity(48);
+        ds.read_coalesced_tensor_range_into(&[a, b], a.file_offset, 48, &mut buffer)
+            .unwrap();
+        ds.read_coalesced_tensor_range_into(&[a, b], a.file_offset, 48, &mut buffer)
+            .unwrap();
+        let profile = ds.io_profile();
+        assert_eq!(profile.read_buffer_reuses, 2);
+        assert_eq!(profile.read_buffer_growths, 0);
+        assert_eq!(buffer.len(), 48);
     }
 
     #[test]

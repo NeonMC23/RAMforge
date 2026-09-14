@@ -353,6 +353,16 @@ fn output_generation_profile(
         "  Coalesced gap overhead: {}",
         format_bytes(profile.io.coalesced_gap_bytes)
     );
+    eprintln!("  Read-buffer reuses: {}", profile.io.read_buffer_reuses);
+    eprintln!("  Read-buffer growths: {}", profile.io.read_buffer_growths);
+    eprintln!(
+        "  Grouped quantized copies: {}",
+        runtime.grouped_quantized_copy_count
+    );
+    eprintln!(
+        "  Grouped quantized copy bytes: {}",
+        format_bytes(runtime.grouped_quantized_copy_bytes)
+    );
     eprintln!("  Prompt token forwards: {}", runtime.prompt_forwards);
     eprintln!("  Decode token forwards: {}", runtime.decode_forwards);
     eprintln!(
@@ -399,6 +409,10 @@ fn output_generation_profile(
     eprintln!("  Layer compute:            {}", format_duration(runtime.layer_compute));
     eprintln!("  Layer release:            {}", format_duration(runtime.layer_release));
     eprintln!("  Tensor construction:      {}", format_duration(runtime.tensor_construction));
+    eprintln!(
+        "  Grouped quantized copy:   {}",
+        format_duration(runtime.grouped_quantized_copy_time)
+    );
     eprintln!("  Explicit dequant/copies:  {}", format_duration(runtime.dequantization));
     eprintln!("  F32 matvec (subset):      {}", format_duration(runtime.float_matvec));
     eprintln!("  Quant matvec/dequant:     {}", format_duration(runtime.quantized_matvec));
