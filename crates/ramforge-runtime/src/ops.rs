@@ -56,8 +56,8 @@ fn rope_single(x: &mut [f32], pos: usize, freq_base: f32) {
 /// - `k_new`/`v_new`: current token, `[n_kv_heads * head_dim]` each
 ///
 /// Position `p < hist_len` reads from the cache slices; position `hist_len`
-/// reads the current-token vectors. The only allocation is the `scores`
-/// vector (`hist_len + 1` per head) plus the output.
+/// reads the current-token vectors. The only allocations are one `scores`
+/// vector (`hist_len + 1`, reused across heads) plus the output.
 ///
 /// Returns output `[n_heads * head_dim]`.
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
@@ -98,6 +98,10 @@ pub fn attention(
     };
 
     let mut output = vec![0.0f32; n_heads * head_dim];
+    if n_heads == 0 {
+        return output;
+    }
+    let mut scores = vec![0.0f32; total];
 
     for h in 0..n_heads {
         let q_offset = h * head_dim;
@@ -109,7 +113,6 @@ pub fn attention(
             h * n_kv_heads / n_heads
         };
 
-        let mut scores = vec![0.0f32; total];
         for pos in 0..total {
             let k_pos = k_at(pos);
             let k_head = &k_pos[kv_h * head_dim..kv_h * head_dim + head_dim];
@@ -280,6 +283,11 @@ mod tests {
     }
 
     #[test]
+    fn test_attention_zero_heads_preserves_empty_output() {
+        assert!(attention(&[], &[], &[], &[], &[], 0, 0, 0, 1).is_empty());
+    }
+
+    #[test]
     fn test_attention_simple() {
         // Single head, head_dim 2, single (new) position, no history
         let q = vec![1.0, 0.0];
@@ -323,5 +331,34 @@ mod tests {
             expected += (scores[p] / sum) * vs[p];
         }
         assert!((out[0] - expected).abs() < 1e-5, "out={} expected={}", out[0], expected);
+    }
+
+    #[test]
+    fn test_attention_reused_scores_are_independent_per_head() {
+        // Two heads deliberately produce different score distributions. A
+        // scratch vector reused across heads must be fully overwritten.
+        let q = [1.0f32, 2.0];
+        let k_hist = [1.0f32, 3.0];
+        let v_hist = [10.0f32, 100.0];
+        let k_new = [2.0f32, 1.0];
+        let v_new = [20.0f32, 200.0];
+
+        let out = attention(&q, &k_hist, &v_hist, &k_new, &v_new, 1, 2, 2, 1);
+        let weighted_two = |score0: f32, score1: f32, value0: f32, value1: f32| {
+            let max = score0.max(score1);
+            let mut weight0 = (score0 - max).exp();
+            let mut weight1 = (score1 - max).exp();
+            let sum = weight0 + weight1;
+            weight0 /= sum;
+            weight1 /= sum;
+            let mut output = 0.0;
+            output += weight0 * value0;
+            output += weight1 * value1;
+            output
+        };
+        let expected_head0 = weighted_two(1.0, 2.0, 10.0, 20.0);
+        let expected_head1 = weighted_two(6.0, 2.0, 100.0, 200.0);
+
+        assert_eq!(out, vec![expected_head0, expected_head1]);
     }
 }
