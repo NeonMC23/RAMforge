@@ -553,10 +553,9 @@ pub fn dequantize_row_q4_0(bytes: &[u8], n_elements: usize, out: &mut [f32]) -> 
     }
     for (i, chunk) in bytes.chunks(BLOCK_SIZE_Q4_0).enumerate().take(n_blocks) {
         let block = BlockQ4_0::from_bytes(chunk)?;
-        let block_out: &mut [f32; QK4_0] = (&mut out[i * QK4_0..(i + 1) * QK4_0])
-            .try_into()
-            .expect("Q4_0 output block has exact length");
-        block.dequantize(block_out);
+        let mut tmp = [0f32; 32];
+        block.dequantize(&mut tmp);
+        out[i * QK4_0..(i + 1) * QK4_0].copy_from_slice(&tmp);
     }
     Ok(())
 }
