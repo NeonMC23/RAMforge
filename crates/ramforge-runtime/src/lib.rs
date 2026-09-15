@@ -14,6 +14,7 @@
 
 pub(crate) mod accounting;
 pub mod backend;
+pub mod calibration;
 pub mod inference;
 pub mod kv_cache;
 pub mod layer;

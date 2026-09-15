@@ -19,6 +19,8 @@ use crate::support::{architecture_capability, ggml_type_supported_for_inference,
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const PLANNER_RULESET_VERSION: u32 = 1;
+pub const CALIBRATION_PLAN_VERSION: u32 = 1;
+pub const CALIBRATION_RULESET_VERSION: u32 = 1;
 
 // GPU hardware may be represented in profiles, but RAMforge has no GPU
 // execution backend yet. Capability derivation must not imply otherwise.
@@ -42,16 +44,16 @@ pub enum GpuPreference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalibrationLevel {
     None,
-    Basic,
+    Quick,
     Standard,
     Thorough,
 }
 
 impl CalibrationLevel {
-    const fn rank(self) -> u8 {
+    pub(crate) const fn rank(self) -> u8 {
         match self {
             Self::None => 0,
-            Self::Basic => 1,
+            Self::Quick => 1,
             Self::Standard => 2,
             Self::Thorough => 3,
         }
@@ -597,6 +599,7 @@ impl CapabilitySet {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservationMetric {
+    CpuFloatThroughput,
     SequentialReadThroughput,
     RandomReadLatency,
     MemoryBandwidth,
@@ -611,40 +614,121 @@ pub enum ObservationUnit {
     Nanoseconds,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationStatus {
+    Measured,
+    Unavailable,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationStatusReason {
+    CapabilityUnavailable,
+    DependencyUnavailable,
+    ResourceLimitExceeded,
+    TimeLimitReached,
+    TestNotImplemented,
+    IoFailure,
+    InvalidWorkload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasurementSample {
+    pub elapsed_ns: u64,
+    pub units_processed: u64,
+}
+
+/// Derive observation quality from the relative spread of per-sample rates.
+/// Identical rates produce 10,000 basis points; a spread equal to the maximum
+/// observed rate produces zero. No statistical confidence is implied.
+pub fn observation_quality_basis_points(samples: &[MeasurementSample]) -> u16 {
+    if samples.is_empty()
+        || samples
+            .iter()
+            .any(|sample| sample.elapsed_ns == 0 || sample.units_processed == 0)
+    {
+        return 0;
+    }
+    let mut minimum_rate = u128::MAX;
+    let mut maximum_rate = 0u128;
+    for sample in samples {
+        let rate = sample.units_processed as u128 * 1_000_000_000u128
+            / sample.elapsed_ns as u128;
+        minimum_rate = minimum_rate.min(rate);
+        maximum_rate = maximum_rate.max(rate);
+    }
+    if maximum_rate == 0 {
+        return 0;
+    }
+    let spread_basis_points =
+        ((maximum_rate - minimum_rate) * 10_000u128 / maximum_rate).min(10_000);
+    (10_000u128 - spread_basis_points) as u16
+}
+
+pub fn aggregate_observation_value(
+    unit: ObservationUnit,
+    samples: &[MeasurementSample],
+) -> Option<u64> {
+    if samples.is_empty()
+        || samples
+            .iter()
+            .any(|sample| sample.elapsed_ns == 0 || sample.units_processed == 0)
+    {
+        return None;
+    }
+    let elapsed_ns: u128 = samples.iter().map(|sample| sample.elapsed_ns as u128).sum();
+    let units: u128 = samples
+        .iter()
+        .map(|sample| sample.units_processed as u128)
+        .sum();
+    let value = match unit {
+        ObservationUnit::BytesPerSecond | ObservationUnit::ElementsPerSecond => {
+            units.checked_mul(1_000_000_000u128)? / elapsed_ns
+        }
+        ObservationUnit::Nanoseconds => elapsed_ns / units,
+    };
+    Some(value.min(u64::MAX as u128) as u64).filter(|value| *value > 0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PerformanceObservation {
     pub identifier: String,
     pub metric: ObservationMetric,
     pub unit: ObservationUnit,
-    pub value: u64,
+    /// Measured aggregate value in `unit`; absent for non-measured states.
+    pub value: Option<u64>,
+    pub status: ObservationStatus,
+    pub status_reason: Option<ObservationStatusReason>,
     pub strategy: Option<StrategyId>,
     pub quantization_format: Option<String>,
+    pub calibration_level: CalibrationLevel,
     pub workload_bytes: u64,
     pub workload_elements: u64,
     pub measurement_duration_ns: u64,
     pub sample_count: u32,
+    pub raw_samples: Vec<MeasurementSample>,
     pub timestamp_unix_seconds: Option<u64>,
-    /// Integer confidence metadata in basis points, from 0 through 10,000.
-    pub confidence_basis_points: u16,
+    /// Sample-spread quality in basis points, calculated from raw samples.
+    pub quality_basis_points: u16,
 }
 
 impl PerformanceObservation {
     pub fn validate(&self) -> Result<(), PlannerError> {
         if self.identifier.is_empty()
-            || self.value == 0
-            || self.measurement_duration_ns == 0
-            || self.sample_count == 0
-            || self.confidence_basis_points > 10_000
+            || self.calibration_level == CalibrationLevel::None
+            || self.quality_basis_points > 10_000
         {
             return Err(PlannerError::invalid(
                 "PerformanceObservation",
-                "identity/value/quality",
+                "identity/level/quality",
             ));
         }
         let expected_unit = match self.metric {
             ObservationMetric::SequentialReadThroughput
             | ObservationMetric::MemoryBandwidth => ObservationUnit::BytesPerSecond,
-            ObservationMetric::QuantizedDecodeThroughput => ObservationUnit::ElementsPerSecond,
+            ObservationMetric::CpuFloatThroughput
+            | ObservationMetric::QuantizedDecodeThroughput => ObservationUnit::ElementsPerSecond,
             ObservationMetric::RandomReadLatency | ObservationMetric::StrategyLatency => {
                 ObservationUnit::Nanoseconds
             }
@@ -669,6 +753,53 @@ impl PerformanceObservation {
                 "decode throughput without quantization format",
             ));
         }
+
+        match self.status {
+            ObservationStatus::Measured => {
+                if !self.value.is_some_and(|value| value > 0)
+                    || self.measurement_duration_ns == 0
+                    || self.sample_count == 0
+                    || self.raw_samples.len() != self.sample_count as usize
+                    || self.status_reason.is_some()
+                    || self
+                        .raw_samples
+                        .iter()
+                        .any(|sample| sample.elapsed_ns == 0 || sample.units_processed == 0)
+                    || self
+                        .raw_samples
+                        .iter()
+                        .try_fold(0u64, |total, sample| {
+                            total.checked_add(sample.elapsed_ns)
+                        })
+                        != Some(self.measurement_duration_ns)
+                    || self.quality_basis_points
+                        != observation_quality_basis_points(&self.raw_samples)
+                    || self.value
+                        != aggregate_observation_value(self.unit, &self.raw_samples)
+                {
+                    return Err(PlannerError::invalid(
+                        "PerformanceObservation",
+                        "measured state",
+                    ));
+                }
+            }
+            ObservationStatus::Unavailable
+            | ObservationStatus::Skipped
+            | ObservationStatus::Failed => {
+                if self.value.is_some()
+                    || self.measurement_duration_ns != 0
+                    || self.sample_count != 0
+                    || !self.raw_samples.is_empty()
+                    || self.status_reason.is_none()
+                    || self.quality_basis_points != 0
+                {
+                    return Err(PlannerError::invalid(
+                        "PerformanceObservation",
+                        "non-measured state",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -681,6 +812,9 @@ pub struct CalibrationResult {
     pub machine_fingerprint: u64,
     pub model_fingerprint: Option<u64>,
     pub storage_fingerprint: Option<u64>,
+    pub calibration_plan_identifier: String,
+    pub calibration_plan_version: u32,
+    pub calibration_ruleset_version: u32,
     pub observations: Vec<PerformanceObservation>,
 }
 
@@ -692,6 +826,9 @@ impl CalibrationResult {
             || self.machine_fingerprint == 0
             || self.model_fingerprint == Some(0)
             || self.storage_fingerprint == Some(0)
+            || self.calibration_plan_identifier.is_empty()
+            || self.calibration_plan_version != CALIBRATION_PLAN_VERSION
+            || self.calibration_ruleset_version != CALIBRATION_RULESET_VERSION
         {
             return Err(PlannerError::invalid(
                 "CalibrationResult",
@@ -701,6 +838,12 @@ impl CalibrationResult {
         let mut identifiers = BTreeSet::new();
         for observation in &self.observations {
             observation.validate()?;
+            if observation.calibration_level != self.level {
+                return Err(PlannerError::invalid(
+                    "CalibrationResult",
+                    "observation calibration level mismatch",
+                ));
+            }
             if !identifiers.insert(observation.identifier.as_str()) {
                 return Err(PlannerError::invalid(
                     "CalibrationResult",
@@ -833,6 +976,9 @@ pub struct CostEstimate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalibrationProvenance {
     pub calibration_identifier: Option<String>,
+    pub calibration_plan_identifier: Option<String>,
+    pub calibration_plan_version: Option<u32>,
+    pub calibration_ruleset_version: Option<u32>,
     pub observation_identifiers: Vec<String>,
 }
 
@@ -1273,6 +1419,9 @@ fn estimate_cost(
     };
     let mut provenance = CalibrationProvenance {
         calibration_identifier: None,
+        calibration_plan_identifier: None,
+        calibration_plan_version: None,
+        calibration_ruleset_version: None,
         observation_identifiers: Vec::new(),
     };
     if user.calibration_level == CalibrationLevel::None {
@@ -1306,6 +1455,10 @@ fn estimate_cost(
     }
 
     provenance.calibration_identifier = Some(calibration.identifier.clone());
+    provenance.calibration_plan_identifier =
+        Some(calibration.calibration_plan_identifier.clone());
+    provenance.calibration_plan_version = Some(calibration.calibration_plan_version);
+    provenance.calibration_ruleset_version = Some(calibration.calibration_ruleset_version);
     if let Some(read) = best_observation(
         calibration,
         ObservationMetric::SequentialReadThroughput,
@@ -1313,7 +1466,7 @@ fn estimate_cost(
     ) {
         estimate.calibrated_read_time_ns_per_forward = Some(ceil_rate_duration_ns(
             execution.estimated_physical_bytes_per_forward,
-            read.value,
+            read.value.expect("measured observation validated above"),
         ));
         provenance
             .observation_identifiers
@@ -1324,7 +1477,8 @@ fn estimate_cost(
         ObservationMetric::StrategyLatency,
         Some(strategy),
     ) {
-        estimate.observed_strategy_latency_ns = Some(latency.value);
+        estimate.observed_strategy_latency_ns =
+            Some(latency.value.expect("measured observation validated above"));
         provenance
             .observation_identifiers
             .push(latency.identifier.clone());
@@ -1346,10 +1500,14 @@ fn best_observation(
     calibration
         .observations
         .iter()
-        .filter(|observation| observation.metric == metric && observation.strategy == strategy)
+        .filter(|observation| {
+            observation.status == ObservationStatus::Measured
+                && observation.metric == metric
+                && observation.strategy == strategy
+        })
         .max_by(|left, right| {
-            left.confidence_basis_points
-                .cmp(&right.confidence_basis_points)
+            left.quality_basis_points
+                .cmp(&right.quality_basis_points)
                 .then(left.sample_count.cmp(&right.sample_count))
                 .then(
                     left.measurement_duration_ns
@@ -1860,38 +2018,72 @@ mod tests {
             machine_fingerprint: machine.fingerprint(),
             model_fingerprint: Some(model.identity.descriptor_fingerprint),
             storage_fingerprint: Some(storage.fingerprint()),
+            calibration_plan_identifier: "calibration-plan-1".to_string(),
+            calibration_plan_version: CALIBRATION_PLAN_VERSION,
+            calibration_ruleset_version: CALIBRATION_RULESET_VERSION,
             observations: vec![
                 PerformanceObservation {
                     identifier: "sequential-read".to_string(),
                     metric: ObservationMetric::SequentialReadThroughput,
                     unit: ObservationUnit::BytesPerSecond,
-                    value: 1_000_000,
+                    value: Some(1_000_000),
+                    status: ObservationStatus::Measured,
+                    status_reason: None,
                     strategy: None,
                     quantization_format: None,
+                    calibration_level: CalibrationLevel::Standard,
                     workload_bytes: 8_000_000,
                     workload_elements: 0,
                     measurement_duration_ns: 8_000_000_000,
                     sample_count: 4,
+                    raw_samples: vec![
+                        MeasurementSample {
+                            elapsed_ns: 2_000_000_000,
+                            units_processed: 2_000_000,
+                        };
+                        4
+                    ],
                     timestamp_unix_seconds: Some(1_700_000_000),
-                    confidence_basis_points: 9_000,
+                    quality_basis_points: 10_000,
                 },
                 PerformanceObservation {
                     identifier: "strategy-latency".to_string(),
                     metric: ObservationMetric::StrategyLatency,
                     unit: ObservationUnit::Nanoseconds,
-                    value: 5_000_000,
+                    value: Some(5_000_000),
+                    status: ObservationStatus::Measured,
+                    status_reason: None,
                     strategy: Some(StrategyId::CpuLayerStreaming),
                     quantization_format: None,
+                    calibration_level: CalibrationLevel::Standard,
                     workload_bytes: 0,
-                    workload_elements: 0,
+                    workload_elements: 4,
                     measurement_duration_ns: 20_000_000,
                     sample_count: 4,
+                    raw_samples: vec![
+                        MeasurementSample {
+                            elapsed_ns: 5_000_000,
+                            units_processed: 1,
+                        };
+                        4
+                    ],
                     timestamp_unix_seconds: Some(1_700_000_001),
-                    confidence_basis_points: 9_500,
+                    quality_basis_points: 10_000,
                 },
             ],
         };
         calibration.validate().unwrap();
+        let uncalibrated = planner
+            .plan(
+                &user,
+                &machine,
+                &model,
+                &storage,
+                &capabilities,
+                &static_plan,
+                None,
+            )
+            .unwrap();
         let plan = planner
             .plan(
                 &user,
@@ -1903,13 +2095,35 @@ mod tests {
                 Some(&calibration),
             )
             .unwrap();
+        let repeated = planner
+            .plan(
+                &user,
+                &machine,
+                &model,
+                &storage,
+                &capabilities,
+                &static_plan,
+                Some(&calibration),
+            )
+            .unwrap();
+        assert_eq!(plan, repeated);
         assert_eq!(capabilities, capabilities_before);
+        assert_eq!(plan.strategy, uncalibrated.strategy);
+        assert_eq!(plan.cpu_thread_count, uncalibrated.cpu_thread_count);
+        assert_eq!(plan.layer_cache, uncalibrated.layer_cache);
+        assert_eq!(plan.io, uncalibrated.io);
+        assert_eq!(plan.gpu, uncalibrated.gpu);
+        assert_eq!(plan.reservations, uncalibrated.reservations);
         assert_eq!(plan.strategy, StrategyId::CpuLayerStreaming);
         assert_eq!(
             plan.cost.calibrated_read_time_ns_per_forward,
             Some(2_624_000)
         );
         assert_eq!(plan.cost.observed_strategy_latency_ns, Some(5_000_000));
+        assert_eq!(
+            plan.calibration.calibration_plan_identifier.as_deref(),
+            Some("calibration-plan-1")
+        );
         assert_eq!(
             plan.calibration.observation_identifiers,
             vec![
@@ -1928,6 +2142,25 @@ mod tests {
             PlannerError::Infeasible(
                 FeasibilityRejection::AdvancedOverrideRequiresAdvancedMode
             )
+        );
+    }
+
+    #[test]
+    fn test_observation_aggregation_and_quality_are_mathematical() {
+        let samples = [
+            MeasurementSample {
+                elapsed_ns: 100,
+                units_processed: 100,
+            },
+            MeasurementSample {
+                elapsed_ns: 200,
+                units_processed: 100,
+            },
+        ];
+        assert_eq!(observation_quality_basis_points(&samples), 5_000);
+        assert_eq!(
+            aggregate_observation_value(ObservationUnit::ElementsPerSecond, &samples),
+            Some(666_666_666)
         );
     }
 
