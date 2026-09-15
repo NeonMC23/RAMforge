@@ -5,9 +5,8 @@ use crate::types::{GgmlType, MetadataValue};
 
 /// Describes a single tensor in a GGUF file without loading its data.
 ///
-/// This is file-backed: it records where the tensor data lives inside the
-/// original file so future out-of-core access can mmap or read only the needed
-/// bytes.
+/// This is file-backed: it records where tensor data lives inside the original
+/// file so bounded out-of-core reads can access only the needed bytes.
 #[derive(Debug, Clone)]
 pub struct TensorDescriptor {
     /// Tensor name (e.g. "blk.0.attn_q.weight")
@@ -174,6 +173,8 @@ impl GgufModel {
     }
 }
 
+/// Generic inspection summary derived from GGUF metadata. Execution-specific
+/// validation and defaults belong to the runtime configuration layer.
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub architecture: Option<String>,

@@ -5,6 +5,9 @@
 //! also computes a runtime-aligned lower bound for resident persistent weights
 //! plus the largest streamed layer load. This lower bound deliberately excludes
 //! prompt-dependent KV, activations, logits, and streamed-persistent workspaces.
+//!
+//! Planning consumes parsed descriptors and shared runtime accounting rules. It
+//! performs no tensor payload I/O and does not own or mutate inference state.
 
 use ramforge_core::{memory::MemoryBudget, tensor::TensorData, GgufModel};
 
@@ -60,6 +63,8 @@ pub struct PlanResult {
     pub total_tensor_bytes: Option<u64>,
     pub execution_memory: Option<ExecutionMemoryPlan>,
     pub execution_preflight_error: Option<String>,
+    /// Empty generic budget snapshot retained for the existing CLI/API report.
+    /// Runtime execution owns a separate authoritative `MemoryBudget`.
     pub budget: MemoryBudget,
 }
 

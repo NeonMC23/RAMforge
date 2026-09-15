@@ -1,5 +1,8 @@
 //! Dependency-free synthetic microbenchmark for quantized row decoders.
 //!
+//! Q4_0 is measured only in its retained production form. Q8_0 compares its
+//! provisional direct-destination path with the former decode-and-copy path.
+//!
 //! Run with:
 //! cargo run --release -p ramforge-core --example quantized_row_decode_bench
 
@@ -11,7 +14,7 @@ use std::time::{Duration, Instant};
 use ramforge_core::quant::{
     dequantize_row_q2_k, dequantize_row_q3_k, dequantize_row_q4_0, dequantize_row_q4_k,
     dequantize_row_q5_k, dequantize_row_q6_k, dequantize_row_q8_0, dequantize_row_q8_k,
-    BlockQ4_0, BlockQ8_0, BLOCK_SIZE_Q2_K, BLOCK_SIZE_Q3_K, BLOCK_SIZE_Q4_0,
+    BlockQ8_0, BLOCK_SIZE_Q2_K, BLOCK_SIZE_Q3_K, BLOCK_SIZE_Q4_0,
     BLOCK_SIZE_Q4_K, BLOCK_SIZE_Q5_K, BLOCK_SIZE_Q6_K, BLOCK_SIZE_Q8_0, BLOCK_SIZE_Q8_K,
     QK4_0, QK8_0, QK_K,
 };
@@ -113,12 +116,6 @@ fn main() {
     let q8_k = build_workload(QK_K, BLOCK_SIZE_Q8_K, make_q8_k_block);
 
     assert_reference_parity(
-        "Q4_0",
-        dequantize_row_q4_0_reference,
-        dequantize_row_q4_0,
-        &q4_0,
-    );
-    assert_reference_parity(
         "Q8_0",
         dequantize_row_q8_0_reference,
         dequantize_row_q8_0,
@@ -147,7 +144,7 @@ fn main() {
         "  decoded elements/sample: {}",
         ROWS * ELEMENTS_PER_ROW * ITERATIONS_PER_SAMPLE
     );
-    println!("  parity: Q4_0 exact, Q8_0 exact");
+    println!("  parity: Q8_0 production direct path matches its reference exactly");
     println!();
     println!(
         "{:<15} {:>9} {:>19} {:>14} {:>14} {:>14} {:>17} {:>12}",
@@ -161,12 +158,7 @@ fn main() {
         "alloc KiB"
     );
 
-    let q4_reference = benchmark(
-        "Q4_0 reference",
-        dequantize_row_q4_0_reference,
-        &q4_0,
-    );
-    let q4_direct = benchmark("Q4_0 direct", dequantize_row_q4_0, &q4_0);
+    let q4_production = benchmark("Q4_0 production", dequantize_row_q4_0, &q4_0);
     let q8_reference = benchmark(
         "Q8_0 reference",
         dequantize_row_q8_0_reference,
@@ -175,8 +167,7 @@ fn main() {
     let q8_direct = benchmark("Q8_0 direct", dequantize_row_q8_0, &q8_0);
 
     for (name, result) in [
-        ("Q4_0 reference", &q4_reference),
-        ("Q4_0 direct", &q4_direct),
+        ("Q4_0 production", &q4_production),
         ("Q8_0 reference", &q8_reference),
         ("Q8_0 direct", &q8_direct),
     ] {
@@ -189,7 +180,6 @@ fn main() {
     }
 
     println!();
-    print_relative_difference("Q4_0", q4_reference.median, q4_direct.median);
     print_relative_difference("Q8_0", q8_reference.median, q8_direct.median);
     println!(
         "Allocation counters use separate decode loops; timed samples disable counting."
@@ -360,38 +350,6 @@ fn print_relative_difference(name: &str, reference: Duration, direct: Duration) 
     println!(
         "{name} direct median time relative to reference: {relative:+.2}% (negative is faster)"
     );
-}
-
-fn dequantize_row_q4_0_reference(
-    bytes: &[u8],
-    n_elements: usize,
-    out: &mut [f32],
-) -> Result<(), DataSourceError> {
-    if n_elements % QK4_0 != 0 {
-        return Err(DataSourceError::General(format!(
-            "Q4_0 row size {} not divisible by block size {}",
-            n_elements, QK4_0
-        )));
-    }
-    let n_blocks = n_elements / QK4_0;
-    if bytes.len() < n_blocks * BLOCK_SIZE_Q4_0 {
-        return Err(DataSourceError::General(format!(
-            "Q4_0 row truncated: expected {} bytes, got {}",
-            n_blocks * BLOCK_SIZE_Q4_0,
-            bytes.len()
-        )));
-    }
-    for (index, chunk) in bytes
-        .chunks(BLOCK_SIZE_Q4_0)
-        .enumerate()
-        .take(n_blocks)
-    {
-        let block = BlockQ4_0::from_bytes(chunk)?;
-        let mut decoded = [0.0f32; QK4_0];
-        block.dequantize(&mut decoded);
-        out[index * QK4_0..(index + 1) * QK4_0].copy_from_slice(&decoded);
-    }
-    Ok(())
 }
 
 fn dequantize_row_q8_0_reference(

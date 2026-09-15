@@ -1,6 +1,6 @@
 //! Inference engine for RAMforge (CPU, llama/qwen2, out-of-core).
 //!
-//! Memory contract for `generate()` (hardened in Milestone 7.1):
+//! Memory contract for `generate()`:
 //! - every allocation that lives across a step is budget-charged for its
 //!   lifetime: persistent weights (`weight:*`), streamed layers
 //!   (`layer:{i}:*`), the KV cache (`kv_cache`), the single logits buffer

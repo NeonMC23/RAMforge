@@ -16,7 +16,6 @@ const MAX_TENSOR_COUNT: u64 = 10_000_000;
 
 struct Reader<R: Read + Seek> {
     inner: R,
-    // For debugging, track position
 }
 
 impl<R: Read + Seek> Reader<R> {
@@ -190,8 +189,7 @@ impl<R: Read + Seek> Reader<R> {
 /// This function implements the core memory-efficiency guarantee of RAMforge:
 /// - Only header (24 bytes), metadata KV pairs, and tensor descriptors are read
 /// - Tensor data is NOT copied into RAM; only file offsets and byte lengths are recorded
-/// - The resulting `GgufModel` is file-backed and supports future out-of-core access
-///   via mmap or streaming reads
+/// - The resulting `GgufModel` is file-backed and supports bounded streaming reads
 ///
 /// The parser validates magic, version, and structure, and returns clear errors
 /// for invalid or truncated files.
@@ -211,8 +209,7 @@ pub fn parse_gguf_file<P: AsRef<Path>>(path: P) -> Result<GgufModel> {
 
     let version = r.read_u32_le()?;
     if version != 1 && version != 2 && version != 3 {
-        // Allow but warn? For milestone we error on unsupported version
-        // but spec says current is 3, older versions also exist. Let's allow 1,2,3 only.
+        // Current parser support is intentionally limited to GGUF versions 1–3.
         return Err(GgufError::UnsupportedVersion(version));
     }
 
@@ -346,45 +343,6 @@ mod tests {
 
     fn write_u64<W: Write>(w: &mut W, v: u64) {
         w.write_all(&v.to_le_bytes()).unwrap();
-    }
-
-    #[allow(dead_code)]
-    fn make_minimal_gguf() -> Vec<u8> {
-        let mut buf = Vec::new();
-        // magic
-        buf.extend_from_slice(&GGUF_MAGIC);
-        // version 3
-        write_u32(&mut buf, 3);
-        // tensor_count 1
-        write_u64(&mut buf, 1);
-        // kv_count 2
-        write_u64(&mut buf, 2);
-        // kv 1: general.architecture = "llama"
-        write_string(&mut buf, "general.architecture");
-        write_u32(&mut buf, 8); // string
-        write_string(&mut buf, "llama");
-        // kv 2: llama.context_length = 2048 uint32
-        write_string(&mut buf, "llama.context_length");
-        write_u32(&mut buf, 4); // uint32
-        write_u32(&mut buf, 2048);
-        // tensor info
-        write_string(&mut buf, "token_embd.weight");
-        write_u32(&mut buf, 2); // n_dims
-        write_u64(&mut buf, 4096);
-        write_u64(&mut buf, 32000);
-        write_u32(&mut buf, 0); // F32
-        write_u64(&mut buf, 0); // offset
-        // padding to alignment 32
-        let pos = buf.len() as u64;
-        let aligned = align_offset(pos, 32);
-        let pad = (aligned - pos) as usize;
-        buf.extend(vec![0u8; pad]);
-        // tensor data: 4096*32000*4 bytes would be huge, but we don't need full data for test; we just write small dummy
-        // For test we use small dims earlier? Let's use small dims for test; but this is minimal file with dummy data.
-        // We'll not write full data; just enough to not be truncated for header parsing.
-        // Actually we need to adjust dims to small for test.
-        // This function is not used for file size validation, so we can leave data empty.
-        buf
     }
 
     fn make_gguf_with_small_tensor() -> Vec<u8> {

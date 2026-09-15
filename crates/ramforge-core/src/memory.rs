@@ -3,7 +3,7 @@
 //! RAMforge-managed memory is defined as memory that is explicitly tracked
 //! via `MemoryBudget`. It does NOT represent total process RSS or OS page
 //! cache. It only tracks allocations that RAMforge itself accounts for, such
-//! as tensor cache, KV cache, prefetch buffers, etc.
+//! as tensor caches, KV caches, and bounded read or decode buffers.
 //!
 //! This design makes it difficult for future code to bypass the budget
 //! accidentally: all RAMforge-managed allocations should go through

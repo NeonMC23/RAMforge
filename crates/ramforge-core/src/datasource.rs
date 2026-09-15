@@ -1,8 +1,7 @@
 //! File-backed tensor access
 //!
-//! This module builds directly on tensor descriptors from Milestone 1.
-//! It provides explicit access to tensor data from the original GGUF file
-//! without loading the entire model into RAM.
+//! This module uses parsed tensor descriptors to provide explicit access to
+//! data in the original GGUF file without loading the entire model into RAM.
 
 use std::collections::BTreeMap;
 use std::fs::File;

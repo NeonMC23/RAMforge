@@ -13,11 +13,11 @@
 //!   clear errors for invalid or truncated files.
 //! - Metadata is exposed as structured types, not raw maps, via helpers.
 //!
-//! # Milestone 2 additions
+//! # Core components
 //!
 //! - `memory`: `MemoryBudget` and human size parsing (`parse_memory_size`)
-//! - `cache`: Strict bounded LRU cache with byte-exact accounting
-//! - `datasource`: File-backed tensor access without loading entire model
+//! - `cache`: strict bounded LRU cache with byte-exact accounting
+//! - `datasource`: file-backed tensor access without loading the entire model
 //!
 //! RAMforge-managed memory is defined as memory explicitly tracked via
 //! `MemoryBudget`. It does NOT include total process RSS or OS page cache.

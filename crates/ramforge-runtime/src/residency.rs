@@ -1,4 +1,7 @@
-//! Residency observability for out-of-core layer streaming
+//! Residency observability for out-of-core layer streaming.
+//!
+//! These execution counters complement the optional timing profiler. Exact
+//! allocation authority remains with `MemoryBudget`.
 
 #[derive(Debug, Clone, Default)]
 pub struct ResidencyStats {

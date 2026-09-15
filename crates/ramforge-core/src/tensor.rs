@@ -832,9 +832,9 @@ pub fn decode_tensor_to_f32(
     num_elements: u64,
 ) -> Result<Vec<f32>, DataSourceError> {
     // For F32/F16/BF16, decode directly
-    // For quantized, we now support via quant module but still return full F32 for legacy path
-    // However milestone 5 says do NOT force quantized through this path if it would require full expansion
-    // We keep it for backward compatibility but it will fully dequantize quantized tensors (not ideal for memory, but allowed for tests)
+    // Quantized formats are supported here for callers that explicitly request
+    // a complete F32 representation. Inference matvec paths retain compact
+    // quantized storage and do not force weights through this expansion.
     match ggml_type {
         GgmlType::F32 => decode_f32(bytes, num_elements),
         GgmlType::F16 => decode_f16(bytes, num_elements),

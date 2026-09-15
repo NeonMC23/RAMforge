@@ -40,7 +40,10 @@ pub use ramforge_core::{
 };
 pub use plan::{plan_model, PlanResult};
 
-/// Runtime that owns a data source, budget, and cache
+/// Basic raw-tensor cache runtime retained as a public utility.
+///
+/// This is separate from `InferenceEngine` and its generation-local,
+/// decoded-layer cache; it is not the model execution planner.
 #[derive(Debug)]
 pub struct Runtime {
     pub data_source: GgufDataSource,

@@ -10,13 +10,11 @@
 //!   feed_forward_length, attention.head_count, attention.head_count_kv,
 //!   attention.layer_norm_rms_epsilon, rope.freq_base
 //!
-//! The actual weights are handled by `streaming_model.rs` (out-of-core,
-//! compact quantized residency). The former fully-resident F32 model
-//! loader was removed in Milestone 6: it violated budget integrity,
-//! guessed matrix orientation, and duplicated the KV prefix per token.
+//! The actual weights are handled by `streaming_model.rs` using out-of-core,
+//! compact quantized residency. Execution configuration remains separate from
+//! generic GGUF inspection metadata.
 
 use ramforge_core::model::GgufModel;
-
 
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
@@ -192,9 +190,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_config_from_gguf() {
-        // This test would require a real GGUF, we test validation logic separately
-        // For now just test that unsupported arch fails
+    fn test_unsupported_architecture_is_rejected() {
         let model = ramforge_core::model::GgufModel {
             path: std::path::PathBuf::from("/tmp/test.gguf"),
             file_size: 0,
