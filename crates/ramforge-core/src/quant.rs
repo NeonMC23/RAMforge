@@ -578,9 +578,10 @@ pub fn dequantize_row_q8_0(bytes: &[u8], n_elements: usize, out: &mut [f32]) -> 
     }
     for (i, chunk) in bytes.chunks(BLOCK_SIZE_Q8_0).enumerate().take(n_blocks) {
         let block = BlockQ8_0::from_bytes(chunk)?;
-        let mut tmp = [0f32; 32];
-        block.dequantize(&mut tmp);
-        out[i * QK8_0..(i + 1) * QK8_0].copy_from_slice(&tmp);
+        let block_out: &mut [f32; QK8_0] = out[i * QK8_0..(i + 1) * QK8_0]
+            .try_into()
+            .expect("Q8_0 output block has exact length");
+        block.dequantize(block_out);
     }
     Ok(())
 }
@@ -1147,6 +1148,43 @@ mod tests {
         Ok(())
     }
 
+    fn q8_0_test_block(scale: u16, quants: [i8; 32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(BLOCK_SIZE_Q8_0);
+        bytes.extend_from_slice(&scale.to_le_bytes());
+        bytes.extend(quants.into_iter().map(|value| value as u8));
+        bytes
+    }
+
+    /// Pre-optimization Q8_0 row path retained as a parity oracle: decode each
+    /// block into a fixed array, then copy it into the caller's destination.
+    fn dequantize_row_q8_0_reference(
+        bytes: &[u8],
+        n_elements: usize,
+        out: &mut [f32],
+    ) -> Result<(), DataSourceError> {
+        if n_elements % QK8_0 != 0 {
+            return Err(DataSourceError::General(format!(
+                "Q8_0 row size {} not divisible by block size {}",
+                n_elements, QK8_0
+            )));
+        }
+        let n_blocks = n_elements / QK8_0;
+        if bytes.len() < n_blocks * BLOCK_SIZE_Q8_0 {
+            return Err(DataSourceError::General(format!(
+                "Q8_0 row truncated: expected {} bytes, got {}",
+                n_blocks * BLOCK_SIZE_Q8_0,
+                bytes.len()
+            )));
+        }
+        for (i, chunk) in bytes.chunks(BLOCK_SIZE_Q8_0).enumerate().take(n_blocks) {
+            let block = BlockQ8_0::from_bytes(chunk)?;
+            let mut tmp = [0f32; QK8_0];
+            block.dequantize(&mut tmp);
+            out[i * QK8_0..(i + 1) * QK8_0].copy_from_slice(&tmp);
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_q4_0_block_size() {
         assert_eq!(QK4_0, 32);
@@ -1294,6 +1332,73 @@ mod tests {
         for &v in &out {
             assert!((v - 1.0).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn test_q8_0_row_direct_decode_matches_reference_and_overwrites_output() {
+        let quants = [
+            -128, 127, -64, 64, -17, 17, -8, 8, -1, 0, 1, 2, -2, 31, -31, 63, -63,
+            126, -127, 5, -5, 12, -12, 42, -42, 99, -99, 3, -3, 7, -7, 16,
+        ];
+        let bytes = q8_0_test_block(0x3800, quants); // scale = 0.5
+        let mut expected = [0.0f32; QK8_0];
+        let mut actual = [777.0f32; QK8_0];
+        dequantize_row_q8_0_reference(&bytes, QK8_0, &mut expected).unwrap();
+        dequantize_row_q8_0(&bytes, QK8_0, &mut actual).unwrap();
+
+        assert_eq!(actual.len(), QK8_0);
+        assert_eq!(actual, expected);
+        assert_eq!(actual[0], -64.0);
+        assert_eq!(actual[1], 63.5);
+        assert!(actual.iter().any(|value| *value < 0.0));
+        assert!(actual.iter().any(|value| *value > 0.0));
+        assert!(actual.iter().all(|value| *value != 777.0));
+
+        let zero_bytes = q8_0_test_block(0x3C00, [0; 32]);
+        dequantize_row_q8_0(&zero_bytes, QK8_0, &mut actual).unwrap();
+        assert!(actual.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn test_q8_0_row_direct_decode_matches_reference_for_multiple_rows_and_blocks() {
+        let mut row0 = q8_0_test_block(0x3C00, [-3; 32]);
+        row0.extend_from_slice(&q8_0_test_block(0x3800, [7; 32]));
+        let mut row1 = q8_0_test_block(0xBC00, [-8; 32]);
+        row1.extend_from_slice(&q8_0_test_block(0x4000, [5; 32]));
+
+        for row in [&row0, &row1] {
+            let mut expected = [0.0f32; 2 * QK8_0];
+            let mut actual = [321.0f32; 2 * QK8_0];
+            dequantize_row_q8_0_reference(row, 2 * QK8_0, &mut expected).unwrap();
+            dequantize_row_q8_0(row, 2 * QK8_0, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn test_q8_0_row_direct_decode_preserves_validation_and_error_cleanup() {
+        let truncated = vec![0u8; BLOCK_SIZE_Q8_0 - 1];
+        let mut expected = [17.0f32; QK8_0];
+        let mut actual = expected;
+        let reference_error =
+            dequantize_row_q8_0_reference(&truncated, QK8_0, &mut expected).unwrap_err();
+        let direct_error = dequantize_row_q8_0(&truncated, QK8_0, &mut actual).unwrap_err();
+        assert_eq!(direct_error.to_string(), reference_error.to_string());
+        assert_eq!(actual, [17.0; QK8_0]);
+
+        let bytes = q8_0_test_block(0x3C00, [0; 32]);
+        let mut invalid_expected = [29.0f32; QK8_0 - 1];
+        let mut invalid_actual = invalid_expected;
+        let reference_error = dequantize_row_q8_0_reference(
+            &bytes,
+            QK8_0 - 1,
+            &mut invalid_expected,
+        )
+        .unwrap_err();
+        let direct_error =
+            dequantize_row_q8_0(&bytes, QK8_0 - 1, &mut invalid_actual).unwrap_err();
+        assert_eq!(direct_error.to_string(), reference_error.to_string());
+        assert_eq!(invalid_actual, [29.0; QK8_0 - 1]);
     }
 
     #[test]
