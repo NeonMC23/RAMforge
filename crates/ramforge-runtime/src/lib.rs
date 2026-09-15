@@ -24,6 +24,7 @@ pub mod model;
 pub mod ops;
 pub mod persistent;
 pub mod plan;
+pub mod planner;
 pub mod profile;
 pub mod residency;
 pub mod sampling;
