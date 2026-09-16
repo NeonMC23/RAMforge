@@ -1987,6 +1987,52 @@ mod tests {
     }
 
     #[test]
+    fn test_planner_output_compiles_to_concrete_runtime_config() {
+        let (user, machine, model, storage, static_plan) =
+            profiles_and_static_plan(OperatingMode::BalancedNormal);
+        let planner = Planner;
+        let capabilities = planner.derive_capabilities(&machine, &model, &storage, &static_plan);
+        let plan = planner
+            .plan(
+                &user,
+                &machine,
+                &model,
+                &storage,
+                &capabilities,
+                &static_plan,
+                None,
+            )
+            .unwrap();
+        let config = crate::plan_compiler::PlanCompiler
+            .compile(
+                &plan,
+                crate::plan_compiler::PlanCompilationContext {
+                    machine: &machine,
+                    model: &model,
+                    storage: &storage,
+                    capabilities: &capabilities,
+                    static_plan: &static_plan,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(config.cpu_thread_count, plan.cpu_thread_count);
+        assert_eq!(config.ram_budget_bytes, plan.ram_budget_bytes);
+        assert_eq!(
+            config.layer_cache_capacity_bytes,
+            plan.layer_cache.capacity_bytes
+        );
+        assert_eq!(
+            config.read_coalescing_enabled,
+            plan.io.read_coalescing_enabled
+        );
+        assert_eq!(
+            config.grouped_read_buffer_reuse_enabled,
+            plan.io.grouped_read_buffer_reuse_enabled
+        );
+    }
+
+    #[test]
     fn test_maximum_performance_respects_explicit_resource_limits() {
         let (mut user, machine, model, storage, static_plan) =
             profiles_and_static_plan(OperatingMode::MaximumPerformance);
@@ -2159,6 +2205,23 @@ mod tests {
         assert_eq!(plan.layer_cache.capacity_bytes, 3_000);
         assert!(!plan.io.read_coalescing_enabled);
         assert!(!plan.io.grouped_read_buffer_reuse_enabled);
+
+        let config = crate::plan_compiler::PlanCompiler
+            .compile(
+                &plan,
+                crate::plan_compiler::PlanCompilationContext {
+                    machine: &machine,
+                    model: &model,
+                    storage: &storage,
+                    capabilities: &capabilities,
+                    static_plan: &static_plan,
+                },
+            )
+            .unwrap();
+        assert_eq!(config.cpu_thread_count, 3);
+        assert_eq!(config.layer_cache_capacity_bytes, 3_000);
+        assert!(!config.read_coalescing_enabled);
+        assert!(!config.grouped_read_buffer_reuse_enabled);
     }
 
     #[test]

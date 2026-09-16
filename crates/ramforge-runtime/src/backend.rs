@@ -12,13 +12,15 @@
 //!
 //! Arity mismatches are hard errors, never orientation guesses.
 
-use std::fmt::Debug;
+use std::fmt;
+use std::sync::Arc;
 
 use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::simd;
 
-pub trait ComputeBackend: Debug + Send + Sync {
+pub trait ComputeBackend: fmt::Debug + Send + Sync {
     fn name(&self) -> &'static str;
 
     /// F32 matvec in explicit ggml layout; errors on arity mismatch.
@@ -41,10 +43,22 @@ pub trait ComputeBackend: Debug + Send + Sync {
     fn softmax(&self, x: &mut [f32]);
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CpuBackend {
     pub num_threads: usize,
     pub use_simd: bool,
+    thread_pool: Option<Arc<ThreadPool>>,
+}
+
+impl fmt::Debug for CpuBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CpuBackend")
+            .field("num_threads", &self.num_threads)
+            .field("use_simd", &self.use_simd)
+            .field("thread_pool_configured", &self.thread_pool.is_some())
+            .finish()
+    }
 }
 
 impl Default for CpuBackend {
@@ -56,6 +70,7 @@ impl Default for CpuBackend {
         Self {
             num_threads,
             use_simd,
+            thread_pool: None,
         }
     }
 }
@@ -66,16 +81,36 @@ impl CpuBackend {
     }
 
     pub fn with_threads(num_threads: usize) -> Self {
-        Self {
-            num_threads: num_threads.max(1),
-            ..Self::default()
+        Self::try_with_threads(num_threads.max(1))
+            .expect("failed to construct explicitly sized CPU thread pool")
+    }
+
+    pub fn try_with_threads(num_threads: usize) -> Result<Self, String> {
+        if num_threads == 0 {
+            return Err("CPU thread count must be greater than zero".to_string());
         }
+        let thread_pool = if num_threads > 1 {
+            Some(Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(num_threads)
+                    .build()
+                    .map_err(|error| format!("failed to construct CPU thread pool: {error}"))?,
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            num_threads,
+            use_simd: simd::is_avx2_available(),
+            thread_pool,
+        })
     }
 
     pub fn scalar() -> Self {
         Self {
             num_threads: 1,
             use_simd: false,
+            thread_pool: None,
         }
     }
 
@@ -85,6 +120,24 @@ impl CpuBackend {
             ..Self::default()
         }
     }
+}
+
+fn matvec_rows_parallel(
+    use_simd: bool,
+    w: &[f32],
+    in_dim: usize,
+    x: &[f32],
+    y: &mut [f32],
+) {
+    y.par_iter_mut().enumerate().for_each(|(o, yo)| {
+        let row_offset = o * in_dim;
+        let row = &w[row_offset..row_offset + in_dim];
+        if use_simd {
+            *yo = simd::dot_f32_avx2(row, x);
+        } else {
+            *yo = simd::dot_f32_scalar(row, x);
+        }
+    });
 }
 
 impl ComputeBackend for CpuBackend {
@@ -127,16 +180,14 @@ impl ComputeBackend for CpuBackend {
 
         // Buffer is row-major [out][in]: y[o] = sum_i w[o*in + i] * x[i].
         if self.num_threads > 1 && out_dim >= 4 {
-            // Parallelize rows via rayon (global pool).
-            y.par_iter_mut().enumerate().for_each(|(o, yo)| {
-                let row_offset = o * in_dim;
-                let row = &w[row_offset..row_offset + in_dim];
-                if self.use_simd {
-                    *yo = simd::dot_f32_avx2(row, x);
-                } else {
-                    *yo = simd::dot_f32_scalar(row, x);
-                }
-            });
+            if let Some(thread_pool) = &self.thread_pool {
+                thread_pool.install(|| {
+                    matvec_rows_parallel(self.use_simd, w, in_dim, x, y);
+                });
+            } else {
+                // Preserve the legacy backend's use of Rayon's global pool.
+                matvec_rows_parallel(self.use_simd, w, in_dim, x, y);
+            }
         } else if self.use_simd {
             simd::matvec_f32_avx2(w, out_dim, in_dim, x, y);
         } else {
@@ -249,6 +300,7 @@ mod tests {
         let simd_backend = CpuBackend {
             num_threads: 1,
             use_simd: true,
+            thread_pool: None,
         };
         simd_backend.matvec(&w, &[3, 2], &x, &mut y_simd).unwrap();
 
@@ -267,10 +319,22 @@ mod tests {
         let single = CpuBackend::with_threads(1);
         single.matvec(&w, &[2, 4], &x, &mut y_single).unwrap();
 
-        let multi = CpuBackend::with_threads(4);
+        let multi = CpuBackend::with_threads(2);
+        assert_eq!(
+            multi
+                .thread_pool
+                .as_ref()
+                .map(|pool| pool.current_num_threads()),
+            Some(2)
+        );
         multi.matvec(&w, &[2, 4], &x, &mut y_multi).unwrap();
 
         assert_eq!(y_single, y_multi);
+    }
+
+    #[test]
+    fn test_explicit_zero_thread_count_is_rejected() {
+        assert!(CpuBackend::try_with_threads(0).is_err());
     }
 
     #[test]

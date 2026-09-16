@@ -26,9 +26,11 @@ pub mod model;
 pub mod ops;
 pub mod persistent;
 pub mod plan;
+pub mod plan_compiler;
 pub mod planner;
 pub mod profile;
 pub mod residency;
+pub mod runtime_config;
 pub mod sampling;
 pub mod simd;
 pub mod streaming_model;
@@ -42,6 +44,8 @@ pub use ramforge_core::{
     CacheError, CacheStats, DataSourceError, GgufError, MemoryError, ParseSizeError,
 };
 pub use plan::{plan_model, PlanResult};
+pub use plan_compiler::{PlanCompilationContext, PlanCompilationError, PlanCompiler};
+pub use runtime_config::{RuntimeConfig, RuntimeConfigError, RuntimeExecutionDevice};
 
 /// Basic raw-tensor cache runtime retained as a public utility.
 ///

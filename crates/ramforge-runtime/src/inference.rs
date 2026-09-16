@@ -27,6 +27,7 @@ use crate::memory_report::MemoryReport;
 use crate::model::LlamaConfig;
 use crate::profile::{ProfileEvent, ProfileSnapshot};
 use crate::residency::ResidencyStats;
+use crate::runtime_config::RuntimeConfig;
 use crate::sampling::Sampler;
 use crate::streaming_model::StreamingLlamaModel;
 
@@ -39,6 +40,7 @@ pub struct InferenceEngine {
     pub backend: CpuBackend,
     pub budget: MemoryBudget,
     pub ram_budget_bytes: u64,
+    runtime_config: RuntimeConfig,
     pub residency_stats: ResidencyStats,
 }
 
@@ -72,23 +74,57 @@ impl GenerationProfile {
 }
 
 impl InferenceEngine {
-    pub fn new(
+    /// Construct the legacy/manual execution path. Its behavior is unchanged:
+    /// all available CPU threads are exposed to the existing backend, the
+    /// model-derived cache maximum is used, and both grouped-read optimizations
+    /// are permitted subject to their existing runtime feasibility checks.
+    pub fn new(model_path: &str, ram_budget_bytes: u64) -> Result<Self, String> {
+        Self::new_internal(model_path, ram_budget_bytes, None)
+    }
+
+    /// Construct an engine from a concrete execution contract. Planner policy
+    /// is intentionally absent here; callers may obtain this value from the
+    /// `PlanCompiler` or construct it explicitly for manual execution.
+    pub fn new_with_runtime_config(
+        model_path: &str,
+        runtime_config: RuntimeConfig,
+    ) -> Result<Self, String> {
+        runtime_config
+            .validate()
+            .map_err(|error| format!("invalid runtime configuration: {error}"))?;
+        let available_threads = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1);
+        if runtime_config.cpu_thread_count > available_threads {
+            return Err(format!(
+                "runtime configuration requests {} CPU threads but only {} are available",
+                runtime_config.cpu_thread_count, available_threads
+            ));
+        }
+        Self::new_internal(
+            model_path,
+            runtime_config.ram_budget_bytes,
+            Some(runtime_config),
+        )
+    }
+
+    fn new_internal(
         model_path: &str,
         ram_budget_bytes: u64,
+        requested_config: Option<RuntimeConfig>,
     ) -> Result<Self, String> {
-        // Parse model file-backed (does NOT load tensor payloads)
+        // Parse model file-backed (does NOT load tensor payloads).
         let data_source = GgufDataSource::open(model_path)
             .map_err(|e| format!("failed to open GGUF data source: {}", e))?;
 
         let gguf_model = data_source.model();
-        // Validate architecture via config (will error if unsupported)
+        // Validate architecture via config (will error if unsupported).
         let _ = LlamaConfig::from_gguf(gguf_model)?;
 
-        // Tokenizer
         let tokenizer = Tokenizer::from_gguf(gguf_model)
             .map_err(|e| format!("failed to load tokenizer: {}", e))?;
 
-        // Budget – RAMforge-managed memory
+        // MemoryBudget remains the sole allocation and accounting authority.
         let mut budget = MemoryBudget::new(ram_budget_bytes)
             .map_err(|e| format!("invalid RAM budget: {}", e))?;
 
@@ -96,9 +132,27 @@ impl InferenceEngine {
         // forward call. Resident persistents are charged to the budget
         // (weight:*), anything that does not fit is streamed on demand with
         // charged, bounded temps.
-        let model = StreamingLlamaModel::load(&data_source, &mut budget)
-            .map_err(|e| format!("failed to load model weights: {}", e))?;
+        let model = match requested_config.as_ref() {
+            Some(config) => {
+                StreamingLlamaModel::load_with_runtime_config(&data_source, &mut budget, config)
+            }
+            None => StreamingLlamaModel::load(&data_source, &mut budget),
+        }
+        .map_err(|e| format!("failed to load model weights: {}", e))?;
 
+        let backend = match requested_config.as_ref() {
+            Some(config) => CpuBackend::try_with_threads(config.cpu_thread_count)?,
+            None => CpuBackend::new(),
+        };
+        let runtime_config = match requested_config {
+            Some(config) => config,
+            None => RuntimeConfig::current_defaults_with_thread_count(
+                backend.num_threads,
+                ram_budget_bytes,
+                model.layer_cache_capacity_bytes(),
+            )
+            .map_err(|error| format!("failed to materialize runtime defaults: {error}"))?,
+        };
         let residency_stats = ResidencyStats::new(model.total_weight_bytes);
 
         Ok(Self {
@@ -106,9 +160,10 @@ impl InferenceEngine {
             tokenizer,
             model,
             kv_cache: None,
-            backend: CpuBackend::new(),
+            backend,
             budget,
             ram_budget_bytes,
+            runtime_config,
             residency_stats,
         })
     }
@@ -459,6 +514,10 @@ impl InferenceEngine {
     pub fn config(&self) -> &LlamaConfig {
         &self.model.config
     }
+
+    pub fn runtime_config(&self) -> &RuntimeConfig {
+        &self.runtime_config
+    }
 }
 
 #[cfg(test)]
@@ -642,6 +701,72 @@ mod tests {
         let (tokens2, text2) = engine2.generate("hello", 5, &sampler).unwrap();
         assert_eq!(tokens, tokens2);
         assert_eq!(text, text2);
+    }
+
+    #[test]
+    fn test_default_runtime_config_preserves_legacy_execution_behavior() {
+        let tmp = create_tiny_llama_gguf();
+        let model_path = tmp.path().to_str().unwrap();
+        let mut legacy = InferenceEngine::new(model_path, 8 * 1024 * 1024).unwrap();
+        let default_config = legacy.runtime_config().clone();
+
+        assert_eq!(
+            default_config.cpu_thread_count,
+            legacy.backend.num_threads
+        );
+        assert_eq!(
+            default_config.layer_cache_capacity_bytes,
+            legacy.model.layer_cache_capacity_bytes()
+        );
+        assert!(default_config.read_coalescing_enabled);
+        assert!(default_config.grouped_read_buffer_reuse_enabled);
+
+        let mut explicit =
+            InferenceEngine::new_with_runtime_config(model_path, default_config).unwrap();
+        assert_eq!(
+            explicit.model.layer_cache_capacity_bytes(),
+            legacy.model.layer_cache_capacity_bytes()
+        );
+        let sampler = crate::sampling::Sampler::greedy();
+        assert_eq!(
+            legacy.generate("hello", 3, &sampler).unwrap(),
+            explicit.generate("hello", 3, &sampler).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_explicit_runtime_config_reaches_execution_components() {
+        let tmp = create_tiny_llama_gguf();
+        let config = RuntimeConfig::new(
+            1,
+            8 * 1024 * 1024,
+            false,
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+        let mut engine = InferenceEngine::new_with_runtime_config(
+            tmp.path().to_str().unwrap(),
+            config.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(engine.runtime_config(), &config);
+        assert_eq!(engine.backend.num_threads, 1);
+        assert_eq!(engine.budget.total_bytes(), config.ram_budget_bytes);
+        assert_eq!(engine.ram_budget_bytes, config.ram_budget_bytes);
+        assert_eq!(engine.model.layer_cache_capacity_bytes(), 0);
+        assert!(!engine.model.read_coalescing_enabled());
+        assert!(!engine.model.grouped_read_buffer_reuse_enabled());
+
+        engine.set_profiling(true);
+        let sampler = crate::sampling::Sampler::greedy();
+        engine.generate("hello", 1, &sampler).unwrap();
+        let profile = engine.generation_profile();
+        assert_eq!(profile.io.coalesced_ranges, 0);
+        assert_eq!(profile.ramforge_budget_bytes, config.ram_budget_bytes);
+        assert!(profile.ramforge_peak_bytes <= profile.ramforge_budget_bytes);
     }
 
     #[test]

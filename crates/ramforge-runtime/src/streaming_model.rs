@@ -27,6 +27,7 @@ use crate::model::{validate_required_tensors, LlamaConfig};
 use crate::persistent::{row_bytes_for, PersistentWeight, should_keep_resident};
 use crate::profile::{ProfileEvent, Profiler};
 use crate::residency::ResidencyStats;
+use crate::runtime_config::RuntimeConfig;
 
 #[derive(Debug, Clone)]
 pub struct StreamingLayerWeights {
@@ -84,14 +85,46 @@ pub struct StreamingLlamaModel {
     grouped_layer_memory_estimates: Vec<LayerMemoryEstimate>,
     layer_read_plans: Vec<LayerReadPlan>,
     layer_cache: Mutex<LayerCache<StreamingLayerWeights>>,
+    read_coalescing_enabled: bool,
+    grouped_read_buffer_reuse_enabled: bool,
     pub(crate) profiler: Profiler,
 }
 
 impl StreamingLlamaModel {
-    /// Load persistent weights only if they fit comfortably, otherwise stream
+    /// Load with the existing runtime behavior used by legacy/manual callers.
     pub fn load(
         data_source: &GgufDataSource,
         budget: &mut MemoryBudget,
+    ) -> Result<Self, String> {
+        Self::load_internal(data_source, budget, None)
+    }
+
+    /// Load with concrete decisions that have already crossed the planning
+    /// boundary. Runtime feasibility checks remain authoritative at the point
+    /// where allocations are attempted.
+    pub fn load_with_runtime_config(
+        data_source: &GgufDataSource,
+        budget: &mut MemoryBudget,
+        runtime_config: &RuntimeConfig,
+    ) -> Result<Self, String> {
+        runtime_config
+            .validate()
+            .map_err(|error| format!("invalid runtime configuration: {error}"))?;
+        if budget.total_bytes() != runtime_config.ram_budget_bytes {
+            return Err(format!(
+                "runtime configuration RAM budget {} does not match MemoryBudget {}",
+                runtime_config.ram_budget_bytes,
+                budget.total_bytes()
+            ));
+        }
+        Self::load_internal(data_source, budget, Some(runtime_config))
+    }
+
+    /// Load persistent weights only if they fit comfortably, otherwise stream.
+    fn load_internal(
+        data_source: &GgufDataSource,
+        budget: &mut MemoryBudget,
+        runtime_config: Option<&RuntimeConfig>,
     ) -> Result<Self, String> {
         let gguf_model = data_source.model();
         let config = LlamaConfig::from_gguf(gguf_model)?;
@@ -195,7 +228,35 @@ impl StreamingLlamaModel {
             .checked_add(max_layer_load_peak)
             .ok_or_else(|| "layer cache lower-bound overflow".to_string())?;
         let managed_lower_bound = budget.peak_used_bytes().max(layer_lower_bound);
-        let layer_cache_capacity = budget.total_bytes().saturating_sub(managed_lower_bound);
+        let maximum_layer_cache_capacity =
+            budget.total_bytes().saturating_sub(managed_lower_bound);
+        let layer_cache_capacity = runtime_config
+            .map(|config| {
+                if config.layer_cache_enabled {
+                    config.layer_cache_capacity_bytes
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(maximum_layer_cache_capacity);
+        if layer_cache_capacity > maximum_layer_cache_capacity {
+            drop(output);
+            drop(output_norm);
+            drop(token_embd);
+            for name in persistent_allocations.iter().rev() {
+                let _ = budget.release(name);
+            }
+            return Err(format!(
+                "configured layer cache capacity {} exceeds runtime maximum {}",
+                layer_cache_capacity, maximum_layer_cache_capacity
+            ));
+        }
+        let read_coalescing_enabled = runtime_config
+            .map(|config| config.read_coalescing_enabled)
+            .unwrap_or(RuntimeConfig::CURRENT_READ_COALESCING_ENABLED);
+        let grouped_read_buffer_reuse_enabled = runtime_config
+            .map(|config| config.grouped_read_buffer_reuse_enabled)
+            .unwrap_or(RuntimeConfig::CURRENT_GROUPED_READ_BUFFER_REUSE_ENABLED);
         let attn_bias_present = gguf_model
             .tensors
             .iter()
@@ -215,6 +276,8 @@ impl StreamingLlamaModel {
             grouped_layer_memory_estimates,
             layer_read_plans,
             layer_cache: Mutex::new(LayerCache::new(layer_cache_capacity)),
+            read_coalescing_enabled,
+            grouped_read_buffer_reuse_enabled,
             profiler,
         })
     }
@@ -232,6 +295,14 @@ impl StreamingLlamaModel {
             .lock()
             .map(|cache| cache.capacity_bytes())
             .unwrap_or(0)
+    }
+
+    pub fn read_coalescing_enabled(&self) -> bool {
+        self.read_coalescing_enabled
+    }
+
+    pub fn grouped_read_buffer_reuse_enabled(&self) -> bool {
+        self.grouped_read_buffer_reuse_enabled
     }
 
     pub fn clear_layer_cache(&self, budget: &mut MemoryBudget) -> Result<(), String> {
@@ -284,7 +355,11 @@ impl StreamingLlamaModel {
         let mut total_layer_bytes = 0u64;
 
         let read_plan = &self.layer_read_plans[layer_idx];
-        let use_grouped_reads = read_plan.ranges.iter().any(|range| range.tensors.len() > 1)
+        let use_grouped_reads = self.read_coalescing_enabled
+            && read_plan
+                .ranges
+                .iter()
+                .any(|range| range.tensors.len() > 1)
             && budget.can_allocate(
                 self.grouped_layer_memory_estimates[layer_idx].load_peak_bytes,
             );
@@ -294,7 +369,8 @@ impl StreamingLlamaModel {
                 self.grouped_layer_memory_estimates[layer_idx].resident_bytes,
             )
         });
-        let use_reusable_buffer = use_grouped_reads
+        let use_reusable_buffer = self.grouped_read_buffer_reuse_enabled
+            && use_grouped_reads
             && reusable_peak.is_some_and(|required| budget.can_allocate(required));
         let result = (|budget: &mut MemoryBudget| -> Result<(), String> {
             if !use_grouped_reads {
@@ -1836,6 +1912,30 @@ mod tests {
     }
 
     #[test]
+    fn test_configured_cache_above_runtime_maximum_rolls_back_startup_charges() {
+        let tmp = create_model_with_n_layers(1, 8, 16);
+        let data_source = GgufDataSource::open(tmp.path()).unwrap();
+        let mut budget = MemoryBudget::new(4096).unwrap();
+        budget.allocate("existing", 17).unwrap();
+        let used_before = budget.used_bytes();
+        let config = RuntimeConfig::new(1, 4096, true, 4096, true, true).unwrap();
+
+        let error = StreamingLlamaModel::load_with_runtime_config(
+            &data_source,
+            &mut budget,
+            &config,
+        )
+        .unwrap_err();
+        assert!(error.contains("configured layer cache capacity"));
+        assert_eq!(budget.used_bytes(), used_before);
+        assert_eq!(budget.get("existing"), Some(17));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("weight:")));
+    }
+
+    #[test]
     fn test_persistent_f32_direct_load_uses_one_owned_representation() {
         let raw = vec![0u8; 8 * 4];
         let tmp = create_single_tensor_gguf("test.weight", GgmlType::F32, &[8], &raw);
@@ -2084,6 +2184,37 @@ mod tests {
             .allocations()
             .keys()
             .any(|name| name.starts_with("tmp:layer_read:")));
+        model.release_layer(0, &mut budget, &mut stats);
+        drop(layer);
+        assert_eq!(budget.used_bytes(), before);
+    }
+
+    #[test]
+    fn test_runtime_config_can_disable_grouped_buffer_reuse_without_disabling_coalescing() {
+        let gap = crate::layer_read::MAX_COALESCED_GAP_BYTES + 1;
+        let tmp = create_model_with_optional_gap(1, 8, 16, Some((6, gap)));
+        let data_source = GgufDataSource::open(tmp.path()).unwrap();
+        let mut budget = MemoryBudget::new(1024 * 1024).unwrap();
+        let config = RuntimeConfig::new(1, 1024 * 1024, false, 0, true, false).unwrap();
+        let model = StreamingLlamaModel::load_with_runtime_config(
+            &data_source,
+            &mut budget,
+            &config,
+        )
+        .unwrap();
+
+        data_source.set_profiling(true);
+        data_source.reset_io_profile();
+        let before = budget.used_bytes();
+        let mut stats = ResidencyStats::new(model.total_weight_bytes);
+        let layer = model
+            .load_layer(0, &data_source, &mut budget, &mut stats)
+            .unwrap();
+        let profile = data_source.io_profile();
+        assert_eq!(profile.read_operations, 2);
+        assert_eq!(profile.coalesced_ranges, 2);
+        assert_eq!(profile.read_buffer_reuses, 0);
+        assert_eq!(profile.read_buffer_growths, 2);
         model.release_layer(0, &mut budget, &mut stats);
         drop(layer);
         assert_eq!(budget.used_bytes(), before);
