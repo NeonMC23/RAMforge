@@ -6,7 +6,10 @@
 //! - Bounded LRU cache whose contents are charged to the budget
 //! - Planning logic for `ramforge plan`
 //! - Explicit discovery → Planner → compiler → runtime orchestration
+<<<<<<< HEAD
 //! - Versioned, bounded ExecutionPlan persistence and compatibility validation
+=======
+>>>>>>> origin/main
 //! - CPU inference for llama/qwen2 (F32/F16/BF16 + ggml quant formats),
 //!   out-of-core layer streaming with compact quantized residency
 //! - SIMD (AVX2) + rayon-threaded F32 matvec hot path
