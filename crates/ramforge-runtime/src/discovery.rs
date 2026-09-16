@@ -442,7 +442,7 @@ struct LinuxMount {
 
 #[cfg(any(target_os = "linux", test))]
 fn find_linux_mount(contents: &str, path: &Path) -> Option<LinuxMount> {
-    let mut best = None;
+    let mut best: Option<LinuxMount> = None;
     for line in contents.lines() {
         let Some((left, right)) = line.split_once(" - ") else {
             continue;

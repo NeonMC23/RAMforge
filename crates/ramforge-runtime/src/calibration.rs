@@ -1094,7 +1094,7 @@ fn quantized_task(
 }
 
 fn strategy_task(
-    level: CalibrationLevel,
+    _level: CalibrationLevel,
     strategy: StrategyId,
     model_fingerprint: u64,
     limits: CalibrationLimits,
