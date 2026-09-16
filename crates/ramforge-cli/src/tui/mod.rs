@@ -11,7 +11,7 @@ use ramforge_runtime::calibration::{
 use ramforge_runtime::discovery::StorageDiscovery;
 use ramforge_runtime::orchestration::RuntimeOrchestrator;
 use ramforge_runtime::plan_persistence::{
-    PersistedExecutionPlan, PlanPersistenceError,
+    PersistedExecutionPlan, PersistedPlanCompatibilityContext, PlanPersistenceError,
 };
 
 use app::{AppAction, CalibrationTaskView, Screen, TuiApp, TuiError};
@@ -38,16 +38,26 @@ fn execute_action(
     action: AppAction,
 ) -> io::Result<()> {
     match action {
+        AppAction::LoadPlan(path) => {
+            app.load_finished(load_plan(&path));
+        }
         AppAction::ValidateModelPath(path) => {
             let result = StorageDiscovery
                 .discover(&path)
                 .map(|_| ())
                 .map_err(TuiError::Storage);
-            app.model_path_validation_finished(result);
+            if let Some(next_action) = app.model_path_validation_finished(result) {
+                draw_app(terminal, app, None)?;
+                execute_action(app, terminal, next_action)?;
+            }
         }
         AppAction::Analyze => {
             let result = analyze(app);
             app.analysis_finished(result);
+        }
+        AppAction::AnalyzeLoadedPlan => {
+            let result = analyze_loaded_plan(app);
+            app.loaded_analysis_finished(result);
         }
         AppAction::RunCalibration => run_calibration(app, terminal)?,
         AppAction::CreatePlan => {
@@ -66,6 +76,10 @@ fn execute_action(
     Ok(())
 }
 
+fn load_plan(path: &Path) -> Result<PersistedExecutionPlan, TuiError> {
+    PersistedExecutionPlan::load(path).map_err(TuiError::Persistence)
+}
+
 fn analyze(app: &TuiApp) -> Result<ramforge_runtime::PlanningSession, TuiError> {
     let user = app.user_profile.as_ref().ok_or_else(|| TuiError::Input {
         field: "execution preferences",
@@ -74,6 +88,34 @@ fn analyze(app: &TuiApp) -> Result<ramforge_runtime::PlanningSession, TuiError> 
     RuntimeOrchestrator
         .analyze(Path::new(&app.model_input), user.ram_budget_bytes)
         .map_err(TuiError::Analysis)
+}
+
+fn analyze_loaded_plan(
+    app: &TuiApp,
+) -> Result<
+    (
+        ramforge_runtime::PlanningSession,
+        ramforge_runtime::planner::ExecutionPlan,
+        ramforge_runtime::PlanCompatibilityReport,
+    ),
+    TuiError,
+> {
+    let persisted = app.persisted_plan.as_ref().ok_or_else(|| TuiError::Input {
+        field: "persisted plan",
+        message: "loaded plan is unavailable".to_string(),
+    })?;
+    let session = RuntimeOrchestrator
+        .analyze(Path::new(&app.model_input), persisted.ram_budget_bytes)
+        .map_err(TuiError::Analysis)?;
+    let compilation = session.compilation_context();
+    let report = persisted.compatibility_report(PersistedPlanCompatibilityContext {
+        compilation,
+        calibration: None,
+    });
+    let execution_plan = persisted
+        .materialize_for_validation(compilation)
+        .map_err(TuiError::Persistence)?;
+    Ok((session, execution_plan, report))
 }
 
 fn run_calibration(app: &mut TuiApp, terminal: &mut TerminalSession) -> io::Result<()> {
@@ -232,6 +274,20 @@ fn draw_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_plan_file_preserves_persistence_error() {
+        let path = std::env::temp_dir().join(format!(
+            "ramforge-missing-plan-{}.rfp",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            load_plan(&path),
+            Err(TuiError::Persistence(PlanPersistenceError::Io(ref error)))
+                if error.kind() == io::ErrorKind::NotFound
+        ));
+    }
 
     #[test]
     fn save_plan_requires_an_execution_plan() {

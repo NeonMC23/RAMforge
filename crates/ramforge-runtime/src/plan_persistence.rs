@@ -179,6 +179,45 @@ pub struct PersistedPlanCompatibilityContext<'a> {
     pub calibration: Option<&'a CalibrationResult>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanCompatibilityReason {
+    PersistedPlanInvalid,
+    ModelFingerprintMismatch,
+    PlanCompilationFailed(PlanCompilationError),
+    CalibrationNotApplied,
+    CalibrationMissing,
+    CalibrationInvalid,
+    CalibrationSourceMachineChanged,
+    CalibrationSourceStorageChanged,
+    CalibrationProvenanceMismatch,
+    CalibrationBindingMismatch,
+    CalibrationObservationUnavailable,
+}
+
+impl fmt::Display for PlanCompatibilityReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PersistedPlanInvalid => write!(formatter, "persisted plan structure is invalid"),
+            Self::ModelFingerprintMismatch => write!(formatter, "model fingerprint does not match"),
+            Self::PlanCompilationFailed(error) => write!(formatter, "PlanCompiler rejected the plan: {error}"),
+            Self::CalibrationNotApplied => write!(formatter, "calibration was requested but no observation was applied"),
+            Self::CalibrationMissing => write!(formatter, "matching calibration result is not available"),
+            Self::CalibrationInvalid => write!(formatter, "current calibration result is invalid"),
+            Self::CalibrationSourceMachineChanged => write!(formatter, "calibrated source machine differs from the current machine"),
+            Self::CalibrationSourceStorageChanged => write!(formatter, "calibrated source storage differs from the current storage"),
+            Self::CalibrationProvenanceMismatch => write!(formatter, "calibration provenance no longer matches"),
+            Self::CalibrationBindingMismatch => write!(formatter, "calibration environment binding no longer matches"),
+            Self::CalibrationObservationUnavailable => write!(formatter, "an applied calibration observation is missing or no longer measured"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanCompatibilityReport {
+    pub state: PlanCompatibility,
+    pub reasons: Vec<PlanCompatibilityReason>,
+}
+
 impl PersistedExecutionPlan {
     pub fn from_execution_plan(plan: &ExecutionPlan) -> Result<Self, PlanPersistenceError> {
         let persisted = Self {
@@ -375,22 +414,58 @@ impl PersistedExecutionPlan {
             .map_err(PersistedPlanValidationError::Compilation)
     }
 
+    /// Materialize an in-memory ExecutionPlan for review and explicit compiler
+    /// validation. This does not validate runtime compatibility and never
+    /// yields RuntimeConfig; callers must still invoke PlanCompiler.
+    pub fn materialize_for_validation(
+        &self,
+        context: PlanCompilationContext<'_>,
+    ) -> Result<ExecutionPlan, PlanPersistenceError> {
+        self.validate_structure()?;
+        Ok(self.materialize_for_context(context))
+    }
+
+    pub fn compatibility_report(
+        &self,
+        context: PersistedPlanCompatibilityContext<'_>,
+    ) -> PlanCompatibilityReport {
+        if self.validate_structure().is_err() {
+            return PlanCompatibilityReport {
+                state: PlanCompatibility::Incompatible,
+                reasons: vec![PlanCompatibilityReason::PersistedPlanInvalid],
+            };
+        }
+        if self.model_descriptor_fingerprint
+            != context.compilation.model.identity.descriptor_fingerprint
+        {
+            return PlanCompatibilityReport {
+                state: PlanCompatibility::Incompatible,
+                reasons: vec![PlanCompatibilityReason::ModelFingerprintMismatch],
+            };
+        }
+        let candidate = self.materialize_for_context(context.compilation);
+        if let Err(error) = PlanCompiler.compile(&candidate, context.compilation) {
+            return PlanCompatibilityReport {
+                state: PlanCompatibility::Incompatible,
+                reasons: vec![PlanCompatibilityReason::PlanCompilationFailed(error)],
+            };
+        }
+        let reasons = self.recalibration_reasons(context);
+        PlanCompatibilityReport {
+            state: if reasons.is_empty() {
+                PlanCompatibility::Valid
+            } else {
+                PlanCompatibility::CompatibleRecalibrationRecommended
+            },
+            reasons,
+        }
+    }
+
     pub fn validate_compatibility(
         &self,
         context: PersistedPlanCompatibilityContext<'_>,
     ) -> PlanCompatibility {
-        if self
-            .compile_runtime_config(context.compilation)
-            .is_err()
-        {
-            return PlanCompatibility::Incompatible;
-        }
-
-        if self.recalibration_recommended(context) {
-            PlanCompatibility::CompatibleRecalibrationRecommended
-        } else {
-            PlanCompatibility::Valid
-        }
+        self.compatibility_report(context).state
     }
 
     fn validate_structure(&self) -> Result<(), PlanPersistenceError> {
@@ -627,17 +702,20 @@ impl PersistedExecutionPlan {
         }
     }
 
-    fn recalibration_recommended(
+    fn recalibration_reasons(
         &self,
         context: PersistedPlanCompatibilityContext<'_>,
-    ) -> bool {
+    ) -> Vec<PlanCompatibilityReason> {
         match self.calibration_reason() {
-            Some(PlanReasonCode::CalibrationNotRequested) => false,
-            Some(PlanReasonCode::CalibrationNotApplicable) => true,
-            Some(PlanReasonCode::CalibrationObservationsApplied) => {
-                !self.calibration_matches_current_context(context)
+            Some(PlanReasonCode::CalibrationNotRequested) => Vec::new(),
+            Some(PlanReasonCode::CalibrationNotApplicable) => {
+                vec![PlanCompatibilityReason::CalibrationNotApplied]
             }
-            _ => true,
+            Some(PlanReasonCode::CalibrationObservationsApplied) => self
+                .calibration_mismatch_reason(context)
+                .into_iter()
+                .collect(),
+            _ => vec![PlanCompatibilityReason::CalibrationNotApplied],
         }
     }
 
@@ -653,20 +731,24 @@ impl PersistedExecutionPlan {
         })
     }
 
-    fn calibration_matches_current_context(
+    fn calibration_mismatch_reason(
         &self,
         context: PersistedPlanCompatibilityContext<'_>,
-    ) -> bool {
+    ) -> Option<PlanCompatibilityReason> {
         let Some(calibration) = context.calibration else {
-            return false;
+            return Some(PlanCompatibilityReason::CalibrationMissing);
         };
         if calibration.validate().is_err() {
-            return false;
+            return Some(PlanCompatibilityReason::CalibrationInvalid);
         }
-        if self.source_machine_fingerprint != context.compilation.machine.fingerprint()
-            || self.source_storage_fingerprint != context.compilation.storage.fingerprint()
-            || calibration.identifier.as_str()
-                != self
+        if self.source_machine_fingerprint != context.compilation.machine.fingerprint() {
+            return Some(PlanCompatibilityReason::CalibrationSourceMachineChanged);
+        }
+        if self.source_storage_fingerprint != context.compilation.storage.fingerprint() {
+            return Some(PlanCompatibilityReason::CalibrationSourceStorageChanged);
+        }
+        if calibration.identifier.as_str()
+            != self
                 .calibration
                 .calibration_identifier
                 .as_deref()
@@ -677,7 +759,10 @@ impl PersistedExecutionPlan {
                 != self.calibration.calibration_plan_version
             || Some(calibration.calibration_ruleset_version)
                 != self.calibration.calibration_ruleset_version
-            || calibration.machine_fingerprint != context.compilation.machine.fingerprint()
+        {
+            return Some(PlanCompatibilityReason::CalibrationProvenanceMismatch);
+        }
+        if calibration.machine_fingerprint != context.compilation.machine.fingerprint()
             || calibration.model_fingerprint.is_some_and(|fingerprint| {
                 fingerprint != context.compilation.model.identity.descriptor_fingerprint
             })
@@ -685,17 +770,22 @@ impl PersistedExecutionPlan {
                 .storage_fingerprint
                 .is_some_and(|fingerprint| fingerprint != context.compilation.storage.fingerprint())
         {
-            return false;
+            return Some(PlanCompatibilityReason::CalibrationBindingMismatch);
         }
-        self.calibration
+        if self
+            .calibration
             .observation_identifiers
             .iter()
-            .all(|identifier| {
-                calibration.observations.iter().any(|observation| {
+            .any(|identifier| {
+                !calibration.observations.iter().any(|observation| {
                     observation.identifier.as_str() == identifier.as_str()
                         && observation.status == crate::planner::ObservationStatus::Measured
                 })
             })
+        {
+            return Some(PlanCompatibilityReason::CalibrationObservationUnavailable);
+        }
+        None
     }
 
     fn encode_unchecked(&self) -> Result<Vec<u8>, PlanPersistenceError> {
@@ -1268,7 +1358,14 @@ mod tests {
         let path = directory.path().join("plan.rfp");
         persisted.save_new(&path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), first);
-        assert_eq!(PersistedExecutionPlan::load(&path).unwrap(), persisted);
+        let loaded = PersistedExecutionPlan::load(&path).unwrap();
+        assert_eq!(loaded, persisted);
+        assert_eq!(
+            loaded.validate_compatibility(compatibility_context(&fixture, None)),
+            PlanCompatibility::Valid
+        );
+        let runtime_config = loaded.compile_runtime_config(fixture.context()).unwrap();
+        assert_eq!(runtime_config.cpu_thread_count, fixture.plan.cpu_thread_count);
         assert!(matches!(
             persisted.save_new(&path),
             Err(PlanPersistenceError::Io(ref error))
@@ -1441,9 +1538,11 @@ mod tests {
             .wrapping_add(1)
             .max(1);
         current.refresh_capabilities();
+        let report = loaded.compatibility_report(compatibility_context(&current, None));
+        assert_eq!(report.state, PlanCompatibility::Incompatible);
         assert_eq!(
-            loaded.validate_compatibility(compatibility_context(&current, None)),
-            PlanCompatibility::Incompatible
+            report.reasons,
+            vec![PlanCompatibilityReason::ModelFingerprintMismatch]
         );
     }
 
@@ -1487,9 +1586,15 @@ mod tests {
         let mut stale = calibration.clone();
         stale.machine_fingerprint = stale.machine_fingerprint.wrapping_add(1).max(1);
         stale.validate().unwrap();
+        let stale_report =
+            loaded.compatibility_report(compatibility_context(&fixture, Some(&stale)));
         assert_eq!(
-            loaded.validate_compatibility(compatibility_context(&fixture, Some(&stale))),
+            stale_report.state,
             PlanCompatibility::CompatibleRecalibrationRecommended
+        );
+        assert_eq!(
+            stale_report.reasons,
+            vec![PlanCompatibilityReason::CalibrationBindingMismatch]
         );
     }
 
@@ -1499,12 +1604,17 @@ mod tests {
         let calibration = matching_calibration(&calibrated_fixture);
         apply_calibration_provenance(&mut calibrated_fixture, &calibration);
         let loaded = persisted(&calibrated_fixture);
+        let missing_report = loaded.compatibility_report(compatibility_context(
+            &calibrated_fixture,
+            None,
+        ));
         assert_eq!(
-            loaded.validate_compatibility(compatibility_context(
-                &calibrated_fixture,
-                None,
-            )),
+            missing_report.state,
             PlanCompatibility::CompatibleRecalibrationRecommended
+        );
+        assert_eq!(
+            missing_report.reasons,
+            vec![PlanCompatibilityReason::CalibrationMissing]
         );
 
         let mut requested_without_result = fixture();

@@ -1,13 +1,14 @@
 use std::fmt::Write as _;
 
 use ramforge_runtime::planner::{
-    Availability, ModelExecutionCompatibility, ObservationUnit, PlanReasonCode,
+    Availability, ModelExecutionCompatibility, ObservationUnit, PlanCompatibility,
+    PlanReasonCode,
 };
 use ramforge_runtime::runtime_config::RuntimeConfig;
 
 use super::app::{
     calibration_level_for_index, calibration_level_label, mode_label,
-    CalibrationTaskDisplayState, CalibrationTaskView, Screen, TuiApp,
+    CalibrationTaskDisplayState, CalibrationTaskView, ModelFlow, PlanOrigin, Screen, TuiApp,
 };
 
 pub fn render(
@@ -25,6 +26,7 @@ pub fn render(
 
     match app.screen {
         Screen::Welcome => render_welcome(app, &mut output),
+        Screen::LoadPlan => render_load_plan(app, &mut output),
         Screen::ModelInput => render_model_input(app, &mut output),
         Screen::Preferences => render_preferences(app, &mut output),
         Screen::Analyzing => render_analyzing(&mut output),
@@ -38,6 +40,7 @@ pub fn render(
         Screen::PlanReview => render_plan_review(app, &mut output),
         Screen::PlanValidation => render_plan_validation(&mut output),
         Screen::PlanValid => render_plan_valid(app, runtime_config, &mut output),
+        Screen::PlanCompatibility => render_plan_compatibility(app, &mut output),
         Screen::SavePlan => render_save_plan(app, &mut output),
         Screen::Error => render_error(app, &mut output),
     }
@@ -61,12 +64,38 @@ pub fn render(
 fn render_welcome(app: &TuiApp, output: &mut String) {
     let _ = writeln!(output);
     menu_line(output, app.menu_index == 0, "Select model");
-    menu_line(output, app.menu_index == 1, "Exit");
+    menu_line(output, app.menu_index == 1, "Load plan");
+    menu_line(output, app.menu_index == 2, "Exit");
+}
+
+fn render_load_plan(app: &TuiApp, output: &mut String) {
+    let _ = writeln!(output, "Load persisted plan");
+    let _ = writeln!(output, "Enter a PersistedExecutionPlan path.");
+    let _ = writeln!(output);
+    let _ = writeln!(output, "> {}_", app.load_path_input);
+    let _ = writeln!(output);
+    let _ = writeln!(output, "The plan will not be executed or modified.");
 }
 
 fn render_model_input(app: &TuiApp, output: &mut String) {
-    let _ = writeln!(output, "Model selection");
-    let _ = writeln!(output, "Enter an absolute or relative GGUF path.");
+    let _ = writeln!(
+        output,
+        "{}",
+        if app.model_flow == ModelFlow::LoadedPlan {
+            "Current model context"
+        } else {
+            "Model selection"
+        }
+    );
+    let _ = writeln!(
+        output,
+        "{}",
+        if app.model_flow == ModelFlow::LoadedPlan {
+            "Enter the GGUF path to validate the loaded plan against."
+        } else {
+            "Enter an absolute or relative GGUF path."
+        }
+    );
     let _ = writeln!(output);
     let _ = writeln!(output, "> {}_", app.model_input);
     let _ = writeln!(output);
@@ -319,8 +348,25 @@ fn render_plan_review(app: &TuiApp, output: &mut String) {
     };
     render_plan(plan, output);
     let _ = writeln!(output);
-    menu_line(output, app.menu_index == 0, "Validate plan");
-    menu_line(output, app.menu_index == 1, "Change preferences");
+    if app.plan_origin == PlanOrigin::LoadedPlan {
+        let compatible = app
+            .compatibility_report
+            .as_ref()
+            .is_some_and(|report| report.state != PlanCompatibility::Incompatible);
+        menu_line(
+            output,
+            app.menu_index == 0,
+            if compatible {
+                "Validate/compile loaded plan"
+            } else {
+                "Back to compatibility"
+            },
+        );
+        menu_line(output, app.menu_index == 1, "Plan with current model");
+    } else {
+        menu_line(output, app.menu_index == 0, "Validate plan");
+        menu_line(output, app.menu_index == 1, "Change preferences");
+    }
 }
 
 fn render_plan_validation(output: &mut String) {
@@ -369,8 +415,89 @@ fn render_plan_valid(
         field(output, "Execution device", &format!("{:?}", config.execution_device));
     }
     let _ = writeln!(output);
-    menu_line(output, app.menu_index == 0, "Save plan");
-    menu_line(output, app.menu_index == 1, "Back to plan");
+    if app.plan_origin == PlanOrigin::LoadedPlan {
+        menu_line(output, true, "Back to compatibility");
+    } else {
+        menu_line(output, app.menu_index == 0, "Save plan");
+        menu_line(output, app.menu_index == 1, "Back to plan");
+    }
+}
+
+fn render_plan_compatibility(app: &TuiApp, output: &mut String) {
+    let Some(report) = app.compatibility_report.as_ref() else {
+        let _ = writeln!(output, "Compatibility result is unavailable.");
+        return;
+    };
+    let state = match report.state {
+        PlanCompatibility::Valid => "VALID",
+        PlanCompatibility::CompatibleRecalibrationRecommended => {
+            "COMPATIBLE — RECALIBRATION RECOMMENDED"
+        }
+        PlanCompatibility::Incompatible => "INCOMPATIBLE",
+    };
+    let _ = writeln!(output, "Plan compatibility");
+    let _ = writeln!(output, "{state}");
+    let _ = writeln!(output);
+
+    if let (Some(persisted), Some(session)) = (
+        app.persisted_plan.as_ref(),
+        app.planning_session.as_ref(),
+    ) {
+        let _ = writeln!(output, "Source context");
+        field(
+            output,
+            "Model fingerprint",
+            &persisted.model_descriptor_fingerprint.to_string(),
+        );
+        field(
+            output,
+            "Machine fingerprint",
+            &persisted.source_machine_fingerprint.to_string(),
+        );
+        field(
+            output,
+            "Storage fingerprint",
+            &persisted.source_storage_fingerprint.to_string(),
+        );
+        let _ = writeln!(output, "Current context");
+        field(
+            output,
+            "Machine fingerprint",
+            &session.machine.fingerprint().to_string(),
+        );
+        field(
+            output,
+            "Storage fingerprint",
+            &session.storage.fingerprint().to_string(),
+        );
+        field(
+            output,
+            "CPU",
+            session.machine.cpu_model.as_deref().unwrap_or("Unavailable"),
+        );
+        field(
+            output,
+            "Logical CPUs",
+            &session.machine.logical_cpu_cores.to_string(),
+        );
+        field(output, "Storage kind", &format!("{:?}", session.storage.kind));
+        field(
+            output,
+            "Model fingerprint",
+            &session.model.identity.descriptor_fingerprint.to_string(),
+        );
+    }
+    if !report.reasons.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Compatibility reasons");
+        for reason in &report.reasons {
+            let _ = writeln!(output, "  {reason}");
+        }
+    }
+    let _ = writeln!(output);
+    menu_line(output, app.menu_index == 0, "Review persisted plan");
+    menu_line(output, app.menu_index == 1, "Plan with current model");
+    menu_line(output, app.menu_index == 2, "Select another model");
 }
 
 fn render_save_plan(app: &TuiApp, output: &mut String) {
@@ -628,7 +755,7 @@ fn task_state_label(state: CalibrationTaskDisplayState) -> &'static str {
 
 fn footer(app: &TuiApp) -> &'static str {
     match app.screen {
-        Screen::ModelInput | Screen::SavePlan => {
+        Screen::LoadPlan | Screen::ModelInput | Screen::SavePlan => {
             "Type path  Enter Submit  Backspace Delete  Esc Back  Ctrl-C Quit"
         }
         Screen::Preferences if app.accepts_text() => {
@@ -660,9 +787,31 @@ mod tests {
     fn welcome_render_contains_real_actions_and_navigation() {
         let rendered = render(&TuiApp::default(), None, None);
         assert!(rendered.contains("Select model"));
+        assert!(rendered.contains("Load plan"));
         assert!(rendered.contains("Exit"));
         assert!(rendered.contains("Up/Down"));
         assert!(!rendered.contains("Chat"));
+    }
+
+    #[test]
+    fn compatibility_screen_uses_only_existing_categories() {
+        for (state, label) in [
+            (PlanCompatibility::Valid, "VALID"),
+            (
+                PlanCompatibility::CompatibleRecalibrationRecommended,
+                "COMPATIBLE — RECALIBRATION RECOMMENDED",
+            ),
+            (PlanCompatibility::Incompatible, "INCOMPATIBLE"),
+        ] {
+            let mut app = TuiApp::default();
+            app.screen = Screen::PlanCompatibility;
+            app.compatibility_report = Some(ramforge_runtime::PlanCompatibilityReport {
+                state,
+                reasons: Vec::new(),
+            });
+            let rendered = render(&app, None, None);
+            assert!(rendered.contains(label));
+        }
     }
 
     #[test]

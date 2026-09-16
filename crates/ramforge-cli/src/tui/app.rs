@@ -9,15 +9,18 @@ use ramforge_runtime::discovery::StorageDiscoveryError;
 use ramforge_runtime::orchestration::{
     OrchestrationError, PlanningSession,
 };
-use ramforge_runtime::plan_persistence::PlanPersistenceError;
+use ramforge_runtime::plan_persistence::{
+    PersistedExecutionPlan, PlanCompatibilityReport, PlanPersistenceError,
+};
 use ramforge_runtime::planner::{
     AdvancedOverrides, CalibrationLevel, CalibrationResult, ExecutionPlan,
-    ObservationStatus, ObservationStatusReason, OperatingMode, UserProfile,
+    ObservationStatus, ObservationStatusReason, OperatingMode, PlanCompatibility, UserProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Welcome,
+    LoadPlan,
     ModelInput,
     Preferences,
     Analyzing,
@@ -27,8 +30,21 @@ pub enum Screen {
     PlanReview,
     PlanValidation,
     PlanValid,
+    PlanCompatibility,
     SavePlan,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFlow {
+    NewPlan,
+    LoadedPlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanOrigin {
+    NewPlan,
+    LoadedPlan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +61,10 @@ pub enum UiCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
+    LoadPlan(PathBuf),
     ValidateModelPath(PathBuf),
     Analyze,
+    AnalyzeLoadedPlan,
     RunCalibration,
     CreatePlan,
     ValidatePlan,
@@ -209,7 +227,10 @@ pub struct TuiApp {
     pub screen: Screen,
     pub should_quit: bool,
     pub menu_index: usize,
+    pub load_path_input: String,
     pub model_input: String,
+    pub model_flow: ModelFlow,
+    pub plan_origin: PlanOrigin,
     pub ram_input: String,
     pub mode: OperatingMode,
     pub advanced_thread_input: String,
@@ -228,6 +249,8 @@ pub struct TuiApp {
     pub planning_session: Option<PlanningSession>,
     pub calibration_result: Option<CalibrationResult>,
     pub execution_plan: Option<ExecutionPlan>,
+    pub persisted_plan: Option<PersistedExecutionPlan>,
+    pub compatibility_report: Option<PlanCompatibilityReport>,
 }
 
 impl Default for TuiApp {
@@ -236,7 +259,10 @@ impl Default for TuiApp {
             screen: Screen::Welcome,
             should_quit: false,
             menu_index: 0,
+            load_path_input: String::new(),
             model_input: String::new(),
+            model_flow: ModelFlow::NewPlan,
+            plan_origin: PlanOrigin::NewPlan,
             ram_input: String::new(),
             mode: OperatingMode::BalancedNormal,
             advanced_thread_input: String::new(),
@@ -255,6 +281,8 @@ impl Default for TuiApp {
             planning_session: None,
             calibration_result: None,
             execution_plan: None,
+            persisted_plan: None,
+            compatibility_report: None,
         }
     }
 }
@@ -271,6 +299,7 @@ impl TuiApp {
         }
         match self.screen {
             Screen::Welcome => self.handle_welcome(command),
+            Screen::LoadPlan => self.handle_load_plan(command),
             Screen::ModelInput => self.handle_model_input(command),
             Screen::Preferences => self.handle_preferences(command),
             Screen::ModelInfo => self.handle_model_info(command),
@@ -278,6 +307,7 @@ impl TuiApp {
             Screen::Calibrating => self.handle_calibrating(command),
             Screen::PlanReview => self.handle_plan_review(command),
             Screen::PlanValid => self.handle_plan_valid(command),
+            Screen::PlanCompatibility => self.handle_plan_compatibility(command),
             Screen::SavePlan => self.handle_save_plan(command),
             Screen::Error => {
                 if command == UiCommand::Back || command == UiCommand::Enter {
@@ -293,7 +323,7 @@ impl TuiApp {
 
     pub fn accepts_text(&self) -> bool {
         match self.screen {
-            Screen::ModelInput | Screen::SavePlan => true,
+            Screen::LoadPlan | Screen::ModelInput | Screen::SavePlan => true,
             Screen::Preferences => matches!(
                 self.preference_field(),
                 PreferenceField::Ram
@@ -304,13 +334,65 @@ impl TuiApp {
         }
     }
 
+    pub fn load_finished(
+        &mut self,
+        result: Result<PersistedExecutionPlan, TuiError>,
+    ) {
+        match result {
+            Ok(plan) => {
+                self.persisted_plan = Some(plan);
+                self.compatibility_report = None;
+                self.execution_plan = None;
+                self.planning_session = None;
+                self.model_input.clear();
+                self.model_flow = ModelFlow::LoadedPlan;
+                self.plan_origin = PlanOrigin::LoadedPlan;
+                self.screen = Screen::ModelInput;
+                self.menu_index = 0;
+                self.error = None;
+            }
+            Err(error) => self.show_error(error, Screen::LoadPlan),
+        }
+    }
+
     pub fn model_path_validation_finished(
         &mut self,
         result: Result<(), TuiError>,
-    ) {
+    ) -> Option<AppAction> {
         match result {
+            Ok(()) if self.model_flow == ModelFlow::LoadedPlan => {
+                self.screen = Screen::Analyzing;
+                self.menu_index = 0;
+                self.error = None;
+                Some(AppAction::AnalyzeLoadedPlan)
+            }
             Ok(()) => {
                 self.screen = Screen::Preferences;
+                self.menu_index = 0;
+                self.error = None;
+                None
+            }
+            Err(error) => {
+                self.show_error(error, Screen::ModelInput);
+                None
+            }
+        }
+    }
+
+    pub fn loaded_analysis_finished(
+        &mut self,
+        result: Result<
+            (PlanningSession, ExecutionPlan, PlanCompatibilityReport),
+            TuiError,
+        >,
+    ) {
+        match result {
+            Ok((session, plan, report)) => {
+                self.planning_session = Some(session);
+                self.execution_plan = Some(plan);
+                self.compatibility_report = Some(report);
+                self.plan_origin = PlanOrigin::LoadedPlan;
+                self.screen = Screen::PlanCompatibility;
                 self.menu_index = 0;
                 self.error = None;
             }
@@ -363,6 +445,7 @@ impl TuiApp {
         match result {
             Ok(plan) => {
                 self.execution_plan = Some(plan);
+                self.plan_origin = PlanOrigin::NewPlan;
                 self.screen = Screen::PlanReview;
                 self.menu_index = 0;
                 self.error = None;
@@ -415,12 +498,46 @@ impl TuiApp {
 
     fn handle_welcome(&mut self, command: UiCommand) -> Option<AppAction> {
         match command {
-            UiCommand::Up | UiCommand::Down => self.menu_index = 1 - self.menu_index.min(1),
+            UiCommand::Up => self.move_menu_up(3),
+            UiCommand::Down => self.move_menu_down(3),
             UiCommand::Enter if self.menu_index == 0 => {
-                self.screen = Screen::ModelInput;
+                self.start_new_model_flow();
+            }
+            UiCommand::Enter if self.menu_index == 1 => {
+                self.screen = Screen::LoadPlan;
+                self.load_path_input.clear();
                 self.menu_index = 0;
             }
             UiCommand::Enter => self.should_quit = true,
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_load_plan(&mut self, command: UiCommand) -> Option<AppAction> {
+        match command {
+            UiCommand::Character(character) if !character.is_control() => {
+                self.load_path_input.push(character)
+            }
+            UiCommand::Backspace => {
+                self.load_path_input.pop();
+            }
+            UiCommand::Back => {
+                self.screen = Screen::Welcome;
+                self.menu_index = 1;
+            }
+            UiCommand::Enter if self.load_path_input.is_empty() => {
+                self.error = Some(TuiError::Input {
+                    field: "persisted plan path",
+                    message: "a path is required".to_string(),
+                });
+            }
+            UiCommand::Enter => {
+                self.screen = Screen::Analyzing;
+                return Some(AppAction::LoadPlan(PathBuf::from(
+                    self.load_path_input.as_str(),
+                )));
+            }
             _ => {}
         }
         None
@@ -435,7 +552,11 @@ impl TuiApp {
                 self.model_input.pop();
             }
             UiCommand::Back => {
-                self.screen = Screen::Welcome;
+                self.screen = if self.model_flow == ModelFlow::LoadedPlan {
+                    Screen::LoadPlan
+                } else {
+                    Screen::Welcome
+                };
                 self.menu_index = 0;
             }
             UiCommand::Enter if self.model_input.is_empty() => {
@@ -489,6 +610,10 @@ impl TuiApp {
                         self.planning_session = None;
                         self.calibration_result = None;
                         self.execution_plan = None;
+                        self.persisted_plan = None;
+                        self.compatibility_report = None;
+                        self.plan_origin = PlanOrigin::NewPlan;
+                        self.model_flow = ModelFlow::NewPlan;
                         self.screen = Screen::Analyzing;
                         return Some(AppAction::Analyze);
                     }
@@ -565,6 +690,9 @@ impl TuiApp {
     }
 
     fn handle_plan_review(&mut self, command: UiCommand) -> Option<AppAction> {
+        if self.plan_origin == PlanOrigin::LoadedPlan {
+            return self.handle_loaded_plan_review(command);
+        }
         match command {
             UiCommand::Up | UiCommand::Down => self.menu_index = 1 - self.menu_index.min(1),
             UiCommand::Back => {
@@ -585,7 +713,40 @@ impl TuiApp {
         None
     }
 
+    fn handle_loaded_plan_review(&mut self, command: UiCommand) -> Option<AppAction> {
+        let compatible = self
+            .compatibility_report
+            .as_ref()
+            .is_some_and(|report| report.state != PlanCompatibility::Incompatible);
+        match command {
+            UiCommand::Up | UiCommand::Down => self.menu_index = 1 - self.menu_index.min(1),
+            UiCommand::Back => {
+                self.screen = Screen::PlanCompatibility;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter if self.menu_index == 0 && compatible => {
+                self.screen = Screen::PlanValidation;
+                self.error = None;
+                return Some(AppAction::ValidatePlan);
+            }
+            UiCommand::Enter if self.menu_index == 0 => {
+                self.screen = Screen::PlanCompatibility;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter => self.return_loaded_model_to_planning(),
+            _ => {}
+        }
+        None
+    }
+
     fn handle_plan_valid(&mut self, command: UiCommand) -> Option<AppAction> {
+        if self.plan_origin == PlanOrigin::LoadedPlan {
+            if command == UiCommand::Back || command == UiCommand::Enter {
+                self.screen = Screen::PlanCompatibility;
+                self.menu_index = 0;
+            }
+            return None;
+        }
         match command {
             UiCommand::Up | UiCommand::Down => self.menu_index = 1 - self.menu_index.min(1),
             UiCommand::Back => {
@@ -601,6 +762,25 @@ impl TuiApp {
                 self.screen = Screen::PlanReview;
                 self.menu_index = 0;
             }
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_plan_compatibility(&mut self, command: UiCommand) -> Option<AppAction> {
+        match command {
+            UiCommand::Up => self.move_menu_up(3),
+            UiCommand::Down => self.move_menu_down(3),
+            UiCommand::Back => {
+                self.screen = Screen::LoadPlan;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter if self.menu_index == 0 => {
+                self.screen = Screen::PlanReview;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter if self.menu_index == 1 => self.return_loaded_model_to_planning(),
+            UiCommand::Enter => self.start_new_model_flow(),
             _ => {}
         }
         None
@@ -633,6 +813,34 @@ impl TuiApp {
             _ => {}
         }
         None
+    }
+
+    fn start_new_model_flow(&mut self) {
+        self.model_flow = ModelFlow::NewPlan;
+        self.plan_origin = PlanOrigin::NewPlan;
+        self.persisted_plan = None;
+        self.compatibility_report = None;
+        self.planning_session = None;
+        self.execution_plan = None;
+        self.calibration_result = None;
+        self.model_input.clear();
+        self.screen = Screen::ModelInput;
+        self.menu_index = 0;
+    }
+
+    fn return_loaded_model_to_planning(&mut self) {
+        if let Some(persisted) = self.persisted_plan.as_ref() {
+            self.ram_input = format!("{}B", persisted.ram_budget_bytes);
+            self.mode = persisted.mode;
+        }
+        self.model_flow = ModelFlow::NewPlan;
+        self.plan_origin = PlanOrigin::NewPlan;
+        self.persisted_plan = None;
+        self.compatibility_report = None;
+        self.execution_plan = None;
+        self.calibration_result = None;
+        self.screen = Screen::Preferences;
+        self.menu_index = 0;
     }
 
     fn show_error(&mut self, error: TuiError, return_to: Screen) {
@@ -833,6 +1041,35 @@ mod tests {
     }
 
     #[test]
+    fn welcome_exposes_load_plan_and_back_navigation() {
+        let mut app = TuiApp::default();
+        app.handle(UiCommand::Down);
+        app.handle(UiCommand::Enter);
+        assert_eq!(app.screen, Screen::LoadPlan);
+        app.handle(UiCommand::Back);
+        assert_eq!(app.screen, Screen::Welcome);
+        assert_eq!(app.menu_index, 1);
+    }
+
+    #[test]
+    fn load_plan_requests_exact_path_and_recovers_from_errors() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::LoadPlan;
+        app.load_path_input = "relative/plan.rfp".to_string();
+        assert_eq!(
+            app.handle(UiCommand::Enter),
+            Some(AppAction::LoadPlan(PathBuf::from("relative/plan.rfp")))
+        );
+        app.load_finished(Err(TuiError::Persistence(
+            PlanPersistenceError::InvalidMagic,
+        )));
+        assert_eq!(app.screen, Screen::Error);
+        assert_eq!(app.error.as_ref().unwrap().title(), "Plan persistence failed");
+        app.handle(UiCommand::Back);
+        assert_eq!(app.screen, Screen::LoadPlan);
+    }
+
+    #[test]
     fn model_input_accepts_exact_path_and_rejects_empty_input() {
         let mut app = TuiApp::default();
         app.handle(UiCommand::Enter);
@@ -850,15 +1087,29 @@ mod tests {
                 "relative/model.gguf"
             )))
         );
-        app.model_path_validation_finished(Ok(()));
+        assert!(app.model_path_validation_finished(Ok(())).is_none());
         assert_eq!(app.screen, Screen::Preferences);
 
         app.screen = Screen::Analyzing;
-        app.model_path_validation_finished(Err(TuiError::Storage(
-            StorageDiscoveryError::InvalidPath,
-        )));
+        assert!(app
+            .model_path_validation_finished(Err(TuiError::Storage(
+                StorageDiscoveryError::InvalidPath,
+            )))
+            .is_none());
         assert_eq!(app.screen, Screen::Error);
         assert_eq!(app.error.as_ref().unwrap().title(), "Storage discovery failed");
+    }
+
+    #[test]
+    fn loaded_plan_model_context_requests_compatibility_analysis() {
+        let mut app = TuiApp::default();
+        app.model_flow = ModelFlow::LoadedPlan;
+        app.screen = Screen::Analyzing;
+        assert_eq!(
+            app.model_path_validation_finished(Ok(())),
+            Some(AppAction::AnalyzeLoadedPlan)
+        );
+        assert_eq!(app.screen, Screen::Analyzing);
     }
 
     #[test]
@@ -943,6 +1194,47 @@ mod tests {
         )));
         assert_eq!(app.screen, Screen::Error);
         assert_eq!(app.error.as_ref().unwrap().title(), "Planning failed");
+    }
+
+    #[test]
+    fn incompatible_loaded_plan_cannot_request_compilation() {
+        let mut app = TuiApp::default();
+        app.plan_origin = PlanOrigin::LoadedPlan;
+        app.compatibility_report = Some(PlanCompatibilityReport {
+            state: PlanCompatibility::Incompatible,
+            reasons: Vec::new(),
+        });
+        app.screen = Screen::PlanReview;
+        assert!(app.handle(UiCommand::Enter).is_none());
+        assert_eq!(app.screen, Screen::PlanCompatibility);
+    }
+
+    #[test]
+    fn compatible_loaded_plan_requires_explicit_compilation() {
+        let mut app = TuiApp::default();
+        app.plan_origin = PlanOrigin::LoadedPlan;
+        app.compatibility_report = Some(PlanCompatibilityReport {
+            state: PlanCompatibility::Valid,
+            reasons: Vec::new(),
+        });
+        app.screen = Screen::PlanReview;
+        assert_eq!(app.handle(UiCommand::Enter), Some(AppAction::ValidatePlan));
+        assert_eq!(app.screen, Screen::PlanValidation);
+    }
+
+    #[test]
+    fn recalibration_recommendation_never_starts_calibration_automatically() {
+        let mut app = TuiApp::default();
+        app.plan_origin = PlanOrigin::LoadedPlan;
+        app.compatibility_report = Some(PlanCompatibilityReport {
+            state: PlanCompatibility::CompatibleRecalibrationRecommended,
+            reasons: Vec::new(),
+        });
+        app.screen = Screen::PlanCompatibility;
+        app.menu_index = 1;
+        assert!(app.handle(UiCommand::Enter).is_none());
+        assert_eq!(app.screen, Screen::Preferences);
+        assert!(app.calibration_result.is_none());
     }
 
     #[test]

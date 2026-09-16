@@ -55,7 +55,8 @@ pub use plan::{plan_model, PlanResult};
 pub use plan_compiler::{PlanCompilationContext, PlanCompilationError, PlanCompiler};
 pub use plan_persistence::{
     PersistedExecutionPlan, PersistedPlanCompatibilityContext, PersistedPlanValidationError,
-    PlanPersistenceError, PERSISTED_EXECUTION_PLAN_SCHEMA_VERSION,
+    PlanCompatibilityReason, PlanCompatibilityReport, PlanPersistenceError,
+    PERSISTED_EXECUTION_PLAN_SCHEMA_VERSION,
 };
 pub use runtime_config::{RuntimeConfig, RuntimeConfigError, RuntimeExecutionDevice};
 
