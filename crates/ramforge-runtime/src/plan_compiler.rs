@@ -226,7 +226,9 @@ fn validate_plan_header(plan: &ExecutionPlan) -> Result<(), PlanCompilationError
     Ok(())
 }
 
-fn validate_concrete_decisions(plan: &ExecutionPlan) -> Result<(), PlanCompilationError> {
+pub(crate) fn validate_concrete_decisions(
+    plan: &ExecutionPlan,
+) -> Result<(), PlanCompilationError> {
     if plan.cpu_thread_count == 0 {
         return Err(PlanCompilationError::ZeroThreadCount);
     }
@@ -518,7 +520,7 @@ fn validate_io(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
@@ -533,17 +535,17 @@ mod tests {
         PROFILE_SCHEMA_VERSION,
     };
 
-    struct CompilerFixture {
-        plan: ExecutionPlan,
-        machine: MachineProfile,
-        model: ModelProfile,
-        storage: StorageProfile,
-        capabilities: CapabilitySet,
-        static_plan: PlanResult,
+    pub(crate) struct CompilerFixture {
+        pub(crate) plan: ExecutionPlan,
+        pub(crate) machine: MachineProfile,
+        pub(crate) model: ModelProfile,
+        pub(crate) storage: StorageProfile,
+        pub(crate) capabilities: CapabilitySet,
+        pub(crate) static_plan: PlanResult,
     }
 
     impl CompilerFixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let machine = MachineProfile {
                 schema_version: PROFILE_SCHEMA_VERSION,
                 os: "linux".to_string(),
@@ -696,7 +698,7 @@ mod tests {
             }
         }
 
-        fn context(&self) -> PlanCompilationContext<'_> {
+        pub(crate) fn context(&self) -> PlanCompilationContext<'_> {
             PlanCompilationContext {
                 machine: &self.machine,
                 model: &self.model,
@@ -706,7 +708,7 @@ mod tests {
             }
         }
 
-        fn refresh_capabilities(&mut self) {
+        pub(crate) fn refresh_capabilities(&mut self) {
             self.capabilities = CapabilitySet::derive(
                 &self.machine,
                 &self.model,

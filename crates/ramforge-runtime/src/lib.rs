@@ -6,6 +6,7 @@
 //! - Bounded LRU cache whose contents are charged to the budget
 //! - Planning logic for `ramforge plan`
 //! - Explicit discovery → Planner → compiler → runtime orchestration
+//! - Versioned, bounded ExecutionPlan persistence and compatibility validation
 //! - CPU inference for llama/qwen2 (F32/F16/BF16 + ggml quant formats),
 //!   out-of-core layer streaming with compact quantized residency
 //! - SIMD (AVX2) + rayon-threaded F32 matvec hot path
@@ -29,6 +30,7 @@ pub mod orchestration;
 pub mod persistent;
 pub mod plan;
 pub mod plan_compiler;
+pub mod plan_persistence;
 pub mod planner;
 pub mod profile;
 pub mod residency;
@@ -50,6 +52,10 @@ pub use orchestration::{
 };
 pub use plan::{plan_model, PlanResult};
 pub use plan_compiler::{PlanCompilationContext, PlanCompilationError, PlanCompiler};
+pub use plan_persistence::{
+    PersistedExecutionPlan, PersistedPlanCompatibilityContext, PersistedPlanValidationError,
+    PlanPersistenceError, PERSISTED_EXECUTION_PLAN_SCHEMA_VERSION,
+};
 pub use runtime_config::{RuntimeConfig, RuntimeConfigError, RuntimeExecutionDevice};
 
 /// Basic raw-tensor cache runtime retained as a public utility.

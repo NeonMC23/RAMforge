@@ -2030,6 +2030,17 @@ mod tests {
             config.grouped_read_buffer_reuse_enabled,
             plan.io.grouped_read_buffer_reuse_enabled
         );
+
+        let persisted =
+            crate::plan_persistence::PersistedExecutionPlan::from_execution_plan(&plan).unwrap();
+        let loaded = crate::plan_persistence::PersistedExecutionPlan::from_bytes(
+            &persisted.to_bytes().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.strategy, plan.strategy);
+        assert_eq!(loaded.ram_budget_bytes, plan.ram_budget_bytes);
+        assert_eq!(loaded.layer_cache, plan.layer_cache);
+        assert_eq!(loaded.io, plan.io);
     }
 
     #[test]
