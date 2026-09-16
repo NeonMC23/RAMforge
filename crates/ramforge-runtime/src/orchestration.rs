@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::Path;
 
 use ramforge_core::datasource::GgufDataSource;
-use ramforge_core::DataSourceError;
+use ramforge_core::{DataSourceError, ModelInfo};
 
 use crate::discovery::{
     MachineDiscovery, MachineDiscoveryError, StorageDiscovery, StorageDiscoveryError,
@@ -41,6 +41,63 @@ impl<'a> OrchestrationRequest<'a> {
     pub fn with_calibration(mut self, calibration: &'a CalibrationResult) -> Self {
         self.calibration = Some(calibration);
         self
+    }
+}
+
+/// Planning-only facts retained for interactive inspection, optional
+/// calibration, Planner invocation, and explicit compilation. No model weights,
+/// runtime allocations, or inference state are owned here.
+#[derive(Debug)]
+pub struct PlanningSession {
+    pub machine: MachineProfile,
+    pub model: ModelProfile,
+    pub model_info: ModelInfo,
+    pub storage: StorageProfile,
+    pub capabilities: CapabilitySet,
+    pub static_plan: PlanResult,
+}
+
+impl PlanningSession {
+    pub fn create_plan(
+        &self,
+        user_profile: &UserProfile,
+        calibration: Option<&CalibrationResult>,
+    ) -> Result<ExecutionPlan, OrchestrationError> {
+        Planner
+            .plan(
+                user_profile,
+                &self.machine,
+                &self.model,
+                &self.storage,
+                &self.capabilities,
+                &self.static_plan,
+                calibration,
+            )
+            .map_err(OrchestrationError::Planning)
+    }
+
+    pub fn compile_plan(
+        &self,
+        execution_plan: &ExecutionPlan,
+    ) -> Result<RuntimeConfig, OrchestrationError> {
+        compile_runtime_config(
+            execution_plan,
+            &self.machine,
+            &self.model,
+            &self.storage,
+            &self.capabilities,
+            &self.static_plan,
+        )
+    }
+
+    pub fn compilation_context(&self) -> PlanCompilationContext<'_> {
+        PlanCompilationContext {
+            machine: &self.machine,
+            model: &self.model,
+            storage: &self.storage,
+            capabilities: &self.capabilities,
+            static_plan: &self.static_plan,
+        }
     }
 }
 
@@ -114,24 +171,56 @@ impl std::error::Error for OrchestrationError {
 pub struct RuntimeOrchestrator;
 
 impl RuntimeOrchestrator {
+    /// Inspect and discover everything needed for planning without loading
+    /// model weights or constructing inference state.
+    pub fn analyze(
+        &self,
+        model_path: &Path,
+        ram_budget_bytes: u64,
+    ) -> Result<PlanningSession, OrchestrationError> {
+        let (session, _) = self.analyze_retained(model_path, ram_budget_bytes)?;
+        Ok(session)
+    }
+
     pub fn orchestrate(
         &self,
         request: OrchestrationRequest<'_>,
     ) -> Result<OrchestratedRuntime, OrchestrationError> {
+        let (session, data_source) = self.analyze_retained(
+            request.model_path,
+            request.user_profile.ram_budget_bytes,
+        )?;
+        let execution_plan =
+            session.create_plan(request.user_profile, request.calibration)?;
+        let runtime_config = session.compile_plan(&execution_plan)?;
+        let engine = construct_runtime(data_source, runtime_config)?;
+
+        Ok(OrchestratedRuntime {
+            execution_plan,
+            engine,
+        })
+    }
+
+    fn analyze_retained(
+        &self,
+        model_path: &Path,
+        ram_budget_bytes: u64,
+    ) -> Result<(PlanningSession, GgufDataSource), OrchestrationError> {
         let storage = StorageDiscovery
-            .discover(request.model_path)
+            .discover(model_path)
             .map_err(OrchestrationError::StorageDiscovery)?;
 
         // GgufDataSource parses metadata/descriptors and opens the retained
-        // synchronized handle exactly once. The same value is moved into the
-        // engine after planning and compilation.
+        // synchronized handle exactly once. The full orchestration path moves
+        // the same value into the engine; planning-only callers drop it.
         let data_source = GgufDataSource::open(&storage.model_path)
             .map_err(OrchestrationError::ModelInspection)?;
+        let model_info = data_source.model().info();
         let model = ModelProfile::from_gguf(data_source.model());
         model
             .validate()
             .map_err(OrchestrationError::ModelProfileConstruction)?;
-        let static_plan = plan_model(data_source.model(), request.user_profile.ram_budget_bytes)
+        let static_plan = plan_model(data_source.model(), ram_budget_bytes)
             .map_err(OrchestrationError::StaticPlanning)?;
 
         let machine = MachineDiscovery
@@ -140,31 +229,15 @@ impl RuntimeOrchestrator {
         let planner = Planner;
         let capabilities =
             construct_capabilities(&planner, &machine, &model, &storage, &static_plan)?;
-        let execution_plan = planner
-            .plan(
-                request.user_profile,
-                &machine,
-                &model,
-                &storage,
-                &capabilities,
-                &static_plan,
-                request.calibration,
-            )
-            .map_err(OrchestrationError::Planning)?;
-        let runtime_config = compile_runtime_config(
-            &execution_plan,
-            &machine,
-            &model,
-            &storage,
-            &capabilities,
-            &static_plan,
-        )?;
-        let engine = construct_runtime(data_source, runtime_config)?;
-
-        Ok(OrchestratedRuntime {
-            execution_plan,
-            engine,
-        })
+        let session = PlanningSession {
+            machine,
+            model,
+            model_info,
+            storage,
+            capabilities,
+            static_plan,
+        };
+        Ok((session, data_source))
     }
 }
 
@@ -347,6 +420,23 @@ mod tests {
         let request = OrchestrationRequest::new(Path::new("/tmp/model.gguf"), &user);
         assert_eq!(request.model_path, Path::new("/tmp/model.gguf"));
         assert!(request.calibration.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_planning_only_analysis_exposes_real_profiles_without_runtime_state() {
+        let model_file = create_tiny_llama_gguf();
+        let session = RuntimeOrchestrator
+            .analyze(model_file.path(), TEST_RAM_BYTES)
+            .unwrap();
+        assert_eq!(session.model.tensor_count, 11);
+        assert_eq!(session.model_info.embedding_length, Some(8));
+        assert_eq!(session.model_info.vocab_size, Some(16));
+        assert_eq!(session.storage.file_size_bytes, Some(session.model.file_size_bytes));
+        assert_eq!(
+            session.capabilities.model_fingerprint,
+            session.model.identity.descriptor_fingerprint
+        );
     }
 
     #[cfg(target_os = "linux")]

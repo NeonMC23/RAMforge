@@ -5,7 +5,7 @@
 //! allocations, caches, and inference state are deliberately excluded.
 
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -322,6 +322,18 @@ impl PersistedExecutionPlan {
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), PlanPersistenceError> {
         let bytes = self.to_bytes()?;
         let mut file = File::create(path)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        Ok(())
+    }
+
+    /// Save only when the destination does not already exist.
+    pub fn save_new(&self, path: impl AsRef<Path>) -> Result<(), PlanPersistenceError> {
+        let bytes = self.to_bytes()?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
         file.write_all(&bytes)?;
         file.flush()?;
         Ok(())
@@ -1254,9 +1266,14 @@ mod tests {
 
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("plan.rfp");
-        persisted.save(&path).unwrap();
+        persisted.save_new(&path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), first);
         assert_eq!(PersistedExecutionPlan::load(&path).unwrap(), persisted);
+        assert!(matches!(
+            persisted.save_new(&path),
+            Err(PlanPersistenceError::Io(ref error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
     }
 
     #[test]

@@ -434,6 +434,21 @@ impl fmt::Display for CalibrationError {
 
 impl std::error::Error for CalibrationError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationTaskProgressState {
+    Started,
+    Finished,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CalibrationTaskProgress<'a> {
+    pub task_index: usize,
+    pub total_tasks: usize,
+    pub task: &'a CalibrationTask,
+    pub state: CalibrationTaskProgressState,
+    pub observation: Option<&'a PerformanceObservation>,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CalibrationRunner;
 
@@ -447,6 +462,31 @@ impl CalibrationRunner {
         storage: &StorageProfile,
         capabilities: &CapabilitySet,
     ) -> Result<CalibrationResult, CalibrationError> {
+        self.run_with_progress(
+            plan,
+            user,
+            machine,
+            model,
+            storage,
+            capabilities,
+            |_| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_progress<F>(
+        &self,
+        plan: &CalibrationPlan,
+        user: &UserProfile,
+        machine: &MachineProfile,
+        model: &ModelProfile,
+        storage: &StorageProfile,
+        capabilities: &CapabilitySet,
+        mut on_progress: F,
+    ) -> Result<CalibrationResult, CalibrationError>
+    where
+        F: for<'a> FnMut(CalibrationTaskProgress<'a>),
+    {
         plan.validate()?;
         user.validate()?;
         machine.validate()?;
@@ -483,43 +523,44 @@ impl CalibrationRunner {
         let mut budget = MemoryBudget::new(user.ram_budget_bytes)?;
         let calibration_started = Instant::now();
         let mut observations = Vec::with_capacity(plan.tasks.len());
-        for task in &plan.tasks {
+        for (task_index, task) in plan.tasks.iter().enumerate() {
+            on_progress(CalibrationTaskProgress {
+                task_index,
+                total_tasks: plan.tasks.len(),
+                task,
+                state: CalibrationTaskProgressState::Started,
+                observation: None,
+            });
             let elapsed_ns = duration_ns(&calibration_started);
             let remaining_ns = plan.limits.max_total_duration_ns.saturating_sub(elapsed_ns);
-            if remaining_ns < task.work.max_duration_ns {
-                observations.push(non_measured_observation(
+            let observation = if remaining_ns < task.work.max_duration_ns {
+                non_measured_observation(
                     task,
                     plan.level,
                     ObservationStatus::Skipped,
                     ObservationStatusReason::TimeLimitReached,
-                ));
-                continue;
-            }
-            if task
+                )
+            } else if task
                 .model_fingerprint
                 .is_some_and(|fingerprint| fingerprint != plan.model_fingerprint)
                 || task
                     .storage_fingerprint
                     .is_some_and(|fingerprint| fingerprint != plan.storage_fingerprint)
             {
-                observations.push(non_measured_observation(
+                non_measured_observation(
                     task,
                     plan.level,
                     ObservationStatus::Unavailable,
                     ObservationStatusReason::DependencyUnavailable,
-                ));
-                continue;
-            }
-            if let Some(reason) = unavailable_requirement(task, capabilities) {
-                observations.push(non_measured_observation(
+                )
+            } else if let Some(reason) = unavailable_requirement(task, capabilities) {
+                non_measured_observation(
                     task,
                     plan.level,
                     ObservationStatus::Unavailable,
                     reason,
-                ));
-                continue;
-            }
-            if task.expected_resources.memory_bytes > plan.limits.max_memory_bytes
+                )
+            } else if task.expected_resources.memory_bytes > plan.limits.max_memory_bytes
                 || task.expected_resources.storage_read_bytes
                     > plan.limits.max_storage_read_bytes
                 || task.work.sample_count > plan.limits.max_samples
@@ -527,22 +568,28 @@ impl CalibrationRunner {
                 || task.work.iterations_per_sample > plan.limits.max_iterations_per_sample
                 || task.work.max_duration_ns > plan.limits.max_task_duration_ns
             {
-                observations.push(non_measured_observation(
+                non_measured_observation(
                     task,
                     plan.level,
                     ObservationStatus::Skipped,
                     ObservationStatusReason::ResourceLimitExceeded,
-                ));
-                continue;
-            }
-
-            let charge_name = format!("calibration:{}", task.identifier);
-            let charge_bytes = task.expected_resources.memory_bytes.max(1);
-            let observation = budget.with_temp(
-                &charge_name,
-                charge_bytes,
-                |_budget| Ok::<_, CalibrationError>(execute_task(task, plan.level, storage)),
-            )?;
+                )
+            } else {
+                let charge_name = format!("calibration:{}", task.identifier);
+                let charge_bytes = task.expected_resources.memory_bytes.max(1);
+                budget.with_temp(
+                    &charge_name,
+                    charge_bytes,
+                    |_budget| Ok::<_, CalibrationError>(execute_task(task, plan.level, storage)),
+                )?
+            };
+            on_progress(CalibrationTaskProgress {
+                task_index,
+                total_tasks: plan.tasks.len(),
+                task,
+                state: CalibrationTaskProgressState::Finished,
+                observation: Some(&observation),
+            });
             observations.push(observation);
         }
         debug_assert_eq!(budget.used_bytes(), 0);
@@ -1451,9 +1498,29 @@ mod tests {
             test_limits(),
         )
         .unwrap();
+        let mut progress = Vec::new();
         let result = CalibrationRunner
-            .run(&plan, &user, &machine, &model, &storage, &capabilities)
+            .run_with_progress(
+                &plan,
+                &user,
+                &machine,
+                &model,
+                &storage,
+                &capabilities,
+                |event| {
+                    progress.push((
+                        event.task_index,
+                        event.total_tasks,
+                        event.state,
+                        event.observation.map(|observation| observation.status),
+                    ));
+                },
+            )
             .unwrap();
+        assert_eq!(progress.len(), plan.tasks.len() * 2);
+        assert_eq!(progress[0].2, CalibrationTaskProgressState::Started);
+        assert_eq!(progress[1].2, CalibrationTaskProgressState::Finished);
+        assert!(progress[1].3.is_some());
         assert_eq!(result.calibration_plan_identifier, plan.identifier);
         assert_eq!(result.calibration_plan_version, CALIBRATION_PLAN_VERSION);
         assert_eq!(result.calibration_ruleset_version, CALIBRATION_RULESET_VERSION);

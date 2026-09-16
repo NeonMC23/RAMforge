@@ -9,6 +9,10 @@ license = "MIT OR Apache-2.0"
 name = "ramforge"
 path = "src/main.rs"
 
+[[bin]]
+name = "ramforge-tui"
+path = "src/bin/ramforge-tui.rs"
+
 [dependencies]
 ramforge-core = { path = "../ramforge-core", features = ["serde"] }
 ramforge-runtime = { path = "../ramforge-runtime" }
@@ -17,3 +21,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
