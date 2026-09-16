@@ -73,6 +73,22 @@ impl GenerationProfile {
     }
 }
 
+fn validate_runtime_config_for_host(runtime_config: &RuntimeConfig) -> Result<(), String> {
+    runtime_config
+        .validate()
+        .map_err(|error| format!("invalid runtime configuration: {error}"))?;
+    let available_threads = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    if runtime_config.cpu_thread_count > available_threads {
+        return Err(format!(
+            "runtime configuration requests {} CPU threads but only {} are available",
+            runtime_config.cpu_thread_count, available_threads
+        ));
+    }
+    Ok(())
+}
+
 impl InferenceEngine {
     /// Construct the legacy/manual execution path. Its behavior is unchanged:
     /// all available CPU threads are exposed to the existing backend, the
@@ -89,20 +105,24 @@ impl InferenceEngine {
         model_path: &str,
         runtime_config: RuntimeConfig,
     ) -> Result<Self, String> {
-        runtime_config
-            .validate()
-            .map_err(|error| format!("invalid runtime configuration: {error}"))?;
-        let available_threads = std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(1);
-        if runtime_config.cpu_thread_count > available_threads {
-            return Err(format!(
-                "runtime configuration requests {} CPU threads but only {} are available",
-                runtime_config.cpu_thread_count, available_threads
-            ));
-        }
+        validate_runtime_config_for_host(&runtime_config)?;
         Self::new_internal(
             model_path,
+            runtime_config.ram_budget_bytes,
+            Some(runtime_config),
+        )
+    }
+
+    /// Construct from an already inspected, retained data source. This is the
+    /// orchestration path: GGUF metadata/descriptors are parsed once and the
+    /// same synchronized file handle proceeds into runtime execution.
+    pub(crate) fn from_data_source_with_runtime_config(
+        data_source: GgufDataSource,
+        runtime_config: RuntimeConfig,
+    ) -> Result<Self, String> {
+        validate_runtime_config_for_host(&runtime_config)?;
+        Self::from_data_source_internal(
+            data_source,
             runtime_config.ram_budget_bytes,
             Some(runtime_config),
         )
@@ -116,7 +136,14 @@ impl InferenceEngine {
         // Parse model file-backed (does NOT load tensor payloads).
         let data_source = GgufDataSource::open(model_path)
             .map_err(|e| format!("failed to open GGUF data source: {}", e))?;
+        Self::from_data_source_internal(data_source, ram_budget_bytes, requested_config)
+    }
 
+    fn from_data_source_internal(
+        data_source: GgufDataSource,
+        ram_budget_bytes: u64,
+        requested_config: Option<RuntimeConfig>,
+    ) -> Result<Self, String> {
         let gguf_model = data_source.model();
         // Validate architecture via config (will error if unsupported).
         let _ = LlamaConfig::from_gguf(gguf_model)?;
@@ -521,7 +548,7 @@ impl InferenceEngine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -531,7 +558,7 @@ mod tests {
 
     // Create a tiny deterministic LLaMA model for testing
     // Config: vocab 16, n_embd 8, n_layer 1, n_head 2, head_dim 4, ffn 16
-    fn create_tiny_llama_gguf() -> NamedTempFile {
+    pub(crate) fn create_tiny_llama_gguf() -> NamedTempFile {
         fn write_string<W: Write>(w: &mut W, s: &str) {
             w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
             w.write_all(s.as_bytes()).unwrap();

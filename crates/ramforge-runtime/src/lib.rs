@@ -5,6 +5,7 @@
 //! - File-backed tensor data source
 //! - Bounded LRU cache whose contents are charged to the budget
 //! - Planning logic for `ramforge plan`
+//! - Explicit discovery → Planner → compiler → runtime orchestration
 //! - CPU inference for llama/qwen2 (F32/F16/BF16 + ggml quant formats),
 //!   out-of-core layer streaming with compact quantized residency
 //! - SIMD (AVX2) + rayon-threaded F32 matvec hot path
@@ -24,6 +25,7 @@ pub(crate) mod layer_read;
 pub mod memory_report;
 pub mod model;
 pub mod ops;
+pub mod orchestration;
 pub mod persistent;
 pub mod plan;
 pub mod plan_compiler;
@@ -42,6 +44,9 @@ use ramforge_core::{
 
 pub use ramforge_core::{
     CacheError, CacheStats, DataSourceError, GgufError, MemoryError, ParseSizeError,
+};
+pub use orchestration::{
+    OrchestratedRuntime, OrchestrationError, OrchestrationRequest, RuntimeOrchestrator,
 };
 pub use plan::{plan_model, PlanResult};
 pub use plan_compiler::{PlanCompilationContext, PlanCompilationError, PlanCompiler};
