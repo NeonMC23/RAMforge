@@ -16,9 +16,9 @@ use crate::layer_read::build_layer_read_plan;
 use crate::plan::{ExecutionMemoryPlan, PlanResult};
 use crate::support::{architecture_capability, ggml_type_supported_for_inference, RunSupport};
 
-pub const PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const PROFILE_SCHEMA_VERSION: u32 = 2;
 pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 1;
-pub const PLANNER_RULESET_VERSION: u32 = 1;
+pub const PLANNER_RULESET_VERSION: u32 = 2;
 pub const CALIBRATION_PLAN_VERSION: u32 = 1;
 pub const CALIBRATION_RULESET_VERSION: u32 = 1;
 
@@ -170,6 +170,13 @@ pub enum CpuFeature {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryState {
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Availability {
     pub detected: bool,
     pub supported: bool,
@@ -199,6 +206,8 @@ impl Availability {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuDeviceProfile {
     pub identifier: String,
+    pub vendor: Option<String>,
+    pub device_id: Option<String>,
     pub name: Option<String>,
     pub dedicated_memory_bytes: Option<u64>,
     pub backend: Availability,
@@ -209,12 +218,17 @@ pub struct MachineProfile {
     pub schema_version: u32,
     pub os: String,
     pub architecture: String,
+    pub kernel_version: Option<String>,
+    pub cpu_vendor: Option<String>,
+    pub cpu_model: Option<String>,
     pub physical_cpu_cores: Option<usize>,
     pub logical_cpu_cores: usize,
     pub cpu_features: BTreeSet<CpuFeature>,
-    pub total_ram_bytes: u64,
-    pub available_ram_bytes: u64,
+    pub total_ram_bytes: Option<u64>,
+    /// Volatile snapshot excluded from the stable machine fingerprint.
+    pub available_ram_bytes: Option<u64>,
     pub cpu_backend: Availability,
+    pub gpu_inventory_state: DiscoveryState,
     pub gpus: Vec<GpuDeviceProfile>,
 }
 
@@ -226,24 +240,35 @@ impl MachineProfile {
         if self.os.is_empty() || self.architecture.is_empty() {
             return Err(PlannerError::invalid("MachineProfile", "platform"));
         }
-        if self.logical_cpu_cores == 0
-            || self.physical_cpu_cores == Some(0)
-            || self
-                .physical_cpu_cores
-                .is_some_and(|cores| cores > self.logical_cpu_cores)
-        {
+        if self.logical_cpu_cores == 0 || self.physical_cpu_cores == Some(0) {
             return Err(PlannerError::invalid("MachineProfile", "cpu core count"));
         }
-        if self.total_ram_bytes == 0 || self.available_ram_bytes > self.total_ram_bytes {
+        if self.total_ram_bytes == Some(0)
+            || self.available_ram_bytes == Some(0)
+            || matches!((self.total_ram_bytes, self.available_ram_bytes), (None, Some(_)))
+            || matches!(
+                (self.total_ram_bytes, self.available_ram_bytes),
+                (Some(total), Some(available)) if available > total
+            )
+        {
             return Err(PlannerError::invalid("MachineProfile", "RAM values"));
         }
         self.cpu_backend.validate("MachineProfile.cpu_backend")?;
+        if self.gpu_inventory_state == DiscoveryState::Unavailable && !self.gpus.is_empty() {
+            return Err(PlannerError::invalid(
+                "MachineProfile",
+                "GPU inventory state",
+            ));
+        }
         let mut identifiers = BTreeSet::new();
         for gpu in &self.gpus {
-            if gpu.identifier.is_empty() || !identifiers.insert(gpu.identifier.as_str()) {
+            if gpu.identifier.is_empty()
+                || !gpu.backend.detected
+                || !identifiers.insert(gpu.identifier.as_str())
+            {
                 return Err(PlannerError::invalid(
                     "MachineProfile",
-                    "GPU identifier",
+                    "GPU identifier/detection state",
                 ));
             }
             gpu.backend.validate("MachineProfile.gpu.backend")?;
@@ -251,21 +276,28 @@ impl MachineProfile {
         Ok(())
     }
 
+    /// Deterministic identity aid over relatively stable planning facts. The
+    /// kernel version and volatile available-memory snapshot are excluded.
     pub fn fingerprint(&self) -> u64 {
         let mut hash = fingerprint_start();
         fingerprint_str(&mut hash, &self.os);
         fingerprint_str(&mut hash, &self.architecture);
+        fingerprint_str(&mut hash, self.cpu_vendor.as_deref().unwrap_or(""));
+        fingerprint_str(&mut hash, self.cpu_model.as_deref().unwrap_or(""));
         fingerprint_u64(&mut hash, self.physical_cpu_cores.unwrap_or(0) as u64);
         fingerprint_u64(&mut hash, self.logical_cpu_cores as u64);
-        fingerprint_u64(&mut hash, self.total_ram_bytes);
+        fingerprint_u64(&mut hash, self.total_ram_bytes.unwrap_or(0));
         for feature in &self.cpu_features {
             fingerprint_u64(&mut hash, *feature as u64 + 1);
         }
         fingerprint_availability(&mut hash, self.cpu_backend);
+        fingerprint_u64(&mut hash, self.gpu_inventory_state as u64);
         let mut gpus: Vec<&GpuDeviceProfile> = self.gpus.iter().collect();
         gpus.sort_by(|left, right| left.identifier.cmp(&right.identifier));
         for gpu in gpus {
             fingerprint_str(&mut hash, &gpu.identifier);
+            fingerprint_str(&mut hash, gpu.vendor.as_deref().unwrap_or(""));
+            fingerprint_str(&mut hash, gpu.device_id.as_deref().unwrap_or(""));
             fingerprint_str(&mut hash, gpu.name.as_deref().unwrap_or(""));
             fingerprint_u64(&mut hash, gpu.dedicated_memory_bytes.unwrap_or(0));
             fingerprint_availability(&mut hash, gpu.backend);
@@ -445,15 +477,31 @@ impl ModelProfile {
 pub enum StorageKind {
     Unknown,
     Local,
+    Nvme,
+    SolidState,
+    Rotational,
     Network,
     Removable,
     MemoryBacked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoragePathState {
+    Unverified,
+    Ready,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageProfile {
     pub schema_version: u32,
     pub model_path: PathBuf,
+    pub path_state: StoragePathState,
+    pub readable: bool,
+    pub regular_file: bool,
+    /// Filesystem metadata snapshot used to cross-check the inspected model.
+    /// GGUF tensor sizing remains owned by `ModelProfile`.
+    pub file_size_bytes: Option<u64>,
+    pub filesystem_type: Option<String>,
     pub filesystem_id: Option<String>,
     pub device_id: Option<String>,
     pub kind: StorageKind,
@@ -465,10 +513,15 @@ impl StorageProfile {
         Self {
             schema_version: PROFILE_SCHEMA_VERSION,
             model_path: model_path.into(),
+            path_state: StoragePathState::Unverified,
+            readable: false,
+            regular_file: false,
+            file_size_bytes: None,
+            filesystem_type: None,
             filesystem_id: None,
             device_id: None,
             kind: StorageKind::Unknown,
-            seekable: true,
+            seekable: false,
         }
     }
 
@@ -479,12 +532,30 @@ impl StorageProfile {
         if self.model_path.as_os_str().is_empty() {
             return Err(PlannerError::invalid("StorageProfile", "model_path"));
         }
+        if self.path_state == StoragePathState::Ready
+            && (!self.readable || !self.regular_file || self.file_size_bytes.is_none())
+        {
+            return Err(PlannerError::invalid(
+                "StorageProfile",
+                "ready path facts",
+            ));
+        }
+        if self.path_state == StoragePathState::Unverified
+            && (self.readable || self.regular_file || self.file_size_bytes.is_some())
+        {
+            return Err(PlannerError::invalid(
+                "StorageProfile",
+                "unverified path has verified facts",
+            ));
+        }
         Ok(())
     }
 
+    /// Storage-context identity aid. Model paths and file sizes are excluded;
+    /// model identity is tracked separately by `ModelProfile`.
     pub fn fingerprint(&self) -> u64 {
         let mut hash = fingerprint_start();
-        fingerprint_str(&mut hash, &self.model_path.to_string_lossy());
+        fingerprint_str(&mut hash, self.filesystem_type.as_deref().unwrap_or(""));
         fingerprint_str(&mut hash, self.filesystem_id.as_deref().unwrap_or(""));
         fingerprint_str(&mut hash, self.device_id.as_deref().unwrap_or(""));
         fingerprint_u64(&mut hash, self.kind as u64);
@@ -545,6 +616,10 @@ impl CapabilitySet {
         static_plan: &PlanResult,
     ) -> Self {
         let execution = static_plan.execution_memory.as_ref();
+        let storage_usable = storage.path_state == StoragePathState::Ready
+            && storage.readable
+            && storage.regular_file
+            && storage.seekable;
         let layer_cache_possible = execution.is_some_and(|memory| {
             memory.min_layer_resident_bytes > 0
                 && memory.layer_cache_capacity_bytes >= memory.min_layer_resident_bytes
@@ -575,7 +650,7 @@ impl CapabilitySet {
             machine_fingerprint: machine.fingerprint(),
             model_fingerprint: model.identity.descriptor_fingerprint,
             storage_fingerprint: storage.fingerprint(),
-            storage_usable: storage.seekable,
+            storage_usable,
             cpu_backend_usable: machine.cpu_backend.usable && cpu_strategy_available,
             cpu_simd_avx2: machine.cpu_backend.usable
                 && cpu_strategy_available
@@ -586,10 +661,10 @@ impl CapabilitySet {
                 && execution.is_some(),
             layer_cache_possible,
             read_coalescing_possible: execution.is_some()
-                && storage.seekable
+                && storage_usable
                 && model.has_coalescible_layer_reads,
             grouped_read_buffer_reuse_possible: execution.is_some()
-                && storage.seekable
+                && storage_usable
                 && model.has_reusable_grouped_read_candidate,
             supported_tensor_formats,
             unsupported_tensor_formats,
@@ -1024,6 +1099,8 @@ pub enum FeasibilityRejection {
     RamBudgetExceedsTotalRam,
     RamBudgetExceedsAvailableRam,
     StorageNotUsable,
+    StorageModelSizeMismatch,
+    MachineMemoryUnavailable,
     CpuBackendUnavailable,
     ModelNotExecutable,
     ExecutionPreflightUnavailable,
@@ -1115,12 +1192,26 @@ impl Planner {
                 FeasibilityRejection::StaticPlanDoesNotMatchProfiles,
             ));
         }
-        if user.ram_budget_bytes > machine.total_ram_bytes {
+        if storage
+            .file_size_bytes
+            .is_some_and(|bytes| bytes != model.file_size_bytes)
+        {
+            return Err(PlannerError::Infeasible(
+                FeasibilityRejection::StorageModelSizeMismatch,
+            ));
+        }
+        let total_ram_bytes = machine.total_ram_bytes.ok_or(PlannerError::Infeasible(
+            FeasibilityRejection::MachineMemoryUnavailable,
+        ))?;
+        let available_ram_bytes = machine.available_ram_bytes.ok_or(
+            PlannerError::Infeasible(FeasibilityRejection::MachineMemoryUnavailable),
+        )?;
+        if user.ram_budget_bytes > total_ram_bytes {
             return Err(PlannerError::Infeasible(
                 FeasibilityRejection::RamBudgetExceedsTotalRam,
             ));
         }
-        if user.ram_budget_bytes > machine.available_ram_bytes {
+        if user.ram_budget_bytes > available_ram_bytes {
             return Err(PlannerError::Infeasible(
                 FeasibilityRejection::RamBudgetExceedsAvailableRam,
             ));
@@ -1353,7 +1444,7 @@ impl Planner {
                 selected_device_id,
             },
             reservations: ResourceReservations {
-                available_ram_bytes_at_planning: machine.available_ram_bytes,
+                available_ram_bytes_at_planning: available_ram_bytes,
                 persistent_resident_bytes: execution.persistent_resident_bytes,
                 persistent_startup_peak_bytes: execution.persistent_startup_peak_bytes,
                 largest_layer_load_peak_bytes: execution.largest_layer_load_peak_bytes,
@@ -1670,18 +1761,24 @@ mod tests {
             schema_version: PROFILE_SCHEMA_VERSION,
             os: "linux".to_string(),
             architecture: "x86_64".to_string(),
+            kernel_version: Some("test-kernel".to_string()),
+            cpu_vendor: Some("test-vendor".to_string()),
+            cpu_model: Some("test-cpu".to_string()),
             physical_cpu_cores: Some(4),
             logical_cpu_cores: 8,
             cpu_features,
-            total_ram_bytes: 32_000,
-            available_ram_bytes: 24_000,
+            total_ram_bytes: Some(32_000),
+            available_ram_bytes: Some(24_000),
             cpu_backend: Availability {
                 detected: true,
                 supported: true,
                 usable: true,
             },
+            gpu_inventory_state: DiscoveryState::Complete,
             gpus: vec![GpuDeviceProfile {
                 identifier: "gpu0".to_string(),
+                vendor: Some("test-vendor".to_string()),
+                device_id: Some("test-device".to_string()),
                 name: Some("detected-only".to_string()),
                 dedicated_memory_bytes: Some(8_000),
                 backend: Availability {
@@ -1694,7 +1791,19 @@ mod tests {
     }
 
     fn storage_profile() -> StorageProfile {
-        StorageProfile::for_model_path("/models/tiny.gguf")
+        StorageProfile {
+            schema_version: PROFILE_SCHEMA_VERSION,
+            model_path: PathBuf::from("/models/tiny.gguf"),
+            path_state: StoragePathState::Ready,
+            readable: true,
+            regular_file: true,
+            file_size_bytes: Some(3_168),
+            filesystem_type: Some("testfs".to_string()),
+            filesystem_id: Some("testfs:1".to_string()),
+            device_id: Some("test-device".to_string()),
+            kind: StorageKind::Local,
+            seekable: true,
+        }
     }
 
     fn profiles_and_static_plan(
@@ -1756,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn test_capability_derivation_is_independent_from_calibration() {
+    fn test_discovered_profile_capabilities_are_independent_from_calibration() {
         let (user, machine, model, storage, static_plan) =
             profiles_and_static_plan(OperatingMode::BalancedNormal);
         let planner = Planner;
@@ -1775,6 +1884,31 @@ mod tests {
         );
         assert!(capabilities.unsupported_tensor_formats.is_empty());
         assert_eq!(static_plan.ram_requested, user.ram_budget_bytes);
+    }
+
+    #[test]
+    fn test_unknown_discovery_facts_do_not_create_false_capabilities() {
+        let (_user, mut machine, model, mut storage, static_plan) =
+            profiles_and_static_plan(OperatingMode::BalancedNormal);
+        machine.cpu_backend = Availability::unavailable();
+        machine.cpu_features.clear();
+        machine.total_ram_bytes = None;
+        machine.available_ram_bytes = None;
+        machine.gpu_inventory_state = DiscoveryState::Unavailable;
+        machine.gpus.clear();
+        storage.path_state = StoragePathState::Unverified;
+        storage.readable = false;
+        storage.regular_file = false;
+        storage.file_size_bytes = None;
+        storage.seekable = false;
+
+        let capabilities = CapabilitySet::derive(&machine, &model, &storage, &static_plan);
+        assert!(!capabilities.cpu_backend_usable);
+        assert!(!capabilities.cpu_simd_avx2);
+        assert!(!capabilities.gpu_backend_usable);
+        assert!(!capabilities.storage_usable);
+        assert!(!capabilities.read_coalescing_possible);
+        assert!(!capabilities.grouped_read_buffer_reuse_possible);
     }
 
     #[test]
@@ -1902,10 +2036,34 @@ mod tests {
     }
 
     #[test]
+    fn test_storage_file_size_must_match_model_profile() {
+        let (user, machine, model, mut storage, static_plan) =
+            profiles_and_static_plan(OperatingMode::BalancedNormal);
+        storage.file_size_bytes = Some(model.file_size_bytes + 1);
+        let planner = Planner;
+        let capabilities =
+            planner.derive_capabilities(&machine, &model, &storage, &static_plan);
+        assert_eq!(
+            planner
+                .plan(
+                    &user,
+                    &machine,
+                    &model,
+                    &storage,
+                    &capabilities,
+                    &static_plan,
+                    None,
+                )
+                .unwrap_err(),
+            PlannerError::Infeasible(FeasibilityRejection::StorageModelSizeMismatch)
+        );
+    }
+
+    #[test]
     fn test_feasibility_rejects_budget_above_available_ram() {
         let (user, mut machine, model, storage, static_plan) =
             profiles_and_static_plan(OperatingMode::BalancedNormal);
-        machine.available_ram_bytes = user.ram_budget_bytes - 1;
+        machine.available_ram_bytes = Some(user.ram_budget_bytes - 1);
         let planner = Planner;
         let capabilities = planner.derive_capabilities(&machine, &model, &storage, &static_plan);
         assert_eq!(

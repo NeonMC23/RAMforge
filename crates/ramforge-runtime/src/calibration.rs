@@ -268,7 +268,18 @@ impl CalibrationPlan {
         model.validate()?;
         storage.validate()?;
         limits.validate(user)?;
-        if limits.max_memory_bytes > machine.available_ram_bytes {
+        if storage
+            .file_size_bytes
+            .is_some_and(|bytes| bytes != model.file_size_bytes)
+        {
+            return Err(CalibrationError::InvalidPlan(
+                "storage file size does not match model profile",
+            ));
+        }
+        let available_ram_bytes = machine.available_ram_bytes.ok_or(
+            CalibrationError::InvalidPlan("available machine RAM is unknown"),
+        )?;
+        if limits.max_memory_bytes > available_ram_bytes {
             return Err(CalibrationError::InvalidPlan(
                 "calibration memory exceeds available machine RAM",
             ));
@@ -442,7 +453,10 @@ impl CalibrationRunner {
         model.validate()?;
         storage.validate()?;
         plan.limits.validate(user)?;
-        if plan.limits.max_memory_bytes > machine.available_ram_bytes {
+        let available_ram_bytes = machine.available_ram_bytes.ok_or(
+            CalibrationError::InvalidPlan("current available RAM is unknown"),
+        )?;
+        if plan.limits.max_memory_bytes > available_ram_bytes {
             return Err(CalibrationError::InvalidPlan(
                 "calibration memory exceeds current available RAM",
             ));
@@ -651,6 +665,12 @@ fn measure_storage(
         .metadata()
         .map_err(|_| ObservationStatusReason::IoFailure)?
         .len();
+    if storage
+        .file_size_bytes
+        .is_some_and(|expected| expected != file_bytes)
+    {
+        return Err(ObservationStatusReason::DependencyUnavailable);
+    }
     let bytes_to_read = task.work.bytes_per_iteration.min(file_bytes);
     let length = usize::try_from(bytes_to_read)
         .map_err(|_| ObservationStatusReason::InvalidWorkload)?;
@@ -1208,8 +1228,9 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::planner::{
-        AdvancedOverrides, Availability, CpuFeature, GpuPreference, ModelExecutionCompatibility,
-        ModelIdentity, OperatingMode, TensorFormatProfile,
+        AdvancedOverrides, Availability, CpuFeature, DiscoveryState, GpuPreference,
+        ModelExecutionCompatibility, ModelIdentity, OperatingMode, StoragePathState,
+        TensorFormatProfile,
     };
     use tempfile::NamedTempFile;
 
@@ -1234,16 +1255,20 @@ mod tests {
             schema_version: PROFILE_SCHEMA_VERSION,
             os: "linux".to_string(),
             architecture: "x86_64".to_string(),
+            kernel_version: Some("test-kernel".to_string()),
+            cpu_vendor: Some("test-vendor".to_string()),
+            cpu_model: Some("test-cpu".to_string()),
             physical_cpu_cores: Some(2),
             logical_cpu_cores: 4,
             cpu_features,
-            total_ram_bytes: 16 * 1024 * 1024,
-            available_ram_bytes: 12 * 1024 * 1024,
+            total_ram_bytes: Some(16 * 1024 * 1024),
+            available_ram_bytes: Some(12 * 1024 * 1024),
             cpu_backend: Availability {
                 detected: true,
                 supported: true,
                 usable: true,
             },
+            gpu_inventory_state: DiscoveryState::Complete,
             gpus: Vec::new(),
         };
         let model = ModelProfile {
@@ -1282,6 +1307,11 @@ mod tests {
         let storage = StorageProfile {
             schema_version: PROFILE_SCHEMA_VERSION,
             model_path: path,
+            path_state: StoragePathState::Ready,
+            readable: true,
+            regular_file: true,
+            file_size_bytes: Some(4_096),
+            filesystem_type: Some("testfs".to_string()),
             filesystem_id: Some("test-fs".to_string()),
             device_id: Some("test-device".to_string()),
             kind: crate::planner::StorageKind::Local,
@@ -1469,7 +1499,7 @@ mod tests {
     #[test]
     fn test_storage_measurement_is_bounded_and_structurally_valid() {
         let mut file = NamedTempFile::new().unwrap();
-        let data = vec![0xA5; 128 * 1024];
+        let data = vec![0xA5; 4 * 1024];
         file.write_all(&data).unwrap();
         file.flush().unwrap();
         let (user, machine, model, storage, capabilities) = profiles(
