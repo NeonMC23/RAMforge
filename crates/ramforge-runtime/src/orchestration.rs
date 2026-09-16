@@ -55,6 +55,7 @@ pub struct PlanningSession {
     pub storage: StorageProfile,
     pub capabilities: CapabilitySet,
     pub static_plan: PlanResult,
+    data_source: Option<GgufDataSource>,
 }
 
 impl PlanningSession {
@@ -88,6 +89,20 @@ impl PlanningSession {
             &self.capabilities,
             &self.static_plan,
         )
+    }
+
+    /// Compile and activate only this already analyzed plan. Compilation occurs
+    /// before ownership of the retained datasource is transferred.
+    pub fn activate_plan(
+        &mut self,
+        execution_plan: &ExecutionPlan,
+    ) -> Result<InferenceEngine, OrchestrationError> {
+        let runtime_config = self.compile_plan(execution_plan)?;
+        let data_source = self
+            .data_source
+            .take()
+            .ok_or(OrchestrationError::RuntimeSourceUnavailable)?;
+        construct_runtime(data_source, runtime_config)
     }
 
     pub fn compilation_context(&self) -> PlanCompilationContext<'_> {
@@ -125,6 +140,7 @@ pub enum OrchestrationError {
     },
     Planning(PlannerError),
     PlanCompilation(PlanCompilationError),
+    RuntimeSourceUnavailable,
     RuntimeConstruction(String),
 }
 
@@ -145,6 +161,9 @@ impl fmt::Display for OrchestrationError {
             }
             Self::Planning(error) => write!(formatter, "deterministic planning failed: {error}"),
             Self::PlanCompilation(error) => write!(formatter, "plan compilation failed: {error}"),
+            Self::RuntimeSourceUnavailable => {
+                write!(formatter, "validated model datasource is no longer available")
+            }
             Self::RuntimeConstruction(error) => {
                 write!(formatter, "runtime construction failed: {error}")
             }
@@ -162,6 +181,7 @@ impl std::error::Error for OrchestrationError {
             Self::PlanCompilation(error) => Some(error),
             Self::StaticPlanning(_)
             | Self::CapabilityConstruction { .. }
+            | Self::RuntimeSourceUnavailable
             | Self::RuntimeConstruction(_) => None,
         }
     }
@@ -178,22 +198,20 @@ impl RuntimeOrchestrator {
         model_path: &Path,
         ram_budget_bytes: u64,
     ) -> Result<PlanningSession, OrchestrationError> {
-        let (session, _) = self.analyze_retained(model_path, ram_budget_bytes)?;
-        Ok(session)
+        self.analyze_retained(model_path, ram_budget_bytes)
     }
 
     pub fn orchestrate(
         &self,
         request: OrchestrationRequest<'_>,
     ) -> Result<OrchestratedRuntime, OrchestrationError> {
-        let (session, data_source) = self.analyze_retained(
+        let mut session = self.analyze_retained(
             request.model_path,
             request.user_profile.ram_budget_bytes,
         )?;
         let execution_plan =
             session.create_plan(request.user_profile, request.calibration)?;
-        let runtime_config = session.compile_plan(&execution_plan)?;
-        let engine = construct_runtime(data_source, runtime_config)?;
+        let engine = session.activate_plan(&execution_plan)?;
 
         Ok(OrchestratedRuntime {
             execution_plan,
@@ -205,7 +223,7 @@ impl RuntimeOrchestrator {
         &self,
         model_path: &Path,
         ram_budget_bytes: u64,
-    ) -> Result<(PlanningSession, GgufDataSource), OrchestrationError> {
+    ) -> Result<PlanningSession, OrchestrationError> {
         let storage = StorageDiscovery
             .discover(model_path)
             .map_err(OrchestrationError::StorageDiscovery)?;
@@ -229,15 +247,15 @@ impl RuntimeOrchestrator {
         let planner = Planner;
         let capabilities =
             construct_capabilities(&planner, &machine, &model, &storage, &static_plan)?;
-        let session = PlanningSession {
+        Ok(PlanningSession {
             machine,
             model,
             model_info,
             storage,
             capabilities,
             static_plan,
-        };
-        Ok((session, data_source))
+            data_source: Some(data_source),
+        })
     }
 }
 
@@ -437,6 +455,42 @@ mod tests {
             session.capabilities.model_fingerprint,
             session.model.identity.descriptor_fingerprint
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_plan_activation_compiles_before_transferring_runtime_source() {
+        let model_file = create_tiny_llama_gguf();
+        let user = user_profile();
+        let mut session = RuntimeOrchestrator
+            .analyze(model_file.path(), user.ram_budget_bytes)
+            .unwrap();
+        let plan = session.create_plan(&user, None).unwrap();
+        let mut rejected = plan.clone();
+        rejected.cpu_thread_count = 0;
+        assert!(matches!(
+            session.activate_plan(&rejected),
+            Err(OrchestrationError::PlanCompilation(
+                crate::plan_compiler::PlanCompilationError::ZeroThreadCount
+            ))
+        ));
+
+        let mut engine = session.activate_plan(&plan).unwrap();
+        assert_eq!(
+            engine.runtime_config().cpu_thread_count,
+            plan.cpu_thread_count
+        );
+        assert_eq!(engine.budget.total_bytes(), plan.ram_budget_bytes);
+        let (tokens, generated_text) = engine
+            .generate("hello", 1, &crate::sampling::Sampler::greedy())
+            .unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(generated_text, engine.tokenizer.decode(&tokens));
+        drop(engine);
+        assert!(matches!(
+            session.activate_plan(&plan),
+            Err(OrchestrationError::RuntimeSourceUnavailable)
+        ));
     }
 
     #[cfg(target_os = "linux")]

@@ -40,6 +40,10 @@ pub fn render(
         Screen::PlanReview => render_plan_review(app, &mut output),
         Screen::PlanValidation => render_plan_validation(&mut output),
         Screen::PlanValid => render_plan_valid(app, runtime_config, &mut output),
+        Screen::RuntimeActivation => render_runtime_activation(&mut output),
+        Screen::GenerationInput => render_generation_input(app, &mut output),
+        Screen::GenerationRunning => render_generation_running(&mut output),
+        Screen::GenerationResult => render_generation_result(app, &mut output),
         Screen::PlanCompatibility => render_plan_compatibility(app, &mut output),
         Screen::SavePlan => render_save_plan(app, &mut output),
         Screen::Error => render_error(app, &mut output),
@@ -415,12 +419,62 @@ fn render_plan_valid(
         field(output, "Execution device", &format!("{:?}", config.execution_device));
     }
     let _ = writeln!(output);
+    menu_line(output, app.menu_index == 0, "Activate runtime");
     if app.plan_origin == PlanOrigin::LoadedPlan {
-        menu_line(output, true, "Back to compatibility");
+        menu_line(output, app.menu_index == 1, "Back to compatibility");
     } else {
-        menu_line(output, app.menu_index == 0, "Save plan");
-        menu_line(output, app.menu_index == 1, "Back to plan");
+        menu_line(output, app.menu_index == 1, "Save plan");
+        menu_line(output, app.menu_index == 2, "Back to plan");
     }
+}
+
+fn render_runtime_activation(output: &mut String) {
+    let _ = writeln!(output, "Activating validated runtime...");
+    let _ = writeln!(
+        output,
+        "ExecutionPlan -> PlanCompiler -> RuntimeConfig -> InferenceEngine"
+    );
+}
+
+fn render_generation_input(app: &TuiApp, output: &mut String) {
+    let _ = writeln!(output, "Single-prompt generation");
+    let _ = writeln!(output, "Executable runtime: active");
+    let _ = writeln!(output, "Sampling: greedy");
+    let _ = writeln!(
+        output,
+        "Maximum generated tokens: {}",
+        super::SINGLE_PROMPT_MAX_TOKENS
+    );
+    let _ = writeln!(output, "Enter one prompt. Generation starts only on Enter.");
+    let _ = writeln!(output);
+    let _ = writeln!(output, "> {}_", app.prompt_input);
+}
+
+fn render_generation_running(output: &mut String) {
+    let _ = writeln!(output, "Generation running...");
+    let _ = writeln!(output, "Using the active InferenceEngine.");
+    let _ = writeln!(output, "No cancellation is exposed by this synchronous path.");
+}
+
+fn render_generation_result(app: &TuiApp, output: &mut String) {
+    let _ = writeln!(output, "Generation result");
+    if let Some(result) = app.generation_result.as_ref() {
+        field(
+            output,
+            "Generated tokens",
+            &result.generated_token_count.to_string(),
+        );
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Generated text");
+        if result.generated_text.is_empty() {
+            let _ = writeln!(output, "<empty generated text>");
+        } else {
+            let _ = writeln!(output, "{}", result.generated_text);
+        }
+    }
+    let _ = writeln!(output);
+    menu_line(output, app.menu_index == 0, "Generate another prompt");
+    menu_line(output, app.menu_index == 1, "Return to validated plan");
 }
 
 fn render_plan_compatibility(app: &TuiApp, output: &mut String) {
@@ -758,10 +812,16 @@ fn footer(app: &TuiApp) -> &'static str {
         Screen::LoadPlan | Screen::ModelInput | Screen::SavePlan => {
             "Type path  Enter Submit  Backspace Delete  Esc Back  Ctrl-C Quit"
         }
+        Screen::GenerationInput => {
+            "Type prompt  Enter Generate  Backspace Delete  Esc Leave runtime  Ctrl-C Quit"
+        }
         Screen::Preferences if app.accepts_text() => {
             "Type value  Up/Down Navigate  Enter Select  Esc Back  Ctrl-C Quit"
         }
-        Screen::Analyzing | Screen::PlanValidation => "Please wait  Ctrl-C Quit",
+        Screen::Analyzing | Screen::PlanValidation | Screen::RuntimeActivation => {
+            "Please wait  Ctrl-C Quit"
+        }
+        Screen::GenerationRunning => "Generation running",
         Screen::Calibrating if !app.calibration_complete => "Calibration running",
         _ => "Up/Down Navigate  Enter Select  Esc Back  q Quit",
     }
@@ -812,6 +872,20 @@ mod tests {
             let rendered = render(&app, None, None);
             assert!(rendered.contains(label));
         }
+    }
+
+    #[test]
+    fn generation_result_renders_only_the_actual_latest_result() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::GenerationResult;
+        app.generation_result = Some(super::super::app::SinglePromptResult {
+            generated_text: "actual output".to_string(),
+            generated_token_count: 2,
+        });
+        let rendered = render(&app, None, None);
+        assert!(rendered.contains("actual output"));
+        assert!(rendered.contains("Generated tokens"));
+        assert!(!rendered.contains("conversation"));
     }
 
     #[test]

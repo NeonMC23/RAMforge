@@ -6,6 +6,7 @@ use ramforge_runtime::calibration::{
     CalibrationError, CalibrationTask, CalibrationTestKind,
 };
 use ramforge_runtime::discovery::StorageDiscoveryError;
+use ramforge_runtime::inference::InferenceEngine;
 use ramforge_runtime::orchestration::{
     OrchestrationError, PlanningSession,
 };
@@ -30,6 +31,10 @@ pub enum Screen {
     PlanReview,
     PlanValidation,
     PlanValid,
+    RuntimeActivation,
+    GenerationInput,
+    GenerationRunning,
+    GenerationResult,
     PlanCompatibility,
     SavePlan,
     Error,
@@ -68,6 +73,8 @@ pub enum AppAction {
     RunCalibration,
     CreatePlan,
     ValidatePlan,
+    ActivateRuntime,
+    GeneratePrompt(String),
     SavePlan(PathBuf),
 }
 
@@ -162,6 +169,12 @@ impl CalibrationTaskView {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinglePromptResult {
+    pub generated_text: String,
+    pub generated_token_count: usize,
+}
+
 #[derive(Debug)]
 pub enum TuiError {
     Input {
@@ -173,6 +186,8 @@ pub enum TuiError {
     Calibration(CalibrationError),
     Planning(OrchestrationError),
     Compilation(OrchestrationError),
+    RuntimeConstruction(OrchestrationError),
+    Generation(String),
     Persistence(PlanPersistenceError),
     DestinationExists(PathBuf),
 }
@@ -186,6 +201,8 @@ impl TuiError {
             Self::Calibration(_) => "Calibration failed",
             Self::Planning(_) => "Planning failed",
             Self::Compilation(_) => "Plan compilation failed",
+            Self::RuntimeConstruction(_) => "Runtime construction failed",
+            Self::Generation(_) => "Generation failed",
             Self::Persistence(_) | Self::DestinationExists(_) => "Plan persistence failed",
         }
     }
@@ -196,9 +213,11 @@ impl fmt::Display for TuiError {
         match self {
             Self::Input { field, message } => write!(formatter, "{field}: {message}"),
             Self::Storage(error) => write!(formatter, "{error}"),
-            Self::Analysis(error) | Self::Planning(error) | Self::Compilation(error) => {
-                write!(formatter, "{error}")
-            }
+            Self::Analysis(error)
+            | Self::Planning(error)
+            | Self::Compilation(error)
+            | Self::RuntimeConstruction(error) => write!(formatter, "{error}"),
+            Self::Generation(error) => write!(formatter, "{error}"),
             Self::Calibration(error) => write!(formatter, "{error}"),
             Self::Persistence(error) => write!(formatter, "{error}"),
             Self::DestinationExists(path) => {
@@ -218,6 +237,7 @@ fn orchestration_error_title(error: &OrchestrationError) -> &'static str {
         OrchestrationError::CapabilityConstruction { .. } => "Capability construction failed",
         OrchestrationError::Planning(_) => "Planning failed",
         OrchestrationError::PlanCompilation(_) => "Plan compilation failed",
+        OrchestrationError::RuntimeSourceUnavailable => "Runtime source unavailable",
         OrchestrationError::RuntimeConstruction(_) => "Runtime construction failed",
     }
 }
@@ -251,6 +271,9 @@ pub struct TuiApp {
     pub execution_plan: Option<ExecutionPlan>,
     pub persisted_plan: Option<PersistedExecutionPlan>,
     pub compatibility_report: Option<PlanCompatibilityReport>,
+    pub prompt_input: String,
+    pub generation_result: Option<SinglePromptResult>,
+    pub active_runtime: Option<InferenceEngine>,
 }
 
 impl Default for TuiApp {
@@ -283,6 +306,9 @@ impl Default for TuiApp {
             execution_plan: None,
             persisted_plan: None,
             compatibility_report: None,
+            prompt_input: String::new(),
+            generation_result: None,
+            active_runtime: None,
         }
     }
 }
@@ -307,6 +333,8 @@ impl TuiApp {
             Screen::Calibrating => self.handle_calibrating(command),
             Screen::PlanReview => self.handle_plan_review(command),
             Screen::PlanValid => self.handle_plan_valid(command),
+            Screen::GenerationInput => self.handle_generation_input(command),
+            Screen::GenerationResult => self.handle_generation_result(command),
             Screen::PlanCompatibility => self.handle_plan_compatibility(command),
             Screen::SavePlan => self.handle_save_plan(command),
             Screen::Error => {
@@ -317,13 +345,19 @@ impl TuiApp {
                 }
                 None
             }
-            Screen::Analyzing | Screen::PlanValidation => None,
+            Screen::Analyzing
+            | Screen::PlanValidation
+            | Screen::RuntimeActivation
+            | Screen::GenerationRunning => None,
         }
     }
 
     pub fn accepts_text(&self) -> bool {
         match self.screen {
-            Screen::LoadPlan | Screen::ModelInput | Screen::SavePlan => true,
+            Screen::LoadPlan
+            | Screen::ModelInput
+            | Screen::GenerationInput
+            | Screen::SavePlan => true,
             Screen::Preferences => matches!(
                 self.preference_field(),
                 PreferenceField::Ram
@@ -469,6 +503,38 @@ impl TuiApp {
         }
     }
 
+    pub fn runtime_activation_finished(
+        &mut self,
+        result: Result<InferenceEngine, TuiError>,
+    ) {
+        match result {
+            Ok(runtime) => {
+                self.active_runtime = Some(runtime);
+                self.prompt_input.clear();
+                self.generation_result = None;
+                self.screen = Screen::GenerationInput;
+                self.menu_index = 0;
+                self.error = None;
+            }
+            Err(error) => self.show_error(error, Screen::PlanReview),
+        }
+    }
+
+    pub fn generation_finished(
+        &mut self,
+        result: Result<SinglePromptResult, TuiError>,
+    ) {
+        match result {
+            Ok(result) => {
+                self.generation_result = Some(result);
+                self.screen = Screen::GenerationResult;
+                self.menu_index = 0;
+                self.error = None;
+            }
+            Err(error) => self.show_error(error, Screen::GenerationInput),
+        }
+    }
+
     pub fn save_finished(&mut self, result: Result<PathBuf, TuiError>) {
         match result {
             Ok(path) => {
@@ -607,6 +673,9 @@ impl TuiApp {
                 PreferenceField::Continue => match self.build_user_profile() {
                     Ok(profile) => {
                         self.user_profile = Some(profile);
+                        self.active_runtime = None;
+                        self.prompt_input.clear();
+                        self.generation_result = None;
                         self.planning_session = None;
                         self.calibration_result = None;
                         self.execution_plan = None;
@@ -740,28 +809,67 @@ impl TuiApp {
     }
 
     fn handle_plan_valid(&mut self, command: UiCommand) -> Option<AppAction> {
-        if self.plan_origin == PlanOrigin::LoadedPlan {
-            if command == UiCommand::Back || command == UiCommand::Enter {
-                self.screen = Screen::PlanCompatibility;
-                self.menu_index = 0;
-            }
-            return None;
-        }
+        let item_count = if self.plan_origin == PlanOrigin::LoadedPlan {
+            2
+        } else {
+            3
+        };
         match command {
-            UiCommand::Up | UiCommand::Down => self.menu_index = 1 - self.menu_index.min(1),
-            UiCommand::Back => {
-                self.screen = Screen::PlanReview;
-                self.menu_index = 0;
-            }
+            UiCommand::Up => self.move_menu_up(item_count),
+            UiCommand::Down => self.move_menu_down(item_count),
+            UiCommand::Back => self.return_from_runtime_activation(),
             UiCommand::Enter if self.menu_index == 0 => {
+                self.screen = Screen::RuntimeActivation;
+                self.error = None;
+                return Some(AppAction::ActivateRuntime);
+            }
+            UiCommand::Enter if self.plan_origin == PlanOrigin::NewPlan && self.menu_index == 1 => {
                 self.screen = Screen::SavePlan;
                 self.save_path_input.clear();
                 self.error = None;
             }
+            UiCommand::Enter => self.return_from_runtime_activation(),
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_generation_input(&mut self, command: UiCommand) -> Option<AppAction> {
+        match command {
+            UiCommand::Character(character) if !character.is_control() => {
+                self.prompt_input.push(character)
+            }
+            UiCommand::Backspace => {
+                self.prompt_input.pop();
+            }
+            UiCommand::Back => self.leave_runtime_session(),
+            UiCommand::Enter if self.prompt_input.is_empty() => {
+                self.error = Some(TuiError::Input {
+                    field: "prompt",
+                    message: "prompt text is required".to_string(),
+                });
+            }
             UiCommand::Enter => {
-                self.screen = Screen::PlanReview;
+                self.screen = Screen::GenerationRunning;
+                self.generation_result = None;
+                return Some(AppAction::GeneratePrompt(self.prompt_input.clone()));
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_generation_result(&mut self, command: UiCommand) -> Option<AppAction> {
+        match command {
+            UiCommand::Up | UiCommand::Down => self.menu_index = 1 - self.menu_index.min(1),
+            UiCommand::Back => self.leave_runtime_session(),
+            UiCommand::Enter if self.menu_index == 0 => {
+                self.prompt_input.clear();
+                self.generation_result = None;
+                self.screen = Screen::GenerationInput;
                 self.menu_index = 0;
             }
+            UiCommand::Enter => self.leave_runtime_session(),
             _ => {}
         }
         None
@@ -815,7 +923,27 @@ impl TuiApp {
         None
     }
 
+    fn return_from_runtime_activation(&mut self) {
+        self.screen = if self.plan_origin == PlanOrigin::LoadedPlan {
+            Screen::PlanCompatibility
+        } else {
+            Screen::PlanReview
+        };
+        self.menu_index = 0;
+    }
+
+    fn leave_runtime_session(&mut self) {
+        self.active_runtime = None;
+        self.prompt_input.clear();
+        self.generation_result = None;
+        self.screen = Screen::PlanReview;
+        self.menu_index = 0;
+    }
+
     fn start_new_model_flow(&mut self) {
+        self.active_runtime = None;
+        self.prompt_input.clear();
+        self.generation_result = None;
         self.model_flow = ModelFlow::NewPlan;
         self.plan_origin = PlanOrigin::NewPlan;
         self.persisted_plan = None;
@@ -829,6 +957,9 @@ impl TuiApp {
     }
 
     fn return_loaded_model_to_planning(&mut self) {
+        self.active_runtime = None;
+        self.prompt_input.clear();
+        self.generation_result = None;
         if let Some(persisted) = self.persisted_plan.as_ref() {
             self.ram_input = format!("{}B", persisted.ram_budget_bytes);
             self.mode = persisted.mode;
@@ -1220,6 +1351,10 @@ mod tests {
         app.screen = Screen::PlanReview;
         assert_eq!(app.handle(UiCommand::Enter), Some(AppAction::ValidatePlan));
         assert_eq!(app.screen, Screen::PlanValidation);
+        assert!(app.active_runtime.is_none());
+        app.plan_validation_finished(Ok(()));
+        assert_eq!(app.screen, Screen::PlanValid);
+        assert_eq!(app.handle(UiCommand::Enter), Some(AppAction::ActivateRuntime));
     }
 
     #[test]
@@ -1250,11 +1385,14 @@ mod tests {
     }
 
     #[test]
-    fn successful_validation_reaches_plan_valid_and_save_request() {
+    fn successful_validation_does_not_generate_and_preserves_explicit_save() {
         let mut app = TuiApp::default();
         app.screen = Screen::PlanValidation;
         app.plan_validation_finished(Ok(()));
         assert_eq!(app.screen, Screen::PlanValid);
+        assert!(app.active_runtime.is_none());
+        assert!(app.generation_result.is_none());
+        app.handle(UiCommand::Down);
         app.handle(UiCommand::Enter);
         assert_eq!(app.screen, Screen::SavePlan);
         app.save_path_input = "/tmp/plan.rfp".to_string();
@@ -1262,6 +1400,64 @@ mod tests {
             app.handle(UiCommand::Enter),
             Some(AppAction::SavePlan(PathBuf::from("/tmp/plan.rfp")))
         );
+    }
+
+    #[test]
+    fn runtime_activation_is_an_explicit_post_validation_action() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::PlanValid;
+        assert_eq!(app.handle(UiCommand::Enter), Some(AppAction::ActivateRuntime));
+        assert_eq!(app.screen, Screen::RuntimeActivation);
+        assert!(app.active_runtime.is_none());
+    }
+
+    #[test]
+    fn runtime_construction_errors_are_distinct_and_recoverable() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::RuntimeActivation;
+        app.runtime_activation_finished(Err(TuiError::RuntimeConstruction(
+            OrchestrationError::RuntimeSourceUnavailable,
+        )));
+        assert_eq!(app.screen, Screen::Error);
+        assert_eq!(
+            app.error.as_ref().unwrap().title(),
+            "Runtime construction failed"
+        );
+        app.handle(UiCommand::Back);
+        assert_eq!(app.screen, Screen::PlanReview);
+    }
+
+    #[test]
+    fn prompt_submission_is_the_only_generation_action() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::GenerationInput;
+        app.prompt_input = "Explain RAMforge".to_string();
+        assert_eq!(
+            app.handle(UiCommand::Enter),
+            Some(AppAction::GeneratePrompt("Explain RAMforge".to_string()))
+        );
+        assert_eq!(app.screen, Screen::GenerationRunning);
+    }
+
+    #[test]
+    fn generation_result_and_error_paths_are_recoverable() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::GenerationRunning;
+        app.generation_finished(Ok(SinglePromptResult {
+            generated_text: "result".to_string(),
+            generated_token_count: 1,
+        }));
+        assert_eq!(app.screen, Screen::GenerationResult);
+        app.handle(UiCommand::Enter);
+        assert_eq!(app.screen, Screen::GenerationInput);
+        assert!(app.generation_result.is_none());
+
+        app.screen = Screen::GenerationRunning;
+        app.generation_finished(Err(TuiError::Generation("budget failure".to_string())));
+        assert_eq!(app.screen, Screen::Error);
+        assert_eq!(app.error.as_ref().unwrap().title(), "Generation failed");
+        app.handle(UiCommand::Back);
+        assert_eq!(app.screen, Screen::GenerationInput);
     }
 
     #[test]

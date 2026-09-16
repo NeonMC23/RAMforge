@@ -13,9 +13,14 @@ use ramforge_runtime::orchestration::RuntimeOrchestrator;
 use ramforge_runtime::plan_persistence::{
     PersistedExecutionPlan, PersistedPlanCompatibilityContext, PlanPersistenceError,
 };
+use ramforge_runtime::sampling::Sampler;
 
-use app::{AppAction, CalibrationTaskView, Screen, TuiApp, TuiError};
+use app::{
+    AppAction, CalibrationTaskView, Screen, SinglePromptResult, TuiApp, TuiError,
+};
 use terminal::TerminalSession;
+
+const SINGLE_PROMPT_MAX_TOKENS: usize = 32;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = TerminalSession::new()?;
@@ -67,6 +72,14 @@ fn execute_action(
         AppAction::ValidatePlan => {
             let result = validate_plan(app);
             app.plan_validation_finished(result);
+        }
+        AppAction::ActivateRuntime => {
+            let result = activate_runtime(app);
+            app.runtime_activation_finished(result);
+        }
+        AppAction::GeneratePrompt(prompt) => {
+            let result = generate_prompt(app, &prompt);
+            app.generation_finished(result);
         }
         AppAction::SavePlan(path) => {
             let result = save_plan(app, &path);
@@ -231,6 +244,41 @@ fn validate_plan(app: &TuiApp) -> Result<(), TuiError> {
         .compile_plan(plan)
         .map(|_| ())
         .map_err(TuiError::Compilation)
+}
+
+fn activate_runtime(app: &mut TuiApp) -> Result<ramforge_runtime::inference::InferenceEngine, TuiError> {
+    let plan = app.execution_plan.as_ref().ok_or_else(|| TuiError::Input {
+        field: "execution plan",
+        message: "plan is unavailable".to_string(),
+    })?;
+    let session = app
+        .planning_session
+        .as_mut()
+        .ok_or_else(|| TuiError::Input {
+            field: "analysis",
+            message: "planning analysis is unavailable".to_string(),
+        })?;
+    session.activate_plan(plan).map_err(|error| match error {
+        error @ ramforge_runtime::orchestration::OrchestrationError::PlanCompilation(_) => {
+            TuiError::Compilation(error)
+        }
+        error => TuiError::RuntimeConstruction(error),
+    })
+}
+
+fn generate_prompt(app: &mut TuiApp, prompt: &str) -> Result<SinglePromptResult, TuiError> {
+    let runtime = app.active_runtime.as_mut().ok_or_else(|| TuiError::Input {
+        field: "runtime",
+        message: "validated runtime is not active".to_string(),
+    })?;
+    let sampler = Sampler::greedy();
+    runtime
+        .generate(prompt, SINGLE_PROMPT_MAX_TOKENS, &sampler)
+        .map(|(tokens, generated_text)| SinglePromptResult {
+            generated_text,
+            generated_token_count: tokens.len(),
+        })
+        .map_err(TuiError::Generation)
 }
 
 fn save_plan(app: &TuiApp, path: &Path) -> Result<PathBuf, TuiError> {
