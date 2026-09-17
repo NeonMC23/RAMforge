@@ -1,5 +1,73 @@
 use super::app::UiCommand;
 
+fn arrow_command(final_byte: u8) -> UiCommand {
+    match final_byte {
+        b'A' => UiCommand::Up,
+        b'B' => UiCommand::Down,
+        b'C' => UiCommand::Right,
+        b'D' => UiCommand::Left,
+        _ => UiCommand::None,
+    }
+}
+
+fn ascii_command(byte: u8, text_mode: bool) -> UiCommand {
+    match byte {
+        3 => UiCommand::Quit,
+        b'\r' | b'\n' => UiCommand::Enter,
+        8 | 127 => UiCommand::Backspace,
+        b'q' if !text_mode => UiCommand::Quit,
+        byte if (0x20..=0x7e).contains(&byte) => UiCommand::Character(byte as char),
+        _ => UiCommand::None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeDecode {
+    NeedMore,
+    Complete(UiCommand),
+}
+
+#[derive(Debug, Default)]
+struct EscapeSequenceDecoder {
+    bytes: Vec<u8>,
+}
+
+impl EscapeSequenceDecoder {
+    fn push(&mut self, byte: u8) -> EscapeDecode {
+        self.bytes.push(byte);
+        match self.bytes.as_slice() {
+            [b'['] | [b'O'] => EscapeDecode::NeedMore,
+            [b'O', final_byte] => EscapeDecode::Complete(arrow_command(*final_byte)),
+            [b'[', remainder @ ..] => {
+                let Some(final_byte) = remainder.last().copied() else {
+                    return EscapeDecode::NeedMore;
+                };
+                if (0x40..=0x7e).contains(&final_byte) {
+                    EscapeDecode::Complete(arrow_command(final_byte))
+                } else if remainder.len() >= 15 {
+                    EscapeDecode::Complete(UiCommand::None)
+                } else {
+                    EscapeDecode::NeedMore
+                }
+            }
+            [_] => EscapeDecode::Complete(UiCommand::None),
+            _ => EscapeDecode::Complete(UiCommand::None),
+        }
+    }
+
+    fn finish(&self) -> UiCommand {
+        if self.bytes.is_empty() {
+            UiCommand::Back
+        } else {
+            UiCommand::None
+        }
+    }
+
+    fn has_unknown_prefix(&self) -> bool {
+        !matches!(self.bytes.first(), Some(b'[') | Some(b'O'))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TerminalSize {
     width: usize,
@@ -71,15 +139,17 @@ fn sanitize_and_clip(line: &str, width: usize) -> String {
 
 #[cfg(unix)]
 mod platform {
-    use std::io::{self, Read, Write};
+    use std::io::{self, Write};
 
-    use super::{compose_frame, TerminalSize, UiCommand};
+    use super::{
+        ascii_command, compose_frame, EscapeDecode, EscapeSequenceDecoder, TerminalSize,
+        UiCommand,
+    };
 
     const ESCAPE_SEQUENCE_TIMEOUT_MS: i32 = 100;
     const MAX_ESCAPE_SEQUENCE_BYTES: usize = 16;
 
     pub struct TerminalSession {
-        stdin: io::Stdin,
         stdout: io::Stdout,
         original: libc::termios,
     }
@@ -108,7 +178,6 @@ mod platform {
             }
 
             let mut session = Self {
-                stdin: io::stdin(),
                 stdout: io::stdout(),
                 original,
             };
@@ -133,26 +202,17 @@ mod platform {
 
         pub fn read_command(&mut self, text_mode: bool) -> io::Result<UiCommand> {
             let first = self.read_byte()?;
-            match first {
-                3 => Ok(UiCommand::Quit),
-                b'\r' | b'\n' => Ok(UiCommand::Enter),
-                8 | 127 => Ok(UiCommand::Backspace),
-                27 => self.read_escape_sequence(),
-                b'q' if !text_mode => Ok(UiCommand::Quit),
-                b'k' if !text_mode => Ok(UiCommand::Up),
-                b'j' if !text_mode => Ok(UiCommand::Down),
-                byte if (0x20..=0x7e).contains(&byte) => {
-                    Ok(UiCommand::Character(byte as char))
-                }
-                byte if !byte.is_ascii() => self.read_utf8_character(byte),
-                _ => Ok(UiCommand::None),
+            if first == 27 {
+                return self.read_escape_sequence();
             }
+            if !first.is_ascii() {
+                return self.read_utf8_character(first);
+            }
+            Ok(ascii_command(first, text_mode))
         }
 
         fn read_byte(&mut self) -> io::Result<u8> {
-            let mut byte = [0u8; 1];
-            self.stdin.read_exact(&mut byte)?;
-            Ok(byte[0])
+            read_fd_byte()
         }
 
         fn read_byte_with_timeout(&mut self, timeout_ms: i32) -> io::Result<Option<u8>> {
@@ -164,34 +224,36 @@ mod platform {
         }
 
         fn read_escape_sequence(&mut self) -> io::Result<UiCommand> {
-            let Some(prefix) = self.read_byte_with_timeout(ESCAPE_SEQUENCE_TIMEOUT_MS)? else {
-                return Ok(UiCommand::Back);
-            };
-            match prefix {
-                b'[' => self.read_csi_sequence(),
-                b'O' => match self.read_byte_with_timeout(ESCAPE_SEQUENCE_TIMEOUT_MS)? {
-                    Some(b'A') => Ok(UiCommand::Up),
-                    Some(b'B') => Ok(UiCommand::Down),
-                    _ => Ok(UiCommand::None),
-                },
-                _ => Ok(UiCommand::Back),
-            }
-        }
-
-        fn read_csi_sequence(&mut self) -> io::Result<UiCommand> {
+            let mut decoder = EscapeSequenceDecoder::default();
             for _ in 0..MAX_ESCAPE_SEQUENCE_BYTES {
                 let Some(byte) = self.read_byte_with_timeout(ESCAPE_SEQUENCE_TIMEOUT_MS)? else {
-                    return Ok(UiCommand::None);
+                    return Ok(decoder.finish());
                 };
-                if (0x40..=0x7e).contains(&byte) {
-                    return match byte {
-                        b'A' => Ok(UiCommand::Up),
-                        b'B' => Ok(UiCommand::Down),
-                        _ => Ok(UiCommand::None),
-                    };
+                match decoder.push(byte) {
+                    EscapeDecode::NeedMore => {}
+                    EscapeDecode::Complete(command) => {
+                        if command == UiCommand::None && decoder.has_unknown_prefix() {
+                            self.drain_escape_tail()?;
+                        }
+                        return Ok(command);
+                    }
                 }
             }
             Ok(UiCommand::None)
+        }
+
+        fn drain_escape_tail(&mut self) -> io::Result<()> {
+            const UNKNOWN_TAIL_TIMEOUT_MS: i32 = 10;
+            const MAX_UNKNOWN_TAIL_BYTES: usize = 256;
+            for _ in 0..MAX_UNKNOWN_TAIL_BYTES {
+                if self
+                    .read_byte_with_timeout(UNKNOWN_TAIL_TIMEOUT_MS)?
+                    .is_none()
+                {
+                    break;
+                }
+            }
+            Ok(())
         }
 
         fn read_utf8_character(&mut self, first: u8) -> io::Result<UiCommand> {
@@ -227,6 +289,32 @@ mod platform {
                 .stdout
                 .write_all(b"\x1b[0m\x1b[?25h\x1b[2J\x1b[H");
             let _ = self.stdout.flush();
+        }
+    }
+
+    fn read_fd_byte() -> io::Result<u8> {
+        loop {
+            let mut byte = 0u8;
+            let result = unsafe {
+                libc::read(
+                    libc::STDIN_FILENO,
+                    (&mut byte as *mut u8).cast::<libc::c_void>(),
+                    1,
+                )
+            };
+            if result == 1 {
+                return Ok(byte);
+            }
+            if result == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "terminal input closed",
+                ));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
         }
     }
 
@@ -297,6 +385,57 @@ pub use platform::TerminalSession;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_escape(continuation: &[u8]) -> UiCommand {
+        let mut decoder = EscapeSequenceDecoder::default();
+        for (index, byte) in continuation.iter().copied().enumerate() {
+            match decoder.push(byte) {
+                EscapeDecode::NeedMore => {}
+                EscapeDecode::Complete(command) => {
+                    assert_eq!(index + 1, continuation.len());
+                    return command;
+                }
+            }
+        }
+        decoder.finish()
+    }
+
+    #[test]
+    fn csi_arrows_are_consumed_as_single_navigation_events() {
+        for (sequence, expected) in [
+            (b"[A".as_slice(), UiCommand::Up),
+            (b"[B".as_slice(), UiCommand::Down),
+            (b"[C".as_slice(), UiCommand::Right),
+            (b"[D".as_slice(), UiCommand::Left),
+        ] {
+            let command = decode_escape(sequence);
+            assert_eq!(command, expected);
+            assert!(!matches!(command, UiCommand::Character(_)));
+        }
+    }
+
+    #[test]
+    fn ss3_arrows_are_consumed_as_single_navigation_events() {
+        for (sequence, expected) in [
+            (b"OA".as_slice(), UiCommand::Up),
+            (b"OB".as_slice(), UiCommand::Down),
+            (b"OC".as_slice(), UiCommand::Right),
+            (b"OD".as_slice(), UiCommand::Left),
+        ] {
+            let command = decode_escape(sequence);
+            assert_eq!(command, expected);
+            assert!(!matches!(command, UiCommand::Character(_)));
+        }
+    }
+
+    #[test]
+    fn standalone_escape_and_printable_j_k_remain_distinct() {
+        assert_eq!(decode_escape(&[]), UiCommand::Back);
+        assert_eq!(ascii_command(b'j', false), UiCommand::Character('j'));
+        assert_eq!(ascii_command(b'k', false), UiCommand::Character('k'));
+        assert_eq!(decode_escape(b"["), UiCommand::None);
+        assert_eq!(decode_escape(b"[1;5B"), UiCommand::Down);
+    }
 
     #[test]
     fn frame_clips_width_and_preserves_top_and_bottom_on_short_terminals() {

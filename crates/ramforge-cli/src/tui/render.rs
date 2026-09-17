@@ -154,7 +154,12 @@ fn render_preferences(app: &TuiApp, output: &mut String) {
     );
     let _ = writeln!(
         output,
-        "Enter cycles mode and existing Advanced override choices."
+        "{}",
+        if app.preference_editing {
+            "Editing selected value. Enter or Esc ends editing."
+        } else {
+            "Enter edits text values. Left/Right changes selectable options."
+        }
     );
 }
 
@@ -816,14 +821,14 @@ fn footer(app: &TuiApp) -> &'static str {
             "Type prompt  Enter Generate  Backspace Delete  Esc Leave runtime  Ctrl-C Quit"
         }
         Screen::Preferences if app.accepts_text() => {
-            "Type value  Up/Down Navigate  Enter Select  Esc Back  Ctrl-C Quit"
+            "Type value  Enter/Esc Finish editing  Up/Down Move  Ctrl-C Quit"
         }
         Screen::Analyzing | Screen::PlanValidation | Screen::RuntimeActivation => {
             "Please wait  Ctrl-C Quit"
         }
         Screen::GenerationRunning => "Generation running",
         Screen::Calibrating if !app.calibration_complete => "Calibration running",
-        _ => "Up/Down Navigate  Enter Select  Esc Back  q Quit",
+        _ => "Arrow keys Navigate/Change  Enter Select  Esc Back  q Quit",
     }
 }
 

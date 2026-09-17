@@ -53,9 +53,21 @@ pub enum PlanOrigin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputContext {
+    None,
+    LoadPlanPath,
+    ModelPath,
+    PreferenceValue,
+    GenerationPrompt,
+    SavePlanPath,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiCommand {
     Up,
     Down,
+    Left,
+    Right,
     Enter,
     Back,
     Backspace,
@@ -91,6 +103,14 @@ impl OverrideChoice {
             Self::PlannerDefault => Self::Enabled,
             Self::Enabled => Self::Disabled,
             Self::Disabled => Self::PlannerDefault,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::PlannerDefault => Self::Disabled,
+            Self::Enabled => Self::PlannerDefault,
+            Self::Disabled => Self::Enabled,
         }
     }
 
@@ -258,6 +278,7 @@ pub struct TuiApp {
     pub advanced_cache_capacity_input: String,
     pub advanced_read_coalescing: OverrideChoice,
     pub advanced_grouped_buffer: OverrideChoice,
+    pub preference_editing: bool,
     pub calibration_index: usize,
     pub calibration_complete: bool,
     pub calibration_tasks: Vec<CalibrationTaskView>,
@@ -293,6 +314,7 @@ impl Default for TuiApp {
             advanced_cache_capacity_input: String::new(),
             advanced_read_coalescing: OverrideChoice::PlannerDefault,
             advanced_grouped_buffer: OverrideChoice::PlannerDefault,
+            preference_editing: false,
             calibration_index: 0,
             calibration_complete: false,
             calibration_tasks: Vec::new(),
@@ -352,20 +374,19 @@ impl TuiApp {
         }
     }
 
-    pub fn accepts_text(&self) -> bool {
+    pub fn active_input_context(&self) -> InputContext {
         match self.screen {
-            Screen::LoadPlan
-            | Screen::ModelInput
-            | Screen::GenerationInput
-            | Screen::SavePlan => true,
-            Screen::Preferences => matches!(
-                self.preference_field(),
-                PreferenceField::Ram
-                    | PreferenceField::AdvancedThreads
-                    | PreferenceField::AdvancedCacheCapacity
-            ),
-            _ => false,
+            Screen::LoadPlan => InputContext::LoadPlanPath,
+            Screen::ModelInput => InputContext::ModelPath,
+            Screen::Preferences if self.preference_editing => InputContext::PreferenceValue,
+            Screen::GenerationInput => InputContext::GenerationPrompt,
+            Screen::SavePlan => InputContext::SavePlanPath,
+            _ => InputContext::None,
         }
+    }
+
+    pub fn accepts_text(&self) -> bool {
+        self.active_input_context() != InputContext::None
     }
 
     pub fn load_finished(
@@ -403,6 +424,7 @@ impl TuiApp {
             Ok(()) => {
                 self.screen = Screen::Preferences;
                 self.menu_index = 0;
+                self.preference_editing = false;
                 self.error = None;
                 None
             }
@@ -643,36 +665,52 @@ impl TuiApp {
     }
 
     fn handle_preferences(&mut self, command: UiCommand) -> Option<AppAction> {
+        if self.preference_editing {
+            match command {
+                UiCommand::Character(character) if !character.is_control() => {
+                    self.edit_preference_character(character)
+                }
+                UiCommand::Backspace => self.edit_preference_backspace(),
+                UiCommand::Enter | UiCommand::Back => self.preference_editing = false,
+                UiCommand::Up => {
+                    self.preference_editing = false;
+                    self.move_menu_up(self.preference_count());
+                }
+                UiCommand::Down => {
+                    self.preference_editing = false;
+                    self.move_menu_down(self.preference_count());
+                }
+                _ => {}
+            }
+            return None;
+        }
+
         match command {
             UiCommand::Up => self.move_menu_up(self.preference_count()),
             UiCommand::Down => self.move_menu_down(self.preference_count()),
+            UiCommand::Left => self.change_preference_value(false),
+            UiCommand::Right => self.change_preference_value(true),
             UiCommand::Back => {
+                self.preference_editing = false;
                 self.screen = Screen::ModelInput;
                 self.menu_index = 0;
             }
-            UiCommand::Backspace => self.edit_preference_backspace(),
-            UiCommand::Character(character) if !character.is_control() => {
-                self.edit_preference_character(character)
-            }
             UiCommand::Enter => match self.preference_field() {
-                PreferenceField::Mode => {
-                    self.mode = next_mode(self.mode);
-                    if self.menu_index >= self.preference_count() {
-                        self.menu_index = self.preference_count() - 1;
-                    }
+                PreferenceField::Ram
+                | PreferenceField::AdvancedThreads
+                | PreferenceField::AdvancedCacheCapacity => {
+                    self.preference_editing = true;
                 }
-                PreferenceField::AdvancedCache => {
-                    self.advanced_cache = self.advanced_cache.next()
-                }
-                PreferenceField::AdvancedReadCoalescing => {
-                    self.advanced_read_coalescing = self.advanced_read_coalescing.next()
-                }
-                PreferenceField::AdvancedGroupedBuffer => {
-                    self.advanced_grouped_buffer = self.advanced_grouped_buffer.next()
+                PreferenceField::Mode
+                | PreferenceField::AdvancedCache
+                | PreferenceField::AdvancedReadCoalescing
+                | PreferenceField::AdvancedGroupedBuffer => {
+                    self.change_preference_value(true);
                 }
                 PreferenceField::Continue => match self.build_user_profile() {
                     Ok(profile) => {
                         self.user_profile = Some(profile);
+                        self.preference_editing = false;
                         self.active_runtime = None;
                         self.prompt_input.clear();
                         self.generation_result = None;
@@ -688,9 +726,6 @@ impl TuiApp {
                     }
                     Err(error) => self.error = Some(error),
                 },
-                PreferenceField::Ram
-                | PreferenceField::AdvancedThreads
-                | PreferenceField::AdvancedCacheCapacity => {}
             },
             _ => {}
         }
@@ -703,6 +738,7 @@ impl TuiApp {
             UiCommand::Back => {
                 self.screen = Screen::Preferences;
                 self.menu_index = 0;
+                self.preference_editing = false;
             }
             UiCommand::Enter if self.menu_index == 0 => {
                 self.screen = Screen::CalibrationSelect;
@@ -711,6 +747,7 @@ impl TuiApp {
             UiCommand::Enter => {
                 self.screen = Screen::Preferences;
                 self.menu_index = 0;
+                self.preference_editing = false;
             }
             _ => {}
         }
@@ -719,8 +756,8 @@ impl TuiApp {
 
     fn handle_calibration_select(&mut self, command: UiCommand) -> Option<AppAction> {
         match command {
-            UiCommand::Up => self.move_menu_up(4),
-            UiCommand::Down => self.move_menu_down(4),
+            UiCommand::Up | UiCommand::Left => self.move_menu_up(4),
+            UiCommand::Down | UiCommand::Right => self.move_menu_down(4),
             UiCommand::Back => {
                 self.screen = Screen::ModelInfo;
                 self.menu_index = 0;
@@ -776,6 +813,7 @@ impl TuiApp {
             UiCommand::Enter => {
                 self.screen = Screen::Preferences;
                 self.menu_index = 0;
+                self.preference_editing = false;
             }
             _ => {}
         }
@@ -972,6 +1010,7 @@ impl TuiApp {
         self.calibration_result = None;
         self.screen = Screen::Preferences;
         self.menu_index = 0;
+        self.preference_editing = false;
     }
 
     fn show_error(&mut self, error: TuiError, return_to: Screen) {
@@ -1041,6 +1080,46 @@ impl TuiApp {
             5 => PreferenceField::AdvancedReadCoalescing,
             6 => PreferenceField::AdvancedGroupedBuffer,
             _ => PreferenceField::Continue,
+        }
+    }
+
+    fn change_preference_value(&mut self, forward: bool) {
+        match self.preference_field() {
+            PreferenceField::Mode => {
+                self.mode = if forward {
+                    next_mode(self.mode)
+                } else {
+                    previous_mode(self.mode)
+                };
+                if self.menu_index >= self.preference_count() {
+                    self.menu_index = self.preference_count() - 1;
+                }
+            }
+            PreferenceField::AdvancedCache => {
+                self.advanced_cache = if forward {
+                    self.advanced_cache.next()
+                } else {
+                    self.advanced_cache.previous()
+                }
+            }
+            PreferenceField::AdvancedReadCoalescing => {
+                self.advanced_read_coalescing = if forward {
+                    self.advanced_read_coalescing.next()
+                } else {
+                    self.advanced_read_coalescing.previous()
+                }
+            }
+            PreferenceField::AdvancedGroupedBuffer => {
+                self.advanced_grouped_buffer = if forward {
+                    self.advanced_grouped_buffer.next()
+                } else {
+                    self.advanced_grouped_buffer.previous()
+                }
+            }
+            PreferenceField::Ram
+            | PreferenceField::AdvancedThreads
+            | PreferenceField::AdvancedCacheCapacity
+            | PreferenceField::Continue => {}
         }
     }
 
@@ -1126,6 +1205,15 @@ fn next_mode(mode: OperatingMode) -> OperatingMode {
     }
 }
 
+fn previous_mode(mode: OperatingMode) -> OperatingMode {
+    match mode {
+        OperatingMode::BackgroundConstrained => OperatingMode::Advanced,
+        OperatingMode::BalancedNormal => OperatingMode::BackgroundConstrained,
+        OperatingMode::MaximumPerformance => OperatingMode::BalancedNormal,
+        OperatingMode::Advanced => OperatingMode::MaximumPerformance,
+    }
+}
+
 pub fn calibration_level_for_index(index: usize) -> CalibrationLevel {
     match index % 4 {
         0 => CalibrationLevel::None,
@@ -1172,6 +1260,21 @@ mod tests {
     }
 
     #[test]
+    fn welcome_uses_arrow_navigation_only() {
+        let mut app = TuiApp::default();
+        app.handle(UiCommand::Down);
+        assert_eq!(app.menu_index, 1);
+        app.handle(UiCommand::Up);
+        assert_eq!(app.menu_index, 0);
+        app.handle(UiCommand::Up);
+        assert_eq!(app.menu_index, 2);
+
+        app.handle(UiCommand::Character('j'));
+        app.handle(UiCommand::Character('k'));
+        assert_eq!(app.menu_index, 2);
+    }
+
+    #[test]
     fn welcome_exposes_load_plan_and_back_navigation() {
         let mut app = TuiApp::default();
         app.handle(UiCommand::Down);
@@ -1205,6 +1308,11 @@ mod tests {
         let mut app = TuiApp::default();
         app.handle(UiCommand::Enter);
         assert_eq!(app.screen, Screen::ModelInput);
+        assert_eq!(app.active_input_context(), InputContext::ModelPath);
+        app.handle(UiCommand::Character('j'));
+        app.handle(UiCommand::Character('k'));
+        assert_eq!(app.model_input, "jk");
+        app.model_input.clear();
         assert!(app.handle(UiCommand::Enter).is_none());
         assert!(matches!(
             app.error.as_ref(),
@@ -1220,6 +1328,12 @@ mod tests {
         );
         assert!(app.model_path_validation_finished(Ok(())).is_none());
         assert_eq!(app.screen, Screen::Preferences);
+        assert_eq!(app.active_input_context(), InputContext::None);
+        let stored_path = app.model_input.clone();
+        app.handle(UiCommand::Character('x'));
+        assert_eq!(app.model_input, stored_path);
+        app.handle(UiCommand::Down);
+        assert_eq!(app.menu_index, 1);
 
         app.screen = Screen::Analyzing;
         assert!(app
@@ -1241,6 +1355,34 @@ mod tests {
             Some(AppAction::AnalyzeLoadedPlan)
         );
         assert_eq!(app.screen, Screen::Analyzing);
+    }
+
+    #[test]
+    fn preference_left_and_right_change_horizontal_options() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::Preferences;
+        app.menu_index = 1;
+        assert_eq!(app.mode, OperatingMode::BalancedNormal);
+        app.handle(UiCommand::Right);
+        assert_eq!(app.mode, OperatingMode::MaximumPerformance);
+        app.handle(UiCommand::Left);
+        assert_eq!(app.mode, OperatingMode::BalancedNormal);
+        assert!(!app.preference_editing);
+    }
+
+    #[test]
+    fn preference_text_editing_requires_explicit_enter() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::Preferences;
+        app.menu_index = 0;
+        app.handle(UiCommand::Character('8'));
+        assert!(app.ram_input.is_empty());
+        app.handle(UiCommand::Enter);
+        assert_eq!(app.active_input_context(), InputContext::PreferenceValue);
+        app.handle(UiCommand::Character('8'));
+        assert_eq!(app.ram_input, "8");
+        app.handle(UiCommand::Enter);
+        assert_eq!(app.active_input_context(), InputContext::None);
     }
 
     #[test]
@@ -1431,26 +1573,39 @@ mod tests {
     fn prompt_submission_is_the_only_generation_action() {
         let mut app = TuiApp::default();
         app.screen = Screen::GenerationInput;
-        app.prompt_input = "Explain RAMforge".to_string();
+        assert_eq!(app.active_input_context(), InputContext::GenerationPrompt);
+        app.handle(UiCommand::Character('H'));
+        app.handle(UiCommand::Character('i'));
+        assert_eq!(app.prompt_input, "Hi");
         assert_eq!(
             app.handle(UiCommand::Enter),
-            Some(AppAction::GeneratePrompt("Explain RAMforge".to_string()))
+            Some(AppAction::GeneratePrompt("Hi".to_string()))
         );
         assert_eq!(app.screen, Screen::GenerationRunning);
+        assert_eq!(app.active_input_context(), InputContext::None);
+        app.handle(UiCommand::Character('x'));
+        assert_eq!(app.prompt_input, "Hi");
     }
 
     #[test]
     fn generation_result_and_error_paths_are_recoverable() {
         let mut app = TuiApp::default();
         app.screen = Screen::GenerationRunning;
+        app.prompt_input = "submitted".to_string();
         app.generation_finished(Ok(SinglePromptResult {
             generated_text: "result".to_string(),
             generated_token_count: 1,
         }));
         assert_eq!(app.screen, Screen::GenerationResult);
+        assert_eq!(app.active_input_context(), InputContext::None);
+        app.handle(UiCommand::Character('x'));
+        assert_eq!(app.prompt_input, "submitted");
         app.handle(UiCommand::Enter);
         assert_eq!(app.screen, Screen::GenerationInput);
         assert!(app.generation_result.is_none());
+        assert_eq!(app.active_input_context(), InputContext::GenerationPrompt);
+        app.handle(UiCommand::Character('n'));
+        assert_eq!(app.prompt_input, "n");
 
         app.screen = Screen::GenerationRunning;
         app.generation_finished(Err(TuiError::Generation("budget failure".to_string())));
