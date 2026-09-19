@@ -2,8 +2,9 @@ pub mod app;
 mod render;
 mod terminal;
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use ramforge_runtime::calibration::{
     CalibrationLimits, CalibrationPlan, CalibrationRunner, CalibrationTaskProgressState,
@@ -271,14 +272,120 @@ fn generate_prompt(app: &mut TuiApp, prompt: &str) -> Result<SinglePromptResult,
         field: "runtime",
         message: "validated runtime is not active".to_string(),
     })?;
+    runtime.set_profiling(true);
+    let prompt_token_count = runtime.tokenizer.encode(prompt, true).len();
+    emit_generation_start_diagnostic(runtime, prompt_token_count);
+
     let sampler = Sampler::greedy();
-    runtime
-        .generate(prompt, SINGLE_PROMPT_MAX_TOKENS, &sampler)
+    let started = Instant::now();
+    let result = runtime.generate(prompt, SINGLE_PROMPT_MAX_TOKENS, &sampler);
+    let elapsed = started.elapsed();
+    let profile = runtime.generation_profile();
+    let generated_token_count = result
+        .as_ref()
+        .map(|(tokens, _)| tokens.len())
+        .unwrap_or(profile.runtime.tokens as usize);
+    emit_generation_summary(runtime, &profile, prompt_token_count, generated_token_count, elapsed);
+
+    result
         .map(|(tokens, generated_text)| SinglePromptResult {
             generated_text,
             generated_token_count: tokens.len(),
         })
         .map_err(TuiError::Generation)
+}
+
+fn emit_generation_start_diagnostic(
+    runtime: &ramforge_runtime::inference::InferenceEngine,
+    prompt_token_count: usize,
+) {
+    let config = runtime.runtime_config();
+    let q4_0_tensors = runtime
+        .data_source
+        .model()
+        .tensors
+        .iter()
+        .filter(|tensor| tensor.ggml_type == ramforge_core::GgmlType::Q4_0)
+        .count();
+    let mut stderr = io::stderr().lock();
+    let _ = write!(
+        stderr,
+        "\r\nRAMforge generation diagnostic (start)\r\n\
+         prompt_tokens={} max_tokens={} cpu_threads={} q4_0_tensors={} \
+         cache_enabled={} cache_capacity_bytes={} read_coalescing={} grouped_buffer_reuse={}\r\n",
+        prompt_token_count,
+        SINGLE_PROMPT_MAX_TOKENS,
+        runtime.backend.num_threads,
+        q4_0_tensors,
+        config.layer_cache_enabled,
+        runtime.model.layer_cache_capacity_bytes(),
+        config.read_coalescing_enabled,
+        config.grouped_read_buffer_reuse_enabled,
+    );
+    let _ = stderr.flush();
+}
+
+fn emit_generation_summary(
+    runtime: &ramforge_runtime::inference::InferenceEngine,
+    profile: &ramforge_runtime::inference::GenerationProfile,
+    prompt_token_count: usize,
+    generated_token_count: usize,
+    elapsed: Duration,
+) {
+    let runtime_profile = &profile.runtime;
+    let elapsed_seconds = elapsed.as_secs_f64();
+    let tokens_per_second = if elapsed_seconds > 0.0 {
+        generated_token_count as f64 / elapsed_seconds
+    } else {
+        0.0
+    };
+    let mut stderr = io::stderr().lock();
+    let _ = write!(
+        stderr,
+        "\r\nRAMforge generation diagnostic (summary)\r\n\
+         prompt_tokens={} generated_tokens={} elapsed_seconds={:.3} tokens_per_second={:.6} cpu_threads={}\r\n\
+         cache_capacity_bytes={} peak_cached_layers={} model_layers={} peak_cache_bytes={} cache_hits={} cache_misses={} cache_evictions={}\r\n\
+         logical_tensor_reads={} physical_reads={} physical_bytes={} coalesced_ranges={} read_seconds={:.3}\r\n\
+         layer_loads={} layer_releases={} prompt_forwards={} decode_forwards={} terminal_forwards_skipped={}\r\n\
+         profile_total_seconds={:.3} prompt_seconds={:.3} layer_load_seconds={:.3} layer_compute_seconds={:.3} logits_seconds={:.3}\r\n\
+         quantized_matvec_seconds={:.3} float_matvec_seconds={:.3} dequantization_seconds={:.3} grouped_quantized_copies={} grouped_quantized_copy_seconds={:.3}\r\n\
+         peak_managed_bytes={} budget_bytes={}\r\n",
+        prompt_token_count,
+        generated_token_count,
+        elapsed_seconds,
+        tokens_per_second,
+        runtime.backend.num_threads,
+        profile.layer_cache_capacity_bytes,
+        runtime_profile.peak_cached_layer_count,
+        runtime.model.config.block_count,
+        runtime_profile.peak_cache_bytes,
+        runtime_profile.cache_hits,
+        runtime_profile.cache_misses,
+        runtime_profile.cache_evictions,
+        profile.io.logical_tensor_reads,
+        profile.io.read_operations,
+        profile.io.bytes_read,
+        profile.io.coalesced_ranges,
+        profile.io.elapsed.as_secs_f64(),
+        runtime_profile.layer_loads,
+        runtime_profile.layer_releases,
+        runtime_profile.prompt_forwards,
+        runtime_profile.decode_forwards,
+        runtime_profile.terminal_forwards_skipped,
+        runtime_profile.total.as_secs_f64(),
+        runtime_profile.prompt.as_secs_f64(),
+        runtime_profile.layer_load.as_secs_f64(),
+        runtime_profile.layer_compute.as_secs_f64(),
+        runtime_profile.logits.as_secs_f64(),
+        runtime_profile.quantized_matvec.as_secs_f64(),
+        runtime_profile.float_matvec.as_secs_f64(),
+        runtime_profile.dequantization.as_secs_f64(),
+        runtime_profile.grouped_quantized_copy_count,
+        runtime_profile.grouped_quantized_copy_time.as_secs_f64(),
+        profile.ramforge_peak_bytes,
+        profile.ramforge_budget_bytes,
+    );
+    let _ = stderr.flush();
 }
 
 fn save_plan(app: &TuiApp, path: &Path) -> Result<PathBuf, TuiError> {
