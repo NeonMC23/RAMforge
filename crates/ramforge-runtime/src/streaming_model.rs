@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use ramforge_core::{
     datasource::GgufDataSource,
     memory::MemoryBudget,
+    quant::{BLOCK_SIZE_Q4_0, QK4_0},
     tensor::{decode_tensor_to_f32, TensorData},
     types::GgmlType,
 };
@@ -20,11 +21,11 @@ use crate::accounting::{
 };
 use crate::backend::ComputeBackend;
 use crate::kv_cache::KvCache;
+use crate::layer::{group_layers, LayerDescriptor, PersistentDescriptors};
 use crate::layer_cache::{InsertOutcome, LayerCache};
 use crate::layer_read::{build_layer_read_plan, LayerReadPlan, PlannedReadRange};
-use crate::layer::{group_layers, LayerDescriptor, PersistentDescriptors};
 use crate::model::{validate_required_tensors, LlamaConfig};
-use crate::persistent::{row_bytes_for, PersistentWeight, should_keep_resident};
+use crate::persistent::{row_bytes_for, should_keep_resident, PersistentWeight};
 use crate::profile::{ProfileEvent, Profiler};
 use crate::residency::ResidencyStats;
 use crate::runtime_config::RuntimeConfig;
@@ -92,10 +93,7 @@ pub struct StreamingLlamaModel {
 
 impl StreamingLlamaModel {
     /// Load with the existing runtime behavior used by legacy/manual callers.
-    pub fn load(
-        data_source: &GgufDataSource,
-        budget: &mut MemoryBudget,
-    ) -> Result<Self, String> {
+    pub fn load(data_source: &GgufDataSource, budget: &mut MemoryBudget) -> Result<Self, String> {
         Self::load_internal(data_source, budget, None)
     }
 
@@ -141,22 +139,39 @@ impl StreamingLlamaModel {
         let quantized_weight_bytes = gguf_model
             .tensors
             .iter()
-            .filter(|t| matches!(t.ggml_type, GgmlType::Q4_0 | GgmlType::Q8_0 | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::Q2_K | GgmlType::Q3_K | GgmlType::Q8_K))
+            .filter(|t| {
+                matches!(
+                    t.ggml_type,
+                    GgmlType::Q4_0
+                        | GgmlType::Q8_0
+                        | GgmlType::Q4_K
+                        | GgmlType::Q5_K
+                        | GgmlType::Q6_K
+                        | GgmlType::Q2_K
+                        | GgmlType::Q3_K
+                        | GgmlType::Q8_K
+                )
+            })
             .filter_map(|t| t.byte_length)
             .sum();
         let layer_descriptors = group_layers(gguf_model, config.block_count);
         let layer_read_plans = layer_descriptors
             .iter()
             .map(|layer| {
-                build_layer_read_plan(&layer.tensors)
-                    .map_err(|error| format!("failed to plan layer {} reads: {}", layer.layer_idx, error))
+                build_layer_read_plan(&layer.tensors).map_err(|error| {
+                    format!("failed to plan layer {} reads: {}", layer.layer_idx, error)
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let layer_memory_estimates = layer_descriptors
             .iter()
             .map(|layer| {
-                estimate_layer_memory(&layer.tensors)
-                    .map_err(|error| format!("failed to estimate layer {} memory: {}", layer.layer_idx, error))
+                estimate_layer_memory(&layer.tensors).map_err(|error| {
+                    format!(
+                        "failed to estimate layer {} memory: {}",
+                        layer.layer_idx, error
+                    )
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let grouped_layer_memory_estimates = layer_descriptors
@@ -164,7 +179,10 @@ impl StreamingLlamaModel {
             .zip(&layer_read_plans)
             .map(|(layer, read_plan)| {
                 estimate_grouped_layer_memory(&layer.tensors, read_plan).map_err(|error| {
-                    format!("failed to estimate grouped layer {} memory: {}", layer.layer_idx, error)
+                    format!(
+                        "failed to estimate grouped layer {} memory: {}",
+                        layer.layer_idx, error
+                    )
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -228,8 +246,7 @@ impl StreamingLlamaModel {
             .checked_add(max_layer_load_peak)
             .ok_or_else(|| "layer cache lower-bound overflow".to_string())?;
         let managed_lower_bound = budget.peak_used_bytes().max(layer_lower_bound);
-        let maximum_layer_cache_capacity =
-            budget.total_bytes().saturating_sub(managed_lower_bound);
+        let maximum_layer_cache_capacity = budget.total_bytes().saturating_sub(managed_lower_bound);
         let layer_cache_capacity = runtime_config
             .map(|config| {
                 if config.layer_cache_enabled {
@@ -356,18 +373,11 @@ impl StreamingLlamaModel {
 
         let read_plan = &self.layer_read_plans[layer_idx];
         let use_grouped_reads = self.read_coalescing_enabled
-            && read_plan
-                .ranges
-                .iter()
-                .any(|range| range.tensors.len() > 1)
-            && budget.can_allocate(
-                self.grouped_layer_memory_estimates[layer_idx].load_peak_bytes,
-            );
+            && read_plan.ranges.iter().any(|range| range.tensors.len() > 1)
+            && budget.can_allocate(self.grouped_layer_memory_estimates[layer_idx].load_peak_bytes);
         let reusable_buffer_bytes = read_plan.reusable_group_buffer_bytes();
         let reusable_peak = reusable_buffer_bytes.and_then(|scratch_bytes| {
-            scratch_bytes.checked_add(
-                self.grouped_layer_memory_estimates[layer_idx].resident_bytes,
-            )
+            scratch_bytes.checked_add(self.grouped_layer_memory_estimates[layer_idx].resident_bytes)
         });
         let use_reusable_buffer = self.grouped_read_buffer_reuse_enabled
             && use_grouped_reads
@@ -480,10 +490,7 @@ impl StreamingLlamaModel {
                         })?
                         .max(1);
                         budget
-                            .allocate(
-                                format!("layer:{}:{}", layer_idx, descriptor.name),
-                                resident,
-                            )
+                            .allocate(format!("layer:{}:{}", layer_idx, descriptor.name), resident)
                             .map_err(|error| {
                                 format!(
                                     "RAM budget too small for grouped layer {} tensor '{}': {}",
@@ -519,9 +526,12 @@ impl StreamingLlamaModel {
                     let charge =
                         tensor_load_charge_bytes(tensor_desc.ggml_type, file_bytes)?.max(1);
                     let alloc_name = format!("layer:{}:{}", layer_idx, name);
-                    budget
-                        .allocate(alloc_name.clone(), charge)
-                        .map_err(|e| format!("RAM budget too small for layer {} tensor '{}': {}", layer_idx, name, e))?;
+                    budget.allocate(alloc_name.clone(), charge).map_err(|e| {
+                        format!(
+                            "RAM budget too small for layer {} tensor '{}': {}",
+                            layer_idx, name, e
+                        )
+                    })?;
 
                     let tensor_data = load_tensor_data(data_source, tensor_desc, &self.profiler)?;
                     let resident = tensor_data.resident_bytes() as u64;
@@ -531,9 +541,12 @@ impl StreamingLlamaModel {
 
                     // Atomically settle the charge to exact resident size.
                     if resident.max(1) != charge {
-                        budget
-                            .resize(&alloc_name, resident.max(1))
-                            .map_err(|e| format!("RAM budget error settling layer {} tensor '{}': {}", layer_idx, name, e))?;
+                        budget.resize(&alloc_name, resident.max(1)).map_err(|e| {
+                            format!(
+                                "RAM budget error settling layer {} tensor '{}': {}",
+                                layer_idx, name, e
+                            )
+                        })?;
                     }
                     loaded.push((name.clone(), tensor_data));
                 }
@@ -560,8 +573,9 @@ impl StreamingLlamaModel {
         let extract_result = (|map: &mut std::collections::HashMap<String, TensorData>| {
             let mut get = |suffix: &str| -> Result<TensorData, String> {
                 let full = format!("blk.{}.{}", layer_idx, suffix);
-                map.remove(&full)
-                    .ok_or_else(|| format!("missing tensor '{}' in loaded layer {}", full, layer_idx))
+                map.remove(&full).ok_or_else(|| {
+                    format!("missing tensor '{}' in loaded layer {}", full, layer_idx)
+                })
             };
 
             let weights = StreamingLayerWeights {
@@ -694,10 +708,7 @@ impl StreamingLlamaModel {
         budget.with_temp("tmp:forward", act_bytes, |budget| {
             // Embedding lookup (streams one row if non-resident; charges its
             // own `tmp:embd_row` inside this scope).
-            self.ensure_layer_cache_headroom(
-                budget,
-                self.embedding_workspace_bytes(n_embd)?,
-            )?;
+            self.ensure_layer_cache_headroom(budget, self.embedding_workspace_bytes(n_embd)?)?;
             let mut hidden = self.token_embd.get_embedding(
                 token_id as usize,
                 n_embd,
@@ -853,12 +864,7 @@ impl StreamingLlamaModel {
             let output_norm_f32 = persistent_f32_view(&self.output_norm, data_source)?;
             self.profiler
                 .record_since(ProfileEvent::Dequantization, dequant_started);
-            backend.rmsnorm(
-                &hidden,
-                output_norm_f32.as_ref(),
-                cfg.rms_eps,
-                final_hidden,
-            );
+            backend.rmsnorm(&hidden, output_norm_f32.as_ref(), cfg.rms_eps, final_hidden);
 
             Ok(())
         })
@@ -910,12 +916,15 @@ impl StreamingLlamaModel {
             (None, None, None) => {}
             (Some(bq), Some(bk), Some(bv)) => {
                 let dequant_started = profiler.start();
-                let bq = tensor_f32_view(bq)
-                    .map_err(|e| format!("failed to decode attn_q.bias of layer {}: {}", layer_idx, e))?;
-                let bk = tensor_f32_view(bk)
-                    .map_err(|e| format!("failed to decode attn_k.bias of layer {}: {}", layer_idx, e))?;
-                let bv = tensor_f32_view(bv)
-                    .map_err(|e| format!("failed to decode attn_v.bias of layer {}: {}", layer_idx, e))?;
+                let bq = tensor_f32_view(bq).map_err(|e| {
+                    format!("failed to decode attn_q.bias of layer {}: {}", layer_idx, e)
+                })?;
+                let bk = tensor_f32_view(bk).map_err(|e| {
+                    format!("failed to decode attn_k.bias of layer {}: {}", layer_idx, e)
+                })?;
+                let bv = tensor_f32_view(bv).map_err(|e| {
+                    format!("failed to decode attn_v.bias of layer {}: {}", layer_idx, e)
+                })?;
                 profiler.record_since(ProfileEvent::Dequantization, dequant_started);
                 for (x, b) in q_tmp.iter_mut().zip(bq.iter()) {
                     *x += *b;
@@ -1096,9 +1105,12 @@ fn read_and_decode_grouped_range(
         let end = start
             .checked_add(length)
             .ok_or_else(|| format!("tensor '{}' grouped slice overflows", descriptor.name))?;
-        let slice = buffer
-            .get(start..end)
-            .ok_or_else(|| format!("tensor '{}' is outside grouped read buffer", descriptor.name))?;
+        let slice = buffer.get(start..end).ok_or_else(|| {
+            format!(
+                "tensor '{}' is outside grouped read buffer",
+                descriptor.name
+            )
+        })?;
         let tensor_data = load_tensor_data_from_borrowed_bytes(descriptor, slice, profiler)?;
         let resident = tensor_data.resident_bytes() as u64;
         let charge_name = format!("layer:{}:{}", layer_index, descriptor.name);
@@ -1164,7 +1176,10 @@ fn load_tensor_data_from_borrowed_bytes(
     profiler: &Profiler,
 ) -> Result<TensorData, String> {
     let started = profiler.start();
-    let result = if matches!(desc.ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+    let result = if matches!(
+        desc.ggml_type,
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+    ) {
         let decoded = decode_tensor_to_f32(bytes, desc.ggml_type, desc.num_elements)
             .map_err(|error| format!("failed to decode tensor '{}': {}", desc.name, error))?;
         TensorData::from_decoded_float_vec(
@@ -1196,7 +1211,10 @@ fn load_tensor_data_from_borrowed_bytes(
     let elapsed = started.map(|instant| instant.elapsed());
     if let Some(elapsed) = elapsed {
         profiler.record(ProfileEvent::TensorConstruction, elapsed);
-        if matches!(desc.ggml_type, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+        if matches!(
+            desc.ggml_type,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16
+        ) {
             profiler.record(ProfileEvent::Dequantization, elapsed);
         }
     }
@@ -1225,12 +1243,9 @@ fn load_persistent_weight(
             desc.ggml_type.name()
         )
     })?;
-    let expected_resident = TensorData::resident_bytes_for(
-        desc.ggml_type,
-        desc.num_elements,
-        file_bytes,
-    )
-    .map_err(|e| format!("failed to determine resident size for '{}': {}", name, e))?;
+    let expected_resident =
+        TensorData::resident_bytes_for(desc.ggml_type, desc.num_elements, file_bytes)
+            .map_err(|e| format!("failed to determine resident size for '{}': {}", name, e))?;
 
     if !should_keep_resident(expected_resident, budget.total_bytes()) {
         return Ok((PersistentWeight::Streamed(desc), None));
@@ -1376,6 +1391,25 @@ fn matvec_backend(
         profiler.record_since(ProfileEvent::FloatMatvec, started);
         result
     } else {
+        // Record Q4_0-specific workload counters *before* dispatching to the
+        // scalar kernel, without altering execution order, arithmetic, or
+        // memory access. Other quantized formats are counted only by the
+        // existing QuantizedMatvec timer.
+        if td.ggml_type() == GgmlType::Q4_0 {
+            let shape = td.shape();
+            // Quantized matvecs use the explicit ggml `[in, out]` layout,
+            // matching `QuantizedTensor::matvec` (tensor.rs): shape[0] is the
+            // input dimension (length of x), shape[1] is the output dimension
+            // (length of y and number of weight rows).
+            if shape.len() == 2 {
+                let in_dim = shape[0] as u64;
+                let out_dim = shape[1] as u64;
+                let blocks_per_row = in_dim / QK4_0 as u64;
+                let blocks = out_dim.saturating_mul(blocks_per_row);
+                let weight_bytes = blocks.saturating_mul(BLOCK_SIZE_Q4_0 as u64);
+                profiler.record_q4_0_matvec(out_dim, in_dim, blocks, weight_bytes);
+            }
+        }
         let started = profiler.start();
         let result = td.matvec(x, y).map_err(|e| e.to_string());
         profiler.record_since(ProfileEvent::QuantizedMatvec, started);
@@ -1397,9 +1431,15 @@ mod tests {
         w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
         w.write_all(s.as_bytes()).unwrap();
     }
-    fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
-    fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
-    fn write_f32<W: Write>(w: &mut W, v: f32) { w.write_all(&v.to_le_bytes()).unwrap(); }
+    fn write_u32<W: Write>(w: &mut W, v: u32) {
+        w.write_all(&v.to_le_bytes()).unwrap();
+    }
+    fn write_u64<W: Write>(w: &mut W, v: u64) {
+        w.write_all(&v.to_le_bytes()).unwrap();
+    }
+    fn write_f32<W: Write>(w: &mut W, v: f32) {
+        w.write_all(&v.to_le_bytes()).unwrap();
+    }
 
     /// Minimal one-tensor GGUF used to exercise persistent loading directly.
     fn create_single_tensor_gguf(
@@ -1451,22 +1491,23 @@ mod tests {
     }
 
     fn assert_grouped_float_copy_not_profiled(ggml_type: GgmlType, bytes: Vec<u8>) {
-        let descriptor = test_descriptor(
-            "blk.0.test.weight",
-            ggml_type,
-            &[2],
-            bytes.len() as u64,
-        );
+        let descriptor = test_descriptor("blk.0.test.weight", ggml_type, &[2], bytes.len() as u64);
         let profiler = Profiler::default();
         profiler.set_enabled(true);
 
-        let tensor =
-            load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
-        assert!(!tensor.is_quantized(), "{} must decode as float", ggml_type.name());
+        let tensor = load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
+        assert!(
+            !tensor.is_quantized(),
+            "{} must decode as float",
+            ggml_type.name()
+        );
         let snapshot = profiler.snapshot();
         assert_eq!(snapshot.grouped_quantized_copy_count, 0);
         assert_eq!(snapshot.grouped_quantized_copy_bytes, 0);
-        assert_eq!(snapshot.grouped_quantized_copy_time, std::time::Duration::ZERO);
+        assert_eq!(
+            snapshot.grouped_quantized_copy_time,
+            std::time::Duration::ZERO
+        );
     }
 
     fn create_model_with_n_layers(n_layers: usize, n_embd: usize, ffn: usize) -> NamedTempFile {
@@ -1491,33 +1532,101 @@ mod tests {
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
         };
-        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "general.architecture",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
         add_kv("llama.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("llama.context_length", 4, Box::new(|b| write_u32(b, 64)));
-        add_kv("llama.embedding_length", 4, Box::new(|b| write_u32(b, n_embd as u32)));
-        add_kv("llama.block_count", 4, Box::new(|b| write_u32(b, n_layers as u32)));
-        add_kv("llama.feed_forward_length", 4, Box::new(|b| write_u32(b, ffn as u32)));
-        add_kv("llama.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
-        add_kv("llama.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
-        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "llama.embedding_length",
+            4,
+            Box::new(|b| write_u32(b, n_embd as u32)),
+        );
+        add_kv(
+            "llama.block_count",
+            4,
+            Box::new(|b| write_u32(b, n_layers as u32)),
+        );
+        add_kv(
+            "llama.feed_forward_length",
+            4,
+            Box::new(|b| write_u32(b, ffn as u32)),
+        );
+        add_kv(
+            "llama.attention.head_count",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.head_count_kv",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.layer_norm_rms_epsilon",
+            6,
+            Box::new(|b| write_f32(b, 1e-5)),
+        );
+        add_kv(
+            "llama.rope.freq_base",
+            6,
+            Box::new(|b| write_f32(b, 10000.0)),
+        );
+        add_kv(
+            "tokenizer.ggml.model",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
 
         let mut offset = 0u64;
         let mut defs: Vec<(String, Vec<u64>, u32)> = Vec::new();
         defs.push(("token_embd.weight".to_string(), vec![n_embd as u64, 16], 0));
         defs.push(("output_norm.weight".to_string(), vec![n_embd as u64], 0));
         for i in 0..n_layers {
-            defs.push((format!("blk.{}.attn_norm.weight", i), vec![n_embd as u64], 0));
-            defs.push((format!("blk.{}.attn_q.weight", i), vec![n_embd as u64, n_embd as u64], 0));
-            defs.push((format!("blk.{}.attn_k.weight", i), vec![n_embd as u64, n_embd as u64], 0));
-            defs.push((format!("blk.{}.attn_v.weight", i), vec![n_embd as u64, n_embd as u64], 0));
-            defs.push((format!("blk.{}.attn_output.weight", i), vec![n_embd as u64, n_embd as u64], 0));
+            defs.push((
+                format!("blk.{}.attn_norm.weight", i),
+                vec![n_embd as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.attn_q.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.attn_k.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.attn_v.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.attn_output.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                0,
+            ));
             defs.push((format!("blk.{}.ffn_norm.weight", i), vec![n_embd as u64], 0));
             // ggml layout [in, out]: gate/up map n_embd -> ffn, down maps ffn -> n_embd
-            defs.push((format!("blk.{}.ffn_gate.weight", i), vec![n_embd as u64, ffn as u64], 0));
-            defs.push((format!("blk.{}.ffn_up.weight", i), vec![n_embd as u64, ffn as u64], 0));
-            defs.push((format!("blk.{}.ffn_down.weight", i), vec![ffn as u64, n_embd as u64], 0));
+            defs.push((
+                format!("blk.{}.ffn_gate.weight", i),
+                vec![n_embd as u64, ffn as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.ffn_up.weight", i),
+                vec![n_embd as u64, ffn as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.ffn_down.weight", i),
+                vec![ffn as u64, n_embd as u64],
+                0,
+            ));
         }
 
         for (definition_index, (name, dims, ty)) in defs.iter().enumerate() {
@@ -1528,7 +1637,9 @@ mod tests {
             }
             write_string(&mut buf, name);
             write_u32(&mut buf, dims.len() as u32);
-            for d in dims { write_u64(&mut buf, *d); }
+            for d in dims {
+                write_u64(&mut buf, *d);
+            }
             write_u32(&mut buf, *ty);
             write_u64(&mut buf, offset);
             let elems: u64 = dims.iter().product();
@@ -1561,17 +1672,45 @@ mod tests {
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
         };
-        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "general.architecture",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
         add_kv("llama.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("llama.context_length", 4, Box::new(|b| write_u32(b, 64)));
         add_kv("llama.embedding_length", 4, Box::new(|b| write_u32(b, 8)));
         add_kv("llama.block_count", 4, Box::new(|b| write_u32(b, 1)));
-        add_kv("llama.feed_forward_length", 4, Box::new(|b| write_u32(b, 16)));
-        add_kv("llama.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
-        add_kv("llama.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
-        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "llama.feed_forward_length",
+            4,
+            Box::new(|b| write_u32(b, 16)),
+        );
+        add_kv(
+            "llama.attention.head_count",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.head_count_kv",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.layer_norm_rms_epsilon",
+            6,
+            Box::new(|b| write_f32(b, 1e-5)),
+        );
+        add_kv(
+            "llama.rope.freq_base",
+            6,
+            Box::new(|b| write_f32(b, 10000.0)),
+        );
+        add_kv(
+            "tokenizer.ggml.model",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
 
         // (name, dims, ggml type id, bytes per element)
         let n_embd: u64 = 8;
@@ -1584,7 +1723,12 @@ mod tests {
         defs.push(("blk.0.attn_q.weight".into(), vec![n_embd, n_embd], 1, 2)); // F16
         defs.push(("blk.0.attn_k.weight".into(), vec![n_embd, n_embd], 30, 2)); // BF16
         defs.push(("blk.0.attn_v.weight".into(), vec![n_embd, n_embd], 0, 4));
-        defs.push(("blk.0.attn_output.weight".into(), vec![n_embd, n_embd], 0, 4));
+        defs.push((
+            "blk.0.attn_output.weight".into(),
+            vec![n_embd, n_embd],
+            0,
+            4,
+        ));
         defs.push(("blk.0.ffn_norm.weight".into(), vec![n_embd], 0, 4));
         defs.push(("blk.0.ffn_gate.weight".into(), vec![n_embd, ffn], 0, 4));
         defs.push(("blk.0.ffn_up.weight".into(), vec![n_embd, ffn], 0, 4));
@@ -1688,17 +1832,45 @@ mod tests {
             write_val(&mut buf);
         };
         // qwen2 arch + qwen2.* metadata keys (same tensor naming as llama)
-        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "qwen2")));
+        add_kv(
+            "general.architecture",
+            8,
+            Box::new(|b| write_string(b, "qwen2")),
+        );
         add_kv("qwen2.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("qwen2.context_length", 4, Box::new(|b| write_u32(b, 64)));
         add_kv("qwen2.embedding_length", 4, Box::new(|b| write_u32(b, 8)));
         add_kv("qwen2.block_count", 4, Box::new(|b| write_u32(b, 1)));
-        add_kv("qwen2.feed_forward_length", 4, Box::new(|b| write_u32(b, 16)));
-        add_kv("qwen2.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("qwen2.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("qwen2.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
-        add_kv("qwen2.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
-        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "qwen2.feed_forward_length",
+            4,
+            Box::new(|b| write_u32(b, 16)),
+        );
+        add_kv(
+            "qwen2.attention.head_count",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "qwen2.attention.head_count_kv",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "qwen2.attention.layer_norm_rms_epsilon",
+            6,
+            Box::new(|b| write_f32(b, 1e-5)),
+        );
+        add_kv(
+            "qwen2.rope.freq_base",
+            6,
+            Box::new(|b| write_f32(b, 10000.0)),
+        );
+        add_kv(
+            "tokenizer.ggml.model",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
 
         let mut offset = 0u64;
         for (name, dims) in &defs {
@@ -1735,8 +1907,7 @@ mod tests {
         let profiler = Profiler::default();
         profiler.set_enabled(true);
 
-        let tensor =
-            load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
+        let tensor = load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
         match tensor {
             TensorData::Q4_K(quantized) => assert_eq!(quantized.raw_data, bytes),
             other => panic!("expected Q4_K tensor, got {:?}", other),
@@ -1808,7 +1979,10 @@ mod tests {
         let snapshot = profiler.snapshot();
         assert_eq!(snapshot.grouped_quantized_copy_count, 0);
         assert_eq!(snapshot.grouped_quantized_copy_bytes, 0);
-        assert_eq!(snapshot.grouped_quantized_copy_time, std::time::Duration::ZERO);
+        assert_eq!(
+            snapshot.grouped_quantized_copy_time,
+            std::time::Duration::ZERO
+        );
     }
 
     #[test]
@@ -1838,22 +2012,20 @@ mod tests {
         let bytes = vec![0; ramforge_core::quant::BLOCK_SIZE_Q4_K];
         let profiler = Profiler::default();
 
-        let tensor =
-            load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
+        let tensor = load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
         assert!(tensor.is_quantized());
-        assert_eq!(profiler.snapshot(), crate::profile::ProfileSnapshot::default());
+        assert_eq!(
+            profiler.snapshot(),
+            crate::profile::ProfileSnapshot::default()
+        );
     }
 
     #[test]
     fn test_tensor_f32_view_borrows_float_storage_and_owns_quantized_fallback() {
         for ggml_type in [GgmlType::F32, GgmlType::F16, GgmlType::BF16] {
-            let tensor = TensorData::from_decoded_float_vec(
-                ggml_type,
-                vec![4],
-                4,
-                vec![1.0, 2.0, 3.0, 4.0],
-            )
-            .unwrap();
+            let tensor =
+                TensorData::from_decoded_float_vec(ggml_type, vec![4], 4, vec![1.0, 2.0, 3.0, 4.0])
+                    .unwrap();
             let resident = tensor.as_f32_slice().unwrap().0;
             let resident_ptr = resident.as_ptr();
             match tensor_f32_view(&tensor).unwrap() {
@@ -1889,8 +2061,7 @@ mod tests {
         let tmp = create_single_tensor_gguf("test.weight", GgmlType::F32, &[2], &raw);
         let data_source = GgufDataSource::open(tmp.path()).unwrap();
 
-        let resident_tensor =
-            TensorData::from_f32_vec(vec![2], 2, vec![1.0, 2.0]).unwrap();
+        let resident_tensor = TensorData::from_f32_vec(vec![2], 2, vec![1.0, 2.0]).unwrap();
         let resident_ptr = resident_tensor.as_f32_slice().unwrap().0.as_ptr();
         let resident_weight = PersistentWeight::Resident(resident_tensor);
         match persistent_f32_view(&resident_weight, &data_source).unwrap() {
@@ -1920,12 +2091,9 @@ mod tests {
         let used_before = budget.used_bytes();
         let config = RuntimeConfig::new(1, 4096, true, 4096, true, true).unwrap();
 
-        let error = StreamingLlamaModel::load_with_runtime_config(
-            &data_source,
-            &mut budget,
-            &config,
-        )
-        .unwrap_err();
+        let error =
+            StreamingLlamaModel::load_with_runtime_config(&data_source, &mut budget, &config)
+                .unwrap_err();
         assert!(error.contains("configured layer cache capacity"));
         assert_eq!(budget.used_bytes(), used_before);
         assert_eq!(budget.get("existing"), Some(17));
@@ -1942,7 +2110,10 @@ mod tests {
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
         let desc = ds.get_descriptor("test.weight").unwrap();
         assert_eq!(desc.byte_length, Some(32));
-        assert_eq!(TensorData::resident_bytes_for(GgmlType::F32, 8, 32).unwrap(), 32);
+        assert_eq!(
+            TensorData::resident_bytes_for(GgmlType::F32, 8, 32).unwrap(),
+            32
+        );
         assert_eq!(tensor_load_charge_bytes(GgmlType::F32, 32).unwrap(), 32);
 
         // Exactly 32 bytes remain. The direct loader succeeds because its only
@@ -1966,11 +2137,15 @@ mod tests {
         let mut tight = MemoryBudget::new(128).unwrap();
         tight.allocate("existing", 97).unwrap();
         let before = tight.used_bytes();
-        let error = load_persistent_weight(&ds, "test.weight", &mut tight, &Profiler::default()).unwrap_err();
+        let error = load_persistent_weight(&ds, "test.weight", &mut tight, &Profiler::default())
+            .unwrap_err();
         assert!(error.contains("load charge"), "unexpected error: {}", error);
         assert_eq!(tight.used_bytes(), before);
         assert!(tight.get("weight:test.weight").is_none());
-        assert!(!tight.allocations().keys().any(|name| name.starts_with("tmp:")));
+        assert!(!tight
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("tmp:")));
     }
 
     #[test]
@@ -1978,10 +2153,20 @@ mod tests {
         let raw: Vec<u8> = (0..8).flat_map(|_| 0x3C00u16.to_le_bytes()).collect();
         let tmp = create_single_tensor_gguf("test.weight", GgmlType::F16, &[8], &raw);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
-        let file_bytes = ds.get_descriptor("test.weight").unwrap().byte_length.unwrap();
+        let file_bytes = ds
+            .get_descriptor("test.weight")
+            .unwrap()
+            .byte_length
+            .unwrap();
         assert_eq!(file_bytes, 8 * 2);
-        assert_eq!(tensor_load_charge_bytes(GgmlType::F16, file_bytes).unwrap(), 3 * file_bytes);
-        assert_eq!(TensorData::resident_bytes_for(GgmlType::F16, 8, file_bytes).unwrap(), 8 * 4);
+        assert_eq!(
+            tensor_load_charge_bytes(GgmlType::F16, file_bytes).unwrap(),
+            3 * file_bytes
+        );
+        assert_eq!(
+            TensorData::resident_bytes_for(GgmlType::F16, 8, file_bytes).unwrap(),
+            8 * 4
+        );
 
         let mut budget = MemoryBudget::new(128).unwrap();
         let (weight, allocation) =
@@ -2003,10 +2188,20 @@ mod tests {
         let raw: Vec<u8> = (0..8).flat_map(|_| one.to_le_bytes()).collect();
         let tmp = create_single_tensor_gguf("test.weight", GgmlType::BF16, &[8], &raw);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
-        let file_bytes = ds.get_descriptor("test.weight").unwrap().byte_length.unwrap();
+        let file_bytes = ds
+            .get_descriptor("test.weight")
+            .unwrap()
+            .byte_length
+            .unwrap();
         assert_eq!(file_bytes, 8 * 2);
-        assert_eq!(tensor_load_charge_bytes(GgmlType::BF16, file_bytes).unwrap(), 3 * file_bytes);
-        assert_eq!(TensorData::resident_bytes_for(GgmlType::BF16, 8, file_bytes).unwrap(), 8 * 4);
+        assert_eq!(
+            tensor_load_charge_bytes(GgmlType::BF16, file_bytes).unwrap(),
+            3 * file_bytes
+        );
+        assert_eq!(
+            TensorData::resident_bytes_for(GgmlType::BF16, 8, file_bytes).unwrap(),
+            8 * 4
+        );
 
         let mut budget = MemoryBudget::new(128).unwrap();
         let (weight, allocation) =
@@ -2029,10 +2224,20 @@ mod tests {
         raw.extend_from_slice(&[0x88; 16]);
         let tmp = create_single_tensor_gguf("test.weight", GgmlType::Q4_0, &[32], &raw);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
-        let file_bytes = ds.get_descriptor("test.weight").unwrap().byte_length.unwrap();
+        let file_bytes = ds
+            .get_descriptor("test.weight")
+            .unwrap()
+            .byte_length
+            .unwrap();
         assert_eq!(file_bytes, 18);
-        assert_eq!(tensor_load_charge_bytes(GgmlType::Q4_0, file_bytes).unwrap(), file_bytes);
-        assert_eq!(TensorData::resident_bytes_for(GgmlType::Q4_0, 32, file_bytes).unwrap(), file_bytes);
+        assert_eq!(
+            tensor_load_charge_bytes(GgmlType::Q4_0, file_bytes).unwrap(),
+            file_bytes
+        );
+        assert_eq!(
+            TensorData::resident_bytes_for(GgmlType::Q4_0, 32, file_bytes).unwrap(),
+            file_bytes
+        );
 
         let mut budget = MemoryBudget::new(72).unwrap();
         let (weight, allocation) =
@@ -2041,7 +2246,9 @@ mod tests {
         assert_eq!(weight.resident_bytes(), 18);
         match &weight {
             PersistentWeight::Resident(tensor) => assert!(tensor.is_quantized()),
-            PersistentWeight::Streamed(_) => panic!("Q4_0 tensor should fit at the policy boundary"),
+            PersistentWeight::Streamed(_) => {
+                panic!("Q4_0 tensor should fit at the policy boundary")
+            }
         }
         assert_eq!(allocation.as_deref(), Some("weight:test.weight"));
         assert_eq!(budget.get("weight:test.weight"), Some(18));
@@ -2055,13 +2262,16 @@ mod tests {
     fn test_persistent_policy_uses_decoded_resident_size() {
         // F32: 32 resident bytes fit exactly at the 25% boundary.
         let f32_raw = vec![0u8; 8 * 4];
-        let f32_tmp =
-            create_single_tensor_gguf("test.weight", GgmlType::F32, &[8], &f32_raw);
-        let f32_ds =
-            ramforge_core::datasource::GgufDataSource::open(f32_tmp.path()).unwrap();
+        let f32_tmp = create_single_tensor_gguf("test.weight", GgmlType::F32, &[8], &f32_raw);
+        let f32_ds = ramforge_core::datasource::GgufDataSource::open(f32_tmp.path()).unwrap();
         let mut f32_budget = MemoryBudget::new(128).unwrap();
-        let (f32_weight, f32_allocation) =
-            load_persistent_weight(&f32_ds, "test.weight", &mut f32_budget, &Profiler::default()).unwrap();
+        let (f32_weight, f32_allocation) = load_persistent_weight(
+            &f32_ds,
+            "test.weight",
+            &mut f32_budget,
+            &Profiler::default(),
+        )
+        .unwrap();
         assert!(f32_weight.is_resident());
         assert!(f32_allocation.is_some());
         drop(f32_weight);
@@ -2077,8 +2287,13 @@ mod tests {
             let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
             let mut budget = MemoryBudget::new(96).unwrap();
             let (weight, allocation) =
-                load_persistent_weight(&ds, "test.weight", &mut budget, &Profiler::default()).unwrap();
-            assert!(weight.is_streamed(), "{} should be streamed", ggml_type.name());
+                load_persistent_weight(&ds, "test.weight", &mut budget, &Profiler::default())
+                    .unwrap();
+            assert!(
+                weight.is_streamed(),
+                "{} should be streamed",
+                ggml_type.name()
+            );
             assert!(allocation.is_none());
             assert_eq!(budget.used_bytes(), 0);
             assert!(budget.get("weight:test.weight").is_none());
@@ -2107,8 +2322,14 @@ mod tests {
         );
         assert_eq!(budget.used_bytes(), before);
         assert_eq!(budget.get("existing"), Some(17));
-        assert!(!budget.allocations().keys().any(|name| name.starts_with("weight:")));
-        assert!(!budget.allocations().keys().any(|name| name.starts_with("tmp:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("weight:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("tmp:")));
     }
 
     #[test]
@@ -2155,7 +2376,10 @@ mod tests {
         model.clear_layer_cache(&mut budget).unwrap();
         assert_eq!(budget.used_bytes(), persistent_used);
         assert!(budget.get("tmp:hidden").is_none());
-        assert!(!budget.allocations().keys().any(|name| name.starts_with("tmp:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("tmp:")));
     }
 
     #[test]
@@ -2196,12 +2420,9 @@ mod tests {
         let data_source = GgufDataSource::open(tmp.path()).unwrap();
         let mut budget = MemoryBudget::new(1024 * 1024).unwrap();
         let config = RuntimeConfig::new(1, 1024 * 1024, false, 0, true, false).unwrap();
-        let model = StreamingLlamaModel::load_with_runtime_config(
-            &data_source,
-            &mut budget,
-            &config,
-        )
-        .unwrap();
+        let model =
+            StreamingLlamaModel::load_with_runtime_config(&data_source, &mut budget, &config)
+                .unwrap();
 
         data_source.set_profiling(true);
         data_source.reset_io_profile();
@@ -2296,14 +2517,22 @@ mod tests {
             .allocations()
             .keys()
             .any(|name| name.starts_with("layer:0:")));
-        assert!(!budget.allocations().keys().any(|name| name.starts_with("tmp:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|name| name.starts_with("tmp:")));
     }
 
     #[test]
     fn test_out_of_core_model_larger_than_budget() {
         let tmp = create_model_with_n_layers(8, 32, 64);
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
-        let total_bytes: u64 = ds.model().tensors.iter().filter_map(|t| t.byte_length).sum();
+        let total_bytes: u64 = ds
+            .model()
+            .tensors
+            .iter()
+            .filter_map(|t| t.byte_length)
+            .sum();
 
         // Per layer ~41 KiB; direct F32 loading charges one final
         // representation, plus persistents (~2.1 KiB). 96 KiB fits one layer
@@ -2348,17 +2577,53 @@ mod tests {
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
         };
-        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "general.architecture",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
         add_kv("llama.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
         add_kv("llama.context_length", 4, Box::new(|b| write_u32(b, 64)));
-        add_kv("llama.embedding_length", 4, Box::new(|b| write_u32(b, n_embd as u32)));
-        add_kv("llama.block_count", 4, Box::new(|b| write_u32(b, n_layers as u32)));
-        add_kv("llama.feed_forward_length", 4, Box::new(|b| write_u32(b, ffn as u32)));
-        add_kv("llama.attention.head_count", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.head_count_kv", 4, Box::new(|b| write_u32(b, 2)));
-        add_kv("llama.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
-        add_kv("llama.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
-        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv(
+            "llama.embedding_length",
+            4,
+            Box::new(|b| write_u32(b, n_embd as u32)),
+        );
+        add_kv(
+            "llama.block_count",
+            4,
+            Box::new(|b| write_u32(b, n_layers as u32)),
+        );
+        add_kv(
+            "llama.feed_forward_length",
+            4,
+            Box::new(|b| write_u32(b, ffn as u32)),
+        );
+        add_kv(
+            "llama.attention.head_count",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.head_count_kv",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.layer_norm_rms_epsilon",
+            6,
+            Box::new(|b| write_f32(b, 1e-5)),
+        );
+        add_kv(
+            "llama.rope.freq_base",
+            6,
+            Box::new(|b| write_f32(b, 10000.0)),
+        );
+        add_kv(
+            "tokenizer.ggml.model",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
 
         let mut offset = 0u64;
         let mut defs: Vec<(String, Vec<u64>, u32)> = Vec::new();
@@ -2366,22 +2631,56 @@ mod tests {
         defs.push(("token_embd.weight".to_string(), vec![n_embd as u64, 16], 0)); // F32 for simplicity
         defs.push(("output_norm.weight".to_string(), vec![n_embd as u64], 0));
         for i in 0..n_layers {
-            defs.push((format!("blk.{}.attn_norm.weight", i), vec![n_embd as u64], 0));
-            defs.push((format!("blk.{}.attn_q.weight", i), vec![n_embd as u64, n_embd as u64], 2)); // Q4_0
-            defs.push((format!("blk.{}.attn_k.weight", i), vec![n_embd as u64, n_embd as u64], 2));
-            defs.push((format!("blk.{}.attn_v.weight", i), vec![n_embd as u64, n_embd as u64], 2));
-            defs.push((format!("blk.{}.attn_output.weight", i), vec![n_embd as u64, n_embd as u64], 2));
+            defs.push((
+                format!("blk.{}.attn_norm.weight", i),
+                vec![n_embd as u64],
+                0,
+            ));
+            defs.push((
+                format!("blk.{}.attn_q.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                2,
+            )); // Q4_0
+            defs.push((
+                format!("blk.{}.attn_k.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                2,
+            ));
+            defs.push((
+                format!("blk.{}.attn_v.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                2,
+            ));
+            defs.push((
+                format!("blk.{}.attn_output.weight", i),
+                vec![n_embd as u64, n_embd as u64],
+                2,
+            ));
             defs.push((format!("blk.{}.ffn_norm.weight", i), vec![n_embd as u64], 0));
             // ggml layout [in, out]: gate/up map n_embd -> ffn, down maps ffn -> n_embd
-            defs.push((format!("blk.{}.ffn_gate.weight", i), vec![n_embd as u64, ffn as u64], 2));
-            defs.push((format!("blk.{}.ffn_up.weight", i), vec![n_embd as u64, ffn as u64], 2));
-            defs.push((format!("blk.{}.ffn_down.weight", i), vec![ffn as u64, n_embd as u64], 2));
+            defs.push((
+                format!("blk.{}.ffn_gate.weight", i),
+                vec![n_embd as u64, ffn as u64],
+                2,
+            ));
+            defs.push((
+                format!("blk.{}.ffn_up.weight", i),
+                vec![n_embd as u64, ffn as u64],
+                2,
+            ));
+            defs.push((
+                format!("blk.{}.ffn_down.weight", i),
+                vec![ffn as u64, n_embd as u64],
+                2,
+            ));
         }
 
         for (name, dims, ty) in &defs {
             write_string(&mut buf, name);
             write_u32(&mut buf, dims.len() as u32);
-            for d in dims { write_u64(&mut buf, *d); }
+            for d in dims {
+                write_u64(&mut buf, *d);
+            }
             write_u32(&mut buf, *ty);
             write_u64(&mut buf, offset);
             let elems: u64 = dims.iter().product();
@@ -2398,16 +2697,23 @@ mod tests {
 
         // Write dummy data: for F32 tensors 1.0, for Q4_0: d=1.0, qs=0x88 (0)
         // token_embd F32
-        for _ in 0..16*n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); }
+        for _ in 0..16 * n_embd {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
         // output_norm
-        for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); }
+        for _ in 0..n_embd {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
         for _ in 0..n_layers {
             // attn_norm F32
-            for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); }
+            for _ in 0..n_embd {
+                buf.extend_from_slice(&1.0f32.to_le_bytes());
+            }
             // Q4_0 tensors: each 32 elements => 18 bytes per block
             // n_embd 32 => 1 block per row? For [32,32] => 32 rows * 18 =576 bytes per tensor
             // We'll write zeros for simplicity: d=1.0, qs=0x88 (dequant 0)
-            for _ in 0..4 { // 4 tensors * 576?
+            for _ in 0..4 {
+                // 4 tensors * 576?
                 for _ in 0..n_embd {
                     let d_fp16: u16 = 0x3C00;
                     buf.extend_from_slice(&d_fp16.to_le_bytes());
@@ -2415,7 +2721,9 @@ mod tests {
                 }
             }
             // ffn_norm
-            for _ in 0..n_embd { buf.extend_from_slice(&1.0f32.to_le_bytes()); }
+            for _ in 0..n_embd {
+                buf.extend_from_slice(&1.0f32.to_le_bytes());
+            }
             // ffn_gate, up, down Q4_0
             // ffn 64, n_embd 32: [64,32] => 64 rows, each row 32 elements => 1 block per row => 64*18=1152 per tensor
             for _ in 0..2 {
@@ -2470,14 +2778,15 @@ mod tests {
         let bytes = vec![0; ramforge_core::quant::BLOCK_SIZE_Q4_K];
         let profiler = Profiler::default();
         profiler.set_enabled(true);
-        let tensor =
-            load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
+        let tensor = load_tensor_data_from_borrowed_bytes(&descriptor, &bytes, &profiler).unwrap();
         let after_load = profiler.snapshot();
         assert_eq!(after_load.grouped_quantized_copy_count, 1);
 
         let resident_bytes = tensor.resident_bytes() as u64;
         let mut budget = MemoryBudget::new(resident_bytes).unwrap();
-        budget.allocate("layer:0:attn_q.weight", resident_bytes).unwrap();
+        budget
+            .allocate("layer:0:attn_q.weight", resident_bytes)
+            .unwrap();
         let mut cache = crate::layer_cache::LayerCache::new(resident_bytes);
         assert!(matches!(
             cache
@@ -2535,7 +2844,10 @@ mod tests {
         model.release_layer(0, &mut budget, &mut stats);
         assert_eq!(budget.used_bytes(), persistents_used);
         drop(layer);
-        assert!(!budget.allocations().keys().any(|k| k.starts_with("layer:0:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|k| k.starts_with("layer:0:")));
     }
 
     #[test]
@@ -2604,7 +2916,10 @@ mod tests {
         );
         // The failed load must leave no partial layer or cache charges behind.
         assert_eq!(budget.used_bytes(), before);
-        assert!(!budget.allocations().keys().any(|k| k.starts_with("layer:0:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|k| k.starts_with("layer:0:")));
         let cache = model.layer_cache.lock().unwrap();
         assert_eq!(cache.entry_count(), 0);
         assert_eq!(cache.used_bytes(), 0);
@@ -2659,7 +2974,10 @@ mod tests {
         );
         // Rejection must not leak the layer's charges.
         assert_eq!(budget.used_bytes(), before);
-        assert!(!budget.allocations().keys().any(|k| k.starts_with("layer:0:")));
+        assert!(!budget
+            .allocations()
+            .keys()
+            .any(|k| k.starts_with("layer:0:")));
     }
 
     #[test]
@@ -2681,5 +2999,79 @@ mod tests {
             err
         );
         assert_eq!(budget.used_bytes(), before);
+    }
+
+    #[test]
+    fn test_q4_0_matvec_counters_are_recorded_without_affecting_result() {
+        use ramforge_core::quant::{BLOCK_SIZE_Q4_0, QK4_0};
+        use std::time::Duration;
+
+        // Build a small Q4_0 weight matrix under the ggml [in, out] layout:
+        // in_dim=32 columns, out_dim=2 rows. Each block encodes zero
+        // magnitudes (qs[i] = 0x88 dequants to 0) so the numerical output is
+        // deterministic zeros regardless of input.
+        let in_dim = 32u64;
+        let out_dim = 2u64;
+        assert_eq!(
+            in_dim as usize % QK4_0,
+            0,
+            "in_dim must be a multiple of QK4_0"
+        );
+        let blocks_per_row = in_dim as usize / QK4_0;
+        let weight_bytes = (out_dim as usize) * blocks_per_row * BLOCK_SIZE_Q4_0;
+        let mut raw = Vec::with_capacity(weight_bytes);
+        for _ in 0..(out_dim as usize) * blocks_per_row {
+            // d = 1.0 in fp16 (0x3C00), qs all 0x88 => dequants to zeros
+            raw.extend_from_slice(&0x3C00u16.to_le_bytes());
+            raw.extend_from_slice(&[0x88; 16]);
+        }
+        assert_eq!(raw.len(), weight_bytes);
+        let w =
+            TensorData::from_bytes(GgmlType::Q4_0, vec![in_dim, out_dim], in_dim * out_dim, raw)
+                .unwrap();
+
+        let profiler = Profiler::default();
+        profiler.set_enabled(true);
+        let backend = crate::backend::CpuBackend::scalar();
+        let x = vec![0.5f32; in_dim as usize];
+        let mut y = vec![-999.0f32; out_dim as usize];
+        matvec_backend(&backend, &profiler, &w, &x, &mut y).unwrap();
+
+        // Numerical result must be unchanged (zeros).
+        for value in y {
+            assert!(value.abs() < 1e-6, "expected zero output, got {}", value);
+        }
+
+        let blocks_total = out_dim * blocks_per_row as u64;
+        let weight_total = weight_bytes as u64;
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.q4_0_matvec_calls, 1);
+        assert_eq!(snapshot.q4_0_matvec_rows, out_dim);
+        assert_eq!(snapshot.q4_0_matvec_input_elements, in_dim);
+        assert_eq!(snapshot.q4_0_matvec_blocks, blocks_total);
+        assert_eq!(snapshot.q4_0_matvec_weight_bytes, weight_total);
+        // Timing must still be recorded under QuantizedMatvec.
+        assert!(snapshot.quantized_matvec >= Duration::ZERO);
+
+        // A second call accumulates additively.
+        let mut y2 = vec![-999.0f32; out_dim as usize];
+        matvec_backend(&backend, &profiler, &w, &x, &mut y2).unwrap();
+        let snapshot2 = profiler.snapshot();
+        assert_eq!(snapshot2.q4_0_matvec_calls, 2);
+        assert_eq!(snapshot2.q4_0_matvec_rows, 2 * out_dim);
+        assert_eq!(snapshot2.q4_0_matvec_input_elements, 2 * in_dim);
+        assert_eq!(snapshot2.q4_0_matvec_blocks, 2 * blocks_total);
+        assert_eq!(snapshot2.q4_0_matvec_weight_bytes, 2 * weight_total);
+
+        // Disabled profiler must not count (counters remain at zero after reset).
+        profiler.reset();
+        profiler.set_enabled(false);
+        let mut y3 = vec![-999.0f32; out_dim as usize];
+        matvec_backend(&backend, &profiler, &w, &x, &mut y3).unwrap();
+        let snapshot3 = profiler.snapshot();
+        assert_eq!(snapshot3.q4_0_matvec_calls, 0);
+        assert_eq!(snapshot3.q4_0_matvec_rows, 0);
+        assert_eq!(snapshot3.q4_0_matvec_blocks, 0);
+        assert_eq!(snapshot3.q4_0_matvec_weight_bytes, 0);
     }
 }

@@ -56,6 +56,12 @@ struct ProfileCounters {
     peak_cached_layer_count: AtomicU64,
     cache_bytes: AtomicU64,
     peak_cache_bytes: AtomicU64,
+    // Q4_0 matvec workload counters.
+    q4_0_matvec_calls: AtomicU64,
+    q4_0_matvec_rows: AtomicU64,
+    q4_0_matvec_input_elements: AtomicU64,
+    q4_0_matvec_blocks: AtomicU64,
+    q4_0_matvec_weight_bytes: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -96,6 +102,16 @@ pub struct ProfileSnapshot {
     pub peak_cached_layer_count: u64,
     pub cache_bytes: u64,
     pub peak_cache_bytes: u64,
+    /// Number of distinct Q4_0 matrix-vector calls issued.
+    pub q4_0_matvec_calls: u64,
+    /// Total output rows (out_dim) across all Q4_0 matvec calls.
+    pub q4_0_matvec_rows: u64,
+    /// Total input elements (in_dim summed across all calls).
+    pub q4_0_matvec_input_elements: u64,
+    /// Total Q4_0 blocks processed.
+    pub q4_0_matvec_blocks: u64,
+    /// Total weight bytes read for Q4_0 matvec work (each row is visited once per call).
+    pub q4_0_matvec_weight_bytes: u64,
 }
 
 impl Profiler {
@@ -140,6 +156,11 @@ impl Profiler {
             &self.counters.peak_cached_layer_count,
             &self.counters.cache_bytes,
             &self.counters.peak_cache_bytes,
+            &self.counters.q4_0_matvec_calls,
+            &self.counters.q4_0_matvec_rows,
+            &self.counters.q4_0_matvec_input_elements,
+            &self.counters.q4_0_matvec_blocks,
+            &self.counters.q4_0_matvec_weight_bytes,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -198,6 +219,36 @@ impl Profiler {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record Q4_0 matvec workload counters. Cheap: one fetch_add per metric per
+    /// invocation, no per-row/per-block logging. Weight bytes is the caller's
+    /// responsibility to compute from the tensor's shape.
+    pub(crate) fn record_q4_0_matvec(
+        &self,
+        rows: u64,
+        input_elements: u64,
+        blocks: u64,
+        weight_bytes: u64,
+    ) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.counters
+            .q4_0_matvec_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .q4_0_matvec_rows
+            .fetch_add(rows, Ordering::Relaxed);
+        self.counters
+            .q4_0_matvec_input_elements
+            .fetch_add(input_elements, Ordering::Relaxed);
+        self.counters
+            .q4_0_matvec_blocks
+            .fetch_add(blocks, Ordering::Relaxed);
+        self.counters
+            .q4_0_matvec_weight_bytes
+            .fetch_add(weight_bytes, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_token(&self) {
         if self.is_enabled() {
             self.counters.tokens.fetch_add(1, Ordering::Relaxed);
@@ -206,13 +257,17 @@ impl Profiler {
 
     pub(crate) fn record_prompt_forward(&self) {
         if self.is_enabled() {
-            self.counters.prompt_forwards.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .prompt_forwards
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
     pub(crate) fn record_decode_forward(&self) {
         if self.is_enabled() {
-            self.counters.decode_forwards.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .decode_forwards
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -315,6 +370,17 @@ impl Profiler {
                 .load(Ordering::Relaxed),
             cache_bytes: self.counters.cache_bytes.load(Ordering::Relaxed),
             peak_cache_bytes: self.counters.peak_cache_bytes.load(Ordering::Relaxed),
+            q4_0_matvec_calls: self.counters.q4_0_matvec_calls.load(Ordering::Relaxed),
+            q4_0_matvec_rows: self.counters.q4_0_matvec_rows.load(Ordering::Relaxed),
+            q4_0_matvec_input_elements: self
+                .counters
+                .q4_0_matvec_input_elements
+                .load(Ordering::Relaxed),
+            q4_0_matvec_blocks: self.counters.q4_0_matvec_blocks.load(Ordering::Relaxed),
+            q4_0_matvec_weight_bytes: self
+                .counters
+                .q4_0_matvec_weight_bytes
+                .load(Ordering::Relaxed),
         }
     }
 }

@@ -587,6 +587,25 @@ fn render_generation_result(app: &TuiApp, output: &mut String) {
             "Quantized matvec",
             &format_seconds(c.quantized_matvec_seconds),
         );
+        if c.q4_0_matvec_calls > 0 {
+            field(
+                output,
+                "Q4_0 matvec calls",
+                &c.q4_0_matvec_calls.to_string(),
+            );
+            field(output, "Q4_0 matvec rows", &c.q4_0_matvec_rows.to_string());
+            field(
+                output,
+                "Q4_0 input elements",
+                &c.q4_0_matvec_input_elements.to_string(),
+            );
+            field(output, "Q4_0 blocks", &c.q4_0_matvec_blocks.to_string());
+            field(
+                output,
+                "Q4_0 weight bytes",
+                &c.q4_0_matvec_weight_bytes.to_string(),
+            );
+        }
         field(
             output,
             "Dequantization",

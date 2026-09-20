@@ -101,6 +101,11 @@ pub struct CpuComputeDiagnostics {
     pub grouped_quantized_copy_count: u64,
     pub grouped_quantized_copy_seconds: f64,
     pub grouped_quantized_copy_bytes: u64,
+    pub q4_0_matvec_calls: u64,
+    pub q4_0_matvec_rows: u64,
+    pub q4_0_matvec_input_elements: u64,
+    pub q4_0_matvec_blocks: u64,
+    pub q4_0_matvec_weight_bytes: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -324,6 +329,11 @@ pub fn build_diagnostic_result(inputs: DiagnosticInputs<'_>) -> DiagnosticResult
         grouped_quantized_copy_count: run.grouped_quantized_copy_count,
         grouped_quantized_copy_seconds: run.grouped_quantized_copy_time.as_secs_f64(),
         grouped_quantized_copy_bytes: run.grouped_quantized_copy_bytes,
+        q4_0_matvec_calls: run.q4_0_matvec_calls,
+        q4_0_matvec_rows: run.q4_0_matvec_rows,
+        q4_0_matvec_input_elements: run.q4_0_matvec_input_elements,
+        q4_0_matvec_blocks: run.q4_0_matvec_blocks,
+        q4_0_matvec_weight_bytes: run.q4_0_matvec_weight_bytes,
     };
 
     let memory = MemoryDiagnostics {

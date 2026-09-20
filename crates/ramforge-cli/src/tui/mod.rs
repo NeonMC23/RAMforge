@@ -479,6 +479,7 @@ fn emit_generation_summary(
          layer_loads={} layer_releases={} prompt_forwards={} decode_forwards={} terminal_forwards_skipped={}\r\n\
          profile_total_seconds={:.3} prompt_seconds={:.3} layer_load_seconds={:.3} layer_compute_seconds={:.3} logits_seconds={:.3}\r\n\
          quantized_matvec_seconds={:.3} float_matvec_seconds={:.3} dequantization_seconds={:.3} grouped_quantized_copies={} grouped_quantized_copy_seconds={:.3}\r\n\
+         q4_0_matvec_calls={} q4_0_matvec_rows={} q4_0_matvec_input_elements={} q4_0_matvec_blocks={} q4_0_matvec_weight_bytes={}\r\n\
          peak_managed_bytes={} budget_bytes={}\r\n",
         prompt_token_count,
         generated_token_count,
@@ -512,6 +513,11 @@ fn emit_generation_summary(
         runtime_profile.dequantization.as_secs_f64(),
         runtime_profile.grouped_quantized_copy_count,
         runtime_profile.grouped_quantized_copy_time.as_secs_f64(),
+        runtime_profile.q4_0_matvec_calls,
+        runtime_profile.q4_0_matvec_rows,
+        runtime_profile.q4_0_matvec_input_elements,
+        runtime_profile.q4_0_matvec_blocks,
+        runtime_profile.q4_0_matvec_weight_bytes,
         profile.ramforge_peak_bytes,
         profile.ramforge_budget_bytes,
     );
