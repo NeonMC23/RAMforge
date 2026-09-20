@@ -13,10 +13,9 @@ use std::time::{Duration, Instant};
 
 use ramforge_core::quant::{
     dequantize_row_q2_k, dequantize_row_q3_k, dequantize_row_q4_0, dequantize_row_q4_k,
-    dequantize_row_q5_k, dequantize_row_q6_k, dequantize_row_q8_0, dequantize_row_q8_k,
-    BlockQ8_0, BLOCK_SIZE_Q2_K, BLOCK_SIZE_Q3_K, BLOCK_SIZE_Q4_0,
-    BLOCK_SIZE_Q4_K, BLOCK_SIZE_Q5_K, BLOCK_SIZE_Q6_K, BLOCK_SIZE_Q8_0, BLOCK_SIZE_Q8_K,
-    QK4_0, QK8_0, QK_K,
+    dequantize_row_q5_k, dequantize_row_q6_k, dequantize_row_q8_0, dequantize_row_q8_k, BlockQ8_0,
+    BLOCK_SIZE_Q2_K, BLOCK_SIZE_Q3_K, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q4_K, BLOCK_SIZE_Q5_K,
+    BLOCK_SIZE_Q6_K, BLOCK_SIZE_Q8_0, BLOCK_SIZE_Q8_K, QK4_0, QK8_0, QK_K,
 };
 use ramforge_core::DataSourceError;
 
@@ -159,11 +158,7 @@ fn main() {
     );
 
     let q4_production = benchmark("Q4_0 production", dequantize_row_q4_0, &q4_0);
-    let q8_reference = benchmark(
-        "Q8_0 reference",
-        dequantize_row_q8_0_reference,
-        &q8_0,
-    );
+    let q8_reference = benchmark("Q8_0 reference", dequantize_row_q8_0_reference, &q8_0);
     let q8_direct = benchmark("Q8_0 direct", dequantize_row_q8_0, &q8_0);
 
     for (name, result) in [
@@ -181,9 +176,7 @@ fn main() {
 
     println!();
     print_relative_difference("Q8_0", q8_reference.median, q8_direct.median);
-    println!(
-        "Allocation counters use separate decode loops; timed samples disable counting."
-    );
+    println!("Allocation counters use separate decode loops; timed samples disable counting.");
     println!("Inputs and output buffers are preallocated outside the measured regions.");
 }
 
@@ -210,12 +203,7 @@ fn build_workload(
     }
 }
 
-fn assert_reference_parity(
-    name: &str,
-    reference: Decoder,
-    direct: Decoder,
-    workload: &Workload,
-) {
+fn assert_reference_parity(name: &str, reference: Decoder, direct: Decoder, workload: &Workload) {
     let mut expected = vec![0.0f32; ELEMENTS_PER_ROW];
     let mut actual = vec![f32::NAN; ELEMENTS_PER_ROW];
     for row in workload.bytes.chunks_exact(workload.row_bytes) {
@@ -247,13 +235,7 @@ fn validate_decoder(name: &str, decoder: Decoder, workload: &Workload) {
 
 fn benchmark(name: &str, decoder: Decoder, workload: &Workload) -> BenchResult {
     let mut output = vec![0.0f32; ELEMENTS_PER_ROW];
-    let _ = run_sample(
-        decoder,
-        workload,
-        WARMUP_ITERATIONS,
-        &mut output,
-        false,
-    );
+    let _ = run_sample(decoder, workload, WARMUP_ITERATIONS, &mut output, false);
 
     let mut samples = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
@@ -269,13 +251,7 @@ fn benchmark(name: &str, decoder: Decoder, workload: &Workload) -> BenchResult {
     let median = samples[SAMPLES / 2];
     let min = samples.first().unwrap().elapsed;
     let max = samples.last().unwrap().elapsed;
-    let allocations = run_sample(
-        decoder,
-        workload,
-        ITERATIONS_PER_SAMPLE,
-        &mut output,
-        true,
-    );
+    let allocations = run_sample(decoder, workload, ITERATIONS_PER_SAMPLE, &mut output, true);
 
     let decoded_elements = (ROWS * ELEMENTS_PER_ROW * ITERATIONS_PER_SAMPLE) as f64;
     let input_bytes = (workload.bytes.len() * ITERATIONS_PER_SAMPLE) as f64;
@@ -371,11 +347,7 @@ fn dequantize_row_q8_0_reference(
             bytes.len()
         )));
     }
-    for (index, chunk) in bytes
-        .chunks(BLOCK_SIZE_Q8_0)
-        .enumerate()
-        .take(n_blocks)
-    {
+    for (index, chunk) in bytes.chunks(BLOCK_SIZE_Q8_0).enumerate().take(n_blocks) {
         let block = BlockQ8_0::from_bytes(chunk)?;
         let mut decoded = [0.0f32; QK8_0];
         block.dequantize(&mut decoded);
@@ -388,8 +360,7 @@ const F16_SCALES: [u16; 4] = [0x3400, 0x3800, 0x3A00, 0x3C00];
 const F16_MINS: [u16; 4] = [0x2C00, 0x3000, 0x3200, 0x3400];
 
 fn pattern(seed: usize, index: usize, salt: usize) -> u8 {
-    seed
-        .wrapping_mul(37 + salt)
+    seed.wrapping_mul(37 + salt)
         .wrapping_add(index.wrapping_mul(29 + 2 * salt))
         .wrapping_add(17 * salt) as u8
 }

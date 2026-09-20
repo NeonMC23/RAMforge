@@ -68,9 +68,13 @@ mod tests {
 
     #[test]
     fn test_parse_proc_memory_fields() {
-        let input = "MemTotal:       16384 kB\nMemAvailable:    4096 kB\nVmRSS:             512 kB\n";
+        let input =
+            "MemTotal:       16384 kB\nMemAvailable:    4096 kB\nVmRSS:             512 kB\n";
         assert_eq!(parse_kib_field(input, "MemTotal:"), Some(16 * 1024 * 1024));
-        assert_eq!(parse_kib_field(input, "MemAvailable:"), Some(4 * 1024 * 1024));
+        assert_eq!(
+            parse_kib_field(input, "MemAvailable:"),
+            Some(4 * 1024 * 1024)
+        );
         assert_eq!(parse_kib_field(input, "VmRSS:"), Some(512 * 1024));
     }
 

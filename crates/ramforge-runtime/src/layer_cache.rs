@@ -79,7 +79,10 @@ impl<T> LayerCache<T> {
         budget: &mut MemoryBudget,
     ) -> Result<InsertOutcome<T>, String> {
         if bytes == 0 || bytes > self.capacity_bytes {
-            return Ok(InsertOutcome::Skipped { value, evictions: 0 });
+            return Ok(InsertOutcome::Skipped {
+                value,
+                evictions: 0,
+            });
         }
         let active_prefix = format!("layer:{}:", layer_index);
         let active_charge_bytes = budget
@@ -88,7 +91,10 @@ impl<T> LayerCache<T> {
             .filter(|(name, _)| name.starts_with(&active_prefix))
             .try_fold(0u64, |total, (_, bytes)| total.checked_add(*bytes));
         if active_charge_bytes != Some(bytes) {
-            return Ok(InsertOutcome::Skipped { value, evictions: 0 });
+            return Ok(InsertOutcome::Skipped {
+                value,
+                evictions: 0,
+            });
         }
 
         let mut evictions = 0usize;
@@ -174,11 +180,7 @@ impl<T> LayerCache<T> {
         Ok(true)
     }
 
-    fn evict_layer(
-        &mut self,
-        layer_index: usize,
-        budget: &mut MemoryBudget,
-    ) -> Result<(), String> {
+    fn evict_layer(&mut self, layer_index: usize, budget: &mut MemoryBudget) -> Result<(), String> {
         self.release_entry(layer_index, budget)?;
         self.lru.retain(|index| *index != layer_index);
         Ok(())
@@ -274,7 +276,13 @@ mod tests {
         charge_layer(&mut budget, 3, 200);
         let before = budget.used_bytes();
         let outcome = cache.insert_loaded(3, "large", 200, &mut budget).unwrap();
-        assert!(matches!(outcome, InsertOutcome::Skipped { value: "large", evictions: 0 }));
+        assert!(matches!(
+            outcome,
+            InsertOutcome::Skipped {
+                value: "large",
+                evictions: 0
+            }
+        ));
         assert_eq!(budget.used_bytes(), before);
         assert_eq!(budget.get("layer:3:weight"), Some(200));
         assert_eq!(cache.used_bytes(), 0);
@@ -286,9 +294,7 @@ mod tests {
         let mut cache = LayerCache::new(200);
         for index in 0..2 {
             charge_layer(&mut budget, index, 100);
-            cache
-                .insert_loaded(index, index, 100, &mut budget)
-                .unwrap();
+            cache.insert_loaded(index, index, 100, &mut budget).unwrap();
         }
         assert_eq!(budget.used_bytes(), 200);
         assert_eq!(cache.evict_until_available(&mut budget, 200).unwrap(), 1);

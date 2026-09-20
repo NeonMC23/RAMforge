@@ -37,7 +37,9 @@ pub enum RuntimeConfigError {
 impl fmt::Display for RuntimeConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ZeroThreadCount => write!(formatter, "CPU thread count must be greater than zero"),
+            Self::ZeroThreadCount => {
+                write!(formatter, "CPU thread count must be greater than zero")
+            }
             Self::ZeroRamBudget => write!(formatter, "RAM budget must be greater than zero"),
             Self::LayerCacheEnabledWithoutCapacity => {
                 write!(formatter, "enabled layer cache must have non-zero capacity")

@@ -3,8 +3,8 @@
 //! Explicitly represented, grows as tokens are generated, avoids recomputing
 //! previous tokens, accounts for memory usage in RAMforge budget.
 
-use ramforge_core::memory::MemoryBudget;
 use ramforge_core::error::MemoryError;
+use ramforge_core::memory::MemoryBudget;
 
 /// KV cache for one layer or all layers?
 /// We implement per-model cache that holds K and V for all layers.
@@ -104,10 +104,7 @@ impl KvCache {
     }
 
     /// Try to allocate KV cache memory from budget
-    pub fn allocate_from_budget(
-        &self,
-        budget: &mut MemoryBudget,
-    ) -> Result<(), MemoryError> {
+    pub fn allocate_from_budget(&self, budget: &mut MemoryBudget) -> Result<(), MemoryError> {
         budget.allocate("kv_cache", self.total_bytes() as u64)
     }
 

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ramforge_core::GgmlType;
+use ramforge_runtime::backend::ComputeBackend as _;
 use ramforge_runtime::calibration::{
     CalibrationLimits, CalibrationPlan, CalibrationRunner, CalibrationTaskProgressState,
 };
@@ -445,7 +446,7 @@ fn emit_generation_start_diagnostic(
          cache_enabled={} cache_capacity_bytes={} read_coalescing={} grouped_buffer_reuse={}\r\n",
         prompt_token_count,
         max_tokens,
-        runtime.backend.num_threads,
+        runtime.backend.num_threads(),
         q4_0_tensors,
         config.layer_cache_enabled,
         runtime.model.layer_cache_capacity_bytes(),
@@ -485,7 +486,7 @@ fn emit_generation_summary(
         generated_token_count,
         elapsed_seconds,
         tokens_per_second,
-        runtime.backend.num_threads,
+        runtime.backend.num_threads(),
         profile.layer_cache_capacity_bytes,
         runtime_profile.peak_cached_layer_count,
         runtime.model.config.block_count,

@@ -17,7 +17,6 @@ use ramforge_core::quant::{
 };
 use ramforge_core::MemoryError;
 
-pub use crate::planner::{CALIBRATION_PLAN_VERSION, CALIBRATION_RULESET_VERSION};
 use crate::planner::{
     aggregate_observation_value, observation_quality_basis_points, CalibrationLevel,
     CalibrationResult, CapabilitySet, MachineProfile, MeasurementSample, ModelProfile,
@@ -25,6 +24,7 @@ use crate::planner::{
     PerformanceObservation, PlannerError, StorageProfile, StrategyId, UserProfile,
     PROFILE_SCHEMA_VERSION,
 };
+pub use crate::planner::{CALIBRATION_PLAN_VERSION, CALIBRATION_RULESET_VERSION};
 use crate::simd::dot_f32_scalar;
 
 const MAX_ABSOLUTE_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
@@ -157,7 +157,8 @@ impl CalibrationTask {
             return Err(CalibrationError::InvalidPlan("unbounded task resources"));
         }
         match self.kind {
-            CalibrationTestKind::SequentialStorageRead | CalibrationTestKind::StorageReadLatency
+            CalibrationTestKind::SequentialStorageRead
+            | CalibrationTestKind::StorageReadLatency
                 if self.storage_fingerprint.is_none() =>
             {
                 return Err(CalibrationError::InvalidPlan(
@@ -179,8 +180,8 @@ impl CalibrationTask {
 }
 
 fn work_volume_is_bounded(work: CalibrationWorkBudget) -> bool {
-    let measured_iterations = (work.iterations_per_sample as u64)
-        .checked_mul(work.sample_count as u64);
+    let measured_iterations =
+        (work.iterations_per_sample as u64).checked_mul(work.sample_count as u64);
     let total_iterations = measured_iterations
         .and_then(|iterations| iterations.checked_add(work.warmup_iterations as u64));
     let Some(total_iterations) = total_iterations else {
@@ -276,9 +277,12 @@ impl CalibrationPlan {
                 "storage file size does not match model profile",
             ));
         }
-        let available_ram_bytes = machine.available_ram_bytes.ok_or(
-            CalibrationError::InvalidPlan("available machine RAM is unknown"),
-        )?;
+        let available_ram_bytes =
+            machine
+                .available_ram_bytes
+                .ok_or(CalibrationError::InvalidPlan(
+                    "available machine RAM is unknown",
+                ))?;
         if limits.max_memory_bytes > available_ram_bytes {
             return Err(CalibrationError::InvalidPlan(
                 "calibration memory exceeds available machine RAM",
@@ -300,7 +304,11 @@ impl CalibrationPlan {
         let mut tasks = Vec::new();
         if user.calibration_level != CalibrationLevel::None {
             tasks.push(cpu_task(user.calibration_level, limits));
-            tasks.push(storage_task(user.calibration_level, storage_fingerprint, limits));
+            tasks.push(storage_task(
+                user.calibration_level,
+                storage_fingerprint,
+                limits,
+            ));
         }
         if level_at_least(user.calibration_level, CalibrationLevel::Standard) {
             tasks.push(memory_task(user.calibration_level, limits));
@@ -351,12 +359,7 @@ impl CalibrationPlan {
                 "strategy measurements require Thorough calibration",
             ));
         }
-        let task = strategy_task(
-            self.level,
-            strategy,
-            self.model_fingerprint,
-            self.limits,
-        );
+        let task = strategy_task(self.level, strategy, self.model_fingerprint, self.limits);
         if self
             .tasks
             .iter()
@@ -380,7 +383,9 @@ impl CalibrationPlan {
             || self.model_fingerprint == 0
             || self.storage_fingerprint == 0
         {
-            return Err(CalibrationError::InvalidPlan("invalid calibration identity"));
+            return Err(CalibrationError::InvalidPlan(
+                "invalid calibration identity",
+            ));
         }
         if self.level == CalibrationLevel::None && !self.tasks.is_empty() {
             return Err(CalibrationError::InvalidPlan(
@@ -462,15 +467,7 @@ impl CalibrationRunner {
         storage: &StorageProfile,
         capabilities: &CapabilitySet,
     ) -> Result<CalibrationResult, CalibrationError> {
-        self.run_with_progress(
-            plan,
-            user,
-            machine,
-            model,
-            storage,
-            capabilities,
-            |_| {},
-        )
+        self.run_with_progress(plan, user, machine, model, storage, capabilities, |_| {})
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -493,9 +490,12 @@ impl CalibrationRunner {
         model.validate()?;
         storage.validate()?;
         plan.limits.validate(user)?;
-        let available_ram_bytes = machine.available_ram_bytes.ok_or(
-            CalibrationError::InvalidPlan("current available RAM is unknown"),
-        )?;
+        let available_ram_bytes =
+            machine
+                .available_ram_bytes
+                .ok_or(CalibrationError::InvalidPlan(
+                    "current available RAM is unknown",
+                ))?;
         if plan.limits.max_memory_bytes > available_ram_bytes {
             return Err(CalibrationError::InvalidPlan(
                 "calibration memory exceeds current available RAM",
@@ -554,15 +554,9 @@ impl CalibrationRunner {
                     ObservationStatusReason::DependencyUnavailable,
                 )
             } else if let Some(reason) = unavailable_requirement(task, capabilities) {
-                non_measured_observation(
-                    task,
-                    plan.level,
-                    ObservationStatus::Unavailable,
-                    reason,
-                )
+                non_measured_observation(task, plan.level, ObservationStatus::Unavailable, reason)
             } else if task.expected_resources.memory_bytes > plan.limits.max_memory_bytes
-                || task.expected_resources.storage_read_bytes
-                    > plan.limits.max_storage_read_bytes
+                || task.expected_resources.storage_read_bytes > plan.limits.max_storage_read_bytes
                 || task.work.sample_count > plan.limits.max_samples
                 || task.work.warmup_iterations > plan.limits.max_iterations_per_sample
                 || task.work.iterations_per_sample > plan.limits.max_iterations_per_sample
@@ -577,11 +571,9 @@ impl CalibrationRunner {
             } else {
                 let charge_name = format!("calibration:{}", task.identifier);
                 let charge_bytes = task.expected_resources.memory_bytes.max(1);
-                budget.with_temp(
-                    &charge_name,
-                    charge_bytes,
-                    |_budget| Ok::<_, CalibrationError>(execute_task(task, plan.level, storage)),
-                )?
+                budget.with_temp(&charge_name, charge_bytes, |_budget| {
+                    Ok::<_, CalibrationError>(execute_task(task, plan.level, storage))
+                })?
             };
             on_progress(CalibrationTaskProgress {
                 task_index,
@@ -639,24 +631,13 @@ fn execute_task(
     };
     match measured {
         Ok(samples) => measured_observation(task, level, samples),
-        Err(reason @ ObservationStatusReason::DependencyUnavailable) => non_measured_observation(
-            task,
-            level,
-            ObservationStatus::Unavailable,
-            reason,
-        ),
-        Err(reason @ ObservationStatusReason::TimeLimitReached) => non_measured_observation(
-            task,
-            level,
-            ObservationStatus::Skipped,
-            reason,
-        ),
-        Err(reason) => non_measured_observation(
-            task,
-            level,
-            ObservationStatus::Failed,
-            reason,
-        ),
+        Err(reason @ ObservationStatusReason::DependencyUnavailable) => {
+            non_measured_observation(task, level, ObservationStatus::Unavailable, reason)
+        }
+        Err(reason @ ObservationStatusReason::TimeLimitReached) => {
+            non_measured_observation(task, level, ObservationStatus::Skipped, reason)
+        }
+        Err(reason) => non_measured_observation(task, level, ObservationStatus::Failed, reason),
     }
 }
 
@@ -688,7 +669,9 @@ fn measure_memory_copy(
     if bytes == 0 {
         return Err(ObservationStatusReason::InvalidWorkload);
     }
-    let source: Vec<u8> = (0..bytes).map(|index| (index as u8).wrapping_mul(31)).collect();
+    let source: Vec<u8> = (0..bytes)
+        .map(|index| (index as u8).wrapping_mul(31))
+        .collect();
     let mut destination = vec![0u8; bytes];
     measure_repeated(task, task.work.bytes_per_iteration, || {
         destination.copy_from_slice(black_box(&source));
@@ -719,8 +702,8 @@ fn measure_storage(
         return Err(ObservationStatusReason::DependencyUnavailable);
     }
     let bytes_to_read = task.work.bytes_per_iteration.min(file_bytes);
-    let length = usize::try_from(bytes_to_read)
-        .map_err(|_| ObservationStatusReason::InvalidWorkload)?;
+    let length =
+        usize::try_from(bytes_to_read).map_err(|_| ObservationStatusReason::InvalidWorkload)?;
     if length == 0 {
         return Err(ObservationStatusReason::DependencyUnavailable);
     }
@@ -741,8 +724,8 @@ fn measure_quantized(
 ) -> Result<Vec<MeasurementSample>, ObservationStatusReason> {
     let elements = usize::try_from(task.work.elements_per_iteration)
         .map_err(|_| ObservationStatusReason::InvalidWorkload)?;
-    let encoded = make_quantized_row(format, elements)
-        .ok_or(ObservationStatusReason::InvalidWorkload)?;
+    let encoded =
+        make_quantized_row(format, elements).ok_or(ObservationStatusReason::InvalidWorkload)?;
     let mut output = vec![0.0f32; elements];
     measure_repeated(task, task.work.elements_per_iteration, || {
         let result = match format {
@@ -808,12 +791,12 @@ fn measured_observation(
     level: CalibrationLevel,
     samples: Vec<MeasurementSample>,
 ) -> PerformanceObservation {
-    let measurement_duration_ns = samples
-        .iter()
-        .fold(0u64, |total, sample| total.saturating_add(sample.elapsed_ns));
-    let total_units = samples
-        .iter()
-        .fold(0u64, |total, sample| total.saturating_add(sample.units_processed));
+    let measurement_duration_ns = samples.iter().fold(0u64, |total, sample| {
+        total.saturating_add(sample.elapsed_ns)
+    });
+    let total_units = samples.iter().fold(0u64, |total, sample| {
+        total.saturating_add(sample.units_processed)
+    });
     let (metric, unit, strategy, quantization_format) = observation_shape(task.kind);
     let value = aggregate_observation_value(unit, &samples);
     let (workload_bytes, workload_elements) = match unit {
@@ -1523,7 +1506,10 @@ mod tests {
         assert!(progress[1].3.is_some());
         assert_eq!(result.calibration_plan_identifier, plan.identifier);
         assert_eq!(result.calibration_plan_version, CALIBRATION_PLAN_VERSION);
-        assert_eq!(result.calibration_ruleset_version, CALIBRATION_RULESET_VERSION);
+        assert_eq!(
+            result.calibration_ruleset_version,
+            CALIBRATION_RULESET_VERSION
+        );
         assert_eq!(result.observations.len(), 2);
         assert_eq!(result.observations[0].status, ObservationStatus::Measured);
         assert_eq!(
@@ -1544,22 +1530,14 @@ mod tests {
         );
         let mut limits = test_limits();
         limits.max_memory_bytes = 1;
-        let plan = CalibrationPlan::build(
-            &user,
-            &machine,
-            &model,
-            &storage,
-            &capabilities,
-            limits,
-        )
-        .unwrap();
+        let plan = CalibrationPlan::build(&user, &machine, &model, &storage, &capabilities, limits)
+            .unwrap();
         let result = CalibrationRunner
             .run(&plan, &user, &machine, &model, &storage, &capabilities)
             .unwrap();
         assert!(result.observations.iter().any(|observation| {
             observation.status == ObservationStatus::Skipped
-                && observation.status_reason
-                    == Some(ObservationStatusReason::ResourceLimitExceeded)
+                && observation.status_reason == Some(ObservationStatusReason::ResourceLimitExceeded)
         }));
     }
 
@@ -1569,10 +1547,8 @@ mod tests {
         let data = vec![0xA5; 4 * 1024];
         file.write_all(&data).unwrap();
         file.flush().unwrap();
-        let (user, machine, model, storage, capabilities) = profiles(
-            CalibrationLevel::Quick,
-            file.path().to_path_buf(),
-        );
+        let (user, machine, model, storage, capabilities) =
+            profiles(CalibrationLevel::Quick, file.path().to_path_buf());
         let plan = CalibrationPlan::build(
             &user,
             &machine,
@@ -1588,9 +1564,7 @@ mod tests {
         let storage_observation = result
             .observations
             .iter()
-            .find(|observation| {
-                observation.metric == ObservationMetric::SequentialReadThroughput
-            })
+            .find(|observation| observation.metric == ObservationMetric::SequentialReadThroughput)
             .unwrap();
         assert_eq!(storage_observation.status, ObservationStatus::Measured);
         assert!(storage_observation.value.is_some());

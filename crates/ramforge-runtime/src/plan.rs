@@ -134,9 +134,13 @@ fn plan_execution_memory(
     let mut resident_persistent_count = 0usize;
     let mut streamed_persistent_count = 0usize;
 
-    for descriptor in [&persistent.token_embd, &persistent.output_norm, &persistent.output]
-        .into_iter()
-        .flatten()
+    for descriptor in [
+        &persistent.token_embd,
+        &persistent.output_norm,
+        &persistent.output,
+    ]
+    .into_iter()
+    .flatten()
     {
         let file_bytes = descriptor.byte_length.ok_or_else(|| {
             format!(
@@ -187,12 +191,10 @@ fn plan_execution_memory(
     let mut estimated_gap_bytes_per_forward = 0u64;
 
     for layer in &layers {
-        let read_plan = build_layer_read_plan(&layer.tensors).map_err(|error| {
-            format!("cannot plan layer {} reads: {}", layer.layer_idx, error)
-        })?;
-        let estimate = estimate_layer_memory(&layer.tensors).map_err(|error| {
-            format!("cannot preflight layer {}: {}", layer.layer_idx, error)
-        })?;
+        let read_plan = build_layer_read_plan(&layer.tensors)
+            .map_err(|error| format!("cannot plan layer {} reads: {}", layer.layer_idx, error))?;
+        let estimate = estimate_layer_memory(&layer.tensors)
+            .map_err(|error| format!("cannot preflight layer {}: {}", layer.layer_idx, error))?;
         logical_tensor_reads_per_forward = logical_tensor_reads_per_forward
             .checked_add(read_plan.logical_tensor_count)
             .ok_or_else(|| "logical tensor read count overflow".to_string())?;
@@ -348,10 +350,7 @@ mod tests {
                 Some(descriptor)
             })
             .collect::<Vec<_>>();
-        let file_size = tensors
-            .iter()
-            .filter_map(|tensor| tensor.byte_length)
-            .sum();
+        let file_size = tensors.iter().filter_map(|tensor| tensor.byte_length).sum();
 
         GgufModel {
             path: PathBuf::from("/tmp/supported-tiny.gguf"),

@@ -24,13 +24,17 @@ pub trait ComputeBackend: fmt::Debug + Send + Sync {
     fn name(&self) -> &'static str;
 
     /// F32 matvec in explicit ggml layout; errors on arity mismatch.
-    fn matvec(
-        &self,
-        w: &[f32],
-        w_shape: &[usize],
-        x: &[f32],
-        y: &mut [f32],
-    ) -> Result<(), String>;
+    fn matvec(&self, w: &[f32], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), String>;
+
+    /// Number of worker threads configured for this backend. Returns 1 for
+    /// the scalar backend; 1+ for backends using an explicit thread pool.
+    fn num_threads(&self) -> usize;
+
+    /// Run `work` inside this backend's thread pool so that any Rayon
+    /// parallel iterators spawned inside it are bounded to the configured
+    /// thread count. Single-threaded backends run work inline. Returns
+    /// whatever `work` returns so parallel kernels can propagate errors.
+    fn in_worker_pool<R: Send>(&self, work: impl FnOnce() -> R + Send) -> R;
 
     fn rmsnorm(&self, x: &[f32], weight: &[f32], eps: f32, y: &mut [f32]);
 
@@ -45,7 +49,7 @@ pub trait ComputeBackend: fmt::Debug + Send + Sync {
 
 #[derive(Clone)]
 pub struct CpuBackend {
-    pub num_threads: usize,
+    thread_count: usize,
     pub use_simd: bool,
     thread_pool: Option<Arc<ThreadPool>>,
 }
@@ -54,7 +58,7 @@ impl fmt::Debug for CpuBackend {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CpuBackend")
-            .field("num_threads", &self.num_threads)
+            .field("num_threads", &self.thread_count)
             .field("use_simd", &self.use_simd)
             .field("thread_pool_configured", &self.thread_pool.is_some())
             .finish()
@@ -63,12 +67,12 @@ impl fmt::Debug for CpuBackend {
 
 impl Default for CpuBackend {
     fn default() -> Self {
-        let num_threads = std::thread::available_parallelism()
+        let thread_count = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         let use_simd = simd::is_avx2_available();
         Self {
-            num_threads,
+            thread_count,
             use_simd,
             thread_pool: None,
         }
@@ -100,7 +104,7 @@ impl CpuBackend {
             None
         };
         Ok(Self {
-            num_threads,
+            thread_count: num_threads,
             use_simd: simd::is_avx2_available(),
             thread_pool,
         })
@@ -108,7 +112,7 @@ impl CpuBackend {
 
     pub fn scalar() -> Self {
         Self {
-            num_threads: 1,
+            thread_count: 1,
             use_simd: false,
             thread_pool: None,
         }
@@ -122,13 +126,7 @@ impl CpuBackend {
     }
 }
 
-fn matvec_rows_parallel(
-    use_simd: bool,
-    w: &[f32],
-    in_dim: usize,
-    x: &[f32],
-    y: &mut [f32],
-) {
+fn matvec_rows_parallel(use_simd: bool, w: &[f32], in_dim: usize, x: &[f32], y: &mut [f32]) {
     y.par_iter_mut().enumerate().for_each(|(o, yo)| {
         let row_offset = o * in_dim;
         let row = &w[row_offset..row_offset + in_dim];
@@ -149,14 +147,20 @@ impl ComputeBackend for CpuBackend {
         }
     }
 
+    fn num_threads(&self) -> usize {
+        self.thread_count
+    }
+
+    fn in_worker_pool<R: Send>(&self, work: impl FnOnce() -> R + Send) -> R {
+        if let Some(pool) = &self.thread_pool {
+            pool.install(work)
+        } else {
+            work()
+        }
+    }
+
     #[allow(clippy::needless_range_loop)]
-    fn matvec(
-        &self,
-        w: &[f32],
-        w_shape: &[usize],
-        x: &[f32],
-        y: &mut [f32],
-    ) -> Result<(), String> {
+    fn matvec(&self, w: &[f32], w_shape: &[usize], x: &[f32], y: &mut [f32]) -> Result<(), String> {
         if w_shape.len() != 2 {
             return Err(format!(
                 "backend matvec expects 2D w_shape [in, out] (ggml layout), got {:?}",
@@ -179,15 +183,10 @@ impl ComputeBackend for CpuBackend {
         }
 
         // Buffer is row-major [out][in]: y[o] = sum_i w[o*in + i] * x[i].
-        if self.num_threads > 1 && out_dim >= 4 {
-            if let Some(thread_pool) = &self.thread_pool {
-                thread_pool.install(|| {
-                    matvec_rows_parallel(self.use_simd, w, in_dim, x, y);
-                });
-            } else {
-                // Preserve the legacy backend's use of Rayon's global pool.
+        if self.thread_count > 1 && out_dim >= 4 {
+            self.in_worker_pool(|| {
                 matvec_rows_parallel(self.use_simd, w, in_dim, x, y);
-            }
+            });
         } else if self.use_simd {
             simd::matvec_f32_avx2(w, out_dim, in_dim, x, y);
         } else {
@@ -295,10 +294,12 @@ mod tests {
         let mut y_simd = vec![0.0; 2];
 
         let scalar_backend = CpuBackend::scalar();
-        scalar_backend.matvec(&w, &[3, 2], &x, &mut y_scalar).unwrap();
+        scalar_backend
+            .matvec(&w, &[3, 2], &x, &mut y_scalar)
+            .unwrap();
 
         let simd_backend = CpuBackend {
-            num_threads: 1,
+            thread_count: 1,
             use_simd: true,
             thread_pool: None,
         };

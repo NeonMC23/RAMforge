@@ -505,7 +505,10 @@ fn classify_linux_storage(filesystem_type: &str, major_minor: &str) -> StorageKi
     let subsystem = device_path.ancestors().take(8).find_map(|ancestor| {
         fs::canonicalize(ancestor.join("device/subsystem"))
             .ok()
-            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
     });
     let rotational = device_path.ancestors().take(8).find_map(|ancestor| {
         match read_trimmed(ancestor.join("queue/rotational")).as_deref() {
@@ -540,14 +543,7 @@ fn classify_block_storage(
 fn is_network_filesystem(filesystem_type: &str) -> bool {
     matches!(
         filesystem_type,
-        "nfs"
-            | "nfs4"
-            | "cifs"
-            | "smb3"
-            | "9p"
-            | "ceph"
-            | "glusterfs"
-            | "fuse.sshfs"
+        "nfs" | "nfs4" | "cifs" | "smb3" | "9p" | "ceph" | "glusterfs" | "fuse.sshfs"
     )
 }
 
@@ -561,9 +557,7 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
 
 fn map_storage_error(error: io::Error) -> StorageDiscoveryError {
     match error.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput => {
-            StorageDiscoveryError::InvalidPath
-        }
+        io::ErrorKind::NotFound | io::ErrorKind::InvalidInput => StorageDiscoveryError::InvalidPath,
         io::ErrorKind::PermissionDenied => StorageDiscoveryError::PermissionDenied,
         _ => StorageDiscoveryError::Unavailable,
     }
@@ -774,10 +768,7 @@ mod tests {
             classify_block_storage(Some(false), None, Some(true)),
             StorageKind::Rotational
         );
-        assert_eq!(
-            classify_block_storage(None, None, None),
-            StorageKind::Local
-        );
+        assert_eq!(classify_block_storage(None, None, None), StorageKind::Local);
     }
 
     #[test]

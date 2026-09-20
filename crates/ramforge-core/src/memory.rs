@@ -93,7 +93,10 @@ impl MemoryBudget {
             });
         }
         self.allocations.insert(name, bytes);
-        self.used = self.used.checked_add(bytes).expect("used overflow checked by can_allocate");
+        self.used = self
+            .used
+            .checked_add(bytes)
+            .expect("used overflow checked by can_allocate");
         self.peak_used = self.peak_used.max(self.used);
         Ok(())
     }
@@ -126,13 +129,13 @@ impl MemoryBudget {
             return Err(MemoryError::InvalidSize(new_bytes));
         }
 
-        let old_bytes = self
-            .allocations
-            .get(name)
-            .copied()
-            .ok_or_else(|| MemoryError::NotFound {
-                name: name.to_string(),
-            })?;
+        let old_bytes =
+            self.allocations
+                .get(name)
+                .copied()
+                .ok_or_else(|| MemoryError::NotFound {
+                    name: name.to_string(),
+                })?;
 
         let new_used = if new_bytes > old_bytes {
             let additional = new_bytes - old_bytes;
@@ -219,7 +222,9 @@ impl MemoryBudget {
     pub fn summary(&self) -> String {
         format!(
             "total={} used={} available={}",
-            self.total, self.used, self.available_bytes()
+            self.total,
+            self.used,
+            self.available_bytes()
         )
     }
 
@@ -305,9 +310,9 @@ pub fn parse_memory_size(s: &str) -> Result<u64, ParseSizeError> {
     let unit_str = trimmed[num_end..].trim().to_ascii_lowercase();
 
     // Parse number as f64 to allow float
-    let num: f64 = num_str
-        .parse()
-        .map_err(|_| ParseSizeError::InvalidFormat(format!("invalid number '{}' in '{}'", num_str, s)))?;
+    let num: f64 = num_str.parse().map_err(|_| {
+        ParseSizeError::InvalidFormat(format!("invalid number '{}' in '{}'", num_str, s))
+    })?;
 
     if num <= 0.0 {
         return Err(ParseSizeError::NonPositive(s.to_string()));
@@ -378,7 +383,10 @@ mod tests {
         assert_eq!(parse_memory_size("8G").unwrap(), 8 * 1024 * 1024 * 1024);
         assert_eq!(parse_memory_size("8GiB").unwrap(), 8 * 1024 * 1024 * 1024);
         assert_eq!(parse_memory_size("8192M").unwrap(), 8192 * 1024 * 1024);
-        assert_eq!(parse_memory_size("1.5G").unwrap(), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+        assert_eq!(
+            parse_memory_size("1.5G").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
         assert_eq!(parse_memory_size(" 8G ").unwrap(), 8 * 1024 * 1024 * 1024);
         assert_eq!(parse_memory_size("8g").unwrap(), 8 * 1024 * 1024 * 1024);
         assert_eq!(parse_memory_size("8Gi").unwrap(), 8 * 1024 * 1024 * 1024);
@@ -404,7 +412,9 @@ mod tests {
         assert_eq!(budget.used_bytes(), 4 * 1024 * 1024 * 1024);
         assert_eq!(budget.available_bytes(), 4 * 1024 * 1024 * 1024);
         // Exceeding should fail
-        let err = budget.allocate("too_big", 5 * 1024 * 1024 * 1024).unwrap_err();
+        let err = budget
+            .allocate("too_big", 5 * 1024 * 1024 * 1024)
+            .unwrap_err();
         match err {
             MemoryError::Insufficient { .. } => {}
             _ => panic!("expected Insufficient"),
@@ -468,16 +478,11 @@ mod tests {
         budget.allocate("other", 50).unwrap();
         let before = budget.used_bytes();
 
-        let mut names = budget
-            .rename_prefix("layer:2:", "cache:layer:2:")
-            .unwrap();
+        let mut names = budget.rename_prefix("layer:2:", "cache:layer:2:").unwrap();
         names.sort();
         assert_eq!(
             names,
-            vec![
-                "cache:layer:2:a".to_string(),
-                "cache:layer:2:b".to_string(),
-            ]
+            vec!["cache:layer:2:a".to_string(), "cache:layer:2:b".to_string(),]
         );
         assert_eq!(budget.used_bytes(), before);
         assert_eq!(budget.get("cache:layer:2:a"), Some(100));
@@ -496,7 +501,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(v, 42);
-        assert_eq!(budget.used_bytes(), 0, "temp must be released after success");
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "temp must be released after success"
+        );
         assert!(budget.get("scratch").is_none());
     }
 

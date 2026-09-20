@@ -10,10 +10,14 @@ use std::sync::Mutex;
 use ramforge_core::{
     datasource::GgufDataSource,
     memory::MemoryBudget,
-    quant::{BLOCK_SIZE_Q4_0, QK4_0},
-    tensor::{decode_tensor_to_f32, TensorData},
+    quant::{
+        matvec_q4_0_row_range, matvec_q6_k_row_range, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q6_K, QK4_0, QK_K,
+    },
+    tensor::{decode_tensor_to_f32, QuantizedTensor, TensorData},
     types::GgmlType,
 };
+
+use rayon::prelude::*;
 
 use crate::accounting::{
     estimate_grouped_layer_memory, estimate_layer_memory, tensor_load_charge_bytes,
@@ -659,12 +663,12 @@ impl StreamingLlamaModel {
     /// `shape = [in, out]`; F32 matvecs go through the SIMD/threaded
     /// backend, quantized matvecs run block-wise on compact bytes.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_single_streaming(
+    pub fn forward_single_streaming<B: ComputeBackend>(
         &self,
         token_id: u32,
         pos: usize,
         kv_cache: &mut KvCache,
-        backend: &dyn ComputeBackend,
+        backend: &B,
         data_source: &GgufDataSource,
         budget: &mut MemoryBudget,
         stats: &mut ResidencyStats,
@@ -873,12 +877,12 @@ impl StreamingLlamaModel {
     /// One transformer block over pre-allocated scratch buffers.
     /// All matvecs honor the explicit ggml layout of `layer` tensors.
     #[allow(clippy::too_many_arguments)]
-    fn forward_layer(
+    fn forward_layer<B: ComputeBackend>(
         layer: &StreamingLayerWeights,
         layer_idx: usize,
         pos: usize,
         kv_cache: &mut KvCache,
-        backend: &dyn ComputeBackend,
+        backend: &B,
         cfg: &LlamaConfig,
         profiler: &Profiler,
         hidden: &mut [f32],
@@ -1020,10 +1024,10 @@ impl StreamingLlamaModel {
     /// matrix. Resident F32 goes through the SIMD/threaded backend;
     /// quantized stays compact (block-wise matvec); streamed weights run
     /// the budget-charged chunked row pass.
-    pub fn compute_logits(
+    pub fn compute_logits<B: ComputeBackend>(
         &self,
         hidden: &[f32],
-        backend: &dyn ComputeBackend,
+        backend: &B,
         data_source: &GgufDataSource,
         budget: &mut MemoryBudget,
         logits_out: &mut [f32],
@@ -1378,8 +1382,8 @@ fn persistent_f32_view<'a>(
 /// resident F32 data goes through the SIMD/threaded compute backend; all other
 /// types use the compact block-wise kernels (no full F32 expansion, no
 /// orientation guessing).
-fn matvec_backend(
-    backend: &dyn ComputeBackend,
+fn matvec_backend<B: ComputeBackend>(
+    backend: &B,
     profiler: &Profiler,
     td: &TensorData,
     x: &[f32],
@@ -1391,29 +1395,168 @@ fn matvec_backend(
         profiler.record_since(ProfileEvent::FloatMatvec, started);
         result
     } else {
-        // Record Q4_0-specific workload counters *before* dispatching to the
-        // scalar kernel, without altering execution order, arithmetic, or
-        // memory access. Other quantized formats are counted only by the
-        // existing QuantizedMatvec timer.
-        if td.ggml_type() == GgmlType::Q4_0 {
-            let shape = td.shape();
-            // Quantized matvecs use the explicit ggml `[in, out]` layout,
-            // matching `QuantizedTensor::matvec` (tensor.rs): shape[0] is the
-            // input dimension (length of x), shape[1] is the output dimension
-            // (length of y and number of weight rows).
-            if shape.len() == 2 {
-                let in_dim = shape[0] as u64;
-                let out_dim = shape[1] as u64;
-                let blocks_per_row = in_dim / QK4_0 as u64;
-                let blocks = out_dim.saturating_mul(blocks_per_row);
-                let weight_bytes = blocks.saturating_mul(BLOCK_SIZE_Q4_0 as u64);
-                profiler.record_q4_0_matvec(out_dim, in_dim, blocks, weight_bytes);
-            }
-        }
         let started = profiler.start();
-        let result = td.matvec(x, y).map_err(|e| e.to_string());
+        let result = quantized_matvec_dispatch(backend, td, x, y, profiler);
         profiler.record_since(ProfileEvent::QuantizedMatvec, started);
         result
+    }
+}
+
+/// Minimum output rows (out_dim) before we hand Q4_0 / Q6_K work to the
+/// backend thread pool. Below this threshold we keep the fused scalar
+/// kernel and avoid Rayon pool/spawn overhead.
+///
+/// Derived from the `quantized_matvec_bench` microbenchmark in this file:
+///   * 32×1536 and 64×1536 (in_dim=1536): no measurable speedup at 2/4/8/9
+///     threads; best-case times match the scalar path to noise.
+///   * 128×1536 and larger: parallel dispatch produces measurable speedup
+///     (≈1.3–2.0× at 2 threads in the sandbox; higher core counts scale
+///     further on real hardware).
+/// Real Qwen2.5-1.5B layer shapes are 1536 / 8960 / 151936 rows — all well
+/// above this threshold and parallelize cleanly.
+const QUANT_PARALLEL_ROW_THRESHOLD: usize = 128;
+
+/// Split `out_dim` rows into `n_chunks` contiguous (start, count) ranges
+/// with at most one row of imbalance across chunks.
+fn make_row_chunks(out_dim: usize, n_chunks: usize) -> Vec<(usize, usize)> {
+    let n = n_chunks.min(out_dim).max(1);
+    let base = out_dim / n;
+    let extra = out_dim % n;
+    let mut out = Vec::with_capacity(n);
+    let mut cursor = 0usize;
+    for i in 0..n {
+        let count = base + if i < extra { 1 } else { 0 };
+        out.push((cursor, count));
+        cursor += count;
+    }
+    out
+}
+
+fn quantized_matvec_dispatch<B: ComputeBackend>(
+    backend: &B,
+    td: &TensorData,
+    x: &[f32],
+    y: &mut [f32],
+    profiler: &Profiler,
+) -> Result<(), String> {
+    /// Returns (raw_data, kernel_shape=[out, in]) for a quantized tensor if
+    /// it matches one of the row-parallel kernels, otherwise None to fall
+    /// back to the generic `td.matvec` path.
+    fn as_quantized_view<'a>(td: &'a TensorData) -> Option<(GgmlType, &'a [u8], [usize; 2])> {
+        let (qt, ty) = match td {
+            TensorData::Q4_0(qt) => (qt, GgmlType::Q4_0),
+            TensorData::Q6_K(qt) => (qt, GgmlType::Q6_K),
+            _ => return None,
+        };
+        if qt.shape.len() != 2 {
+            return None;
+        }
+        // ggml [in, out] → kernel layout [out, in]
+        Some((ty, &qt.raw_data, [qt.shape[1], qt.shape[0]]))
+    }
+
+    match as_quantized_view(td) {
+        Some((GgmlType::Q4_0, raw, [out_dim, in_dim])) => {
+            // Counters follow the same [in, out] semantics as before.
+            let blocks = (out_dim as u64).saturating_mul((in_dim / QK4_0) as u64);
+            let weight_bytes = blocks.saturating_mul(BLOCK_SIZE_Q4_0 as u64);
+            profiler.record_q4_0_matvec(out_dim as u64, in_dim as u64, blocks, weight_bytes);
+
+            let w_shape = [out_dim, in_dim];
+            let n_threads = backend.num_threads();
+            let parallelize = n_threads > 1 && out_dim >= QUANT_PARALLEL_ROW_THRESHOLD;
+            if parallelize {
+                // Split the output rows into n_threads contiguous ranges and
+                // run each range through the fused scalar kernel on the
+                // backend's bounded Rayon pool. No per-row heap allocation;
+                // x and raw_data are shared read-only.
+                //
+                // SAFETY: Row ranges are non-overlapping by construction
+                // (`make_row_chunks` partitions [0, out_dim)), so each worker
+                // writes to a disjoint y subslice. We hand out raw pointers
+                // because Rayon's `into_par_iter().try_for_each` requires a
+                // `Fn` (not `FnMut`) closure and would otherwise forbid
+                // capturing an outer `&mut [f32]`.
+                let blocks_per_row = in_dim / QK4_0;
+                let row_bytes = blocks_per_row * BLOCK_SIZE_Q4_0;
+                let ranges = make_row_chunks(out_dim, n_threads);
+                // SAFETY: row ranges are non-overlapping partitions of
+                // [0, out_dim), so each worker writes to a disjoint y subslice
+                // and reads a disjoint w subslice. We transmit the base
+                // addresses as usizes because raw pointers are neither Send
+                // nor Sync; the addresses remain valid for the whole call
+                // since both `y` and `raw` outlive the worker pool scope.
+                let y_addr = y.as_mut_ptr() as usize;
+                let raw_addr = raw.as_ptr() as usize;
+                backend.in_worker_pool(move || {
+                    ranges.into_par_iter().try_for_each(
+                        |(row_start, row_count)| -> Result<(), String> {
+                            let w_offset = row_start * row_bytes;
+                            let w_sub = unsafe {
+                                std::slice::from_raw_parts(
+                                    (raw_addr + w_offset) as *const u8,
+                                    row_count * row_bytes,
+                                )
+                            };
+                            let y_sub = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (y_addr + row_start * std::mem::size_of::<f32>()) as *mut f32,
+                                    row_count,
+                                )
+                            };
+                            let sub_shape = [row_count, in_dim];
+                            matvec_q4_0_row_range(w_sub, &sub_shape, x, y_sub, 0, None)
+                                .map_err(|e| e.to_string())
+                        },
+                    )
+                })?;
+                Ok(())
+            } else {
+                matvec_q4_0_row_range(raw, &w_shape, x, y, 0, None).map_err(|e| e.to_string())
+            }
+        }
+        Some((GgmlType::Q6_K, raw, [out_dim, in_dim])) => {
+            let w_shape = [out_dim, in_dim];
+            let n_threads = backend.num_threads();
+            let parallelize = n_threads > 1 && out_dim >= QUANT_PARALLEL_ROW_THRESHOLD;
+            if parallelize {
+                let blocks_per_row = in_dim / QK_K;
+                let row_bytes = blocks_per_row * BLOCK_SIZE_Q6_K;
+                let ranges = make_row_chunks(out_dim, n_threads);
+                // SAFETY: same disjoint-range reasoning as the Q4_0 branch.
+                let y_addr = y.as_mut_ptr() as usize;
+                let raw_addr = raw.as_ptr() as usize;
+                backend.in_worker_pool(move || {
+                    ranges.into_par_iter().try_for_each(
+                        |(row_start, row_count)| -> Result<(), String> {
+                            let w_offset = row_start * row_bytes;
+                            let w_sub = unsafe {
+                                std::slice::from_raw_parts(
+                                    (raw_addr + w_offset) as *const u8,
+                                    row_count * row_bytes,
+                                )
+                            };
+                            let y_sub = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (y_addr + row_start * std::mem::size_of::<f32>()) as *mut f32,
+                                    row_count,
+                                )
+                            };
+                            let sub_shape = [row_count, in_dim];
+                            matvec_q6_k_row_range(w_sub, &sub_shape, x, y_sub, 0, None)
+                                .map_err(|e| e.to_string())
+                        },
+                    )
+                })?;
+                Ok(())
+            } else {
+                matvec_q6_k_row_range(raw, &w_shape, x, y, 0, None).map_err(|e| e.to_string())
+            }
+        }
+        _ => {
+            // Other quantized types: original scalar path unchanged.
+            td.matvec(x, y).map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -3074,4 +3217,342 @@ mod tests {
         assert_eq!(snapshot3.q4_0_matvec_blocks, 0);
         assert_eq!(snapshot3.q4_0_matvec_weight_bytes, 0);
     }
+}
+
+// ---------- Quantized matvec microbenchmarks (opt-in) ----------
+//
+// Run with:  cargo test -p ramforge-runtime --release -- --ignored --nocapture quantized_matvec_bench
+//
+// These construct synthetic Q4_0 / Q6_K weight matrices at representative
+// Qwen2.5-1.5B shapes, warm the scalar path for reference, then time scalar
+// vs parallel dispatch at 1/2/4/8/9 threads and report elapsed/throughput/
+// speedup plus maximum absolute numerical error. They do not allocate in
+// the hot path beyond the one-time weight bytes and the caller-provided
+// x/y vectors.
+//
+// Helpers below are only referenced from the `#[ignore]`-gated benchmark
+// and intentionally left dead-code when running the normal test binary.
+
+#[allow(dead_code)]
+fn fill_q4_0_row(row_bytes: &mut [u8], blocks_per_row: usize, seed: &mut u32) {
+    // Cheap deterministic LCG so we get varied-but-reproducible values.
+    let mut next = || -> u32 {
+        *seed = (*seed).wrapping_mul(1664525).wrapping_add(1013904223);
+        *seed
+    };
+    let mut off = 0;
+    for _ in 0..blocks_per_row {
+        // d in fp16: uniform in [0.05, 0.5)
+        let d: f32 = 0.05 + ((next() >> 8) as f32 / (1u64 << 24) as f32) * 0.45;
+        let d_bits = half::f16::from_f32(d).to_bits().to_le_bytes();
+        row_bytes[off] = d_bits[0];
+        row_bytes[off + 1] = d_bits[1];
+        for j in 0..16 {
+            // low nibble and high nibble: q values 0..15
+            let a = (next() & 0x0F) as u8;
+            let b = (next() & 0x0F) as u8;
+            row_bytes[off + 2 + j] = a | (b << 4);
+        }
+        off += BLOCK_SIZE_Q4_0;
+    }
+}
+
+#[allow(dead_code)]
+fn fill_q6_k_row(row_bytes: &mut [u8], blocks_per_row: usize, seed: &mut u32) {
+    let mut next = || -> u32 {
+        *seed = (*seed).wrapping_mul(1664525).wrapping_add(1013904223);
+        *seed
+    };
+    let mut off = 0;
+    for _ in 0..blocks_per_row {
+        // Layout matches BlockQ6K::from_bytes: ql[128] qh[64] scales[16] d(f16, 2)
+        for j in 0..128 {
+            row_bytes[off + j] = (next() & 0xFF) as u8;
+        }
+        for j in 0..64 {
+            row_bytes[off + 128 + j] = (next() & 0xFF) as u8;
+        }
+        for j in 0..16 {
+            // Scales are i8 centered around zero; use -4..=4
+            row_bytes[off + 192 + j] = ((next() % 9) as i8 - 4) as u8;
+        }
+        let d: f32 = 0.05 + ((next() >> 8) as f32 / (1u64 << 24) as f32) * 0.45;
+        let d_bits = half::f16::from_f32(d).to_bits().to_le_bytes();
+        row_bytes[off + 208] = d_bits[0];
+        row_bytes[off + 209] = d_bits[1];
+        off += BLOCK_SIZE_Q6_K;
+    }
+}
+
+/// Returns (raw_q4_0, shape=[out, in]) for a synthetic Q4_0 matrix.
+#[allow(dead_code)]
+fn make_q4_0_matrix(out_dim: usize, in_dim: usize, seed: u32) -> (Vec<u8>, [usize; 2]) {
+    assert_eq!(in_dim % QK4_0, 0, "in_dim must be a multiple of QK4_0=32");
+    let blocks_per_row = in_dim / QK4_0;
+    let row_bytes_len = blocks_per_row * BLOCK_SIZE_Q4_0;
+    let mut bytes = vec![0u8; out_dim * row_bytes_len];
+    let mut s = seed;
+    for r in 0..out_dim {
+        fill_q4_0_row(
+            &mut bytes[r * row_bytes_len..(r + 1) * row_bytes_len],
+            blocks_per_row,
+            &mut s,
+        );
+    }
+    (bytes, [out_dim, in_dim])
+}
+
+#[allow(dead_code)]
+fn make_q6_k_matrix(out_dim: usize, in_dim: usize, seed: u32) -> (Vec<u8>, [usize; 2]) {
+    assert_eq!(in_dim % QK_K, 0, "in_dim must be a multiple of QK_K=256");
+    let blocks_per_row = in_dim / QK_K;
+    let row_bytes_len = blocks_per_row * BLOCK_SIZE_Q6_K;
+    let mut bytes = vec![0u8; out_dim * row_bytes_len];
+    let mut s = seed;
+    for r in 0..out_dim {
+        fill_q6_k_row(
+            &mut bytes[r * row_bytes_len..(r + 1) * row_bytes_len],
+            blocks_per_row,
+            &mut s,
+        );
+    }
+    (bytes, [out_dim, in_dim])
+}
+
+#[allow(dead_code)]
+fn random_x(n: usize, seed: u64) -> Vec<f32> {
+    // Simple xorshift64 for deterministic, varied inputs.
+    let mut s = seed;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        // Map to [-1, 1]
+        let u = (s >> 33) as f32 / (1u64 << 30) as f32 - 1.0;
+        out.push(u);
+    }
+    out
+}
+
+#[allow(dead_code)]
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+#[allow(dead_code)]
+fn make_q4_0_td(raw: Vec<u8>, out_dim: usize, in_dim: usize) -> TensorData {
+    TensorData::Q4_0(QuantizedTensor {
+        ggml_type: GgmlType::Q4_0,
+        shape: vec![in_dim, out_dim], // ggml [in, out] layout
+        num_elements: in_dim * out_dim,
+        raw_data: raw,
+    })
+}
+
+#[allow(dead_code)]
+fn make_q6_k_td(raw: Vec<u8>, out_dim: usize, in_dim: usize) -> TensorData {
+    TensorData::Q6_K(QuantizedTensor {
+        ggml_type: GgmlType::Q6_K,
+        shape: vec![in_dim, out_dim],
+        num_elements: in_dim * out_dim,
+        raw_data: raw,
+    })
+}
+
+#[allow(dead_code)]
+fn bench_q4_0_for_threads(
+    out_dim: usize,
+    in_dim: usize,
+    threads: usize,
+    iters: usize,
+    raw: &[u8],
+    _w_shape: &[usize; 2],
+    x: &[f32],
+    reference_y: &[f32],
+    label: &str,
+) {
+    use std::time::Instant;
+    let backend = crate::backend::CpuBackend::with_threads(threads);
+    let profiler = Profiler::default();
+
+    // Warm up + correctness check.
+    let mut y = vec![0.0f32; out_dim];
+    let td = make_q4_0_td(raw.to_vec(), out_dim, in_dim);
+    quantized_matvec_dispatch(&backend, &td, x, &mut y, &profiler).expect("warmup failed");
+    let err = max_abs_diff(&y, reference_y);
+
+    // Reuse the same raw bytes across iterations; per-iter we must hand the
+    // dispatch a fresh TensorData because QuantizedTensor owns its bytes. We
+    // do not measure this clone cost (it's a single memcpy of the weight
+    // buffer and is not representative of inference, where weights stay
+    // resident). In real inference the TensorData is loaded once per layer.
+    let mut total = std::time::Duration::ZERO;
+    let mut best = std::time::Duration::from_secs(u64::MAX);
+    for _ in 0..iters {
+        y.fill(0.0);
+        let td = make_q4_0_td(raw.to_vec(), out_dim, in_dim);
+        let t0 = Instant::now();
+        quantized_matvec_dispatch(&backend, &td, x, &mut y, &profiler).expect("bench iter failed");
+        let elapsed = t0.elapsed();
+        total += elapsed;
+        if elapsed < best {
+            best = elapsed;
+        }
+    }
+    let avg = total / iters as u32;
+    let flops = (out_dim as f64) * (in_dim as f64) * 2.0; // multiplies + adds per output
+    let avg_secs = avg.as_secs_f64();
+    let gflops = if avg_secs > 0.0 {
+        flops / avg_secs / 1e9
+    } else {
+        0.0
+    };
+    let weight_mb = raw.len() as f64 / (1024.0 * 1024.0);
+    println!(
+        "  [Q4_0 {:>18}] threads={:<2} iters={:<3} avg={:>10.3?} best={:>10.3?} throughput={:>7.2} GFLOP/s weight={:>6.2} MiB max|err|={:.2e}",
+        label, threads, iters, avg, best, gflops, weight_mb, err
+    );
+}
+
+#[test]
+#[ignore]
+fn quantized_matvec_bench() {
+    use std::time::Instant;
+
+    // Representative Qwen2.5-1.5B shapes (ggml [in, out] layout; out x in):
+    //   * attn_q/k/v/o, ffn_down  : in=1536, out=1536    (small per-layer matvec)
+    //   * ffn_gate/up             : in=1536, out=8960    (largest Q4_0 in model)
+    //   * output                  : in=1536, out=151936  (vocab projection)
+    // Plus small shapes below/around the parallel threshold to verify the
+    // scalar fallback is neutral on workloads too small for threading.
+    let shapes: &[(&str, usize, usize)] = &[
+        ("small(32x1536)", 32, 1536),
+        ("small(64x1536)", 64, 1536),
+        ("med(128x1536)", 128, 1536),
+        ("attn(1536x1536)", 1536, 1536),
+        ("ffn(8960x1536)", 8960, 1536),
+        ("output(151936x1536)", 151936, 1536),
+    ];
+
+    println!("\n=== Q4_0 quantized matvec microbenchmark (scalar baseline + thread scaling) ===");
+    for (label, out_dim, in_dim) in shapes {
+        let (out_dim, in_dim) = (*out_dim, *in_dim);
+        let (raw, _w_shape) = make_q4_0_matrix(
+            out_dim,
+            in_dim,
+            0x12345678 ^ (out_dim as u32).wrapping_mul(31) ^ (in_dim as u32),
+        );
+        let backend = crate::backend::CpuBackend::scalar();
+        let profiler = Profiler::default();
+        let x = random_x(in_dim, 0xC0FFEE);
+        let mut y_ref = vec![0.0f32; out_dim];
+        let ref_td = make_q4_0_td(raw.clone(), out_dim, in_dim);
+        quantized_matvec_dispatch(&backend, &ref_td, &x, &mut y_ref, &profiler)
+            .expect("reference failed");
+
+        let iters = if out_dim >= 100_000 {
+            5
+        } else if out_dim >= 4000 {
+            20
+        } else if out_dim >= 128 {
+            50
+        } else {
+            200
+        };
+        bench_q4_0_for_threads(
+            out_dim,
+            in_dim,
+            1,
+            iters,
+            &raw,
+            &[out_dim, in_dim],
+            &x,
+            &y_ref,
+            label,
+        );
+        for t in [2, 4, 8, 9] {
+            bench_q4_0_for_threads(
+                out_dim,
+                in_dim,
+                t,
+                iters,
+                &raw,
+                &[out_dim, in_dim],
+                &x,
+                &y_ref,
+                label,
+            );
+        }
+    }
+
+    println!("\n=== Q6_K quantized matvec microbenchmark (scalar + parallel) ===");
+    for (label, out_dim, in_dim) in shapes {
+        let out_dim = *out_dim;
+        let in_dim = if *in_dim % QK_K == 0 {
+            *in_dim
+        } else {
+            (*in_dim + QK_K - 1) / QK_K * QK_K
+        };
+        let (raw, _w_shape) = make_q6_k_matrix(
+            out_dim,
+            in_dim,
+            0xA5A5A5 ^ (out_dim as u32).wrapping_mul(131) ^ (in_dim as u32),
+        );
+        let backend = crate::backend::CpuBackend::scalar();
+        let profiler = Profiler::default();
+        let x = random_x(in_dim, 0xDEADBEEF);
+        let mut y_ref = vec![0.0f32; out_dim];
+        let ref_td = make_q6_k_td(raw.clone(), out_dim, in_dim);
+        quantized_matvec_dispatch(&backend, &ref_td, &x, &mut y_ref, &profiler)
+            .expect("q6_k reference failed");
+
+        let iters = if out_dim >= 100_000 {
+            5
+        } else if out_dim >= 4000 {
+            20
+        } else if out_dim >= 128 {
+            50
+        } else {
+            200
+        };
+        for threads in [1, 2, 4, 8, 9] {
+            let be = crate::backend::CpuBackend::with_threads(threads);
+            let mut y = vec![0.0f32; out_dim];
+            let td = make_q6_k_td(raw.clone(), out_dim, in_dim);
+            quantized_matvec_dispatch(&be, &td, &x, &mut y, &profiler).expect("q6_k warmup failed");
+            let err = max_abs_diff(&y, &y_ref);
+            let mut total = std::time::Duration::ZERO;
+            let mut best = std::time::Duration::from_secs(u64::MAX);
+            for _ in 0..iters {
+                y.fill(0.0);
+                let td = make_q6_k_td(raw.clone(), out_dim, in_dim);
+                let t0 = Instant::now();
+                quantized_matvec_dispatch(&be, &td, &x, &mut y, &profiler)
+                    .expect("q6_k iter failed");
+                let elapsed = t0.elapsed();
+                total += elapsed;
+                if elapsed < best {
+                    best = elapsed;
+                }
+            }
+            let avg = total / iters as u32;
+            let flops = (out_dim as f64) * (in_dim as f64) * 2.0;
+            let avg_secs = avg.as_secs_f64();
+            let gflops = if avg_secs > 0.0 {
+                flops / avg_secs / 1e9
+            } else {
+                0.0
+            };
+            let weight_mb = raw.len() as f64 / (1024.0 * 1024.0);
+            println!(
+                "  [Q6_K {:>18}] threads={:<2} iters={:<3} avg={:>10.3?} best={:>10.3?} throughput={:>7.2} GFLOP/s weight={:>6.2} MiB max|err|={:.2e}",
+                label, threads, iters, avg, best, gflops, weight_mb, err
+            );
+        }
+    }
+    println!();
 }

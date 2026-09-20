@@ -303,9 +303,7 @@ fn validate_bindings(
             binding: "machine fingerprint",
         });
     }
-    if plan.binding.model_descriptor_fingerprint
-        != context.model.identity.descriptor_fingerprint
-    {
+    if plan.binding.model_descriptor_fingerprint != context.model.identity.descriptor_fingerprint {
         return Err(PlanCompilationError::BindingMismatch {
             binding: "model descriptor fingerprint",
         });
@@ -376,16 +374,20 @@ fn validate_resource_limits(
             limit: context.machine.logical_cpu_cores,
         });
     }
-    let total_ram = context.machine.total_ram_bytes.ok_or(
-        PlanCompilationError::InvalidContext {
-            component: "machine total RAM is unavailable",
-        },
-    )?;
-    let available_ram = context.machine.available_ram_bytes.ok_or(
-        PlanCompilationError::InvalidContext {
-            component: "machine available RAM is unavailable",
-        },
-    )?;
+    let total_ram =
+        context
+            .machine
+            .total_ram_bytes
+            .ok_or(PlanCompilationError::InvalidContext {
+                component: "machine total RAM is unavailable",
+            })?;
+    let available_ram =
+        context
+            .machine
+            .available_ram_bytes
+            .ok_or(PlanCompilationError::InvalidContext {
+                component: "machine available RAM is unavailable",
+            })?;
     if plan.ram_budget_bytes > total_ram {
         return Err(PlanCompilationError::RamBudgetExceedsTotalRam {
             requested: plan.ram_budget_bytes,
@@ -434,8 +436,7 @@ fn validate_reservations(
     }
     for (matches, field) in [
         (
-            plan.reservations.persistent_resident_bytes
-                == execution.persistent_resident_bytes,
+            plan.reservations.persistent_resident_bytes == execution.persistent_resident_bytes,
             "persistent resident bytes",
         ),
         (
@@ -449,8 +450,7 @@ fn validate_reservations(
             "largest layer load peak bytes",
         ),
         (
-            plan.reservations.managed_lower_bound_bytes
-                == execution.managed_lower_bound_bytes,
+            plan.reservations.managed_lower_bound_bytes == execution.managed_lower_bound_bytes,
             "managed-memory lower bound",
         ),
     ] {
@@ -511,8 +511,7 @@ fn validate_io(
     if plan.io.read_coalescing_enabled && !capabilities.read_coalescing_possible {
         return Err(PlanCompilationError::ReadCoalescingUnavailable);
     }
-    if plan.io.grouped_read_buffer_reuse_enabled
-        && !capabilities.grouped_read_buffer_reuse_possible
+    if plan.io.grouped_read_buffer_reuse_enabled && !capabilities.grouped_read_buffer_reuse_possible
     {
         return Err(PlanCompilationError::GroupedReadBufferReuseUnavailable);
     }
@@ -529,9 +528,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::plan::ExecutionMemoryPlan;
     use crate::planner::{
-        Availability, CalibrationProvenance, CostEstimate, DiscoveryState, GpuDecision,
-        IoDecision, LayerCacheDecision, ModelExecutionCompatibility, ModelIdentity, OperatingMode,
-        PlanBinding, ResourceReservations, StorageKind, StoragePathState, TensorFormatProfile,
+        Availability, CalibrationProvenance, CostEstimate, DiscoveryState, GpuDecision, IoDecision,
+        LayerCacheDecision, ModelExecutionCompatibility, ModelIdentity, OperatingMode, PlanBinding,
+        ResourceReservations, StorageKind, StoragePathState, TensorFormatProfile,
         PROFILE_SCHEMA_VERSION,
     };
 
@@ -709,12 +708,8 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn refresh_capabilities(&mut self) {
-            self.capabilities = CapabilitySet::derive(
-                &self.machine,
-                &self.model,
-                &self.storage,
-                &self.static_plan,
-            );
+            self.capabilities =
+                CapabilitySet::derive(&self.machine, &self.model, &self.storage, &self.static_plan);
         }
     }
 

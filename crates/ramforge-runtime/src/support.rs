@@ -110,25 +110,60 @@ pub struct QuantizationCapability {
 }
 
 pub const QUANTIZATIONS: &[QuantizationCapability] = &[
-    QuantizationCapability { name: "F32", inference: true },
-    QuantizationCapability { name: "F16", inference: true },
-    QuantizationCapability { name: "BF16", inference: true },
-    QuantizationCapability { name: "Q4_0", inference: true },
-    QuantizationCapability { name: "Q8_0", inference: true },
-    QuantizationCapability { name: "Q2_K", inference: true },
-    QuantizationCapability { name: "Q3_K", inference: true },
-    QuantizationCapability { name: "Q4_K", inference: true },
-    QuantizationCapability { name: "Q5_K", inference: true },
-    QuantizationCapability { name: "Q6_K", inference: true },
-    QuantizationCapability { name: "Q8_K", inference: true },
-    QuantizationCapability { name: "other GGUF types", inference: false },
+    QuantizationCapability {
+        name: "F32",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "F16",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "BF16",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "Q4_0",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "Q8_0",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "Q2_K",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "Q3_K",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "Q4_K",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "Q5_K",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "Q6_K",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "Q8_K",
+        inference: true,
+    },
+    QuantizationCapability {
+        name: "other GGUF types",
+        inference: false,
+    },
 ];
 
 pub fn architecture_capability(name: &str) -> Option<&'static ArchitectureCapability> {
     let normalized = name.to_ascii_lowercase();
     ARCHITECTURES.iter().find(|capability| {
-        capability.name == normalized.as_str()
-            || capability.aliases.contains(&normalized.as_str())
+        capability.name == normalized.as_str() || capability.aliases.contains(&normalized.as_str())
     })
 }
 

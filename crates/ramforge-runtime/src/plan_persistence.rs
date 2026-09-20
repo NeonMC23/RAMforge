@@ -87,10 +87,16 @@ impl fmt::Display for PlanPersistenceError {
                 write!(formatter, "persisted plan has {bytes} trailing bytes")
             }
             Self::InvalidBoolean { field, value } => {
-                write!(formatter, "persisted plan has invalid boolean {value} for {field}")
+                write!(
+                    formatter,
+                    "persisted plan has invalid boolean {value} for {field}"
+                )
             }
             Self::InvalidEnum { field, value } => {
-                write!(formatter, "persisted plan has invalid enum tag {value} for {field}")
+                write!(
+                    formatter,
+                    "persisted plan has invalid enum tag {value} for {field}"
+                )
             }
             Self::InvalidUtf8 { field } => {
                 write!(formatter, "persisted plan has invalid UTF-8 for {field}")
@@ -137,8 +143,12 @@ pub enum PersistedPlanValidationError {
 impl fmt::Display for PersistedPlanValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Persistence(error) => write!(formatter, "persisted plan validation failed: {error}"),
-            Self::Compilation(error) => write!(formatter, "persisted plan compilation failed: {error}"),
+            Self::Persistence(error) => {
+                write!(formatter, "persisted plan validation failed: {error}")
+            }
+            Self::Compilation(error) => {
+                write!(formatter, "persisted plan compilation failed: {error}")
+            }
         }
     }
 }
@@ -199,15 +209,36 @@ impl fmt::Display for PlanCompatibilityReason {
         match self {
             Self::PersistedPlanInvalid => write!(formatter, "persisted plan structure is invalid"),
             Self::ModelFingerprintMismatch => write!(formatter, "model fingerprint does not match"),
-            Self::PlanCompilationFailed(error) => write!(formatter, "PlanCompiler rejected the plan: {error}"),
-            Self::CalibrationNotApplied => write!(formatter, "calibration was requested but no observation was applied"),
-            Self::CalibrationMissing => write!(formatter, "matching calibration result is not available"),
+            Self::PlanCompilationFailed(error) => {
+                write!(formatter, "PlanCompiler rejected the plan: {error}")
+            }
+            Self::CalibrationNotApplied => write!(
+                formatter,
+                "calibration was requested but no observation was applied"
+            ),
+            Self::CalibrationMissing => {
+                write!(formatter, "matching calibration result is not available")
+            }
             Self::CalibrationInvalid => write!(formatter, "current calibration result is invalid"),
-            Self::CalibrationSourceMachineChanged => write!(formatter, "calibrated source machine differs from the current machine"),
-            Self::CalibrationSourceStorageChanged => write!(formatter, "calibrated source storage differs from the current storage"),
-            Self::CalibrationProvenanceMismatch => write!(formatter, "calibration provenance no longer matches"),
-            Self::CalibrationBindingMismatch => write!(formatter, "calibration environment binding no longer matches"),
-            Self::CalibrationObservationUnavailable => write!(formatter, "an applied calibration observation is missing or no longer measured"),
+            Self::CalibrationSourceMachineChanged => write!(
+                formatter,
+                "calibrated source machine differs from the current machine"
+            ),
+            Self::CalibrationSourceStorageChanged => write!(
+                formatter,
+                "calibrated source storage differs from the current storage"
+            ),
+            Self::CalibrationProvenanceMismatch => {
+                write!(formatter, "calibration provenance no longer matches")
+            }
+            Self::CalibrationBindingMismatch => write!(
+                formatter,
+                "calibration environment binding no longer matches"
+            ),
+            Self::CalibrationObservationUnavailable => write!(
+                formatter,
+                "an applied calibration observation is missing or no longer measured"
+            ),
         }
     }
 }
@@ -309,14 +340,12 @@ impl PersistedExecutionPlan {
         };
         let cost = CostEstimate {
             physical_read_bytes_per_forward: reader.u64("physical read bytes per forward")?,
-            calibrated_read_time_ns_per_forward: reader
-                .optional_u64("calibrated read time")?,
+            calibrated_read_time_ns_per_forward: reader.optional_u64("calibrated read time")?,
             observed_strategy_latency_ns: reader.optional_u64("observed strategy latency")?,
         };
         let calibration = CalibrationProvenance {
             calibration_identifier: reader.optional_string("calibration identifier")?,
-            calibration_plan_identifier: reader
-                .optional_string("calibration plan identifier")?,
+            calibration_plan_identifier: reader.optional_string("calibration plan identifier")?,
             calibration_plan_version: reader.optional_u32("calibration plan version")?,
             calibration_ruleset_version: reader.optional_u32("calibration ruleset version")?,
             observation_identifiers: reader.string_list("calibration observation identifiers")?,
@@ -369,10 +398,7 @@ impl PersistedExecutionPlan {
     /// Save only when the destination does not already exist.
     pub fn save_new(&self, path: impl AsRef<Path>) -> Result<(), PlanPersistenceError> {
         let bytes = self.to_bytes()?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
         file.write_all(&bytes)?;
         file.flush()?;
         Ok(())
@@ -558,9 +584,7 @@ impl PersistedExecutionPlan {
             .calibration
             .calibration_identifier
             .as_ref()
-            .is_some_and(|identifier| {
-                identifier.is_empty() || identifier.len() > MAX_STRING_BYTES
-            })
+            .is_some_and(|identifier| identifier.is_empty() || identifier.len() > MAX_STRING_BYTES)
             || self
                 .calibration
                 .calibration_plan_identifier
@@ -656,10 +680,7 @@ impl PersistedExecutionPlan {
     /// Build a temporary compiler input bound to current facts. Only
     /// environment identity, current model path, and the volatile available-RAM
     /// snapshot are replaced; every concrete planner decision is preserved.
-    fn materialize_for_context(
-        &self,
-        context: PlanCompilationContext<'_>,
-    ) -> ExecutionPlan {
+    fn materialize_for_context(&self, context: PlanCompilationContext<'_>) -> ExecutionPlan {
         self.materialize(
             context.machine.fingerprint(),
             context.storage.fingerprint(),
@@ -824,27 +845,15 @@ impl PersistedExecutionPlan {
             self.reservations.available_ram_bytes_at_planning,
         );
         put_u64(&mut bytes, self.reservations.persistent_resident_bytes);
-        put_u64(
-            &mut bytes,
-            self.reservations.persistent_startup_peak_bytes,
-        );
-        put_u64(
-            &mut bytes,
-            self.reservations.largest_layer_load_peak_bytes,
-        );
-        put_u64(
-            &mut bytes,
-            self.reservations.managed_lower_bound_bytes,
-        );
+        put_u64(&mut bytes, self.reservations.persistent_startup_peak_bytes);
+        put_u64(&mut bytes, self.reservations.largest_layer_load_peak_bytes);
+        put_u64(&mut bytes, self.reservations.managed_lower_bound_bytes);
         put_u64(
             &mut bytes,
             self.reservations.remaining_budget_after_lower_bound_bytes,
         );
         put_u64(&mut bytes, self.cost.physical_read_bytes_per_forward);
-        put_optional_u64(
-            &mut bytes,
-            self.cost.calibrated_read_time_ns_per_forward,
-        );
+        put_optional_u64(&mut bytes, self.cost.calibrated_read_time_ns_per_forward);
         put_optional_u64(&mut bytes, self.cost.observed_strategy_latency_ns);
         put_optional_string(
             &mut bytes,
@@ -897,11 +906,12 @@ impl<'a> PlanReader<'a> {
         length: usize,
         field: &'static str,
     ) -> Result<&'a [u8], PlanPersistenceError> {
-        let end = self.position.checked_add(length).ok_or(
-            PlanPersistenceError::NumericOverflow {
-                field: "persisted plan cursor",
-            },
-        )?;
+        let end =
+            self.position
+                .checked_add(length)
+                .ok_or(PlanPersistenceError::NumericOverflow {
+                    field: "persisted plan cursor",
+                })?;
         let value = self
             .bytes
             .get(self.position..end)
@@ -939,10 +949,7 @@ impl<'a> PlanReader<'a> {
         }
     }
 
-    fn optional_u32(
-        &mut self,
-        field: &'static str,
-    ) -> Result<Option<u32>, PlanPersistenceError> {
+    fn optional_u32(&mut self, field: &'static str) -> Result<Option<u32>, PlanPersistenceError> {
         if self.boolean(field)? {
             self.u32(field).map(Some)
         } else {
@@ -950,10 +957,7 @@ impl<'a> PlanReader<'a> {
         }
     }
 
-    fn optional_u64(
-        &mut self,
-        field: &'static str,
-    ) -> Result<Option<u64>, PlanPersistenceError> {
+    fn optional_u64(&mut self, field: &'static str) -> Result<Option<u64>, PlanPersistenceError> {
         if self.boolean(field)? {
             self.u64(field).map(Some)
         } else {
@@ -999,10 +1003,7 @@ impl<'a> PlanReader<'a> {
         Ok(count)
     }
 
-    fn string_list(
-        &mut self,
-        field: &'static str,
-    ) -> Result<Vec<String>, PlanPersistenceError> {
+    fn string_list(&mut self, field: &'static str) -> Result<Vec<String>, PlanPersistenceError> {
         let count = self.list_count(field)?;
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
@@ -1050,8 +1051,8 @@ fn put_string(
             maximum: MAX_STRING_BYTES,
         });
     }
-    let length = u32::try_from(value.len())
-        .map_err(|_| PlanPersistenceError::NumericOverflow { field })?;
+    let length =
+        u32::try_from(value.len()).map_err(|_| PlanPersistenceError::NumericOverflow { field })?;
     put_u32(bytes, length);
     bytes.extend_from_slice(value.as_bytes());
     Ok(())
@@ -1081,8 +1082,8 @@ fn put_list_count(
             maximum: MAX_LIST_ITEMS,
         });
     }
-    let count = u32::try_from(count)
-        .map_err(|_| PlanPersistenceError::NumericOverflow { field })?;
+    let count =
+        u32::try_from(count).map_err(|_| PlanPersistenceError::NumericOverflow { field })?;
     put_u32(bytes, count);
     Ok(())
 }
@@ -1365,7 +1366,10 @@ mod tests {
             PlanCompatibility::Valid
         );
         let runtime_config = loaded.compile_runtime_config(fixture.context()).unwrap();
-        assert_eq!(runtime_config.cpu_thread_count, fixture.plan.cpu_thread_count);
+        assert_eq!(
+            runtime_config.cpu_thread_count,
+            fixture.plan.cpu_thread_count
+        );
         assert!(matches!(
             persisted.save_new(&path),
             Err(PlanPersistenceError::Io(ref error))
@@ -1405,9 +1409,7 @@ mod tests {
     fn test_unsupported_persistence_schema_is_rejected() {
         let fixture = fixture();
         let mut bytes = persisted(&fixture).to_bytes().unwrap();
-        bytes[8..12].copy_from_slice(
-            &(PERSISTED_EXECUTION_PLAN_SCHEMA_VERSION + 1).to_le_bytes(),
-        );
+        bytes[8..12].copy_from_slice(&(PERSISTED_EXECUTION_PLAN_SCHEMA_VERSION + 1).to_le_bytes());
         assert!(matches!(
             PersistedExecutionPlan::from_bytes(&bytes),
             Err(PlanPersistenceError::UnsupportedPersistenceSchema { .. })
@@ -1453,17 +1455,21 @@ mod tests {
     #[test]
     fn test_same_model_machine_and_storage_are_valid() {
         let fixture = fixture();
-        let loaded = PersistedExecutionPlan::from_bytes(
-            &persisted(&fixture).to_bytes().unwrap(),
-        )
-        .unwrap();
+        let loaded =
+            PersistedExecutionPlan::from_bytes(&persisted(&fixture).to_bytes().unwrap()).unwrap();
         assert_eq!(
             loaded.validate_compatibility(compatibility_context(&fixture, None)),
             PlanCompatibility::Valid
         );
         let runtime_config = loaded.compile_runtime_config(fixture.context()).unwrap();
-        assert_eq!(runtime_config.cpu_thread_count, fixture.plan.cpu_thread_count);
-        assert_eq!(runtime_config.ram_budget_bytes, fixture.plan.ram_budget_bytes);
+        assert_eq!(
+            runtime_config.cpu_thread_count,
+            fixture.plan.cpu_thread_count
+        );
+        assert_eq!(
+            runtime_config.ram_budget_bytes,
+            fixture.plan.ram_budget_bytes
+        );
         assert_eq!(
             runtime_config.layer_cache_capacity_bytes,
             fixture.plan.layer_cache.capacity_bytes
@@ -1501,10 +1507,8 @@ mod tests {
     #[test]
     fn test_changed_storage_is_valid_only_when_required_capabilities_remain() {
         let source = fixture();
-        let loaded = PersistedExecutionPlan::from_bytes(
-            &persisted(&source).to_bytes().unwrap(),
-        )
-        .unwrap();
+        let loaded =
+            PersistedExecutionPlan::from_bytes(&persisted(&source).to_bytes().unwrap()).unwrap();
 
         let mut compatible_storage = fixture();
         compatible_storage.storage.device_id = Some("different-device".to_string());
@@ -1556,10 +1560,8 @@ mod tests {
             let mut persisted = persisted(&fixture);
             persisted.execution_schema_version = schema;
             persisted.planner_ruleset_version = ruleset;
-            let loaded = PersistedExecutionPlan::from_bytes(
-                &persisted.to_bytes().unwrap(),
-            )
-            .unwrap();
+            let loaded =
+                PersistedExecutionPlan::from_bytes(&persisted.to_bytes().unwrap()).unwrap();
             assert_eq!(
                 loaded.validate_compatibility(compatibility_context(&fixture, None)),
                 PlanCompatibility::Incompatible
@@ -1576,10 +1578,7 @@ mod tests {
         let loaded = persisted(&fixture);
 
         assert_eq!(
-            loaded.validate_compatibility(compatibility_context(
-                &fixture,
-                Some(&calibration),
-            )),
+            loaded.validate_compatibility(compatibility_context(&fixture, Some(&calibration),)),
             PlanCompatibility::Valid
         );
 
@@ -1604,10 +1603,8 @@ mod tests {
         let calibration = matching_calibration(&calibrated_fixture);
         apply_calibration_provenance(&mut calibrated_fixture, &calibration);
         let loaded = persisted(&calibrated_fixture);
-        let missing_report = loaded.compatibility_report(compatibility_context(
-            &calibrated_fixture,
-            None,
-        ));
+        let missing_report =
+            loaded.compatibility_report(compatibility_context(&calibrated_fixture, None));
         assert_eq!(
             missing_report.state,
             PlanCompatibility::CompatibleRecalibrationRecommended
@@ -1625,17 +1622,17 @@ mod tests {
             calibration_ruleset_version: None,
             observation_identifiers: Vec::new(),
         };
-        requested_without_result.plan.reasons.retain(|reason| {
-            reason.code != PlanReasonCode::CalibrationNotRequested
-        });
+        requested_without_result
+            .plan
+            .reasons
+            .retain(|reason| reason.code != PlanReasonCode::CalibrationNotRequested);
         requested_without_result.plan.reasons.push(PlanReason {
             code: PlanReasonCode::CalibrationNotApplicable,
             value: Some(0),
         });
         assert_eq!(
-            persisted(&requested_without_result).validate_compatibility(
-                compatibility_context(&requested_without_result, None),
-            ),
+            persisted(&requested_without_result)
+                .validate_compatibility(compatibility_context(&requested_without_result, None),),
             PlanCompatibility::CompatibleRecalibrationRecommended
         );
     }
@@ -1645,10 +1642,7 @@ mod tests {
         let fixture = fixture();
         let mut persisted = persisted(&fixture);
         persisted.layer_cache.capacity_bytes = 1_000;
-        let loaded = PersistedExecutionPlan::from_bytes(
-            &persisted.to_bytes().unwrap(),
-        )
-        .unwrap();
+        let loaded = PersistedExecutionPlan::from_bytes(&persisted.to_bytes().unwrap()).unwrap();
         assert!(matches!(
             loaded.compile_runtime_config(fixture.context()),
             Err(PersistedPlanValidationError::Compilation(
@@ -1671,10 +1665,7 @@ mod tests {
             enabled: true,
             selected_device_id: Some("gpu0".to_string()),
         };
-        let loaded = PersistedExecutionPlan::from_bytes(
-            &persisted.to_bytes().unwrap(),
-        )
-        .unwrap();
+        let loaded = PersistedExecutionPlan::from_bytes(&persisted.to_bytes().unwrap()).unwrap();
         assert_eq!(
             loaded.validate_compatibility(compatibility_context(&fixture, None)),
             PlanCompatibility::Incompatible

@@ -44,9 +44,6 @@ use ramforge_core::{
     cache::BoundedCache, datasource::GgufDataSource, memory::MemoryBudget, GgufModel,
 };
 
-pub use ramforge_core::{
-    CacheError, CacheStats, DataSourceError, GgufError, MemoryError, ParseSizeError,
-};
 pub use orchestration::{
     OrchestratedRuntime, OrchestrationError, OrchestrationRequest, PlanningSession,
     RuntimeOrchestrator,
@@ -57,6 +54,9 @@ pub use plan_persistence::{
     PersistedExecutionPlan, PersistedPlanCompatibilityContext, PersistedPlanValidationError,
     PlanCompatibilityReason, PlanCompatibilityReport, PlanPersistenceError,
     PERSISTED_EXECUTION_PLAN_SCHEMA_VERSION,
+};
+pub use ramforge_core::{
+    CacheError, CacheStats, DataSourceError, GgufError, MemoryError, ParseSizeError,
 };
 pub use runtime_config::{RuntimeConfig, RuntimeConfigError, RuntimeExecutionDevice};
 
@@ -83,7 +83,9 @@ impl Runtime {
         // budget per entry via `insert_budgeted` – no double-counted capacity
         // pre-reservation.
         let cache_capacity = (ram_budget_bytes as f64 * 0.8) as u64;
-        let cache_capacity = cache_capacity.max(1024 * 1024).min(ram_budget_bytes.saturating_sub(1024 * 1024));
+        let cache_capacity = cache_capacity
+            .max(1024 * 1024)
+            .min(ram_budget_bytes.saturating_sub(1024 * 1024));
         let cache = BoundedCache::new(cache_capacity)?;
 
         Ok(Self {
@@ -105,10 +107,13 @@ impl Runtime {
             .cache
             .insert_budgeted(&mut self.budget, name.to_string(), data.clone())
         {
-            Ok(_) => {},
-            Err(ramforge_core::CacheError::TooLarge { .. }) => {},
+            Ok(_) => {}
+            Err(ramforge_core::CacheError::TooLarge { .. }) => {}
             Err(e) => {
-                return Err(DataSourceError::General(format!("cache insert failed: {}", e)));
+                return Err(DataSourceError::General(format!(
+                    "cache insert failed: {}",
+                    e
+                )));
             }
         }
         Ok(data)

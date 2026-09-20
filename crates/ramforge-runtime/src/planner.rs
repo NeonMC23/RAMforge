@@ -152,9 +152,7 @@ impl UserProfile {
                 "disabled layer cache has a capacity override",
             ));
         }
-        if self.advanced.gpu_device_id.is_some()
-            && self.gpu_preference == GpuPreference::Disabled
-        {
+        if self.advanced.gpu_device_id.is_some() && self.gpu_preference == GpuPreference::Disabled {
             return Err(PlannerError::invalid(
                 "UserProfile",
                 "GPU device selected while GPU use is disabled",
@@ -245,7 +243,10 @@ impl MachineProfile {
         }
         if self.total_ram_bytes == Some(0)
             || self.available_ram_bytes == Some(0)
-            || matches!((self.total_ram_bytes, self.available_ram_bytes), (None, Some(_)))
+            || matches!(
+                (self.total_ram_bytes, self.available_ram_bytes),
+                (None, Some(_))
+            )
             || matches!(
                 (self.total_ram_bytes, self.available_ram_bytes),
                 (Some(total), Some(available)) if available > total
@@ -374,14 +375,15 @@ impl ModelProfile {
         let mut formats: BTreeMap<String, FormatAccumulator> = BTreeMap::new();
         let mut total_tensor_elements = Some(0u64);
         for tensor in &model.tensors {
-            let entry = formats
-                .entry(tensor.ggml_type.name())
-                .or_insert_with(|| FormatAccumulator {
-                    tensor_count: 0,
-                    element_count: Some(0),
-                    byte_count: Some(0),
-                    runtime_supported: ggml_type_supported_for_inference(tensor.ggml_type),
-                });
+            let entry =
+                formats
+                    .entry(tensor.ggml_type.name())
+                    .or_insert_with(|| FormatAccumulator {
+                        tensor_count: 0,
+                        element_count: Some(0),
+                        byte_count: Some(0),
+                        runtime_supported: ggml_type_supported_for_inference(tensor.ggml_type),
+                    });
             entry.tensor_count += 1;
             entry.element_count = entry
                 .element_count
@@ -390,8 +392,8 @@ impl ModelProfile {
                 (Some(total), Some(bytes)) => total.checked_add(bytes),
                 _ => None,
             };
-            total_tensor_elements = total_tensor_elements
-                .and_then(|total| total.checked_add(tensor.num_elements));
+            total_tensor_elements =
+                total_tensor_elements.and_then(|total| total.checked_add(tensor.num_elements));
         }
         let tensor_formats = formats
             .into_iter()
@@ -451,9 +453,10 @@ impl ModelProfile {
             ));
         }
         let mut format_names = BTreeSet::new();
-        let represented_tensors = self.tensor_formats.iter().try_fold(
-            0usize,
-            |total, format| {
+        let represented_tensors = self
+            .tensor_formats
+            .iter()
+            .try_fold(0usize, |total, format| {
                 if format.format.is_empty()
                     || format.tensor_count == 0
                     || !format_names.insert(format.format.as_str())
@@ -461,13 +464,9 @@ impl ModelProfile {
                     return None;
                 }
                 total.checked_add(format.tensor_count)
-            },
-        );
+            });
         if represented_tensors != Some(self.tensor_count) {
-            return Err(PlannerError::invalid(
-                "ModelProfile",
-                "tensor distribution",
-            ));
+            return Err(PlannerError::invalid("ModelProfile", "tensor distribution"));
         }
         Ok(())
     }
@@ -535,10 +534,7 @@ impl StorageProfile {
         if self.path_state == StoragePathState::Ready
             && (!self.readable || !self.regular_file || self.file_size_bytes.is_none())
         {
-            return Err(PlannerError::invalid(
-                "StorageProfile",
-                "ready path facts",
-            ));
+            return Err(PlannerError::invalid("StorageProfile", "ready path facts"));
         }
         if self.path_state == StoragePathState::Unverified
             && (self.readable || self.regular_file || self.file_size_bytes.is_some())
@@ -728,8 +724,7 @@ pub fn observation_quality_basis_points(samples: &[MeasurementSample]) -> u16 {
     let mut minimum_rate = u128::MAX;
     let mut maximum_rate = 0u128;
     for sample in samples {
-        let rate = sample.units_processed as u128 * 1_000_000_000u128
-            / sample.elapsed_ns as u128;
+        let rate = sample.units_processed as u128 * 1_000_000_000u128 / sample.elapsed_ns as u128;
         minimum_rate = minimum_rate.min(rate);
         maximum_rate = maximum_rate.max(rate);
     }
@@ -800,8 +795,9 @@ impl PerformanceObservation {
             ));
         }
         let expected_unit = match self.metric {
-            ObservationMetric::SequentialReadThroughput
-            | ObservationMetric::MemoryBandwidth => ObservationUnit::BytesPerSecond,
+            ObservationMetric::SequentialReadThroughput | ObservationMetric::MemoryBandwidth => {
+                ObservationUnit::BytesPerSecond
+            }
             ObservationMetric::CpuFloatThroughput
             | ObservationMetric::QuantizedDecodeThroughput => ObservationUnit::ElementsPerSecond,
             ObservationMetric::RandomReadLatency | ObservationMetric::StrategyLatency => {
@@ -843,14 +839,11 @@ impl PerformanceObservation {
                     || self
                         .raw_samples
                         .iter()
-                        .try_fold(0u64, |total, sample| {
-                            total.checked_add(sample.elapsed_ns)
-                        })
+                        .try_fold(0u64, |total, sample| total.checked_add(sample.elapsed_ns))
                         != Some(self.measurement_duration_ns)
                     || self.quality_basis_points
                         != observation_quality_basis_points(&self.raw_samples)
-                    || self.value
-                        != aggregate_observation_value(self.unit, &self.raw_samples)
+                    || self.value != aggregate_observation_value(self.unit, &self.raw_samples)
                 {
                     return Err(PlannerError::invalid(
                         "PerformanceObservation",
@@ -1203,9 +1196,9 @@ impl Planner {
         let total_ram_bytes = machine.total_ram_bytes.ok_or(PlannerError::Infeasible(
             FeasibilityRejection::MachineMemoryUnavailable,
         ))?;
-        let available_ram_bytes = machine.available_ram_bytes.ok_or(
-            PlannerError::Infeasible(FeasibilityRejection::MachineMemoryUnavailable),
-        )?;
+        let available_ram_bytes = machine.available_ram_bytes.ok_or(PlannerError::Infeasible(
+            FeasibilityRejection::MachineMemoryUnavailable,
+        ))?;
         if user.ram_budget_bytes > total_ram_bytes {
             return Err(PlannerError::Infeasible(
                 FeasibilityRejection::RamBudgetExceedsTotalRam,
@@ -1231,9 +1224,12 @@ impl Planner {
                 FeasibilityRejection::ModelNotExecutable,
             ));
         }
-        let execution = static_plan.execution_memory.as_ref().ok_or(
-            PlannerError::Infeasible(FeasibilityRejection::ExecutionPreflightUnavailable),
-        )?;
+        let execution = static_plan
+            .execution_memory
+            .as_ref()
+            .ok_or(PlannerError::Infeasible(
+                FeasibilityRejection::ExecutionPreflightUnavailable,
+            ))?;
         if !execution.layer_streaming_lower_bound_fits
             || execution.managed_lower_bound_bytes > user.ram_budget_bytes
         {
@@ -1246,26 +1242,22 @@ impl Planner {
         let thread_limit = machine
             .logical_cpu_cores
             .min(user.cpu_thread_limit.unwrap_or(machine.logical_cpu_cores));
-        let (cpu_thread_count, thread_reason) =
-            if let Some(requested) = user.advanced.thread_count {
-                if requested > thread_limit {
-                    return Err(PlannerError::Infeasible(
-                        FeasibilityRejection::RequestedThreadCountUnavailable,
-                    ));
-                }
-                (
-                    requested,
-                    PlanReasonCode::ThreadCountSelectedByAdvancedOverride,
-                )
-            } else {
-                let selected = thread_limit
-                    .saturating_mul(policy.thread_fraction_numerator)
-                    / policy.thread_fraction_denominator;
-                (
-                    selected.max(1),
-                    PlanReasonCode::ThreadCountSelectedByPreset,
-                )
-            };
+        let (cpu_thread_count, thread_reason) = if let Some(requested) = user.advanced.thread_count
+        {
+            if requested > thread_limit {
+                return Err(PlannerError::Infeasible(
+                    FeasibilityRejection::RequestedThreadCountUnavailable,
+                ));
+            }
+            (
+                requested,
+                PlanReasonCode::ThreadCountSelectedByAdvancedOverride,
+            )
+        } else {
+            let selected = thread_limit.saturating_mul(policy.thread_fraction_numerator)
+                / policy.thread_fraction_denominator;
+            (selected.max(1), PlanReasonCode::ThreadCountSelectedByPreset)
+        };
 
         if user.gpu_preference == GpuPreference::Require
             && (!policy.allow_gpu || !capabilities.gpu_backend_usable)
@@ -1313,13 +1305,10 @@ impl Planner {
             }
             capacity
         } else {
-            ((maximum_cache_capacity as u128
-                * policy.layer_cache_capacity_basis_points as u128)
+            ((maximum_cache_capacity as u128 * policy.layer_cache_capacity_basis_points as u128)
                 / 10_000) as u64
         };
-        if cache_is_required
-            && requested_cache_capacity < execution.min_layer_resident_bytes
-        {
+        if cache_is_required && requested_cache_capacity < execution.min_layer_resident_bytes {
             return Err(PlannerError::Infeasible(
                 FeasibilityRejection::LayerCacheCapacityCannotFitCompleteLayer,
             ));
@@ -1546,8 +1535,7 @@ fn estimate_cost(
     }
 
     provenance.calibration_identifier = Some(calibration.identifier.clone());
-    provenance.calibration_plan_identifier =
-        Some(calibration.calibration_plan_identifier.clone());
+    provenance.calibration_plan_identifier = Some(calibration.calibration_plan_identifier.clone());
     provenance.calibration_plan_version = Some(calibration.calibration_plan_version);
     provenance.calibration_ruleset_version = Some(calibration.calibration_ruleset_version);
     if let Some(read) = best_observation(
@@ -1739,10 +1727,7 @@ mod tests {
                 Some(descriptor)
             })
             .collect::<Vec<_>>();
-        let file_size = tensors
-            .iter()
-            .filter_map(|tensor| tensor.byte_length)
-            .sum();
+        let file_size = tensors.iter().filter_map(|tensor| tensor.byte_length).sum();
         GgufModel {
             path: PathBuf::from("/models/tiny.gguf"),
             file_size,
@@ -1808,7 +1793,13 @@ mod tests {
 
     fn profiles_and_static_plan(
         mode: OperatingMode,
-    ) -> (UserProfile, MachineProfile, ModelProfile, StorageProfile, PlanResult) {
+    ) -> (
+        UserProfile,
+        MachineProfile,
+        ModelProfile,
+        StorageProfile,
+        PlanResult,
+    ) {
         let model = tiny_model("llama");
         let user = UserProfile::new(10_000, mode);
         let machine = machine_profile();
@@ -2074,8 +2065,7 @@ mod tests {
             profiles_and_static_plan(OperatingMode::BalancedNormal);
         storage.seekable = false;
         let planner = Planner;
-        let capabilities =
-            planner.derive_capabilities(&machine, &model, &storage, &static_plan);
+        let capabilities = planner.derive_capabilities(&machine, &model, &storage, &static_plan);
         assert_eq!(
             planner
                 .plan(
@@ -2098,8 +2088,7 @@ mod tests {
             profiles_and_static_plan(OperatingMode::BalancedNormal);
         storage.file_size_bytes = Some(model.file_size_bytes + 1);
         let planner = Planner;
-        let capabilities =
-            planner.derive_capabilities(&machine, &model, &storage, &static_plan);
+        let capabilities = planner.derive_capabilities(&machine, &model, &storage, &static_plan);
         assert_eq!(
             planner
                 .plan(
@@ -2165,13 +2154,12 @@ mod tests {
         let unsupported_profile = ModelProfile::from_gguf(&unsupported_model);
         let unsupported_plan =
             crate::plan::plan_model(&unsupported_model, user.ram_budget_bytes).unwrap();
-        let unsupported_capabilities =
-            planner.derive_capabilities(
-                &machine,
-                &unsupported_profile,
-                &storage,
-                &unsupported_plan,
-            );
+        let unsupported_capabilities = planner.derive_capabilities(
+            &machine,
+            &unsupported_profile,
+            &storage,
+            &unsupported_plan,
+        );
         user.gpu_preference = GpuPreference::Disabled;
         assert_eq!(
             planner
@@ -2371,9 +2359,7 @@ mod tests {
         user.advanced.read_coalescing_enabled = Some(false);
         assert_eq!(
             user.validate().unwrap_err(),
-            PlannerError::Infeasible(
-                FeasibilityRejection::AdvancedOverrideRequiresAdvancedMode
-            )
+            PlannerError::Infeasible(FeasibilityRejection::AdvancedOverrideRequiresAdvancedMode)
         );
     }
 

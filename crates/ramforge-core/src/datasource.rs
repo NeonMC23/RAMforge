@@ -84,7 +84,8 @@ impl GgufDataSource {
     /// not load tensor payloads.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DataSourceError> {
         let path_buf = path.as_ref().to_path_buf();
-        let model = parse_gguf_file(&path_buf).map_err(|e| DataSourceError::General(e.to_string()))?;
+        let model =
+            parse_gguf_file(&path_buf).map_err(|e| DataSourceError::General(e.to_string()))?;
         let file_size = model.file_size;
         let file = File::open(&path_buf)?;
         Ok(Self {
@@ -127,8 +128,10 @@ impl GgufDataSource {
         self.profile_read_nanos.store(0, Ordering::Relaxed);
         self.profile_seek_operations.store(0, Ordering::Relaxed);
         self.profile_seeks_avoided.store(0, Ordering::Relaxed);
-        self.profile_logical_tensor_reads.store(0, Ordering::Relaxed);
-        self.profile_logical_tensor_bytes.store(0, Ordering::Relaxed);
+        self.profile_logical_tensor_reads
+            .store(0, Ordering::Relaxed);
+        self.profile_logical_tensor_bytes
+            .store(0, Ordering::Relaxed);
         self.profile_coalesced_ranges.store(0, Ordering::Relaxed);
         self.profile_coalesced_gap_bytes.store(0, Ordering::Relaxed);
         self.profile_read_buffer_reuses.store(0, Ordering::Relaxed);
@@ -166,8 +169,10 @@ impl GgufDataSource {
         if !self.profiling_enabled.load(Ordering::Relaxed) {
             return;
         }
-        self.profile_logical_tensor_reads.fetch_add(1, Ordering::Relaxed);
-        self.profile_logical_tensor_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.profile_logical_tensor_reads
+            .fetch_add(1, Ordering::Relaxed);
+        self.profile_logical_tensor_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
         let Ok(mut profiles) = self.profile_tensors.lock() else {
             return;
         };
@@ -183,7 +188,8 @@ impl GgufDataSource {
         if !self.profiling_enabled.load(Ordering::Relaxed) {
             return;
         }
-        self.profile_coalesced_ranges.fetch_add(1, Ordering::Relaxed);
+        self.profile_coalesced_ranges
+            .fetch_add(1, Ordering::Relaxed);
         self.profile_coalesced_gap_bytes
             .fetch_add(gap_bytes, Ordering::Relaxed);
     }
@@ -374,12 +380,7 @@ impl GgufDataSource {
         byte_length: u64,
     ) -> Result<Vec<u8>, DataSourceError> {
         let mut buffer = Vec::new();
-        self.read_coalesced_tensor_range_into(
-            descriptors,
-            file_offset,
-            byte_length,
-            &mut buffer,
-        )?;
+        self.read_coalesced_tensor_range_into(descriptors, file_offset, byte_length, &mut buffer)?;
         Ok(buffer)
     }
 
@@ -668,9 +669,10 @@ impl GgufDataSource {
             ))
         })?;
 
-        let mut state = self.file.lock().map_err(|_| {
-            DataSourceError::General("GGUF file handle lock poisoned".to_string())
-        })?;
+        let mut state = self
+            .file
+            .lock()
+            .map_err(|_| DataSourceError::General("GGUF file handle lock poisoned".to_string()))?;
         self.ensure_file_position(&mut state, file_offset)?;
         let read_result = {
             let spare = &mut values.spare_capacity_mut()[..element_count];
@@ -682,10 +684,7 @@ impl GgufDataSource {
             // - every possible 32-bit pattern is a valid Rust f32 value;
             // - on success every byte is initialized before `set_len` below.
             let destination = unsafe {
-                std::slice::from_raw_parts_mut(
-                    spare.as_mut_ptr().cast::<u8>(),
-                    byte_length,
-                )
+                std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), byte_length)
             };
             state.file.read_exact(destination)
         };
@@ -957,10 +956,7 @@ mod tests {
         let bytes = ds
             .read_coalesced_tensor_range(&[a, b], a.file_offset, span)
             .unwrap();
-        assert_eq!(
-            f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            1.0
-        );
+        assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1.0);
         let b_start = 8 + gap;
         assert_eq!(
             f32::from_le_bytes(bytes[b_start..b_start + 4].try_into().unwrap()),
@@ -989,7 +985,10 @@ mod tests {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(
-            direct.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            direct
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
             reference
                 .iter()
                 .map(|value| value.to_bits())
@@ -1075,9 +1074,7 @@ mod tests {
             _ => panic!("expected InvalidRange, got {:?}", err),
         }
         // Overflow must be rejected rather than wrapping into an in-bounds read.
-        let err = ds
-            .read_tensor_range("a.weight", 1, u64::MAX)
-            .unwrap_err();
+        let err = ds.read_tensor_range("a.weight", 1, u64::MAX).unwrap_err();
         assert!(matches!(err, DataSourceError::InvalidRange(_)));
     }
 

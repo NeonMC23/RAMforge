@@ -35,16 +35,15 @@ impl LayerReadPlan {
     /// Scratch capacity worth retaining across this layer's grouped reads.
     /// Mixed singleton plans keep the existing per-range allocation path.
     pub(crate) fn reusable_group_buffer_bytes(&self) -> Option<u64> {
-        (self.ranges.len() > 1
-            && self.ranges.iter().all(|range| range.tensors.len() > 1))
-        .then(|| {
-            self.ranges
-                .iter()
-                .map(|range| range.byte_length)
-                .max()
-                .unwrap_or(0)
-        })
-        .filter(|bytes| *bytes > 0)
+        (self.ranges.len() > 1 && self.ranges.iter().all(|range| range.tensors.len() > 1))
+            .then(|| {
+                self.ranges
+                    .iter()
+                    .map(|range| range.byte_length)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .filter(|bytes| *bytes > 0)
     }
 }
 
@@ -54,15 +53,16 @@ pub(crate) fn build_layer_read_plan(
     let mut ordered = Vec::with_capacity(descriptors.len());
     let mut logical_bytes = 0u64;
     for (index, descriptor) in descriptors.iter().enumerate() {
-        let byte_length = descriptor.byte_length.ok_or_else(|| {
-            format!("tensor '{}' byte length is unknown", descriptor.name)
-        })?;
-        let end = descriptor.file_offset.checked_add(byte_length).ok_or_else(|| {
-            format!("tensor '{}' file range overflows", descriptor.name)
-        })?;
-        logical_bytes = logical_bytes.checked_add(byte_length).ok_or_else(|| {
-            "layer logical tensor byte count overflow".to_string()
-        })?;
+        let byte_length = descriptor
+            .byte_length
+            .ok_or_else(|| format!("tensor '{}' byte length is unknown", descriptor.name))?;
+        let end = descriptor
+            .file_offset
+            .checked_add(byte_length)
+            .ok_or_else(|| format!("tensor '{}' file range overflows", descriptor.name))?;
+        logical_bytes = logical_bytes
+            .checked_add(byte_length)
+            .ok_or_else(|| "layer logical tensor byte count overflow".to_string())?;
         ordered.push((descriptor.file_offset, end, byte_length, index));
     }
     ordered.sort_by_key(|(start, _, _, index)| (*start, *index));
@@ -84,9 +84,7 @@ pub(crate) fn build_layer_read_plan(
             let candidate_span = end
                 .checked_sub(current.file_offset)
                 .ok_or_else(|| "planned range span underflow".to_string())?;
-            if gap <= MAX_COALESCED_GAP_BYTES
-                && candidate_span <= MAX_COALESCED_SPAN_BYTES
-            {
+            if gap <= MAX_COALESCED_GAP_BYTES && candidate_span <= MAX_COALESCED_SPAN_BYTES {
                 current.tensors.push(PlannedTensor {
                     descriptor_index,
                     offset_in_range: start - current.file_offset,
@@ -116,12 +114,14 @@ pub(crate) fn build_layer_read_plan(
         });
     }
 
-    let physical_bytes = ranges.iter().try_fold(0u64, |total, range| {
-        total.checked_add(range.byte_length)
-    }).ok_or_else(|| "layer physical read byte count overflow".to_string())?;
-    let gap_bytes = ranges.iter().try_fold(0u64, |total, range| {
-        total.checked_add(range.gap_bytes)
-    }).ok_or_else(|| "layer coalesced gap byte count overflow".to_string())?;
+    let physical_bytes = ranges
+        .iter()
+        .try_fold(0u64, |total, range| total.checked_add(range.byte_length))
+        .ok_or_else(|| "layer physical read byte count overflow".to_string())?;
+    let gap_bytes = ranges
+        .iter()
+        .try_fold(0u64, |total, range| total.checked_add(range.gap_bytes))
+        .ok_or_else(|| "layer coalesced gap byte count overflow".to_string())?;
 
     Ok(LayerReadPlan {
         logical_tensor_count: descriptors.len(),

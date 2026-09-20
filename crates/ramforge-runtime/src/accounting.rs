@@ -43,13 +43,14 @@ pub(crate) fn estimate_layer_memory(
     let mut settled = 0u64;
     let mut load_peak = 0u64;
     for descriptor in tensors {
-        let file_bytes = descriptor.byte_length.ok_or_else(|| {
-            format!("tensor '{}' byte length is unknown", descriptor.name)
-        })?;
+        let file_bytes = descriptor
+            .byte_length
+            .ok_or_else(|| format!("tensor '{}' byte length is unknown", descriptor.name))?;
         let load_charge = tensor_load_charge_bytes(descriptor.ggml_type, file_bytes)?.max(1);
-        load_peak = load_peak.max(settled.checked_add(load_charge).ok_or_else(|| {
-            format!("layer load peak overflow at tensor '{}'", descriptor.name)
-        })?);
+        load_peak =
+            load_peak.max(settled.checked_add(load_charge).ok_or_else(|| {
+                format!("layer load peak overflow at tensor '{}'", descriptor.name)
+            })?);
         let resident = TensorData::resident_bytes_for(
             descriptor.ggml_type,
             descriptor.num_elements,
@@ -57,7 +58,10 @@ pub(crate) fn estimate_layer_memory(
         )
         .map_err(|error| format!("tensor '{}': {}", descriptor.name, error))?;
         settled = settled.checked_add(resident.max(1)).ok_or_else(|| {
-            format!("layer resident size overflow at tensor '{}'", descriptor.name)
+            format!(
+                "layer resident size overflow at tensor '{}'",
+                descriptor.name
+            )
         })?;
     }
     Ok(LayerMemoryEstimate {
@@ -75,9 +79,9 @@ pub(crate) fn estimate_grouped_layer_memory(
     for range in &plan.ranges {
         if range.tensors.len() == 1 {
             let descriptor = &tensors[range.tensors[0].descriptor_index];
-            let file_bytes = descriptor.byte_length.ok_or_else(|| {
-                format!("tensor '{}' byte length is unknown", descriptor.name)
-            })?;
+            let file_bytes = descriptor
+                .byte_length
+                .ok_or_else(|| format!("tensor '{}' byte length is unknown", descriptor.name))?;
             let charge = tensor_load_charge_bytes(descriptor.ggml_type, file_bytes)?.max(1);
             load_peak = load_peak.max(settled.checked_add(charge).ok_or_else(|| {
                 format!("layer load peak overflow at tensor '{}'", descriptor.name)
@@ -89,16 +93,19 @@ pub(crate) fn estimate_grouped_layer_memory(
             )
             .map_err(|error| format!("tensor '{}': {}", descriptor.name, error))?;
             settled = settled.checked_add(resident.max(1)).ok_or_else(|| {
-                format!("layer resident size overflow at tensor '{}'", descriptor.name)
+                format!(
+                    "layer resident size overflow at tensor '{}'",
+                    descriptor.name
+                )
             })?;
             continue;
         }
 
         let range_resident = range.tensors.iter().try_fold(0u64, |total, tensor| {
             let descriptor = &tensors[tensor.descriptor_index];
-            let file_bytes = descriptor.byte_length.ok_or_else(|| {
-                format!("tensor '{}' byte length is unknown", descriptor.name)
-            })?;
+            let file_bytes = descriptor
+                .byte_length
+                .ok_or_else(|| format!("tensor '{}' byte length is unknown", descriptor.name))?;
             let resident = TensorData::resident_bytes_for(
                 descriptor.ggml_type,
                 descriptor.num_elements,

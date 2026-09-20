@@ -104,7 +104,12 @@ mod tests {
         let b = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
         let scalar = dot_f32_scalar(&a, &b);
         let simd = dot_f32_avx2(&a, &b);
-        assert!((scalar - simd).abs() < 1e-4, "scalar {} vs simd {}", scalar, simd);
+        assert!(
+            (scalar - simd).abs() < 1e-4,
+            "scalar {} vs simd {}",
+            scalar,
+            simd
+        );
     }
 
     #[test]

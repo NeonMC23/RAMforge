@@ -104,10 +104,9 @@ impl<'a> TokenDecoder<'a> {
                 Err(error) => {
                     let valid_up_to = error.valid_up_to();
                     if valid_up_to > 0 {
-                        let valid = String::from_utf8(
-                            self.pending_bytes.drain(..valid_up_to).collect(),
-                        )
-                        .expect("UTF-8 valid prefix reported by from_utf8");
+                        let valid =
+                            String::from_utf8(self.pending_bytes.drain(..valid_up_to).collect())
+                                .expect("UTF-8 valid prefix reported by from_utf8");
                         output.push_str(&self.emit_text(&valid));
                         continue;
                     }
@@ -146,8 +145,7 @@ impl<'a> TokenDecoder<'a> {
             }
         }
 
-        if self.tokenizer.token_types.get(id as usize) == Some(&TokenType::Byte)
-            && token.len() == 1
+        if self.tokenizer.token_types.get(id as usize) == Some(&TokenType::Byte) && token.len() == 1
         {
             self.pending_bytes.push(token.as_bytes()[0]);
             return self.drain_bytes(false);
@@ -367,7 +365,10 @@ impl Tokenizer {
             }
         }
 
-        let mut encoded = if self.model == "gpt2" || self.pre.as_deref() == Some("qwen2") || self.merges.is_some() {
+        let mut encoded = if self.model == "gpt2"
+            || self.pre.as_deref() == Some("qwen2")
+            || self.merges.is_some()
+        {
             self.encode_bpe(text)
         } else {
             // Default to SentencePiece unigram (llama)
@@ -646,8 +647,12 @@ mod tests {
             w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
             w.write_all(s.as_bytes()).unwrap();
         }
-        fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
-        fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_u32<W: Write>(w: &mut W, v: u32) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
+        fn write_u64<W: Write>(w: &mut W, v: u64) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
 
         write_string(&mut buf, "tokenizer.ggml.model");
         write_u32(&mut buf, 8);
@@ -665,13 +670,17 @@ mod tests {
         write_u32(&mut buf, 9);
         write_u32(&mut buf, 6);
         write_u64(&mut buf, 7);
-        for _ in 0..7 { write_u32(&mut buf, 0f32.to_bits()); }
+        for _ in 0..7 {
+            write_u32(&mut buf, 0f32.to_bits());
+        }
 
         write_string(&mut buf, "tokenizer.ggml.token_type");
         write_u32(&mut buf, 9);
         write_u32(&mut buf, 5);
         write_u64(&mut buf, 7);
-        for t in [2, 3, 3, 1, 1, 1, 1] { write_u32(&mut buf, t as u32); }
+        for t in [2, 3, 3, 1, 1, 1, 1] {
+            write_u32(&mut buf, t as u32);
+        }
 
         write_string(&mut buf, "tokenizer.ggml.bos_token_id");
         write_u32(&mut buf, 4);
@@ -697,8 +706,12 @@ mod tests {
             w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
             w.write_all(s.as_bytes()).unwrap();
         }
-        fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
-        fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_u32<W: Write>(w: &mut W, v: u32) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
+        fn write_u64<W: Write>(w: &mut W, v: u64) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
 
         write_string(&mut buf, "tokenizer.ggml.model");
         write_u32(&mut buf, 8);
@@ -708,7 +721,9 @@ mod tests {
         write_u32(&mut buf, 9);
         write_u32(&mut buf, 8);
         write_u64(&mut buf, 11);
-        for tok in ["<unk>", "<s>", "</s>", "h", "e", "l", "o", "he", "lo", "hel", "hello"] {
+        for tok in [
+            "<unk>", "<s>", "</s>", "h", "e", "l", "o", "he", "lo", "hel", "hello",
+        ] {
             write_string(&mut buf, tok);
         }
 
@@ -716,13 +731,17 @@ mod tests {
         write_u32(&mut buf, 9);
         write_u32(&mut buf, 6);
         write_u64(&mut buf, 11);
-        for _ in 0..11 { write_u32(&mut buf, 0f32.to_bits()); }
+        for _ in 0..11 {
+            write_u32(&mut buf, 0f32.to_bits());
+        }
 
         write_string(&mut buf, "tokenizer.ggml.token_type");
         write_u32(&mut buf, 9);
         write_u32(&mut buf, 5);
         write_u64(&mut buf, 11);
-        for _ in 0..11 { write_u32(&mut buf, 1); }
+        for _ in 0..11 {
+            write_u32(&mut buf, 1);
+        }
 
         write_string(&mut buf, "tokenizer.ggml.merges");
         write_u32(&mut buf, 9);
@@ -835,7 +854,11 @@ mod tests {
         let ids = tokenizer.encode("hello", false);
         // BPE should merge h+e->he, he+l->hel, l+o->lo, hel+lo->hello
         // So should be [10]
-        assert!(ids.contains(&10), "BPE should produce hello token, got {:?}", ids);
+        assert!(
+            ids.contains(&10),
+            "BPE should produce hello token, got {:?}",
+            ids
+        );
     }
 
     #[test]

@@ -135,9 +135,7 @@ pub enum OrchestrationError {
     ModelProfileConstruction(PlannerError),
     StaticPlanning(String),
     MachineDiscovery(MachineDiscoveryError),
-    CapabilityConstruction {
-        binding: &'static str,
-    },
+    CapabilityConstruction { binding: &'static str },
     Planning(PlannerError),
     PlanCompilation(PlanCompilationError),
     RuntimeSourceUnavailable,
@@ -162,7 +160,10 @@ impl fmt::Display for OrchestrationError {
             Self::Planning(error) => write!(formatter, "deterministic planning failed: {error}"),
             Self::PlanCompilation(error) => write!(formatter, "plan compilation failed: {error}"),
             Self::RuntimeSourceUnavailable => {
-                write!(formatter, "validated model datasource is no longer available")
+                write!(
+                    formatter,
+                    "validated model datasource is no longer available"
+                )
             }
             Self::RuntimeConstruction(error) => {
                 write!(formatter, "runtime construction failed: {error}")
@@ -205,12 +206,9 @@ impl RuntimeOrchestrator {
         &self,
         request: OrchestrationRequest<'_>,
     ) -> Result<OrchestratedRuntime, OrchestrationError> {
-        let mut session = self.analyze_retained(
-            request.model_path,
-            request.user_profile.ram_budget_bytes,
-        )?;
-        let execution_plan =
-            session.create_plan(request.user_profile, request.calibration)?;
+        let mut session =
+            self.analyze_retained(request.model_path, request.user_profile.ram_budget_bytes)?;
+        let execution_plan = session.create_plan(request.user_profile, request.calibration)?;
         let engine = session.activate_plan(&execution_plan)?;
 
         Ok(OrchestratedRuntime {
@@ -329,6 +327,7 @@ mod tests {
     use tempfile::{tempdir, NamedTempFile};
 
     use super::*;
+    use crate::backend::ComputeBackend as _;
     use crate::inference::tests::create_tiny_llama_gguf;
     #[cfg(target_os = "linux")]
     use crate::planner::{
@@ -450,7 +449,10 @@ mod tests {
         assert_eq!(session.model.tensor_count, 11);
         assert_eq!(session.model_info.embedding_length, Some(8));
         assert_eq!(session.model_info.vocab_size, Some(16));
-        assert_eq!(session.storage.file_size_bytes, Some(session.model.file_size_bytes));
+        assert_eq!(
+            session.storage.file_size_bytes,
+            Some(session.model.file_size_bytes)
+        );
         assert_eq!(
             session.capabilities.model_fingerprint,
             session.model.identity.descriptor_fingerprint
@@ -520,7 +522,10 @@ mod tests {
             config.grouped_read_buffer_reuse_enabled,
             plan.io.grouped_read_buffer_reuse_enabled
         );
-        assert_eq!(orchestrated.engine.backend.num_threads, plan.cpu_thread_count);
+        assert_eq!(
+            orchestrated.engine.backend.num_threads(),
+            plan.cpu_thread_count
+        );
         assert_eq!(
             orchestrated.engine.budget.total_bytes(),
             plan.ram_budget_bytes
@@ -557,8 +562,7 @@ mod tests {
 
         let orchestrated = RuntimeOrchestrator
             .orchestrate(
-                OrchestrationRequest::new(model_file.path(), &user)
-                    .with_calibration(&calibration),
+                OrchestrationRequest::new(model_file.path(), &user).with_calibration(&calibration),
             )
             .unwrap();
         assert_eq!(
@@ -596,8 +600,7 @@ mod tests {
 
         let orchestrated = RuntimeOrchestrator
             .orchestrate(
-                OrchestrationRequest::new(model_file.path(), &user)
-                    .with_calibration(&calibration),
+                OrchestrationRequest::new(model_file.path(), &user).with_calibration(&calibration),
             )
             .unwrap();
         assert!(orchestrated
@@ -610,9 +613,11 @@ mod tests {
             .calibration
             .observation_identifiers
             .is_empty());
-        assert!(orchestrated.execution_plan.reasons.iter().any(|reason| {
-            reason.code == PlanReasonCode::CalibrationNotApplicable
-        }));
+        assert!(orchestrated
+            .execution_plan
+            .reasons
+            .iter()
+            .any(|reason| { reason.code == PlanReasonCode::CalibrationNotApplicable }));
     }
 
     #[cfg(target_os = "linux")]
@@ -759,9 +764,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            OrchestrationError::PlanCompilation(
-                PlanCompilationError::LayerCacheStateInconsistent
-            )
+            OrchestrationError::PlanCompilation(PlanCompilationError::LayerCacheStateInconsistent)
         ));
     }
 
@@ -786,9 +789,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            OrchestrationError::PlanCompilation(
-                PlanCompilationError::UnsupportedGpuExecution
-            )
+            OrchestrationError::PlanCompilation(PlanCompilationError::UnsupportedGpuExecution)
         ));
     }
 
@@ -816,11 +817,8 @@ mod tests {
     #[test]
     fn test_legacy_inference_construction_remains_available() {
         let model_file = create_tiny_llama_gguf();
-        let engine = InferenceEngine::new(
-            model_file.path().to_str().unwrap(),
-            TEST_RAM_BYTES,
-        )
-        .unwrap();
+        let engine =
+            InferenceEngine::new(model_file.path().to_str().unwrap(), TEST_RAM_BYTES).unwrap();
         assert_eq!(engine.budget.total_bytes(), TEST_RAM_BYTES);
     }
 }
