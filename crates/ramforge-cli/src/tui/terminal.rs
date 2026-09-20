@@ -98,11 +98,7 @@ fn compose_frame(contents: &str, size: TerminalSize) -> String {
         let mut selected = Vec::with_capacity(size.height);
         selected.extend(lines[..head_count].iter().map(String::as_str));
         selected.push("... content clipped to terminal size ...");
-        selected.extend(
-            lines[lines.len() - tail_count..]
-                .iter()
-                .map(String::as_str),
-        );
+        selected.extend(lines[lines.len() - tail_count..].iter().map(String::as_str));
         selected
     };
 
@@ -142,8 +138,7 @@ mod platform {
     use std::io::{self, Write};
 
     use super::{
-        ascii_command, compose_frame, EscapeDecode, EscapeSequenceDecoder, TerminalSize,
-        UiCommand,
+        ascii_command, compose_frame, EscapeDecode, EscapeSequenceDecoder, TerminalSize, UiCommand,
     };
 
     const ESCAPE_SEQUENCE_TIMEOUT_MS: i32 = 100;
@@ -282,12 +277,8 @@ mod platform {
 
     impl Drop for TerminalSession {
         fn drop(&mut self) {
-            let _ = unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original)
-            };
-            let _ = self
-                .stdout
-                .write_all(b"\x1b[0m\x1b[?25h\x1b[2J\x1b[H");
+            let _ = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original) };
+            let _ = self.stdout.write_all(b"\x1b[0m\x1b[?25h\x1b[2J\x1b[H");
             let _ = self.stdout.flush();
         }
     }

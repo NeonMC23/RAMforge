@@ -5,7 +5,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "ramforge", version, about = "RAMforge – usable, profiled out-of-core GGUF inference")]
+#[command(
+    name = "ramforge",
+    version,
+    about = "RAMforge – usable, profiled out-of-core GGUF inference"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -149,11 +153,13 @@ fn run_inspect(model_path: PathBuf, json_output: bool, max_tensors: usize) -> an
 }
 
 fn run_plan(model_path: PathBuf, ram_str: String, json_output: bool) -> anyhow::Result<()> {
-    let ram_bytes = parse_memory_size(&ram_str).map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
+    let ram_bytes = parse_memory_size(&ram_str)
+        .map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
 
     let gguf = parse_gguf_file(&model_path).map_err(|e| anyhow::anyhow!(e))?;
 
-    let plan = ramforge_runtime::plan::plan_model(&gguf, ram_bytes).map_err(|e| anyhow::anyhow!(e))?;
+    let plan =
+        ramforge_runtime::plan::plan_model(&gguf, ram_bytes).map_err(|e| anyhow::anyhow!(e))?;
 
     if json_output {
         output_plan_json(&plan, &gguf)?;
@@ -177,7 +183,8 @@ fn run_inference(
     profile: bool,
     memory_report: bool,
 ) -> anyhow::Result<()> {
-    let ram_bytes = parse_memory_size(&ram_str).map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
+    let ram_bytes = parse_memory_size(&ram_str)
+        .map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
 
     // Diagnostics to stderr
     eprintln!("RAMforge – Usable Out-of-Core Inference");
@@ -201,7 +208,9 @@ fn run_inference(
     eprintln!("Loading model (file-backed, persistent weights only)...");
     let model_load_started = Instant::now();
     let mut engine = ramforge_runtime::inference::InferenceEngine::new(
-        model_path.to_str().ok_or_else(|| anyhow::anyhow!("invalid model path"))?,
+        model_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid model path"))?,
         ram_bytes,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
@@ -225,7 +234,8 @@ fn run_inference(
         engine.config().feed_forward_length,
         engine.config().head_dim
     );
-    eprintln!("Tokenizer: model={}, vocab_size={}, bos={:?}, eos={:?}",
+    eprintln!(
+        "Tokenizer: model={}, vocab_size={}, bos={:?}, eos={:?}",
         engine.tokenizer.model,
         engine.tokenizer.vocab_size(),
         engine.tokenizer.bos_id,
@@ -235,12 +245,16 @@ fn run_inference(
         "Execution backend: CPU ({} mode)",
         ramforge_runtime::backend::ComputeBackend::name(&engine.backend)
     );
-    eprintln!("Memory budget: total={} used={} (resident weights) available={}",
+    eprintln!(
+        "Memory budget: total={} used={} (resident weights) available={}",
         engine.budget.total_bytes(),
         engine.budget.used_bytes(),
         engine.budget.available_bytes()
     );
-    eprintln!("Total model weight bytes: {} (from descriptors)", engine.model.total_weight_bytes);
+    eprintln!(
+        "Total model weight bytes: {} (from descriptors)",
+        engine.model.total_weight_bytes
+    );
     eprintln!();
 
     let sampler = ramforge_runtime::sampling::Sampler::new(temperature, top_k, top_p);
@@ -270,16 +284,44 @@ fn run_inference(
         let stats = &engine.residency_stats;
         eprintln!();
         eprintln!("Residency stats (verbose):");
-        eprintln!("  Total model weight bytes: {} ({:.2} MiB)", stats.total_model_weight_bytes, stats.total_model_weight_bytes as f64 / (1024.0*1024.0));
-        eprintln!("  Current resident layer bytes: {}", stats.current_resident_layer_bytes);
-        eprintln!("  Peak resident layer bytes: {} ({:.2} MiB)", stats.peak_resident_layer_bytes, stats.peak_resident_layer_bytes as f64 / (1024.0*1024.0));
-        eprintln!("  Peak managed bytes: {} ({:.2} MiB) / budget {} ({:.2} MiB)", stats.peak_managed_bytes, stats.peak_managed_bytes as f64 / (1024.0*1024.0), ram_bytes, ram_bytes as f64 / (1024.0*1024.0));
+        eprintln!(
+            "  Total model weight bytes: {} ({:.2} MiB)",
+            stats.total_model_weight_bytes,
+            stats.total_model_weight_bytes as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "  Current resident layer bytes: {}",
+            stats.current_resident_layer_bytes
+        );
+        eprintln!(
+            "  Peak resident layer bytes: {} ({:.2} MiB)",
+            stats.peak_resident_layer_bytes,
+            stats.peak_resident_layer_bytes as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "  Peak managed bytes: {} ({:.2} MiB) / budget {} ({:.2} MiB)",
+            stats.peak_managed_bytes,
+            stats.peak_managed_bytes as f64 / (1024.0 * 1024.0),
+            ram_bytes,
+            ram_bytes as f64 / (1024.0 * 1024.0)
+        );
         eprintln!("  Layer loads: {}", stats.num_layer_loads);
         eprintln!("  Layer releases: {}", stats.num_layer_releases);
         eprintln!("  Layers retained in cache: {}", stats.num_layer_cached);
-        eprintln!("  Fits check: total {} > budget {} ? {}", stats.total_model_weight_bytes, ram_bytes, stats.total_model_weight_bytes > ram_bytes);
-        eprintln!("  Peak layer < total ? {}", stats.peak_resident_layer_bytes < stats.total_model_weight_bytes);
-        eprintln!("  Peak managed <= budget ? {}", stats.peak_managed_bytes <= ram_bytes);
+        eprintln!(
+            "  Fits check: total {} > budget {} ? {}",
+            stats.total_model_weight_bytes,
+            ram_bytes,
+            stats.total_model_weight_bytes > ram_bytes
+        );
+        eprintln!(
+            "  Peak layer < total ? {}",
+            stats.peak_resident_layer_bytes < stats.total_model_weight_bytes
+        );
+        eprintln!(
+            "  Peak managed <= budget ? {}",
+            stats.peak_managed_bytes <= ram_bytes
+        );
     }
 
     if profile {
@@ -299,7 +341,10 @@ fn output_support() {
 
     println!("RAMforge capability registry");
     println!("Architecture support:");
-    println!("  {:<10} {:<9} {:<9} {:<18} Tokenizer", "Architecture", "Inspect", "Plan", "Run");
+    println!(
+        "  {:<10} {:<9} {:<9} {:<18} Tokenizer",
+        "Architecture", "Inspect", "Plan", "Run"
+    );
     for capability in ARCHITECTURES {
         println!(
             "  {:<10} {:<9} {:<9} {:<18} {}",
@@ -335,20 +380,35 @@ fn output_generation_profile(
     eprintln!("  Model startup: {}", format_duration(model_load_elapsed));
     eprintln!("  Generation total: {}", format_duration(runtime.total));
     if let Some(average) = profile.average_token_latency() {
-        eprintln!("  Average per generated token: {}", format_duration(average));
+        eprintln!(
+            "  Average per generated token: {}",
+            format_duration(average)
+        );
     }
-    eprintln!("  Maximum token loop: {}", format_duration(runtime.max_token_latency));
-    eprintln!("  Logical tensor reads: {}", profile.io.logical_tensor_reads);
+    eprintln!(
+        "  Maximum token loop: {}",
+        format_duration(runtime.max_token_latency)
+    );
+    eprintln!(
+        "  Logical tensor reads: {}",
+        profile.io.logical_tensor_reads
+    );
     eprintln!(
         "  Logical tensor bytes: {}",
         format_bytes(profile.io.logical_tensor_bytes)
     );
     eprintln!("  Physical GGUF reads: {}", profile.io.read_operations);
-    eprintln!("  Physical GGUF bytes: {}", format_bytes(profile.io.bytes_read));
+    eprintln!(
+        "  Physical GGUF bytes: {}",
+        format_bytes(profile.io.bytes_read)
+    );
     eprintln!("  Physical seeks: {}", profile.io.seek_operations);
     eprintln!("  Seeks safely avoided: {}", profile.io.seeks_avoided);
     eprintln!("  GGUF read failures: {}", profile.io.read_failures);
-    eprintln!("  Coalesced physical ranges: {}", profile.io.coalesced_ranges);
+    eprintln!(
+        "  Coalesced physical ranges: {}",
+        profile.io.coalesced_ranges
+    );
     eprintln!(
         "  Coalesced gap overhead: {}",
         format_bytes(profile.io.coalesced_gap_bytes)
@@ -372,7 +432,10 @@ fn output_generation_profile(
     eprintln!("  Layer loads: {}", runtime.layer_loads);
     eprintln!("  Layer releases: {}", runtime.layer_releases);
     eprintln!("  Layer-cache hits: {}", runtime.cache_hits);
-    eprintln!("  Layer-cache misses (disk loads): {}", runtime.cache_misses);
+    eprintln!(
+        "  Layer-cache misses (disk loads): {}",
+        runtime.cache_misses
+    );
     eprintln!("  Layer-cache evictions: {}", runtime.cache_evictions);
     eprintln!(
         "  Cached layers: current={} peak={}",
@@ -384,7 +447,10 @@ fn output_generation_profile(
         format_bytes(runtime.peak_cache_bytes),
         format_bytes(profile.layer_cache_capacity_bytes)
     );
-    eprintln!("  Peak RAMforge-managed memory: {}", format_bytes(profile.ramforge_peak_bytes));
+    eprintln!(
+        "  Peak RAMforge-managed memory: {}",
+        format_bytes(profile.ramforge_peak_bytes)
+    );
     if !profile.tensor_reads.is_empty() {
         eprintln!("  Top tensor reads by volume:");
         for tensor in profile.tensor_reads.iter().take(12) {
@@ -403,23 +469,72 @@ fn output_generation_profile(
     }
     eprintln!();
     eprintln!("Measured timings (some detailed categories are subsets of layer time):");
-    eprintln!("  GGUF read path:           {}", format_duration(profile.io.elapsed));
-    eprintln!("  Prompt/prefill:           {}", format_duration(runtime.prompt));
-    eprintln!("  Layer loading:            {}", format_duration(runtime.layer_load));
-    eprintln!("  Layer compute:            {}", format_duration(runtime.layer_compute));
-    eprintln!("  Layer release:            {}", format_duration(runtime.layer_release));
-    eprintln!("  Tensor construction:      {}", format_duration(runtime.tensor_construction));
+    eprintln!(
+        "  GGUF read path:           {}",
+        format_duration(profile.io.elapsed)
+    );
+    eprintln!(
+        "  Prompt/prefill:           {}",
+        format_duration(runtime.prompt)
+    );
+    eprintln!(
+        "  Layer loading:            {}",
+        format_duration(runtime.layer_load)
+    );
+    eprintln!(
+        "  Layer compute:            {}",
+        format_duration(runtime.layer_compute)
+    );
+    eprintln!(
+        "  Layer release:            {}",
+        format_duration(runtime.layer_release)
+    );
+    eprintln!(
+        "  Tensor construction:      {}",
+        format_duration(runtime.tensor_construction)
+    );
     eprintln!(
         "  Grouped quantized copy:   {}",
         format_duration(runtime.grouped_quantized_copy_time)
     );
-    eprintln!("  Explicit dequant/copies:  {}", format_duration(runtime.dequantization));
-    eprintln!("  F32 matvec (subset):      {}", format_duration(runtime.float_matvec));
-    eprintln!("  Quant matvec/dequant:     {}", format_duration(runtime.quantized_matvec));
-    eprintln!("  Activation allocation:    {}", format_duration(runtime.allocation));
-    eprintln!("  Output projection:        {}", format_duration(runtime.logits));
-    eprintln!("  Sampling:                 {}", format_duration(runtime.sampling));
-    eprintln!("  Stdout callback:          {}", format_duration(runtime.output));
+    eprintln!(
+        "  Explicit dequant/copies:  {}",
+        format_duration(runtime.dequantization)
+    );
+    eprintln!(
+        "  F32 matvec (subset):      {}",
+        format_duration(runtime.float_matvec)
+    );
+    eprintln!(
+        "  Quant matvec/dequant:     {}",
+        format_duration(runtime.quantized_matvec)
+    );
+    if runtime.q4_0_matvec_calls > 0 {
+        eprintln!(
+            "  Q4_0 matvec workload:     {} calls, {} rows, {} in elements, {} blocks, {} weight bytes",
+            runtime.q4_0_matvec_calls,
+            runtime.q4_0_matvec_rows,
+            runtime.q4_0_matvec_input_elements,
+            runtime.q4_0_matvec_blocks,
+            runtime.q4_0_matvec_weight_bytes,
+        );
+    }
+    eprintln!(
+        "  Activation allocation:    {}",
+        format_duration(runtime.allocation)
+    );
+    eprintln!(
+        "  Output projection:        {}",
+        format_duration(runtime.logits)
+    );
+    eprintln!(
+        "  Sampling:                 {}",
+        format_duration(runtime.sampling)
+    );
+    eprintln!(
+        "  Stdout callback:          {}",
+        format_duration(runtime.output)
+    );
 }
 
 fn output_memory_report(report: &ramforge_runtime::memory_report::MemoryReport) {
@@ -453,7 +568,11 @@ fn output_memory_report(report: &ramforge_runtime::memory_report::MemoryReport) 
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -487,7 +606,11 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
     println!("================================");
     println!();
     println!("Model: {}", model.path.display());
-    println!("File size: {} bytes ({:.2} MB)", model.file_size, model.file_size as f64 / (1024.0 * 1024.0));
+    println!(
+        "File size: {} bytes ({:.2} MB)",
+        model.file_size,
+        model.file_size as f64 / (1024.0 * 1024.0)
+    );
     println!("GGUF version: {}", model.version);
     println!("Alignment: {} bytes", model.alignment);
     println!("Data start offset: {} bytes", model.data_start_offset);
@@ -523,13 +646,48 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
     println!();
 
     println!("Known model parameters:");
-    println!("  Context length: {}", info.context_length.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()));
-    println!("  Embedding size: {}", info.embedding_length.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()));
-    println!("  Layer count (block_count): {}", info.block_count.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()));
-    println!("  Attention head count: {}", info.head_count.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()));
-    println!("  Attention head count KV: {}", info.head_count_kv.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()));
-    println!("  Expert count: {}", info.expert_count.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()));
-    println!("  Experts used per token: {}", info.expert_used_count.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()));
+    println!(
+        "  Context length: {}",
+        info.context_length
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "  Embedding size: {}",
+        info.embedding_length
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "  Layer count (block_count): {}",
+        info.block_count
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "  Attention head count: {}",
+        info.head_count
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "  Attention head count KV: {}",
+        info.head_count_kv
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "  Expert count: {}",
+        info.expert_count
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "  Experts used per token: {}",
+        info.expert_used_count
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
     if let Some(ft) = info.file_type {
         println!("  File type: {}", ft);
     } else {
@@ -538,8 +696,16 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
     println!();
 
     println!("Tokenizer:");
-    println!("  Model: {}", info.tokenizer_model.as_deref().unwrap_or("unknown"));
-    println!("  Vocab size: {}", info.vocab_size.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()));
+    println!(
+        "  Model: {}",
+        info.tokenizer_model.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  Vocab size: {}",
+        info.vocab_size
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
     println!();
 
     println!("Quantization / tensor type summary:");
@@ -554,31 +720,57 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
     println!();
 
     if let Some(total) = model.total_tensor_bytes() {
-        println!("Total tensor data (estimated from shapes & types): {} bytes ({:.2} MB)", total, total as f64 / (1024.0*1024.0));
+        println!(
+            "Total tensor data (estimated from shapes & types): {} bytes ({:.2} MB)",
+            total,
+            total as f64 / (1024.0 * 1024.0)
+        );
     } else {
         println!("Total tensor data: unknown (contains types with undetermined size)");
     }
     println!();
 
-    println!("Tensors (first {} of {}):", max_tensors.min(model.tensors.len()), model.tensors.len());
-    println!("  {:<50} {:<12} {:<20} {:<12} Bytes", "Name", "Type", "Shape", "FileOff");
+    println!(
+        "Tensors (first {} of {}):",
+        max_tensors.min(model.tensors.len()),
+        model.tensors.len()
+    );
+    println!(
+        "  {:<50} {:<12} {:<20} {:<12} Bytes",
+        "Name", "Type", "Shape", "FileOff"
+    );
     println!("  {}", "-".repeat(110));
     for tensor in model.tensors.iter().take(max_tensors) {
         let shape = tensor.shape_string();
-        let bytes_str = tensor.byte_length.map(|b| b.to_string()).unwrap_or_else(|| "unknown".to_string());
+        let bytes_str = tensor
+            .byte_length
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         let display_name = if tensor.name.len() > 48 {
-            format!("...{}", &tensor.name[tensor.name.len()-45..])
+            format!("...{}", &tensor.name[tensor.name.len() - 45..])
         } else {
             tensor.name.clone()
         };
-        println!("  {:<50} {:<12} {:<20} {:<12} {}", display_name, tensor.ggml_type.name(), shape, tensor.file_offset, bytes_str);
+        println!(
+            "  {:<50} {:<12} {:<20} {:<12} {}",
+            display_name,
+            tensor.ggml_type.name(),
+            shape,
+            tensor.file_offset,
+            bytes_str
+        );
     }
     if model.tensors.len() > max_tensors {
-        println!("  ... and {} more tensors", model.tensors.len() - max_tensors);
+        println!(
+            "  ... and {} more tensors",
+            model.tensors.len() - max_tensors
+        );
     }
     println!();
 
-    println!("Note: Tensor payloads were NOT loaded into RAM. Only metadata and descriptors were read.");
+    println!(
+        "Note: Tensor payloads were NOT loaded into RAM. Only metadata and descriptors were read."
+    );
     println!("This design enables future out-of-core access for models larger than RAM.");
 }
 
@@ -590,16 +782,28 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     println!();
     println!("Model:");
     println!("  Path: {}", model.path.display());
-    println!("  File size: {} bytes ({:.2} MB, {:.2} GiB)", plan.file_size, plan.file_size as f64 / (1024.0*1024.0), plan.file_size as f64 / (1024.0*1024.0*1024.0));
+    println!(
+        "  File size: {} bytes ({:.2} MB, {:.2} GiB)",
+        plan.file_size,
+        plan.file_size as f64 / (1024.0 * 1024.0),
+        plan.file_size as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
     let architecture = info.architecture.as_deref().unwrap_or("unknown");
     println!("  Architecture: {}", architecture);
     let run_support = ramforge_runtime::support::architecture_capability(architecture)
         .map(|capability| capability.run.label())
         .unwrap_or("not-yet");
-    println!("  Execution support: {} (inspection/planning remain available)", run_support);
+    println!(
+        "  Execution support: {} (inspection/planning remain available)",
+        run_support
+    );
     println!("  Tensor count: {}", plan.tensor_count);
     if let Some(total) = plan.total_tensor_bytes {
-        println!("  Total tensor bytes (estimated): {} bytes ({:.2} MiB)", total, total as f64 / (1024.0*1024.0));
+        println!(
+            "  Total tensor bytes (estimated): {} bytes ({:.2} MiB)",
+            total,
+            total as f64 / (1024.0 * 1024.0)
+        );
     }
     println!();
 
@@ -608,7 +812,11 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     println!("  Total budget: {} bytes", plan.budget.total_bytes());
     println!("  Pre-reserved allocations: none (runtime charges weights, one streamed layer, KV cache, and scoped temps on demand)");
     println!("  Used: {} bytes", plan.budget.used_bytes());
-    println!("  Available: {} bytes ({:.2} MiB)", plan.available, plan.available as f64 / (1024.0*1024.0));
+    println!(
+        "  Available: {} bytes ({:.2} MiB)",
+        plan.available,
+        plan.available as f64 / (1024.0 * 1024.0)
+    );
     println!();
 
     println!("Model Residency:");
@@ -617,7 +825,12 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
         println!("  File-backed needed: 0 bytes");
     } else {
         println!("  Fits entirely in RAM budget: no");
-        println!("  File-backed needed: {} bytes ({:.2} MiB, {:.2} GiB)", plan.file_backed_needed, plan.file_backed_needed as f64 / (1024.0*1024.0), plan.file_backed_needed as f64 / (1024.0*1024.0*1024.0));
+        println!(
+            "  File-backed needed: {} bytes ({:.2} MiB, {:.2} GiB)",
+            plan.file_backed_needed,
+            plan.file_backed_needed as f64 / (1024.0 * 1024.0),
+            plan.file_backed_needed as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
         println!("  Strategy: Model larger than budget – tensor data will be accessed file-backed on demand");
     }
     println!();
@@ -686,15 +899,25 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     println!();
 
     println!("Generic byte-cache bound (informational):");
-    println!("  Capacity bound (informational): {} bytes ({:.2} MiB, {:.2} GiB)", plan.cache_capacity, plan.cache_capacity as f64 / (1024.0*1024.0), plan.cache_capacity as f64 / (1024.0*1024.0*1024.0));
-    println!("  Policy: LRU (least recently used eviction), contents charged to the budget per entry");
+    println!(
+        "  Capacity bound (informational): {} bytes ({:.2} MiB, {:.2} GiB)",
+        plan.cache_capacity,
+        plan.cache_capacity as f64 / (1024.0 * 1024.0),
+        plan.cache_capacity as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+    println!(
+        "  Policy: LRU (least recently used eviction), contents charged to the budget per entry"
+    );
     println!("  Static overhead pre-reservation: none (scoped temp guards charge exact lifetimes)");
     println!("  Accounting: RAMforge-managed memory = memory tracked via MemoryBudget. Does NOT include total process RSS or OS page cache.");
     println!();
 
     println!("File-backed access:");
     println!("  Data source: {}", model.path.display());
-    println!("  Tensor data location: file-backed via offsets (data_start {} + tensor.offset)", model.data_start_offset);
+    println!(
+        "  Tensor data location: file-backed via offsets (data_start {} + tensor.offset)",
+        model.data_start_offset
+    );
     println!("  Access method: explicit read_range with validation (no full model load)");
     println!();
 
@@ -712,18 +935,23 @@ fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {
         metadata_json.insert(k.clone(), json_val);
     }
 
-    let tensors_json: Vec<_> = model.tensors.iter().take(max_tensors).map(|t| {
-        json!({
-            "name": t.name,
-            "dimensions": t.dimensions,
-            "ggml_type": t.ggml_type.name(),
-            "ggml_type_id": t.ggml_type.as_u32(),
-            "offset": t.offset,
-            "file_offset": t.file_offset,
-            "byte_length": t.byte_length,
-            "num_elements": t.num_elements,
+    let tensors_json: Vec<_> = model
+        .tensors
+        .iter()
+        .take(max_tensors)
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "dimensions": t.dimensions,
+                "ggml_type": t.ggml_type.name(),
+                "ggml_type_id": t.ggml_type.as_u32(),
+                "offset": t.offset,
+                "file_offset": t.file_offset,
+                "byte_length": t.byte_length,
+                "num_elements": t.num_elements,
+            })
         })
-    }).collect();
+        .collect();
 
     let summary = model.type_summary();
 
@@ -760,10 +988,14 @@ fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn output_plan_json(plan: &ramforge_runtime::plan::PlanResult, model: &GgufModel) -> anyhow::Result<()> {
+fn output_plan_json(
+    plan: &ramforge_runtime::plan::PlanResult,
+    model: &GgufModel,
+) -> anyhow::Result<()> {
     use serde_json::json;
 
-    let allocations: std::collections::BTreeMap<String, u64> = plan.budget.allocations().clone().into_iter().collect();
+    let allocations: std::collections::BTreeMap<String, u64> =
+        plan.budget.allocations().clone().into_iter().collect();
     let execution_preflight = if let Some(execution) = &plan.execution_memory {
         json!({
             "available": true,
