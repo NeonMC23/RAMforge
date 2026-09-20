@@ -1,15 +1,16 @@
 use std::fmt::Write as _;
 
 use ramforge_runtime::planner::{
-    Availability, ModelExecutionCompatibility, ObservationUnit, PlanCompatibility,
-    PlanReasonCode,
+    Availability, ModelExecutionCompatibility, ObservationUnit, PlanCompatibility, PlanReasonCode,
 };
 use ramforge_runtime::runtime_config::RuntimeConfig;
 
 use super::app::{
-    calibration_level_for_index, calibration_level_label, mode_label,
-    CalibrationTaskDisplayState, CalibrationTaskView, ModelFlow, PlanOrigin, Screen, TuiApp,
+    calibration_level_for_index, calibration_level_label, mode_label, CalibrationTaskDisplayState,
+    CalibrationTaskView, MaxTokensPreset, ModelFlow, PlanOrigin, RamPreset, Screen, TestPreset,
+    TuiApp,
 };
+use super::diagnostics::{format_bytes as diag_format_bytes, format_seconds};
 
 pub fn render(
     app: &TuiApp,
@@ -29,6 +30,8 @@ pub fn render(
         Screen::LoadPlan => render_load_plan(app, &mut output),
         Screen::ModelInput => render_model_input(app, &mut output),
         Screen::Preferences => render_preferences(app, &mut output),
+        Screen::TestPreset => render_test_preset(app, &mut output),
+        Screen::ReviewConfig => render_review_config(app, runtime_config, &mut output),
         Screen::Analyzing => render_analyzing(&mut output),
         Screen::ModelInfo => render_model_info(app, &mut output),
         Screen::CalibrationSelect => render_calibration_select(app, &mut output),
@@ -42,8 +45,13 @@ pub fn render(
         Screen::PlanValid => render_plan_valid(app, runtime_config, &mut output),
         Screen::RuntimeActivation => render_runtime_activation(&mut output),
         Screen::GenerationInput => render_generation_input(app, &mut output),
-        Screen::GenerationRunning => render_generation_running(&mut output),
+        Screen::GenerationRunning => render_generation_running(app, &mut output),
         Screen::GenerationResult => render_generation_result(app, &mut output),
+        Screen::RunHistory => render_run_history(app, &mut output),
+        Screen::RunDetail => render_run_detail(app, &mut output),
+        Screen::RunCompareSelect => render_run_compare_select(app, &mut output),
+        Screen::RunCompare => render_run_compare(app, &mut output),
+        Screen::ExportPath => render_export_path(app, &mut output),
         Screen::PlanCompatibility => render_plan_compatibility(app, &mut output),
         Screen::SavePlan => render_save_plan(app, &mut output),
         Screen::Error => render_error(app, &mut output),
@@ -110,7 +118,22 @@ fn render_preferences(app: &TuiApp, output: &mut String) {
     let _ = writeln!(output, "Execution preferences");
     let _ = writeln!(output, "Values are passed to UserProfile without clamping.");
     let _ = writeln!(output);
-    preference_line(output, app.menu_index == 0, "RAM budget", &app.ram_input);
+    let ram_preset = RamPreset::ALL[app.lab.ram_preset_index.min(RamPreset::ALL.len() - 1)];
+    let ram_value = if app.lab.ram_preset_index == RamPreset::ALL.len() - 1 {
+        if app.ram_input.is_empty() {
+            "<custom>"
+        } else {
+            app.ram_input.as_str()
+        }
+    } else {
+        app.ram_input.as_str()
+    };
+    preference_line(
+        output,
+        app.menu_index == 0,
+        "RAM budget",
+        &format!("{} [{}]", ram_value, ram_preset.label()),
+    );
     preference_line(output, app.menu_index == 1, "Mode", mode_label(app.mode));
     if app.mode == ramforge_runtime::planner::OperatingMode::Advanced {
         preference_line(
@@ -143,11 +166,17 @@ fn render_preferences(app: &TuiApp, output: &mut String) {
             "Grouped buffer reuse",
             app.advanced_grouped_buffer.label(),
         );
-        menu_line(output, app.menu_index == 7, "Analyze model");
+        menu_line(output, app.menu_index == 7, "Test preset...");
+        menu_line(output, app.menu_index == 8, "Analyze model");
     } else {
-        menu_line(output, app.menu_index == 2, "Analyze model");
+        menu_line(output, app.menu_index == 2, "Test preset...");
+        menu_line(output, app.menu_index == 3, "Analyze model");
     }
     let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "RAM presets: 500 MiB | 1 GiB | 2 GiB | 4 GiB | 6 GiB | 8 GiB | 12 GiB | Custom"
+    );
     let _ = writeln!(
         output,
         "Modes: Background / Constrained | Balanced / Normal | Maximum Performance | Advanced"
@@ -158,7 +187,7 @@ fn render_preferences(app: &TuiApp, output: &mut String) {
         if app.preference_editing {
             "Editing selected value. Enter or Esc ends editing."
         } else {
-            "Enter edits text values. Left/Right changes selectable options."
+            "Enter edits text or opens submenu. Left/Right cycles presets/options."
         }
     );
 }
@@ -190,12 +219,28 @@ fn render_model_info(app: &TuiApp, output: &mut String) {
         "Resolved path",
         &storage.model_path.display().to_string(),
     );
-    field(output, "Name", model.identity.display_name.as_deref().unwrap_or("Unavailable"));
-    field(output, "Architecture", model.architecture.as_deref().unwrap_or("Unknown"));
+    field(
+        output,
+        "Name",
+        model
+            .identity
+            .display_name
+            .as_deref()
+            .unwrap_or("Unavailable"),
+    );
+    field(
+        output,
+        "Architecture",
+        model.architecture.as_deref().unwrap_or("Unknown"),
+    );
     field(output, "File size", &format_bytes(model.file_size_bytes));
     field(output, "Tensor count", &model.tensor_count.to_string());
     field(output, "Context length", &optional_u64(model.context_size));
-    field(output, "Embedding length", &optional_u64(info.embedding_length));
+    field(
+        output,
+        "Embedding length",
+        &optional_u64(info.embedding_length),
+    );
     field(output, "Layer count", &optional_u64(model.layer_count));
     field(
         output,
@@ -211,7 +256,9 @@ fn render_model_info(app: &TuiApp, output: &mut String) {
         match model.execution_compatibility {
             ModelExecutionCompatibility::Executable => "Supported",
             ModelExecutionCompatibility::InspectPlanOnly => "Not supported (inspect/plan only)",
-            ModelExecutionCompatibility::UnknownArchitecture => "Not supported (unknown architecture)",
+            ModelExecutionCompatibility::UnknownArchitecture => {
+                "Not supported (unknown architecture)"
+            }
         },
     );
 
@@ -268,15 +315,31 @@ fn render_model_info(app: &TuiApp, output: &mut String) {
 
     let _ = writeln!(output);
     let _ = writeln!(output, "Capabilities");
-    field(output, "Storage usable", yes_no(capabilities.storage_usable));
-    field(output, "CPU backend usable", yes_no(capabilities.cpu_backend_usable));
-    field(output, "GPU backend usable", yes_no(capabilities.gpu_backend_usable));
+    field(
+        output,
+        "Storage usable",
+        yes_no(capabilities.storage_usable),
+    );
+    field(
+        output,
+        "CPU backend usable",
+        yes_no(capabilities.cpu_backend_usable),
+    );
+    field(
+        output,
+        "GPU backend usable",
+        yes_no(capabilities.gpu_backend_usable),
+    );
     field(
         output,
         "Model executable",
         yes_no(capabilities.model_execution_compatible),
     );
-    field(output, "Layer cache possible", yes_no(capabilities.layer_cache_possible));
+    field(
+        output,
+        "Layer cache possible",
+        yes_no(capabilities.layer_cache_possible),
+    );
     field(
         output,
         "Read coalescing possible",
@@ -310,11 +373,7 @@ fn render_calibration_select(app: &TuiApp, output: &mut String) {
     }
 }
 
-fn render_calibration(
-    app: &TuiApp,
-    tasks: &[CalibrationTaskView],
-    output: &mut String,
-) {
+fn render_calibration(app: &TuiApp, tasks: &[CalibrationTaskView], output: &mut String) {
     let _ = writeln!(
         output,
         "Calibration: {}",
@@ -380,17 +439,10 @@ fn render_plan_review(app: &TuiApp, output: &mut String) {
 
 fn render_plan_validation(output: &mut String) {
     let _ = writeln!(output, "Validating plan...");
-    let _ = writeln!(
-        output,
-        "ExecutionPlan -> PlanCompiler -> RuntimeConfig"
-    );
+    let _ = writeln!(output, "ExecutionPlan -> PlanCompiler -> RuntimeConfig");
 }
 
-fn render_plan_valid(
-    app: &TuiApp,
-    runtime_config: Option<&RuntimeConfig>,
-    output: &mut String,
-) {
+fn render_plan_valid(app: &TuiApp, runtime_config: Option<&RuntimeConfig>, output: &mut String) {
     let _ = writeln!(output, "Plan valid");
     if let Some(config) = runtime_config {
         let _ = writeln!(output);
@@ -421,7 +473,11 @@ fn render_plan_valid(
             "Grouped buffer reuse",
             enabled_disabled(config.grouped_read_buffer_reuse_enabled),
         );
-        field(output, "Execution device", &format!("{:?}", config.execution_device));
+        field(
+            output,
+            "Execution device",
+            &format!("{:?}", config.execution_device),
+        );
     }
     let _ = writeln!(output);
     menu_line(output, app.menu_index == 0, "Activate runtime");
@@ -445,41 +501,554 @@ fn render_generation_input(app: &TuiApp, output: &mut String) {
     let _ = writeln!(output, "Single-prompt generation");
     let _ = writeln!(output, "Executable runtime: active");
     let _ = writeln!(output, "Sampling: greedy");
-    let _ = writeln!(
-        output,
-        "Maximum generated tokens: {}",
-        super::SINGLE_PROMPT_MAX_TOKENS
-    );
+    let _ = writeln!(output, "Maximum generated tokens: {}", app.lab.max_tokens);
     let _ = writeln!(output, "Enter one prompt. Generation starts only on Enter.");
     let _ = writeln!(output);
     let _ = writeln!(output, "> {}_", app.prompt_input);
 }
 
-fn render_generation_running(output: &mut String) {
+fn render_generation_running(app: &TuiApp, output: &mut String) {
+    let live = app.snapshot_live_status();
     let _ = writeln!(output, "Generation running...");
-    let _ = writeln!(output, "Using the active InferenceEngine.");
-    let _ = writeln!(output, "No cancellation is exposed by this synchronous path.");
+    let _ = writeln!(output, "Phase: {}", live.phase.label());
+    let _ = writeln!(
+        output,
+        "Elapsed: {}",
+        format_seconds(live.elapsed().as_secs_f64())
+    );
+    let _ = writeln!(output, "Prompt tokens: {}", live.prompt_tokens);
+    let _ = writeln!(output, "Generated tokens: {}", live.generated_tokens);
+    let _ = writeln!(output, "Maximum tokens: {}", live.max_tokens);
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Streaming text output will appear in the result view."
+    );
+    let _ = writeln!(output, "No percentage or ETA is fabricated.");
 }
 
 fn render_generation_result(app: &TuiApp, output: &mut String) {
     let _ = writeln!(output, "Generation result");
-    if let Some(result) = app.generation_result.as_ref() {
+    if let Some(diag) = app.lab.last_result.as_ref() {
+        let g = &diag.generation;
+        let c = &diag.cpu_compute;
+        let m = &diag.memory;
+        let ca = &diag.cache;
+        let io = &diag.io;
+        let ly = &diag.layers;
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Generation");
         field(
             output,
-            "Generated tokens",
-            &result.generated_token_count.to_string(),
+            "Total elapsed",
+            &format_seconds(g.total_elapsed_seconds),
         );
+        field(
+            output,
+            "Prompt/prefill",
+            &format_seconds(g.prompt_elapsed_seconds),
+        );
+        field(
+            output,
+            "Decode",
+            g.decode_elapsed_seconds
+                .map(format_seconds)
+                .as_deref()
+                .unwrap_or("Unavailable"),
+        );
+        field(output, "Prompt tokens", &g.prompt_tokens.to_string());
+        field(output, "Generated tokens", &g.generated_tokens.to_string());
+        field(output, "Max tokens", &g.max_tokens.to_string());
+        field(
+            output,
+            "Tokens/sec (overall)",
+            g.tokens_per_second_overall
+                .map(|v| format!("{v:.3}"))
+                .as_deref()
+                .unwrap_or("Unavailable"),
+        );
+        field(
+            output,
+            "Tokens/sec (gen)",
+            g.tokens_per_second_generated
+                .map(|v| format!("{v:.3}"))
+                .as_deref()
+                .unwrap_or("Unavailable"),
+        );
+        field(output, "Prompt forwards", &g.prompt_forwards.to_string());
+        field(output, "Decode forwards", &g.decode_forwards.to_string());
+
+        let _ = writeln!(output);
+        let _ = writeln!(output, "CPU / Compute");
+        field(output, "CPU threads", &c.cpu_threads.to_string());
+        field(output, "F32 matvec", &format_seconds(c.f32_matvec_seconds));
+        field(
+            output,
+            "Quantized matvec",
+            &format_seconds(c.quantized_matvec_seconds),
+        );
+        field(
+            output,
+            "Dequantization",
+            &format_seconds(c.dequantization_seconds),
+        );
+        field(
+            output,
+            "Layer compute",
+            &format_seconds(c.layer_compute_seconds),
+        );
+        field(output, "Logits", &format_seconds(c.logits_seconds));
+        field(output, "Sampling", &format_seconds(g.sampling_seconds));
+
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Memory");
+        field(
+            output,
+            "Configured budget",
+            &diag_format_bytes(m.configured_budget_bytes),
+        );
+        field(
+            output,
+            "Managed peak",
+            &diag_format_bytes(m.managed_peak_bytes),
+        );
+        field(
+            output,
+            "Managed current",
+            &diag_format_bytes(m.managed_current_bytes),
+        );
+        field(
+            output,
+            "Process RSS",
+            m.process_rss_bytes
+                .map(diag_format_bytes)
+                .as_deref()
+                .unwrap_or("Unavailable"),
+        );
+        field(
+            output,
+            "System memory",
+            match (m.system_total_bytes, m.system_available_bytes) {
+                (Some(t), Some(a)) => format!(
+                    "{} total, {} available",
+                    diag_format_bytes(t),
+                    diag_format_bytes(a)
+                ),
+                _ => "Unavailable".to_string(),
+            }
+            .as_str(),
+        );
+        field(
+            output,
+            "Cache capacity",
+            &diag_format_bytes(ca.capacity_bytes),
+        );
+
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Cache");
+        field(output, "Hits", &ca.hits.to_string());
+        field(output, "Misses", &ca.misses.to_string());
+        field(output, "Evictions", &ca.evictions.to_string());
+        field(
+            output,
+            "Peak cached layers",
+            &ca.peak_cached_layers.to_string(),
+        );
+        field(
+            output,
+            "Peak cache bytes",
+            &diag_format_bytes(ca.peak_cache_bytes),
+        );
+
+        let _ = writeln!(output);
+        let _ = writeln!(output, "I/O");
+        field(
+            output,
+            "Logical reads",
+            &io.logical_tensor_reads.to_string(),
+        );
+        field(output, "Physical reads", &io.physical_reads.to_string());
+        field(
+            output,
+            "Logical bytes",
+            &diag_format_bytes(io.logical_tensor_bytes),
+        );
+        field(
+            output,
+            "Physical bytes",
+            &diag_format_bytes(io.physical_bytes),
+        );
+        field(
+            output,
+            "Read time",
+            &format_seconds(io.read_elapsed_seconds),
+        );
+        field(output, "Seeks avoided", &io.seeks_avoided.to_string());
+        field(output, "Actual seeks", &io.seek_operations.to_string());
+        field(output, "Coalesced ranges", &io.coalesced_ranges.to_string());
+        field(output, "Buffer reuses", &io.read_buffer_reuses.to_string());
+        field(
+            output,
+            "Buffer growths",
+            &io.read_buffer_growths.to_string(),
+        );
+
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Layers");
+        field(output, "Loads", &ly.loads.to_string());
+        field(output, "Releases", &ly.releases.to_string());
+        field(output, "Load time", &format_seconds(ly.load_seconds));
+        field(output, "Compute time", &format_seconds(ly.compute_seconds));
+        field(output, "Release time", &format_seconds(ly.release_seconds));
+
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Calibration");
+        field(output, "Level", &diag.calibration.level);
+        field(
+            output,
+            "Identifier",
+            diag.calibration
+                .calibration_identifier
+                .as_deref()
+                .unwrap_or("Not Applicable"),
+        );
+        field(
+            output,
+            "Consumed by planning",
+            if diag.calibration.consumed_by_planning {
+                "Yes"
+            } else {
+                "No"
+            },
+        );
+
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Observations");
+        if diag.observations.is_empty() {
+            let _ = writeln!(output, "  None");
+        } else {
+            for obs in &diag.observations {
+                let _ = writeln!(output, "  - {obs}");
+            }
+        }
+
         let _ = writeln!(output);
         let _ = writeln!(output, "Generated text");
-        if result.generated_text.is_empty() {
+        if app.lab.last_generated_text.is_empty() {
             let _ = writeln!(output, "<empty generated text>");
         } else {
-            let _ = writeln!(output, "{}", result.generated_text);
+            for line in app.lab.last_generated_text.lines() {
+                let _ = writeln!(output, "{line}");
+            }
+        }
+    } else {
+        let _ = writeln!(output, "No diagnostic result available.");
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Generated text");
+        if app.lab.last_generated_text.is_empty() {
+            // Fall back to legacy generation_result field
+            if let Some(gr) = app.generation_result.as_ref() {
+                if gr.generated_text.is_empty() {
+                    let _ = writeln!(output, "<empty generated text>");
+                } else {
+                    for line in gr.generated_text.lines() {
+                        let _ = writeln!(output, "{line}");
+                    }
+                }
+            } else {
+                let _ = writeln!(output, "<empty generated text>");
+            }
+        } else {
+            for line in app.lab.last_generated_text.lines() {
+                let _ = writeln!(output, "{line}");
+            }
         }
     }
     let _ = writeln!(output);
     menu_line(output, app.menu_index == 0, "Generate another prompt");
-    menu_line(output, app.menu_index == 1, "Return to validated plan");
+    menu_line(output, app.menu_index == 1, "Run history");
+    menu_line(output, app.menu_index == 2, "Export last run JSON");
+    menu_line(output, app.menu_index == 3, "Return to plan");
+}
+
+fn render_test_preset(app: &TuiApp, output: &mut String) {
+    let _ = writeln!(output, "Test presets");
+    let _ = writeln!(
+        output,
+        "Bundles of existing UserProfile / generation values for repeatable runs."
+    );
+    let _ = writeln!(output);
+    for (index, preset) in TestPreset::ALL.iter().enumerate() {
+        menu_line(output, app.menu_index == index, preset.label());
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Presets only set existing Planner/UserProfile values. They do not add new optimization rules.");
+    let _ = writeln!(
+        output,
+        "Current: {}",
+        TestPreset::ALL[app.lab.test_preset_index.min(TestPreset::ALL.len() - 1)].label()
+    );
+}
+
+fn render_review_config(app: &TuiApp, runtime_config: Option<&RuntimeConfig>, output: &mut String) {
+    let _ = writeln!(output, "Test configuration");
+    if let Some(session) = app.planning_session.as_ref() {
+        let model = &session.model;
+        field(output, "Model path", &app.model_input);
+        field(
+            output,
+            "Name",
+            model
+                .identity
+                .display_name
+                .as_deref()
+                .unwrap_or("Unavailable"),
+        );
+        field(
+            output,
+            "Architecture",
+            model.architecture.as_deref().unwrap_or("Unknown"),
+        );
+        field(output, "Tensor count", &model.tensor_count.to_string());
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Tensor / quantization summary");
+        for tf in &model.tensor_formats {
+            let _ = writeln!(
+                output,
+                "  {:<10} count={:<6} bytes={:<12} supported={}",
+                tf.format,
+                tf.tensor_count,
+                tf.byte_count
+                    .map(diag_format_bytes)
+                    .unwrap_or_else(|| "Unavailable".to_string()),
+                yes_no(tf.runtime_supported)
+            );
+        }
+    }
+    if let Some(config) = runtime_config {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Resolved execution configuration");
+        field(
+            output,
+            "RAM budget",
+            &diag_format_bytes(config.ram_budget_bytes),
+        );
+        field(output, "Mode", mode_label(app.mode));
+        field(output, "CPU threads", &config.cpu_thread_count.to_string());
+        field(
+            output,
+            "Layer cache",
+            if config.layer_cache_enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+        );
+        field(
+            output,
+            "Cache capacity",
+            &diag_format_bytes(config.layer_cache_capacity_bytes),
+        );
+        field(
+            output,
+            "Read coalescing",
+            if config.read_coalescing_enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+        );
+        field(
+            output,
+            "Grouped buffer reuse",
+            if config.grouped_read_buffer_reuse_enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            },
+        );
+        field(
+            output,
+            "Execution device",
+            match config.execution_device {
+                ramforge_runtime::runtime_config::RuntimeExecutionDevice::Cpu => "CPU only",
+            },
+        );
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(output, "Calibration");
+    field(
+        output,
+        "Level",
+        calibration_level_label(app.calibration_level()),
+    );
+    let _ = writeln!(output);
+    preference_line(
+        output,
+        app.menu_index == 0,
+        "Max tokens",
+        if app.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1 {
+            if app.lab.custom_max_tokens_input.is_empty() {
+                "<custom>"
+            } else {
+                &app.lab.custom_max_tokens_input
+            }
+        } else {
+            MaxTokensPreset::ALL[app.lab.max_tokens_preset_index].label()
+        },
+    );
+    menu_line(output, app.menu_index == 1, "Enter prompt and run");
+    menu_line(output, app.menu_index == 2, "Back to plan");
+    let _ = writeln!(output);
+    let _ = writeln!(
+        output,
+        "Use Left/Right to change the max-tokens preset. Enter cycles presets."
+    );
+}
+
+fn render_run_history(app: &TuiApp, output: &mut String) {
+    let _ = writeln!(
+        output,
+        "Run history (session-only, bounded to {} entries)",
+        super::diagnostics::MAX_RUN_HISTORY
+    );
+    if app.lab.run_history.is_empty() {
+        let _ = writeln!(output, "  No runs recorded yet.");
+    } else {
+        for (index, run) in app.lab.run_history.iter().enumerate() {
+            let model = run
+                .model_name
+                .as_deref()
+                .or(run.model_architecture.as_deref())
+                .unwrap_or("Unknown model");
+            let selected = app.menu_index == index;
+            let _ = writeln!(
+                output,
+                "{} #{}  {}  {}  tok/s={}  elapsed={}",
+                if selected { ">" } else { " " },
+                run.run_id,
+                run.timestamp_unix_seconds,
+                model,
+                run.diagnostics
+                    .generation
+                    .tokens_per_second_generated
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                format_seconds(run.diagnostics.generation.total_elapsed_seconds),
+            );
+        }
+    }
+    let _ = writeln!(output);
+    let compare_idx = app.lab.run_history.len();
+    menu_line(output, app.menu_index == compare_idx, "Compare two runs");
+    menu_line(output, app.menu_index == compare_idx + 1, "Back to result");
+}
+
+fn render_run_detail(app: &TuiApp, output: &mut String) {
+    let _ = writeln!(output, "Run detail");
+    if let Some(run) = app.selected_history_run() {
+        let g = &run.diagnostics.generation;
+        field(output, "Run ID", &run.run_id.to_string());
+        field(output, "Timestamp", &run.timestamp_unix_seconds.to_string());
+        field(
+            output,
+            "Model",
+            run.model_name.as_deref().unwrap_or("Unavailable"),
+        );
+        field(output, "Model path", &run.model_path);
+        field(output, "Mode", &run.user_config.mode_label);
+        field(
+            output,
+            "RAM budget",
+            &diag_format_bytes(run.user_config.ram_budget_bytes),
+        );
+        field(
+            output,
+            "CPU threads",
+            &run.runtime_config.cpu_thread_count.to_string(),
+        );
+        field(output, "Max tokens", &g.max_tokens.to_string());
+        field(output, "Generated tokens", &g.generated_tokens.to_string());
+        field(output, "Elapsed", &format_seconds(g.total_elapsed_seconds));
+        field(
+            output,
+            "Tokens/sec",
+            g.tokens_per_second_generated
+                .map(|v| format!("{v:.3}"))
+                .as_deref()
+                .unwrap_or("Unavailable"),
+        );
+        field(output, "Success", if run.success { "Yes" } else { "No" });
+        if let Some(err) = run.error.as_deref() {
+            field(output, "Error", err);
+        }
+    } else {
+        let _ = writeln!(output, "No run selected.");
+    }
+    let _ = writeln!(output);
+    menu_line(output, app.menu_index == 0, "Back to history");
+    menu_line(output, app.menu_index == 1, "Export JSON");
+}
+
+fn render_run_compare_select(app: &TuiApp, output: &mut String) {
+    let _ = writeln!(output, "Compare runs");
+    if app.lab.compare_first_id.is_none() {
+        let _ = writeln!(output, "Select the FIRST run.");
+    } else {
+        let _ = writeln!(output, "Select the SECOND run to compare against.");
+    }
+    let _ = writeln!(output);
+    for (index, run) in app.lab.run_history.iter().enumerate() {
+        let mut marker = if app.menu_index == index { ">" } else { " " }.to_string();
+        if Some(run.run_id) == app.lab.compare_first_id {
+            marker.push_str(" [1]");
+        }
+        let _ = writeln!(
+            output,
+            "{marker} #{} elapsed={} tok/s={}",
+            run.run_id,
+            format_seconds(run.diagnostics.generation.total_elapsed_seconds),
+            run.diagnostics
+                .generation
+                .tokens_per_second_generated
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "-".to_string()),
+        );
+    }
+    let _ = writeln!(output);
+    menu_line(output, app.menu_index == app.lab.run_history.len(), "Back");
+}
+
+fn render_run_compare(app: &TuiApp, output: &mut String) {
+    let _ = writeln!(output, "Run comparison");
+    if let Some(cmp) = app.lab.comparison.as_ref() {
+        let _ = writeln!(
+            output,
+            "Comparing run #{} vs run #{}",
+            cmp.left_id, cmp.right_id
+        );
+        let _ = writeln!(output);
+        let _ = writeln!(output, "  {:<24} {:>20} {:>20}", "Metric", "Left", "Right");
+        for f in &cmp.fields {
+            let _ = writeln!(output, "  {:<24} {:>20} {:>20}", f.label, f.left, f.right);
+        }
+        let _ = writeln!(output);
+        let _ = writeln!(
+            output,
+            "No scores, rankings, or value judgments are emitted."
+        );
+    } else {
+        let _ = writeln!(output, "Comparison unavailable.");
+    }
+    let _ = writeln!(output);
+    menu_line(output, true, "Back to history");
+}
+
+fn render_export_path(app: &TuiApp, output: &mut String) {
+    let _ = writeln!(output, "Export JSON");
+    let _ = writeln!(output, "Existing files are not overwritten.");
+    let _ = writeln!(output);
+    let _ = writeln!(output, "> {}_", app.lab.export_path_input);
 }
 
 fn render_plan_compatibility(app: &TuiApp, output: &mut String) {
@@ -498,10 +1067,9 @@ fn render_plan_compatibility(app: &TuiApp, output: &mut String) {
     let _ = writeln!(output, "{state}");
     let _ = writeln!(output);
 
-    if let (Some(persisted), Some(session)) = (
-        app.persisted_plan.as_ref(),
-        app.planning_session.as_ref(),
-    ) {
+    if let (Some(persisted), Some(session)) =
+        (app.persisted_plan.as_ref(), app.planning_session.as_ref())
+    {
         let _ = writeln!(output, "Source context");
         field(
             output,
@@ -532,14 +1100,22 @@ fn render_plan_compatibility(app: &TuiApp, output: &mut String) {
         field(
             output,
             "CPU",
-            session.machine.cpu_model.as_deref().unwrap_or("Unavailable"),
+            session
+                .machine
+                .cpu_model
+                .as_deref()
+                .unwrap_or("Unavailable"),
         );
         field(
             output,
             "Logical CPUs",
             &session.machine.logical_cpu_cores.to_string(),
         );
-        field(output, "Storage kind", &format!("{:?}", session.storage.kind));
+        field(
+            output,
+            "Storage kind",
+            &format!("{:?}", session.storage.kind),
+        );
         field(
             output,
             "Model fingerprint",
@@ -715,11 +1291,7 @@ fn decision_reason(
                 );
             }
             None => {
-                let _ = writeln!(
-                    output,
-                    "  {decision}: {value} | Reason: {:?}",
-                    reason.code
-                );
+                let _ = writeln!(output, "  {decision}: {value} | Reason: {:?}", reason.code);
             }
         }
     } else {
@@ -737,7 +1309,11 @@ fn preference_line(output: &mut String, selected: bool, label: &str, value: &str
         "{} {:<24} {}",
         if selected { ">" } else { " " },
         label,
-        if value.is_empty() { "<required>" } else { value }
+        if value.is_empty() {
+            "<required>"
+        } else {
+            value
+        }
     );
 }
 
@@ -818,10 +1394,17 @@ fn footer(app: &TuiApp) -> &'static str {
             "Type path  Enter Submit  Backspace Delete  Esc Back  Ctrl-C Quit"
         }
         Screen::GenerationInput => {
-            "Type prompt  Enter Generate  Backspace Delete  Esc Leave runtime  Ctrl-C Quit"
+            "Type prompt  Enter Generate  Backspace Delete  Esc Back  Ctrl-C Quit"
         }
+        Screen::ExportPath => "Type path  Enter Export  Backspace Delete  Esc Back  Ctrl-C Quit",
         Screen::Preferences if app.accepts_text() => {
             "Type value  Enter/Esc Finish editing  Up/Down Move  Ctrl-C Quit"
+        }
+        Screen::ReviewConfig
+            if app.menu_index == 0
+                && app.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1 =>
+        {
+            "Type number  Enter/Esc Finish editing  Up/Down Move  Ctrl-C Quit"
         }
         Screen::Analyzing | Screen::PlanValidation | Screen::RuntimeActivation => {
             "Please wait  Ctrl-C Quit"
@@ -854,7 +1437,7 @@ mod tests {
         assert!(rendered.contains("Select model"));
         assert!(rendered.contains("Load plan"));
         assert!(rendered.contains("Exit"));
-        assert!(rendered.contains("Up/Down"));
+        assert!(rendered.contains("Arrow keys"));
         assert!(!rendered.contains("Chat"));
     }
 
@@ -883,13 +1466,14 @@ mod tests {
     fn generation_result_renders_only_the_actual_latest_result() {
         let mut app = TuiApp::default();
         app.screen = Screen::GenerationResult;
+        app.lab.last_generated_text = "actual output".to_string();
         app.generation_result = Some(super::super::app::SinglePromptResult {
             generated_text: "actual output".to_string(),
             generated_token_count: 2,
         });
         let rendered = render(&app, None, None);
         assert!(rendered.contains("actual output"));
-        assert!(rendered.contains("Generated tokens"));
+        assert!(rendered.contains("Generation"));
         assert!(!rendered.contains("conversation"));
     }
 

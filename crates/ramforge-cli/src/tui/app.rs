@@ -1,21 +1,25 @@
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 use ramforge_core::parse_memory_size;
-use ramforge_runtime::calibration::{
-    CalibrationError, CalibrationTask, CalibrationTestKind,
-};
+use ramforge_runtime::calibration::{CalibrationError, CalibrationTask, CalibrationTestKind};
 use ramforge_runtime::discovery::StorageDiscoveryError;
 use ramforge_runtime::inference::InferenceEngine;
-use ramforge_runtime::orchestration::{
-    OrchestrationError, PlanningSession,
-};
+use ramforge_runtime::orchestration::{OrchestrationError, PlanningSession};
 use ramforge_runtime::plan_persistence::{
     PersistedExecutionPlan, PlanCompatibilityReport, PlanPersistenceError,
 };
 use ramforge_runtime::planner::{
-    AdvancedOverrides, CalibrationLevel, CalibrationResult, ExecutionPlan,
-    ObservationStatus, ObservationStatusReason, OperatingMode, PlanCompatibility, UserProfile,
+    AdvancedOverrides, CalibrationLevel, CalibrationResult, ExecutionPlan, ObservationStatus,
+    ObservationStatusReason, OperatingMode, PlanCompatibility, UserProfile,
+};
+
+use super::diagnostics::{
+    DiagnosticResult, GenerationParamsSnapshot, GenerationPhase, LiveStatus, RunComparison,
+    RunRecord, RuntimeConfigSnapshot, UserConfigSnapshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +28,8 @@ pub enum Screen {
     LoadPlan,
     ModelInput,
     Preferences,
+    TestPreset,
+    ReviewConfig,
     Analyzing,
     ModelInfo,
     CalibrationSelect,
@@ -35,6 +41,11 @@ pub enum Screen {
     GenerationInput,
     GenerationRunning,
     GenerationResult,
+    RunHistory,
+    RunDetail,
+    RunCompareSelect,
+    RunCompare,
+    ExportPath,
     PlanCompatibility,
     SavePlan,
     Error,
@@ -60,6 +71,8 @@ pub enum InputContext {
     PreferenceValue,
     GenerationPrompt,
     SavePlanPath,
+    ExportPath,
+    CustomMaxTokens,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +89,7 @@ pub enum UiCommand {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum AppAction {
     LoadPlan(PathBuf),
     ValidateModelPath(PathBuf),
@@ -86,8 +99,9 @@ pub enum AppAction {
     CreatePlan,
     ValidatePlan,
     ActivateRuntime,
-    GeneratePrompt(String),
+    GeneratePrompt(String, usize),
     SavePlan(PathBuf),
+    ExportRun(u64, PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +209,177 @@ pub struct SinglePromptResult {
     pub generated_token_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RamPreset {
+    M500,
+    G1,
+    G2,
+    G4,
+    G6,
+    G8,
+    G12,
+    Custom,
+}
+
+impl RamPreset {
+    pub const ALL: &'static [Self] = &[
+        Self::M500,
+        Self::G1,
+        Self::G2,
+        Self::G4,
+        Self::G6,
+        Self::G8,
+        Self::G12,
+        Self::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::M500 => "500 MiB",
+            Self::G1 => "1 GiB",
+            Self::G2 => "2 GiB",
+            Self::G4 => "4 GiB",
+            Self::G6 => "6 GiB",
+            Self::G8 => "8 GiB",
+            Self::G12 => "12 GiB",
+            Self::Custom => "Custom...",
+        }
+    }
+
+    pub fn bytes(self) -> Option<u64> {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        match self {
+            Self::M500 => Some(500 * MIB),
+            Self::G1 => Some(GIB),
+            Self::G2 => Some(2 * GIB),
+            Self::G4 => Some(4 * GIB),
+            Self::G6 => Some(6 * GIB),
+            Self::G8 => Some(8 * GIB),
+            Self::G12 => Some(12 * GIB),
+            Self::Custom => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxTokensPreset {
+    T1,
+    T8,
+    T16,
+    T32,
+    T64,
+    T128,
+    Custom,
+}
+
+impl MaxTokensPreset {
+    pub const ALL: &'static [Self] = &[
+        Self::T1,
+        Self::T8,
+        Self::T16,
+        Self::T32,
+        Self::T64,
+        Self::T128,
+        Self::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::T1 => "1",
+            Self::T8 => "8",
+            Self::T16 => "16",
+            Self::T32 => "32",
+            Self::T64 => "64",
+            Self::T128 => "128",
+            Self::Custom => "Custom...",
+        }
+    }
+
+    pub fn value(self) -> Option<usize> {
+        match self {
+            Self::T1 => Some(1),
+            Self::T8 => Some(8),
+            Self::T16 => Some(16),
+            Self::T32 => Some(32),
+            Self::T64 => Some(64),
+            Self::T128 => Some(128),
+            Self::Custom => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestPreset {
+    Quick,
+    Balanced,
+    LowRam,
+    Cache,
+    StorageIo,
+    MaximumCpu,
+    Custom,
+}
+
+impl TestPreset {
+    pub const ALL: &'static [Self] = &[
+        Self::Quick,
+        Self::Balanced,
+        Self::LowRam,
+        Self::Cache,
+        Self::StorageIo,
+        Self::MaximumCpu,
+        Self::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Quick => "Quick Test",
+            Self::Balanced => "Balanced Test",
+            Self::LowRam => "Low RAM Test",
+            Self::Cache => "Cache Test",
+            Self::StorageIo => "Storage / I/O Test",
+            Self::MaximumCpu => "Maximum CPU Test",
+            Self::Custom => "Custom Test",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DiagnosticLabState {
+    // RAM preset selection (mirrors/affects ram_input)
+    pub ram_preset_index: usize,
+    pub custom_ram_input: String,
+    // Max tokens selection
+    pub max_tokens_preset_index: usize,
+    pub max_tokens: usize,
+    pub custom_max_tokens_input: String,
+    // Test preset
+    pub test_preset_index: usize,
+    // Live generation status
+    pub live: LiveStatus,
+    pub live_started_at: Option<Instant>,
+    // Last completed diagnostic result (the current screen data)
+    pub last_result: Option<DiagnosticResult>,
+    pub last_run_success: bool,
+    pub last_error: Option<String>,
+    pub last_generated_text: String,
+    pub last_prompt_tokens: usize,
+    pub last_wall_elapsed_ms: u64,
+    // Bounded session history
+    pub run_history: Vec<RunRecord>,
+    pub selected_history_id: Option<u64>,
+    pub compare_first_id: Option<u64>,
+    pub comparison: Option<RunComparison>,
+    // Export path input
+    pub export_path_input: String,
+    // Thread/cache live display state shared by callbacks
+    pub live_prompt_tokens: Arc<AtomicU64>,
+    pub live_generated_tokens: Arc<AtomicU64>,
+    pub live_phase: Arc<AtomicU64>,
+    pub live_stop: Arc<AtomicBool>,
+    pub prompt_input_before_run: String,
+}
+
 #[derive(Debug)]
 pub enum TuiError {
     Input {
@@ -295,6 +480,7 @@ pub struct TuiApp {
     pub prompt_input: String,
     pub generation_result: Option<SinglePromptResult>,
     pub active_runtime: Option<InferenceEngine>,
+    pub lab: DiagnosticLabState,
 }
 
 impl Default for TuiApp {
@@ -307,7 +493,7 @@ impl Default for TuiApp {
             model_input: String::new(),
             model_flow: ModelFlow::NewPlan,
             plan_origin: PlanOrigin::NewPlan,
-            ram_input: String::new(),
+            ram_input: "1GiB".to_string(),
             mode: OperatingMode::BalancedNormal,
             advanced_thread_input: String::new(),
             advanced_cache: OverrideChoice::PlannerDefault,
@@ -331,6 +517,32 @@ impl Default for TuiApp {
             prompt_input: String::new(),
             generation_result: None,
             active_runtime: None,
+            lab: DiagnosticLabState {
+                ram_preset_index: 1, // 1 GiB default
+                custom_ram_input: String::new(),
+                max_tokens_preset_index: 3, // 32 default
+                max_tokens: 32,
+                custom_max_tokens_input: String::new(),
+                test_preset_index: 1, // Balanced
+                live: LiveStatus::default(),
+                live_started_at: None,
+                last_result: None,
+                last_run_success: false,
+                last_error: None,
+                last_generated_text: String::new(),
+                last_prompt_tokens: 0,
+                last_wall_elapsed_ms: 0,
+                run_history: Vec::new(),
+                selected_history_id: None,
+                compare_first_id: None,
+                comparison: None,
+                export_path_input: String::new(),
+                live_prompt_tokens: Arc::new(AtomicU64::new(0)),
+                live_generated_tokens: Arc::new(AtomicU64::new(0)),
+                live_phase: Arc::new(AtomicU64::new(0)),
+                live_stop: Arc::new(AtomicBool::new(false)),
+                prompt_input_before_run: String::new(),
+            },
         }
     }
 }
@@ -350,6 +562,8 @@ impl TuiApp {
             Screen::LoadPlan => self.handle_load_plan(command),
             Screen::ModelInput => self.handle_model_input(command),
             Screen::Preferences => self.handle_preferences(command),
+            Screen::TestPreset => self.handle_test_preset(command),
+            Screen::ReviewConfig => self.handle_review_config(command),
             Screen::ModelInfo => self.handle_model_info(command),
             Screen::CalibrationSelect => self.handle_calibration_select(command),
             Screen::Calibrating => self.handle_calibrating(command),
@@ -357,6 +571,11 @@ impl TuiApp {
             Screen::PlanValid => self.handle_plan_valid(command),
             Screen::GenerationInput => self.handle_generation_input(command),
             Screen::GenerationResult => self.handle_generation_result(command),
+            Screen::RunHistory => self.handle_run_history(command),
+            Screen::RunDetail => self.handle_run_detail(command),
+            Screen::RunCompareSelect => self.handle_run_compare_select(command),
+            Screen::RunCompare => self.handle_run_compare(command),
+            Screen::ExportPath => self.handle_export_path(command),
             Screen::PlanCompatibility => self.handle_plan_compatibility(command),
             Screen::SavePlan => self.handle_save_plan(command),
             Screen::Error => {
@@ -379,20 +598,28 @@ impl TuiApp {
             Screen::LoadPlan => InputContext::LoadPlanPath,
             Screen::ModelInput => InputContext::ModelPath,
             Screen::Preferences if self.preference_editing => InputContext::PreferenceValue,
+            Screen::ReviewConfig
+                if self.preference_editing
+                    || (self.menu_index == 0 && self.custom_max_tokens_focused()) =>
+            {
+                InputContext::CustomMaxTokens
+            }
             Screen::GenerationInput => InputContext::GenerationPrompt,
             Screen::SavePlan => InputContext::SavePlanPath,
+            Screen::ExportPath => InputContext::ExportPath,
             _ => InputContext::None,
         }
+    }
+
+    fn custom_max_tokens_focused(&self) -> bool {
+        self.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1
     }
 
     pub fn accepts_text(&self) -> bool {
         self.active_input_context() != InputContext::None
     }
 
-    pub fn load_finished(
-        &mut self,
-        result: Result<PersistedExecutionPlan, TuiError>,
-    ) {
+    pub fn load_finished(&mut self, result: Result<PersistedExecutionPlan, TuiError>) {
         match result {
             Ok(plan) => {
                 self.persisted_plan = Some(plan);
@@ -437,10 +664,7 @@ impl TuiApp {
 
     pub fn loaded_analysis_finished(
         &mut self,
-        result: Result<
-            (PlanningSession, ExecutionPlan, PlanCompatibilityReport),
-            TuiError,
-        >,
+        result: Result<(PlanningSession, ExecutionPlan, PlanCompatibilityReport), TuiError>,
     ) {
         match result {
             Ok((session, plan, report)) => {
@@ -456,10 +680,7 @@ impl TuiApp {
         }
     }
 
-    pub fn analysis_finished(
-        &mut self,
-        result: Result<PlanningSession, TuiError>,
-    ) {
+    pub fn analysis_finished(&mut self, result: Result<PlanningSession, TuiError>) {
         match result {
             Ok(session) => {
                 self.planning_session = Some(session);
@@ -472,10 +693,7 @@ impl TuiApp {
     }
 
     pub fn calibration_started(&mut self, tasks: &[CalibrationTask]) {
-        self.calibration_tasks = tasks
-            .iter()
-            .map(CalibrationTaskView::pending)
-            .collect();
+        self.calibration_tasks = tasks.iter().map(CalibrationTaskView::pending).collect();
         self.calibration_complete = false;
         self.screen = Screen::Calibrating;
     }
@@ -491,7 +709,8 @@ impl TuiApp {
                 self.calibration_result = Some(calibration);
                 self.calibration_complete = true;
                 self.screen = Screen::Calibrating;
-                self.status_message = Some("Calibration complete. Press Enter to plan.".to_string());
+                self.status_message =
+                    Some("Calibration complete. Press Enter to plan.".to_string());
             }
             Err(error) => self.show_error(error, Screen::CalibrationSelect),
         }
@@ -525,27 +744,21 @@ impl TuiApp {
         }
     }
 
-    pub fn runtime_activation_finished(
-        &mut self,
-        result: Result<InferenceEngine, TuiError>,
-    ) {
+    pub fn runtime_activation_finished(&mut self, result: Result<InferenceEngine, TuiError>) {
         match result {
             Ok(runtime) => {
                 self.active_runtime = Some(runtime);
                 self.prompt_input.clear();
                 self.generation_result = None;
-                self.screen = Screen::GenerationInput;
-                self.menu_index = 0;
+                self.screen = Screen::ReviewConfig;
+                self.menu_index = 1;
                 self.error = None;
             }
             Err(error) => self.show_error(error, Screen::PlanReview),
         }
     }
 
-    pub fn generation_finished(
-        &mut self,
-        result: Result<SinglePromptResult, TuiError>,
-    ) {
+    pub fn generation_finished(&mut self, result: Result<SinglePromptResult, TuiError>) {
         match result {
             Ok(result) => {
                 self.generation_result = Some(result);
@@ -578,10 +791,329 @@ impl TuiApp {
 
     pub fn preference_count(&self) -> usize {
         if self.mode == OperatingMode::Advanced {
-            8
+            9
         } else {
-            3
+            4
         }
+    }
+
+    fn apply_ram_preset(&mut self, index: usize) {
+        self.lab.ram_preset_index = index.min(RamPreset::ALL.len() - 1);
+        let preset = RamPreset::ALL[self.lab.ram_preset_index];
+        if let Some(bytes) = preset.bytes() {
+            use super::diagnostics::format_bytes;
+            self.ram_input = format_bytes(bytes).replace(' ', "");
+            // normalize to the parser's expected unit
+            self.ram_input = normalize_memory_input(bytes);
+        } else {
+            self.ram_input = self.lab.custom_ram_input.clone();
+        }
+    }
+
+    fn apply_test_preset(&mut self, preset: TestPreset) {
+        match preset {
+            TestPreset::Quick => {
+                self.apply_ram_preset(1); // 1 GiB
+                self.mode = OperatingMode::BalancedNormal;
+                self.lab.max_tokens = 8;
+                self.lab.max_tokens_preset_index = 1;
+                self.advanced_cache = OverrideChoice::PlannerDefault;
+                self.advanced_read_coalescing = OverrideChoice::PlannerDefault;
+                self.advanced_grouped_buffer = OverrideChoice::PlannerDefault;
+                self.advanced_thread_input.clear();
+                self.advanced_cache_capacity_input.clear();
+            }
+            TestPreset::Balanced => {
+                self.apply_ram_preset(3); // 4 GiB
+                self.mode = OperatingMode::BalancedNormal;
+                self.lab.max_tokens = 32;
+                self.lab.max_tokens_preset_index = 3;
+                self.advanced_cache = OverrideChoice::PlannerDefault;
+                self.advanced_read_coalescing = OverrideChoice::PlannerDefault;
+                self.advanced_grouped_buffer = OverrideChoice::PlannerDefault;
+                self.advanced_thread_input.clear();
+                self.advanced_cache_capacity_input.clear();
+            }
+            TestPreset::LowRam => {
+                self.apply_ram_preset(0); // 500 MiB
+                self.mode = OperatingMode::BackgroundConstrained;
+                self.lab.max_tokens = 16;
+                self.lab.max_tokens_preset_index = 2;
+                self.advanced_cache = OverrideChoice::Disabled;
+                self.advanced_read_coalescing = OverrideChoice::Enabled;
+                self.advanced_grouped_buffer = OverrideChoice::Disabled;
+                self.advanced_thread_input.clear();
+                self.advanced_cache_capacity_input.clear();
+            }
+            TestPreset::Cache => {
+                self.apply_ram_preset(3); // 4 GiB
+                self.mode = OperatingMode::BalancedNormal;
+                self.lab.max_tokens = 64;
+                self.lab.max_tokens_preset_index = 4;
+                self.advanced_cache = OverrideChoice::Enabled;
+                self.advanced_read_coalescing = OverrideChoice::Enabled;
+                self.advanced_grouped_buffer = OverrideChoice::Enabled;
+                self.advanced_thread_input.clear();
+                self.advanced_cache_capacity_input.clear();
+            }
+            TestPreset::StorageIo => {
+                self.apply_ram_preset(2); // 2 GiB
+                self.mode = OperatingMode::BackgroundConstrained;
+                self.lab.max_tokens = 16;
+                self.lab.max_tokens_preset_index = 2;
+                self.advanced_cache = OverrideChoice::Disabled;
+                self.advanced_read_coalescing = OverrideChoice::Enabled;
+                self.advanced_grouped_buffer = OverrideChoice::Enabled;
+                self.advanced_thread_input.clear();
+                self.advanced_cache_capacity_input.clear();
+            }
+            TestPreset::MaximumCpu => {
+                self.apply_ram_preset(5); // 8 GiB
+                self.mode = OperatingMode::MaximumPerformance;
+                self.lab.max_tokens = 128;
+                self.lab.max_tokens_preset_index = 5;
+                self.advanced_cache = OverrideChoice::PlannerDefault;
+                self.advanced_read_coalescing = OverrideChoice::PlannerDefault;
+                self.advanced_grouped_buffer = OverrideChoice::PlannerDefault;
+                self.advanced_thread_input.clear();
+                self.advanced_cache_capacity_input.clear();
+            }
+            TestPreset::Custom => {
+                // Leave everything as-is; user edits individual fields.
+            }
+        }
+        self.lab.test_preset_index = TestPreset::ALL
+            .iter()
+            .position(|p| *p == preset)
+            .unwrap_or(6);
+    }
+
+    pub fn max_tokens(&self) -> usize {
+        self.lab.max_tokens
+    }
+
+    pub fn selected_run(&self, id: u64) -> Option<&RunRecord> {
+        self.lab.run_history.iter().find(|r| r.run_id == id)
+    }
+
+    pub fn selected_history_run(&self) -> Option<&RunRecord> {
+        self.lab
+            .selected_history_id
+            .and_then(|id| self.selected_run(id))
+    }
+
+    fn start_generation_live(&mut self) {
+        self.lab.live = LiveStatus {
+            started_at: Some(Instant::now()),
+            prompt_tokens: 0,
+            generated_tokens: 0,
+            max_tokens: self.lab.max_tokens,
+            phase: GenerationPhase::Prompt,
+        };
+        self.lab.live_started_at = Some(Instant::now());
+        self.lab.live_prompt_tokens.store(0, Ordering::Relaxed);
+        self.lab.live_generated_tokens.store(0, Ordering::Relaxed);
+        self.lab
+            .live_phase
+            .store(phase_to_u64(GenerationPhase::Prompt), Ordering::Relaxed);
+        self.lab.live_stop.store(false, Ordering::Relaxed);
+    }
+
+    pub fn snapshot_live_status(&self) -> LiveStatus {
+        let phase = match self.lab.live_phase.load(Ordering::Relaxed) {
+            1 => GenerationPhase::Decode,
+            2 => GenerationPhase::Finished,
+            3 => GenerationPhase::Failed,
+            _ => GenerationPhase::Prompt,
+        };
+        LiveStatus {
+            started_at: self.lab.live_started_at,
+            prompt_tokens: self.lab.live_prompt_tokens.load(Ordering::Relaxed) as usize,
+            generated_tokens: self.lab.live_generated_tokens.load(Ordering::Relaxed) as usize,
+            max_tokens: self.lab.max_tokens,
+            phase,
+        }
+    }
+
+    pub fn generation_finished_diagnostic(
+        &mut self,
+        result: Result<(usize, String, DiagnosticResult), TuiError>,
+    ) {
+        match result {
+            Ok((prompt_tokens, generated_text, diag)) => {
+                self.lab.last_result = Some(diag.clone());
+                self.lab.last_run_success = true;
+                self.lab.last_error = None;
+                self.lab.last_generated_text = generated_text.clone();
+                self.lab.last_prompt_tokens = prompt_tokens;
+                self.lab.live.phase = GenerationPhase::Finished;
+                self.generation_result = Some(SinglePromptResult {
+                    generated_text,
+                    generated_token_count: diag.generation.generated_tokens,
+                });
+                // Append to bounded history
+                let id = super::diagnostics::next_run_id(&self.lab.run_history);
+                let runtime_cfg = self
+                    .planning_session
+                    .as_ref()
+                    .zip(self.execution_plan.as_ref())
+                    .and_then(|(session, plan)| session.compile_plan(plan).ok());
+                let rc_snapshot: RuntimeConfigSnapshot = runtime_cfg
+                    .as_ref()
+                    .map(RuntimeConfigSnapshot::from)
+                    .unwrap_or(RuntimeConfigSnapshot {
+                        cpu_thread_count: 0,
+                        ram_budget_bytes: 0,
+                        layer_cache_enabled: false,
+                        layer_cache_capacity_bytes: 0,
+                        read_coalescing_enabled: false,
+                        grouped_read_buffer_reuse_enabled: false,
+                        execution_device: "Unavailable".to_string(),
+                    });
+                let (model_name, arch, mf, machf, storagf) = self
+                    .planning_session
+                    .as_ref()
+                    .map(|s| {
+                        (
+                            s.model.identity.display_name.clone(),
+                            s.model.architecture.clone(),
+                            Some(s.model.identity.descriptor_fingerprint),
+                            Some(s.machine.fingerprint()),
+                            Some(s.storage.fingerprint()),
+                        )
+                    })
+                    .unwrap_or((None, None, None, None, None));
+                let _calibration_id = self
+                    .calibration_result
+                    .as_ref()
+                    .map(|c| c.identifier.clone());
+                let record = RunRecord {
+                    run_id: id,
+                    timestamp_unix_seconds: super::diagnostics::unix_timestamp(),
+                    model_name,
+                    model_architecture: arch,
+                    model_descriptor_fingerprint: mf,
+                    machine_fingerprint: machf,
+                    storage_fingerprint: storagf,
+                    model_path: self.model_input.clone(),
+                    user_config: UserConfigSnapshot {
+                        ram_budget_bytes: diag.memory.configured_budget_bytes,
+                        ram_input: self.ram_input.clone(),
+                        mode_label: mode_label(self.mode).to_string(),
+                        preset_label: Some(
+                            TestPreset::ALL
+                                [self.lab.test_preset_index.min(TestPreset::ALL.len() - 1)]
+                            .label()
+                            .to_string(),
+                        ),
+                        calibration_level: calibration_level_label(self.calibration_level())
+                            .to_string(),
+                    },
+                    runtime_config: rc_snapshot,
+                    generation_params: GenerationParamsSnapshot {
+                        prompt_token_count: prompt_tokens,
+                        max_tokens: self.lab.max_tokens,
+                        sampler: "greedy".to_string(),
+                    },
+                    diagnostics: diag,
+                    success: true,
+                    error: None,
+                };
+                self.lab.run_history.push(record);
+                while self.lab.run_history.len() > super::diagnostics::MAX_RUN_HISTORY {
+                    self.lab.run_history.remove(0);
+                }
+                self.lab.selected_history_id = Some(id);
+                self.screen = Screen::GenerationResult;
+                self.menu_index = 0;
+                self.error = None;
+            }
+            Err(error) => {
+                self.lab.last_run_success = false;
+                self.lab.last_error = Some(error.to_string());
+                self.lab.live.phase = GenerationPhase::Failed;
+                self.show_error(error, Screen::GenerationInput);
+            }
+        }
+    }
+
+    pub fn export_finished(&mut self, result: Result<PathBuf, TuiError>) {
+        match result {
+            Ok(path) => {
+                self.status_message = Some(format!("Exported: {}", path.display()));
+                let target = self
+                    .lab
+                    .selected_history_id
+                    .map(|_| Screen::RunDetail)
+                    .unwrap_or(Screen::GenerationResult);
+                self.screen = target;
+                self.menu_index = 0;
+                self.error = None;
+            }
+            Err(error) => {
+                self.screen = Screen::ExportPath;
+                self.error = Some(error);
+            }
+        }
+    }
+
+    fn return_from_runtime_activation(&mut self) {
+        self.screen = if self.plan_origin == PlanOrigin::LoadedPlan {
+            Screen::PlanCompatibility
+        } else {
+            Screen::PlanReview
+        };
+        self.menu_index = 0;
+    }
+
+    fn leave_runtime_session(&mut self) {
+        self.active_runtime = None;
+        self.prompt_input.clear();
+        self.generation_result = None;
+        self.screen = Screen::PlanReview;
+        self.menu_index = 0;
+    }
+
+    fn start_new_model_flow(&mut self) {
+        self.active_runtime = None;
+        self.prompt_input.clear();
+        self.generation_result = None;
+        self.model_flow = ModelFlow::NewPlan;
+        self.plan_origin = PlanOrigin::NewPlan;
+        self.persisted_plan = None;
+        self.compatibility_report = None;
+        self.planning_session = None;
+        self.execution_plan = None;
+        self.calibration_result = None;
+        self.model_input.clear();
+        self.screen = Screen::ModelInput;
+        self.menu_index = 0;
+    }
+
+    fn return_loaded_model_to_planning(&mut self) {
+        self.active_runtime = None;
+        self.prompt_input.clear();
+        self.generation_result = None;
+        if let Some(persisted) = self.persisted_plan.as_ref() {
+            self.ram_input = format!("{}B", persisted.ram_budget_bytes);
+            self.mode = persisted.mode;
+        }
+        self.model_flow = ModelFlow::NewPlan;
+        self.plan_origin = PlanOrigin::NewPlan;
+        self.persisted_plan = None;
+        self.compatibility_report = None;
+        self.execution_plan = None;
+        self.calibration_result = None;
+        self.screen = Screen::Preferences;
+        self.menu_index = 0;
+        self.preference_editing = false;
+    }
+
+    fn show_error(&mut self, error: TuiError, return_to: Screen) {
+        self.screen = Screen::Error;
+        self.error = Some(error);
+        self.error_return = return_to;
+        self.menu_index = 0;
     }
 
     fn handle_welcome(&mut self, command: UiCommand) -> Option<AppAction> {
@@ -671,13 +1203,18 @@ impl TuiApp {
                     self.edit_preference_character(character)
                 }
                 UiCommand::Backspace => self.edit_preference_backspace(),
-                UiCommand::Enter | UiCommand::Back => self.preference_editing = false,
+                UiCommand::Enter | UiCommand::Back => {
+                    self.preference_editing = false;
+                    self.sync_ram_from_input();
+                }
                 UiCommand::Up => {
                     self.preference_editing = false;
+                    self.sync_ram_from_input();
                     self.move_menu_up(self.preference_count());
                 }
                 UiCommand::Down => {
                     self.preference_editing = false;
+                    self.sync_ram_from_input();
                     self.move_menu_down(self.preference_count());
                 }
                 _ => {}
@@ -696,9 +1233,15 @@ impl TuiApp {
                 self.menu_index = 0;
             }
             UiCommand::Enter => match self.preference_field() {
-                PreferenceField::Ram
-                | PreferenceField::AdvancedThreads
-                | PreferenceField::AdvancedCacheCapacity => {
+                PreferenceField::Ram => {
+                    // Only enter edit mode when Custom preset is selected.
+                    if self.lab.ram_preset_index == RamPreset::ALL.len() - 1 {
+                        self.preference_editing = true;
+                    } else {
+                        self.cycle_ram_preset(true);
+                    }
+                }
+                PreferenceField::AdvancedThreads | PreferenceField::AdvancedCacheCapacity => {
                     self.preference_editing = true;
                 }
                 PreferenceField::Mode
@@ -706,6 +1249,10 @@ impl TuiApp {
                 | PreferenceField::AdvancedReadCoalescing
                 | PreferenceField::AdvancedGroupedBuffer => {
                     self.change_preference_value(true);
+                }
+                PreferenceField::TestPresetEntry => {
+                    self.screen = Screen::TestPreset;
+                    self.menu_index = self.lab.test_preset_index;
                 }
                 PreferenceField::Continue => match self.build_user_profile() {
                     Ok(profile) => {
@@ -727,6 +1274,273 @@ impl TuiApp {
                     Err(error) => self.error = Some(error),
                 },
             },
+            _ => {}
+        }
+        None
+    }
+
+    fn cycle_ram_preset(&mut self, forward: bool) {
+        let len = RamPreset::ALL.len();
+        if forward {
+            self.lab.ram_preset_index = (self.lab.ram_preset_index + 1) % len;
+        } else {
+            self.lab.ram_preset_index = (self.lab.ram_preset_index + len - 1) % len;
+        }
+        let preset = RamPreset::ALL[self.lab.ram_preset_index];
+        if let Some(bytes) = preset.bytes() {
+            self.ram_input = normalize_memory_input(bytes);
+        } else {
+            self.ram_input = self.lab.custom_ram_input.clone();
+        }
+    }
+
+    fn sync_ram_from_input(&mut self) {
+        if self.lab.ram_preset_index == RamPreset::ALL.len() - 1 {
+            self.lab.custom_ram_input = self.ram_input.clone();
+        }
+    }
+
+    fn handle_test_preset(&mut self, command: UiCommand) -> Option<AppAction> {
+        let count = TestPreset::ALL.len() + 1; // items + back option shown as footer Escape
+        match command {
+            UiCommand::Up => self.move_menu_up(TestPreset::ALL.len()),
+            UiCommand::Down => self.move_menu_down(TestPreset::ALL.len()),
+            UiCommand::Back => {
+                self.screen = Screen::Preferences;
+                self.menu_index = if self.mode == OperatingMode::Advanced {
+                    7
+                } else {
+                    2
+                };
+            }
+            UiCommand::Enter => {
+                let preset = TestPreset::ALL[self.menu_index.min(TestPreset::ALL.len() - 1)];
+                self.apply_test_preset(preset);
+                self.screen = Screen::Preferences;
+                self.menu_index = self.preference_count() - 1;
+            }
+            _ => {
+                let _ = count;
+            }
+        }
+        None
+    }
+
+    fn handle_review_config(&mut self, command: UiCommand) -> Option<AppAction> {
+        // Items: max_tokens row, start button, back button  (3 lines; max_tokens row itself cycles preset)
+        let count = 4;
+        match command {
+            UiCommand::Up => self.move_menu_up(count),
+            UiCommand::Down => self.move_menu_down(count),
+            UiCommand::Left | UiCommand::Right if self.menu_index == 0 => {
+                let dir = command == UiCommand::Right;
+                let len = MaxTokensPreset::ALL.len();
+                if dir {
+                    self.lab.max_tokens_preset_index = (self.lab.max_tokens_preset_index + 1) % len;
+                } else {
+                    self.lab.max_tokens_preset_index =
+                        (self.lab.max_tokens_preset_index + len - 1) % len;
+                }
+                let p = MaxTokensPreset::ALL[self.lab.max_tokens_preset_index];
+                if let Some(v) = p.value() {
+                    self.lab.max_tokens = v;
+                } else {
+                    // Custom: start editing
+                    self.preference_editing = true;
+                }
+            }
+            UiCommand::Back => {
+                self.active_runtime = None;
+                self.screen = Screen::PlanValid;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter if self.menu_index == 0 => {
+                if self.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1 {
+                    self.preference_editing = true;
+                } else {
+                    // cycle
+                    self.cycle_max_tokens();
+                }
+            }
+            UiCommand::Enter if self.menu_index == 1 => {
+                // Go to prompt input
+                self.prompt_input.clear();
+                self.lab.prompt_input_before_run.clear();
+                self.screen = Screen::GenerationInput;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter => {
+                self.active_runtime = None;
+                self.screen = Screen::PlanValid;
+                self.menu_index = 0;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn cycle_max_tokens(&mut self) {
+        let len = MaxTokensPreset::ALL.len();
+        self.lab.max_tokens_preset_index = (self.lab.max_tokens_preset_index + 1) % len;
+        if let Some(v) = MaxTokensPreset::ALL[self.lab.max_tokens_preset_index].value() {
+            self.lab.max_tokens = v;
+        }
+    }
+
+    fn handle_run_history(&mut self, command: UiCommand) -> Option<AppAction> {
+        let count = self.lab.run_history.len() + 2; // entries + compare + back
+        match command {
+            UiCommand::Up => self.move_menu_up(count.max(1)),
+            UiCommand::Down => self.move_menu_down(count.max(1)),
+            UiCommand::Back => {
+                self.screen = Screen::GenerationResult;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter if self.menu_index < self.lab.run_history.len() => {
+                let run = &self.lab.run_history[self.menu_index];
+                self.lab.selected_history_id = Some(run.run_id);
+                self.screen = Screen::RunDetail;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter if self.menu_index == self.lab.run_history.len() => {
+                // Compare
+                if self.lab.run_history.len() >= 2 {
+                    self.lab.compare_first_id = None;
+                    self.lab.comparison = None;
+                    self.screen = Screen::RunCompareSelect;
+                    self.menu_index = 0;
+                }
+            }
+            UiCommand::Enter => {
+                self.screen = Screen::GenerationResult;
+                self.menu_index = 0;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_run_detail(&mut self, command: UiCommand) -> Option<AppAction> {
+        // Items: 0 = back to history, 1 = Export JSON
+        match command {
+            UiCommand::Up | UiCommand::Down => self.menu_index = 1 - self.menu_index.min(1),
+            UiCommand::Back => {
+                self.screen = Screen::RunHistory;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter if self.menu_index == 0 => {
+                self.screen = Screen::RunHistory;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter => {
+                self.lab.export_path_input.clear();
+                if let Some(id) = self.lab.selected_history_id {
+                    if let Some(r) = self.selected_run(id) {
+                        let default_path = format!("ramforge-run-{}.json", r.run_id);
+                        self.lab.export_path_input = default_path;
+                    }
+                }
+                self.screen = Screen::ExportPath;
+                self.menu_index = 0;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_run_compare_select(&mut self, command: UiCommand) -> Option<AppAction> {
+        let count = self.lab.run_history.len() + 1;
+        match command {
+            UiCommand::Up => self.move_menu_up(count.max(1)),
+            UiCommand::Down => self.move_menu_down(count.max(1)),
+            UiCommand::Back => {
+                if self.lab.compare_first_id.is_some() {
+                    self.lab.compare_first_id = None;
+                } else {
+                    self.screen = Screen::RunHistory;
+                    self.menu_index = 0;
+                }
+            }
+            UiCommand::Enter if self.menu_index < self.lab.run_history.len() => {
+                let run = &self.lab.run_history[self.menu_index];
+                let id = run.run_id;
+                match self.lab.compare_first_id {
+                    None => {
+                        self.lab.compare_first_id = Some(id);
+                    }
+                    Some(first) if first == id => {
+                        self.lab.compare_first_id = None;
+                    }
+                    Some(first) => {
+                        if let (Some(a), Some(b)) =
+                            (self.selected_run(first), self.selected_run(id))
+                        {
+                            self.lab.comparison = Some(super::diagnostics::compare_runs(a, b));
+                            self.screen = Screen::RunCompare;
+                            self.menu_index = 0;
+                        }
+                    }
+                }
+            }
+            UiCommand::Enter => {
+                self.screen = Screen::RunHistory;
+                self.menu_index = 0;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_run_compare(&mut self, command: UiCommand) -> Option<AppAction> {
+        match command {
+            UiCommand::Back | UiCommand::Enter => {
+                self.lab.comparison = None;
+                self.lab.compare_first_id = None;
+                self.screen = Screen::RunHistory;
+                self.menu_index = 0;
+            }
+            UiCommand::Up | UiCommand::Down => {}
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_export_path(&mut self, command: UiCommand) -> Option<AppAction> {
+        match command {
+            UiCommand::Character(character) if !character.is_control() => {
+                self.lab.export_path_input.push(character)
+            }
+            UiCommand::Backspace => {
+                self.lab.export_path_input.pop();
+            }
+            UiCommand::Back => {
+                let target = self
+                    .lab
+                    .selected_history_id
+                    .map(|_| Screen::RunDetail)
+                    .unwrap_or(Screen::GenerationResult);
+                self.screen = target;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter if self.lab.export_path_input.is_empty() => {
+                self.error = Some(TuiError::Input {
+                    field: "export path",
+                    message: "a destination path is required".to_string(),
+                });
+            }
+            UiCommand::Enter => {
+                if let Some(id) = self.lab.selected_history_id {
+                    return Some(AppAction::ExportRun(
+                        id,
+                        PathBuf::from(self.lab.export_path_input.as_str()),
+                    ));
+                } else if let Some(id) = self.lab.run_history.last().map(|r| r.run_id) {
+                    return Some(AppAction::ExportRun(
+                        id,
+                        PathBuf::from(self.lab.export_path_input.as_str()),
+                    ));
+                }
+            }
             _ => {}
         }
         None
@@ -880,7 +1694,10 @@ impl TuiApp {
             UiCommand::Backspace => {
                 self.prompt_input.pop();
             }
-            UiCommand::Back => self.leave_runtime_session(),
+            UiCommand::Back => {
+                self.screen = Screen::ReviewConfig;
+                self.menu_index = 1;
+            }
             UiCommand::Enter if self.prompt_input.is_empty() => {
                 self.error = Some(TuiError::Input {
                     field: "prompt",
@@ -888,9 +1705,21 @@ impl TuiApp {
                 });
             }
             UiCommand::Enter => {
+                if self.lab.max_tokens == 0 {
+                    self.error = Some(TuiError::Input {
+                        field: "max tokens",
+                        message: "max tokens must be greater than zero".to_string(),
+                    });
+                    return None;
+                }
                 self.screen = Screen::GenerationRunning;
                 self.generation_result = None;
-                return Some(AppAction::GeneratePrompt(self.prompt_input.clone()));
+                self.lab.prompt_input_before_run = self.prompt_input.clone();
+                self.start_generation_live();
+                return Some(AppAction::GeneratePrompt(
+                    self.prompt_input.clone(),
+                    self.lab.max_tokens,
+                ));
             }
             _ => {}
         }
@@ -898,13 +1727,33 @@ impl TuiApp {
     }
 
     fn handle_generation_result(&mut self, command: UiCommand) -> Option<AppAction> {
+        // Menu items:
+        // 0: Generate another
+        // 1: Run history
+        // 2: Export last run JSON
+        // 3: Return to plan
+        let count = 4;
         match command {
-            UiCommand::Up | UiCommand::Down => self.menu_index = 1 - self.menu_index.min(1),
+            UiCommand::Up => self.move_menu_up(count),
+            UiCommand::Down => self.move_menu_down(count),
             UiCommand::Back => self.leave_runtime_session(),
             UiCommand::Enter if self.menu_index == 0 => {
                 self.prompt_input.clear();
                 self.generation_result = None;
                 self.screen = Screen::GenerationInput;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter if self.menu_index == 1 => {
+                self.screen = Screen::RunHistory;
+                self.menu_index = 0;
+            }
+            UiCommand::Enter if self.menu_index == 2 => {
+                self.lab.export_path_input.clear();
+                if let Some(r) = self.lab.run_history.last() {
+                    self.lab.selected_history_id = Some(r.run_id);
+                    self.lab.export_path_input = format!("ramforge-run-{}.json", r.run_id);
+                }
+                self.screen = Screen::ExportPath;
                 self.menu_index = 0;
             }
             UiCommand::Enter => self.leave_runtime_session(),
@@ -961,65 +1810,6 @@ impl TuiApp {
         None
     }
 
-    fn return_from_runtime_activation(&mut self) {
-        self.screen = if self.plan_origin == PlanOrigin::LoadedPlan {
-            Screen::PlanCompatibility
-        } else {
-            Screen::PlanReview
-        };
-        self.menu_index = 0;
-    }
-
-    fn leave_runtime_session(&mut self) {
-        self.active_runtime = None;
-        self.prompt_input.clear();
-        self.generation_result = None;
-        self.screen = Screen::PlanReview;
-        self.menu_index = 0;
-    }
-
-    fn start_new_model_flow(&mut self) {
-        self.active_runtime = None;
-        self.prompt_input.clear();
-        self.generation_result = None;
-        self.model_flow = ModelFlow::NewPlan;
-        self.plan_origin = PlanOrigin::NewPlan;
-        self.persisted_plan = None;
-        self.compatibility_report = None;
-        self.planning_session = None;
-        self.execution_plan = None;
-        self.calibration_result = None;
-        self.model_input.clear();
-        self.screen = Screen::ModelInput;
-        self.menu_index = 0;
-    }
-
-    fn return_loaded_model_to_planning(&mut self) {
-        self.active_runtime = None;
-        self.prompt_input.clear();
-        self.generation_result = None;
-        if let Some(persisted) = self.persisted_plan.as_ref() {
-            self.ram_input = format!("{}B", persisted.ram_budget_bytes);
-            self.mode = persisted.mode;
-        }
-        self.model_flow = ModelFlow::NewPlan;
-        self.plan_origin = PlanOrigin::NewPlan;
-        self.persisted_plan = None;
-        self.compatibility_report = None;
-        self.execution_plan = None;
-        self.calibration_result = None;
-        self.screen = Screen::Preferences;
-        self.menu_index = 0;
-        self.preference_editing = false;
-    }
-
-    fn show_error(&mut self, error: TuiError, return_to: Screen) {
-        self.screen = Screen::Error;
-        self.error = Some(error);
-        self.error_return = return_to;
-        self.menu_index = 0;
-    }
-
     fn move_menu_up(&mut self, item_count: usize) {
         self.menu_index = if self.menu_index == 0 {
             item_count - 1
@@ -1033,12 +1823,11 @@ impl TuiApp {
     }
 
     fn build_user_profile(&self) -> Result<UserProfile, TuiError> {
-        let ram_budget_bytes = parse_memory_size(&self.ram_input).map_err(|error| {
-            TuiError::Input {
+        let ram_budget_bytes =
+            parse_memory_size(&self.ram_input).map_err(|error| TuiError::Input {
                 field: "RAM budget",
                 message: error.to_string(),
-            }
-        })?;
+            })?;
         let mut profile = UserProfile::new(ram_budget_bytes, self.mode);
         if self.mode == OperatingMode::Advanced {
             profile.advanced = AdvancedOverrides {
@@ -1065,13 +1854,14 @@ impl TuiApp {
 
     fn preference_field(&self) -> PreferenceField {
         if self.mode != OperatingMode::Advanced {
-            return match self.menu_index.min(2) {
+            return match self.menu_index.min(3) {
                 0 => PreferenceField::Ram,
                 1 => PreferenceField::Mode,
+                2 => PreferenceField::TestPresetEntry,
                 _ => PreferenceField::Continue,
             };
         }
-        match self.menu_index.min(7) {
+        match self.menu_index.min(8) {
             0 => PreferenceField::Ram,
             1 => PreferenceField::Mode,
             2 => PreferenceField::AdvancedThreads,
@@ -1079,6 +1869,7 @@ impl TuiApp {
             4 => PreferenceField::AdvancedCacheCapacity,
             5 => PreferenceField::AdvancedReadCoalescing,
             6 => PreferenceField::AdvancedGroupedBuffer,
+            7 => PreferenceField::TestPresetEntry,
             _ => PreferenceField::Continue,
         }
     }
@@ -1094,6 +1885,9 @@ impl TuiApp {
                 if self.menu_index >= self.preference_count() {
                     self.menu_index = self.preference_count() - 1;
                 }
+            }
+            PreferenceField::Ram => {
+                self.cycle_ram_preset(forward);
             }
             PreferenceField::AdvancedCache => {
                 self.advanced_cache = if forward {
@@ -1116,21 +1910,36 @@ impl TuiApp {
                     self.advanced_grouped_buffer.previous()
                 }
             }
-            PreferenceField::Ram
-            | PreferenceField::AdvancedThreads
+            PreferenceField::AdvancedThreads
             | PreferenceField::AdvancedCacheCapacity
+            | PreferenceField::TestPresetEntry
             | PreferenceField::Continue => {}
         }
     }
 
     fn edit_preference_character(&mut self, character: char) {
         match self.preference_field() {
-            PreferenceField::Ram => self.ram_input.push(character),
+            PreferenceField::Ram => {
+                self.ram_input.push(character);
+                self.lab.custom_ram_input = self.ram_input.clone();
+            }
             PreferenceField::AdvancedThreads => self.advanced_thread_input.push(character),
             PreferenceField::AdvancedCacheCapacity => {
                 self.advanced_cache_capacity_input.push(character)
             }
             _ => {}
+        }
+        // Handle custom max tokens editing when on review config
+        if self.screen == Screen::ReviewConfig
+            && self.menu_index == 0
+            && self.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1
+        {
+            if character.is_ascii_digit() {
+                self.lab.custom_max_tokens_input.push(character);
+                if let Ok(v) = self.lab.custom_max_tokens_input.parse::<usize>() {
+                    self.lab.max_tokens = v;
+                }
+            }
         }
     }
 
@@ -1138,6 +1947,7 @@ impl TuiApp {
         match self.preference_field() {
             PreferenceField::Ram => {
                 self.ram_input.pop();
+                self.lab.custom_ram_input = self.ram_input.clone();
             }
             PreferenceField::AdvancedThreads => {
                 self.advanced_thread_input.pop();
@@ -1147,6 +1957,38 @@ impl TuiApp {
             }
             _ => {}
         }
+        if self.screen == Screen::ReviewConfig
+            && self.menu_index == 0
+            && self.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1
+        {
+            self.lab.custom_max_tokens_input.pop();
+            if let Ok(v) = self.lab.custom_max_tokens_input.parse::<usize>() {
+                self.lab.max_tokens = v;
+            } else if self.lab.custom_max_tokens_input.is_empty() {
+                self.lab.max_tokens = 0;
+            }
+        }
+    }
+}
+
+fn phase_to_u64(phase: GenerationPhase) -> u64 {
+    match phase {
+        GenerationPhase::Prompt => 0,
+        GenerationPhase::Decode => 1,
+        GenerationPhase::Finished => 2,
+        GenerationPhase::Failed => 3,
+    }
+}
+
+fn normalize_memory_input(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if bytes % GIB == 0 {
+        format!("{}GiB", bytes / GIB)
+    } else if bytes % MIB == 0 {
+        format!("{}MiB", bytes / MIB)
+    } else {
+        format!("{bytes}B")
     }
 }
 
@@ -1159,6 +2001,7 @@ enum PreferenceField {
     AdvancedCacheCapacity,
     AdvancedReadCoalescing,
     AdvancedGroupedBuffer,
+    TestPresetEntry,
     Continue,
 }
 
@@ -1298,7 +2141,10 @@ mod tests {
             PlanPersistenceError::InvalidMagic,
         )));
         assert_eq!(app.screen, Screen::Error);
-        assert_eq!(app.error.as_ref().unwrap().title(), "Plan persistence failed");
+        assert_eq!(
+            app.error.as_ref().unwrap().title(),
+            "Plan persistence failed"
+        );
         app.handle(UiCommand::Back);
         assert_eq!(app.screen, Screen::LoadPlan);
     }
@@ -1314,10 +2160,7 @@ mod tests {
         assert_eq!(app.model_input, "jk");
         app.model_input.clear();
         assert!(app.handle(UiCommand::Enter).is_none());
-        assert!(matches!(
-            app.error.as_ref(),
-            Some(TuiError::Input { .. })
-        ));
+        assert!(matches!(app.error.as_ref(), Some(TuiError::Input { .. })));
 
         app.model_input = "relative/model.gguf".to_string();
         assert_eq!(
@@ -1342,7 +2185,10 @@ mod tests {
             )))
             .is_none());
         assert_eq!(app.screen, Screen::Error);
-        assert_eq!(app.error.as_ref().unwrap().title(), "Storage discovery failed");
+        assert_eq!(
+            app.error.as_ref().unwrap().title(),
+            "Storage discovery failed"
+        );
     }
 
     #[test]
@@ -1375,12 +2221,20 @@ mod tests {
         let mut app = TuiApp::default();
         app.screen = Screen::Preferences;
         app.menu_index = 0;
+        assert_eq!(app.ram_input, "1GiB");
+        // Navigate to Custom RAM preset first. Starting at index 1 (1 GiB), need 6 Rights.
+        for _ in 0..6 {
+            app.handle(UiCommand::Right);
+        }
+        assert_eq!(app.lab.ram_preset_index, RamPreset::ALL.len() - 1);
+        app.ram_input.clear();
+        app.lab.custom_ram_input.clear();
         app.handle(UiCommand::Character('8'));
-        assert!(app.ram_input.is_empty());
+        assert!(app.ram_input.is_empty()); // must press Enter first to edit
         app.handle(UiCommand::Enter);
         assert_eq!(app.active_input_context(), InputContext::PreferenceValue);
         app.handle(UiCommand::Character('8'));
-        assert_eq!(app.ram_input, "8");
+        assert!(app.ram_input.ends_with('8'));
         app.handle(UiCommand::Enter);
         assert_eq!(app.active_input_context(), InputContext::None);
     }
@@ -1393,7 +2247,7 @@ mod tests {
         app.menu_index = 1;
         app.handle(UiCommand::Enter);
         assert_eq!(app.mode, OperatingMode::MaximumPerformance);
-        app.menu_index = 2;
+        app.menu_index = 3; // Analyze (3rd index in non-advanced mode with Test preset)
         assert_eq!(app.handle(UiCommand::Enter), Some(AppAction::Analyze));
         assert_eq!(
             app.user_profile.as_ref().unwrap().ram_budget_bytes,
@@ -1408,12 +2262,9 @@ mod tests {
         app.ram_input = "1GiB".to_string();
         app.mode = OperatingMode::Advanced;
         app.advanced_thread_input = "0".to_string();
-        app.menu_index = 7;
+        app.menu_index = 8; // Analyze in advanced mode (after Test preset entry)
         assert!(app.handle(UiCommand::Enter).is_none());
-        assert!(matches!(
-            app.error.as_ref(),
-            Some(TuiError::Input { .. })
-        ));
+        assert!(matches!(app.error.as_ref(), Some(TuiError::Input { .. })));
         assert_eq!(app.screen, Screen::Preferences);
     }
 
@@ -1431,7 +2282,10 @@ mod tests {
 
         app.screen = Screen::CalibrationSelect;
         app.menu_index = 2;
-        assert_eq!(app.handle(UiCommand::Enter), Some(AppAction::RunCalibration));
+        assert_eq!(
+            app.handle(UiCommand::Enter),
+            Some(AppAction::RunCalibration)
+        );
         assert_eq!(
             app.user_profile.as_ref().unwrap().calibration_level,
             CalibrationLevel::Standard
@@ -1458,13 +2312,11 @@ mod tests {
     fn planner_failure_returns_to_a_structured_error_state() {
         let mut app = TuiApp::default();
         app.screen = Screen::Analyzing;
-        app.planning_finished(Err(TuiError::Planning(
-            OrchestrationError::Planning(
-                ramforge_runtime::planner::PlannerError::Infeasible(
-                    ramforge_runtime::planner::FeasibilityRejection::ModelNotExecutable,
-                ),
+        app.planning_finished(Err(TuiError::Planning(OrchestrationError::Planning(
+            ramforge_runtime::planner::PlannerError::Infeasible(
+                ramforge_runtime::planner::FeasibilityRejection::ModelNotExecutable,
             ),
-        )));
+        ))));
         assert_eq!(app.screen, Screen::Error);
         assert_eq!(app.error.as_ref().unwrap().title(), "Planning failed");
     }
@@ -1496,7 +2348,10 @@ mod tests {
         assert!(app.active_runtime.is_none());
         app.plan_validation_finished(Ok(()));
         assert_eq!(app.screen, Screen::PlanValid);
-        assert_eq!(app.handle(UiCommand::Enter), Some(AppAction::ActivateRuntime));
+        assert_eq!(
+            app.handle(UiCommand::Enter),
+            Some(AppAction::ActivateRuntime)
+        );
     }
 
     #[test]
@@ -1548,7 +2403,10 @@ mod tests {
     fn runtime_activation_is_an_explicit_post_validation_action() {
         let mut app = TuiApp::default();
         app.screen = Screen::PlanValid;
-        assert_eq!(app.handle(UiCommand::Enter), Some(AppAction::ActivateRuntime));
+        assert_eq!(
+            app.handle(UiCommand::Enter),
+            Some(AppAction::ActivateRuntime)
+        );
         assert_eq!(app.screen, Screen::RuntimeActivation);
         assert!(app.active_runtime.is_none());
     }
@@ -1579,7 +2437,10 @@ mod tests {
         assert_eq!(app.prompt_input, "Hi");
         assert_eq!(
             app.handle(UiCommand::Enter),
-            Some(AppAction::GeneratePrompt("Hi".to_string()))
+            Some(AppAction::GeneratePrompt(
+                "Hi".to_string(),
+                app.lab.max_tokens
+            ))
         );
         assert_eq!(app.screen, Screen::GenerationRunning);
         assert_eq!(app.active_input_context(), InputContext::None);
