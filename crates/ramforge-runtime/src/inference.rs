@@ -2543,6 +2543,11 @@ pub(crate) mod tests {
     }
 }
 
+#[cfg(test)]
+mod autoregressive_invariants {
+    use super::*;
+    use super::tests::create_tiny_llama_gguf;
+
     // ---------- Autoregressive decode KV/position invariants ----------
     //
     // These tests exercise the prompt→decode transition on the existing
@@ -2561,8 +2566,6 @@ pub(crate) mod tests {
 
     #[test]
     fn kv_cache_invariants_across_prompt_and_first_decodes() {
-        use ramforge_core::memory::MemoryBudget;
-
         let tmp = create_tiny_llama_gguf();
         let mut engine =
             InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
@@ -2679,3 +2682,386 @@ pub(crate) mod tests {
             "kv_cache charge must be released after a generation run"
         );
     }
+}
+
+/// Bounded real-model numerical trace. This is deliberately test-only and
+/// ignored by the normal suite: it requires the exact Qwen2.5-1.5B Q4_0 GGUF
+/// plus a caller-provided memory budget. It does not alter normal generation.
+#[cfg(test)]
+mod qwen25_bounded_diagnostic {
+    use super::*;
+    use crate::kv_cache::KvCache;
+    use crate::residency::ResidencyStats;
+    use crate::runtime_config::RuntimeConfig;
+    use crate::sampling::Sampler;
+    use ramforge_core::memory::MemoryBudget;
+    use std::cmp::Ordering;
+    use std::env;
+
+    const RAW_PROMPT: &str = "hi, what's 2+2=?";
+    const EXPECTED_PROMPT_TOKENS: [u32; 9] =
+        [6023, 11, 1128, 594, 220, 17, 10, 17, 19884];
+    const TRACE_DECODE_STEPS: usize = 2;
+
+    #[derive(Debug, Clone)]
+    struct NumericSummary {
+        length: usize,
+        min: f32,
+        max: f32,
+        sum: f64,
+        l2_norm: f64,
+        first8: Vec<f32>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct LogitSummary {
+        vocabulary_size: usize,
+        values: NumericSummary,
+        top10: Vec<(u32, f32)>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct DecodeBoundary {
+        input_token_id: u32,
+        position_id: usize,
+        kv_seq_len_before: usize,
+        kv_seq_len_after: usize,
+        hidden: NumericSummary,
+        logits: LogitSummary,
+    }
+
+    #[derive(Debug, Clone)]
+    struct BoundedTrace {
+        prompt_token_ids: Vec<u32>,
+        prompt_positions: Vec<usize>,
+        final_prompt_hidden: NumericSummary,
+        final_prompt_logits: LogitSummary,
+        first_generated_token: u32,
+        first_decode: DecodeBoundary,
+        second_generated_token: u32,
+        second_decode: DecodeBoundary,
+    }
+
+    fn summarize(values: &[f32]) -> NumericSummary {
+        assert!(!values.is_empty(), "diagnostic vectors must not be empty");
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        let mut sum = 0.0f64;
+        let mut sum_squares = 0.0f64;
+        for &value in values {
+            min = min.min(value);
+            max = max.max(value);
+            let value64 = value as f64;
+            sum += value64;
+            sum_squares += value64 * value64;
+        }
+        NumericSummary {
+            length: values.len(),
+            min,
+            max,
+            sum,
+            l2_norm: sum_squares.sqrt(),
+            first8: values.iter().take(8).copied().collect(),
+        }
+    }
+
+    fn summarize_logits(logits: &[f32]) -> LogitSummary {
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_by(|left, right| {
+            logits[*right]
+                .partial_cmp(&logits[*left])
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.cmp(right))
+        });
+        order.truncate(10);
+        let top10: Vec<(u32, f32)> = order
+            .into_iter()
+            .map(|index| (index as u32, logits[index]))
+            .collect();
+        LogitSummary {
+            vocabulary_size: logits.len(),
+            values: summarize(logits),
+            top10,
+        }
+    }
+
+    fn print_numeric(label: &str, summary: &NumericSummary) {
+        println!("{label}.length = {}", summary.length);
+        println!("{label}.min = {:?}", summary.min);
+        println!("{label}.max = {:?}", summary.max);
+        println!("{label}.sum = {:?}", summary.sum);
+        println!("{label}.l2_norm = {:?}", summary.l2_norm);
+        println!("{label}.first8 = {:?}", summary.first8);
+    }
+
+    fn print_logits(label: &str, summary: &LogitSummary) {
+        println!("{label}.vocabulary_size = {}", summary.vocabulary_size);
+        print_numeric(&format!("{label}.values"), &summary.values);
+        println!("{label}.top10 = {:?}", summary.top10);
+    }
+
+    fn print_trace(trace: &BoundedTrace) {
+        println!("RAMFORGE_QWEN25_BOUNDED_TRACE");
+        println!("prompt.raw = {RAW_PROMPT:?}");
+        println!("prompt.token_ids = {:?}", trace.prompt_token_ids);
+        println!("prompt.positions = {:?}", trace.prompt_positions);
+        print_numeric("prompt.final_hidden", &trace.final_prompt_hidden);
+        print_logits("prompt.final_logits", &trace.final_prompt_logits);
+        println!("prompt.first_generated_token = {}", trace.first_generated_token);
+
+        println!("first_decode.input_token_id = {}", trace.first_decode.input_token_id);
+        println!("first_decode.position_id = {}", trace.first_decode.position_id);
+        println!(
+            "first_decode.kv_seq_len_before = {}",
+            trace.first_decode.kv_seq_len_before
+        );
+        println!(
+            "first_decode.kv_seq_len_after = {}",
+            trace.first_decode.kv_seq_len_after
+        );
+        print_numeric("first_decode.final_hidden", &trace.first_decode.hidden);
+        print_logits("first_decode.final_logits", &trace.first_decode.logits);
+        println!("first_decode.second_generated_token = {}", trace.second_generated_token);
+
+        println!("second_decode.input_token_id = {}", trace.second_decode.input_token_id);
+        println!("second_decode.position_id = {}", trace.second_decode.position_id);
+        println!(
+            "second_decode.kv_seq_len_before = {}",
+            trace.second_decode.kv_seq_len_before
+        );
+        println!(
+            "second_decode.kv_seq_len_after = {}",
+            trace.second_decode.kv_seq_len_after
+        );
+        print_numeric("second_decode.final_hidden", &trace.second_decode.hidden);
+        print_logits("second_decode.final_logits", &trace.second_decode.logits);
+    }
+
+    fn ensure_trace_capacity(
+        kv_cache: &mut KvCache,
+        required_tokens: usize,
+        maximum_tokens: usize,
+        budget: &mut MemoryBudget,
+    ) -> Result<(), String> {
+        if required_tokens <= kv_cache.capacity_tokens() {
+            return Ok(());
+        }
+        let target = kv_cache
+            .chunk_aligned_capacity(required_tokens)
+            .min(maximum_tokens);
+        let new_bytes = kv_cache.bytes_for_tokens(target) as u64;
+        budget
+            .resize("kv_cache", new_bytes)
+            .map_err(|error| format!("failed to resize diagnostic KV charge: {error}"))?;
+        kv_cache.grow_to(target)?;
+        Ok(())
+    }
+
+    fn run_bounded_trace(
+        engine: &mut InferenceEngine,
+        prompt_tokens: &[u32],
+    ) -> Result<BoundedTrace, String> {
+        if prompt_tokens != EXPECTED_PROMPT_TOKENS.as_slice() {
+            return Err(format!(
+                "diagnostic requires exact prompt IDs {:?}, got {:?}",
+                EXPECTED_PROMPT_TOKENS, prompt_tokens
+            ));
+        }
+
+        let model = &engine.model;
+        let backend = &engine.backend;
+        let data_source = &engine.data_source;
+        let budget = &mut engine.budget;
+        let mut residency_stats = ResidencyStats::new(model.total_weight_bytes);
+        let n_embd = model.config.embedding_length;
+        let vocab_size = model.config.vocab_size;
+        let n_layers = model.config.block_count;
+        let n_kv_heads = model.config.head_count_kv;
+        let head_dim = model.config.head_dim;
+        let prompt_len = prompt_tokens.len();
+        let needed_len = prompt_len + TRACE_DECODE_STEPS;
+
+        // Match the normal generation lifetime: initial KV capacity equals the
+        // prompt length, then grows only when the first/second decode needs it.
+        let mut kv_cache = KvCache::new(n_layers, n_kv_heads, head_dim, prompt_len)?;
+        kv_cache
+            .allocate_from_budget(budget)
+            .map_err(|error| format!("failed to allocate diagnostic KV cache: {error}"))?;
+
+        let mut hidden = vec![0.0f32; n_embd];
+        for (position_id, &token_id) in prompt_tokens.iter().enumerate() {
+            model.forward_single_streaming(
+                token_id,
+                position_id,
+                &mut kv_cache,
+                backend,
+                data_source,
+                budget,
+                &mut residency_stats,
+                &mut hidden,
+            )?;
+        }
+        if kv_cache.seq_len() != prompt_len {
+            return Err(format!(
+                "prompt KV length mismatch: expected {}, got {}",
+                prompt_len,
+                kv_cache.seq_len()
+            ));
+        }
+
+        // Boundary 1: final prompt hidden is captured before output projection.
+        let final_prompt_hidden = summarize(&hidden);
+        let mut logits = vec![0.0f32; vocab_size];
+        model.compute_logits(
+            &hidden,
+            backend,
+            data_source,
+            budget,
+            &mut logits,
+        )?;
+        let final_prompt_logits = summarize_logits(&logits);
+        let sampler = Sampler::greedy();
+        let first_generated_token = sampler.sample(&logits);
+
+        // Boundary 2: feed the first greedy token at position N.
+        let first_position_id = prompt_len;
+        let first_kv_before = kv_cache.seq_len();
+        ensure_trace_capacity(
+            &mut kv_cache,
+            first_kv_before + 1,
+            needed_len,
+            budget,
+        )?;
+        model.forward_single_streaming(
+            first_generated_token,
+            first_position_id,
+            &mut kv_cache,
+            backend,
+            data_source,
+            budget,
+            &mut residency_stats,
+            &mut hidden,
+        )?;
+        let first_kv_after = kv_cache.seq_len();
+        let first_hidden = summarize(&hidden);
+        model.compute_logits(
+            &hidden,
+            backend,
+            data_source,
+            budget,
+            &mut logits,
+        )?;
+        let first_logits = summarize_logits(&logits);
+        let second_generated_token = sampler.sample(&logits);
+
+        // Boundary 3: feed the second greedy token at position N+1.
+        let second_position_id = prompt_len + 1;
+        let second_kv_before = kv_cache.seq_len();
+        ensure_trace_capacity(
+            &mut kv_cache,
+            second_kv_before + 1,
+            needed_len,
+            budget,
+        )?;
+        model.forward_single_streaming(
+            second_generated_token,
+            second_position_id,
+            &mut kv_cache,
+            backend,
+            data_source,
+            budget,
+            &mut residency_stats,
+            &mut hidden,
+        )?;
+        let second_kv_after = kv_cache.seq_len();
+        let second_hidden = summarize(&hidden);
+        model.compute_logits(
+            &hidden,
+            backend,
+            data_source,
+            budget,
+            &mut logits,
+        )?;
+        let second_logits = summarize_logits(&logits);
+
+        let trace = BoundedTrace {
+            prompt_token_ids: prompt_tokens.to_vec(),
+            prompt_positions: (0..prompt_len).collect::<Vec<usize>>(),
+            final_prompt_hidden,
+            final_prompt_logits,
+            first_generated_token,
+            first_decode: DecodeBoundary {
+                input_token_id: first_generated_token,
+                position_id: first_position_id,
+                kv_seq_len_before: first_kv_before,
+                kv_seq_len_after: first_kv_after,
+                hidden: first_hidden,
+                logits: first_logits,
+            },
+            second_generated_token,
+            second_decode: DecodeBoundary {
+                input_token_id: second_generated_token,
+                position_id: second_position_id,
+                kv_seq_len_before: second_kv_before,
+                kv_seq_len_after: second_kv_after,
+                hidden: second_hidden,
+                logits: second_logits,
+            },
+        };
+
+        budget
+            .release("kv_cache")
+            .map_err(|error| format!("failed to release diagnostic KV charge: {error}"))?;
+        Ok(trace)
+    }
+
+    /// Run with, for example:
+    ///
+    /// ```text
+    /// CARGO_TARGET_DIR=/tmp/ramforge-cargo-target \\
+    /// RAMFORGE_QWEN25_MODEL=/path/to/qwen2.5-1.5b-instruct-q4_0.gguf \\
+    /// RAMFORGE_QWEN25_RAM_BYTES=8589934592 \\
+    /// cargo test -p ramforge-runtime qwen25_bounded_numerical_trace -- \\
+    ///     --ignored --nocapture
+    /// ```
+    ///
+    /// The test is ignored so normal workspace tests never require a real model.
+    #[test]
+    #[ignore = "requires the real Qwen2.5-1.5B Q4_0 GGUF and an explicit RAM budget"]
+    fn qwen25_bounded_numerical_trace() {
+        let model_path = env::var("RAMFORGE_QWEN25_MODEL")
+            .expect("set RAMFORGE_QWEN25_MODEL to the exact Q4_0 GGUF path");
+        let ram_budget_bytes = env::var("RAMFORGE_QWEN25_RAM_BYTES")
+            .expect("set RAMFORGE_QWEN25_RAM_BYTES to a sufficient byte budget")
+            .parse::<u64>()
+            .expect("RAMFORGE_QWEN25_RAM_BYTES must be an integer byte count");
+
+        // One CPU thread is intentional: it removes parallel-dispatch
+        // differences while retaining the normal Q4_0 execution path.
+        let runtime_config = RuntimeConfig::new(
+            1,
+            ram_budget_bytes,
+            false,
+            0,
+            true,
+            true,
+        )
+        .expect("valid one-thread diagnostic runtime configuration");
+        let mut engine = InferenceEngine::new_with_runtime_config(&model_path, runtime_config)
+            .expect("load Qwen2.5 Q4_0 diagnostic model");
+
+        assert_eq!(engine.config().vocab_size, 151_936);
+        let encoded = engine.tokenizer.encode(RAW_PROMPT, true);
+        assert_eq!(
+            encoded.as_slice(),
+            EXPECTED_PROMPT_TOKENS.as_slice(),
+            "the real model tokenizer must retain the confirmed prompt IDs"
+        );
+
+        // Feed the fixed IDs, not just the prompt string, into the numerical
+        // trace so later reference comparisons use exactly the same sequence.
+        let trace = run_bounded_trace(&mut engine, &EXPECTED_PROMPT_TOKENS)
+            .expect("bounded Qwen2.5 numerical trace");
+        print_trace(&trace);
+    }
+}
