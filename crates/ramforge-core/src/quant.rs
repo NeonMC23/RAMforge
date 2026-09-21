@@ -887,7 +887,7 @@ pub fn matvec_q4_0_row_range(
 
     for i in row_start..row_end {
         let rb = i * row_bytes;
-        y[i] = q4_0_row_dot(&w_bytes[rb..rb + row_bytes], blocks_per_row, x);
+        y[i - row_start] = q4_0_row_dot(&w_bytes[rb..rb + row_bytes], blocks_per_row, x);
     }
     Ok(())
 }
@@ -1172,7 +1172,7 @@ pub fn matvec_q6_k_row_range(
 
     for i in row_start..row_end {
         let rb = i * row_bytes;
-        y[i] = q6_k_row_dot(&w_bytes[rb..rb + row_bytes], blocks_per_row, x)?;
+        y[i - row_start] = q6_k_row_dot(&w_bytes[rb..rb + row_bytes], blocks_per_row, x)?;
     }
     Ok(())
 }
