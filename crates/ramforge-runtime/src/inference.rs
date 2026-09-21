@@ -2932,6 +2932,158 @@ mod qwen25_bounded_diagnostic {
         Ok(())
     }
 
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3u64);
+        }
+        hash
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn diagnose_raw_q6_k_output_rows(engine: &InferenceEngine) -> Result<(), String> {
+        const N_EMBD: usize = 1536;
+        const VOCAB_SIZE: usize = 151_936;
+        const ROW_BYTES: usize = 1260;
+        const ROW_IDS: [usize; 2] = [59, 220];
+
+        let descriptor = engine
+            .data_source
+            .get_descriptor("output.weight")
+            .map_err(|error| format!("output.weight descriptor lookup failed: {error}"))?
+            .clone();
+        assert_eq!(descriptor.name, "output.weight");
+        assert_eq!(descriptor.ggml_type, GgmlType::Q6_K);
+        assert_eq!(descriptor.dimensions.as_slice(), &[N_EMBD as u64, VOCAB_SIZE as u64]);
+        assert_eq!(descriptor.byte_length, Some((VOCAB_SIZE * ROW_BYTES) as u64));
+        assert_eq!(N_EMBD / QK_K, 6);
+        assert_eq!((N_EMBD / QK_K) * BLOCK_SIZE_Q6_K, ROW_BYTES);
+
+        let data_start_offset = engine.data_source.model().data_start_offset;
+        println!("output_projection.raw_q6k.tensor_name = {}", descriptor.name);
+        println!(
+            "output_projection.raw_q6k.ggml_type = {}",
+            descriptor.ggml_type.name()
+        );
+        println!(
+            "output_projection.raw_q6k.dimensions = {:?}",
+            descriptor.dimensions
+        );
+        println!(
+            "output_projection.raw_q6k.descriptor_offset = {}",
+            descriptor.offset
+        );
+        println!(
+            "output_projection.raw_q6k.descriptor_file_offset = {}",
+            descriptor.file_offset
+        );
+        println!(
+            "output_projection.raw_q6k.data_start_offset = {}",
+            data_start_offset
+        );
+        println!(
+            "output_projection.raw_q6k.byte_length = {:?}",
+            descriptor.byte_length
+        );
+        println!("output_projection.raw_q6k.row_bytes = {}", ROW_BYTES);
+        println!(
+            "output_projection.raw_q6k.digest = fnv1a64 (deterministic bounded checksum; no external hash dependency)"
+        );
+
+        for row_id in ROW_IDS {
+            let row_offset = row_id
+                .checked_mul(ROW_BYTES)
+                .ok_or_else(|| format!("row {} byte offset overflow", row_id))?;
+            let absolute_file_offset = descriptor
+                .file_offset
+                .checked_add(row_offset as u64)
+                .ok_or_else(|| format!("row {} absolute file offset overflow", row_id))?;
+            let absolute_data_offset = data_start_offset
+                .checked_add(descriptor.offset)
+                .and_then(|offset| offset.checked_add(row_offset as u64))
+                .ok_or_else(|| format!("row {} data offset overflow", row_id))?;
+
+            let row = engine
+                .data_source
+                .read_tensor_range_by_descriptor(
+                    &descriptor,
+                    row_offset as u64,
+                    ROW_BYTES as u64,
+                )
+                .map_err(|error| {
+                    format!(
+                        "failed to read output.weight row {} at offset {}: {}",
+                        row_id, row_offset, error
+                    )
+                })?;
+            assert_eq!(row.len(), ROW_BYTES);
+
+            let first_block = quant::BlockQ6K::from_bytes(&row[..BLOCK_SIZE_Q6_K])
+                .map_err(|error| format!("failed to decode row {} first Q6_K block: {}", row_id, error))?;
+            let d_bits = u16::from_le_bytes([row[208], row[209]]);
+            let mut first_block_decoded = [0.0f32; QK_K];
+            first_block.dequantize(&mut first_block_decoded);
+            let digest = fnv1a64(&row);
+
+            println!("output_projection.raw_q6k.row_id = {}", row_id);
+            println!(
+                "output_projection.raw_q6k.byte_offset = {}",
+                row_offset
+            );
+            println!(
+                "output_projection.raw_q6k.byte_length = {}",
+                row.len()
+            );
+            println!(
+                "output_projection.raw_q6k.absolute_file_offset = {}",
+                absolute_file_offset
+            );
+            println!(
+                "output_projection.raw_q6k.absolute_data_offset = {}",
+                absolute_data_offset
+            );
+            println!(
+                "output_projection.raw_q6k.fnv1a64 = 0x{digest:016x}"
+            );
+            println!(
+                "output_projection.raw_q6k.first32_hex = {}",
+                hex_bytes(&row[..32])
+            );
+            println!(
+                "output_projection.raw_q6k.first_block.ql_first16_hex = {}",
+                hex_bytes(&row[..16])
+            );
+            println!(
+                "output_projection.raw_q6k.first_block.qh_first16_hex = {}",
+                hex_bytes(&row[128..144])
+            );
+            println!(
+                "output_projection.raw_q6k.first_block.scales = {:?}",
+                first_block.scales
+            );
+            println!(
+                "output_projection.raw_q6k.first_block.d_f16_bits = 0x{d_bits:04x}"
+            );
+            println!(
+                "output_projection.raw_q6k.first_block.d_f32 = {:?}",
+                first_block.d
+            );
+            println!(
+                "output_projection.raw_q6k.first_block.decoded_first16 = {:?}",
+                &first_block_decoded[..16]
+            );
+        }
+        Ok(())
+    }
+
     fn ensure_trace_capacity(
         kv_cache: &mut KvCache,
         required_tokens: usize,
@@ -3162,5 +3314,7 @@ mod qwen25_bounded_diagnostic {
         print_trace(&trace);
         diagnose_q6_k_output_rows(&engine, &trace.result_norm)
             .expect("Q6_K output projection row diagnostic");
+        diagnose_raw_q6_k_output_rows(&engine)
+            .expect("raw Q6_K output projection row diagnostic");
     }
 }
