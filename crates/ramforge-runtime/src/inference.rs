@@ -2695,6 +2695,8 @@ mod qwen25_bounded_diagnostic {
     use crate::runtime_config::RuntimeConfig;
     use crate::sampling::Sampler;
     use ramforge_core::memory::MemoryBudget;
+    use ramforge_core::quant::{self, BLOCK_SIZE_Q6_K, QK_K};
+    use ramforge_core::types::GgmlType;
     use std::cmp::Ordering;
     use std::env;
 
@@ -2734,6 +2736,10 @@ mod qwen25_bounded_diagnostic {
     struct BoundedTrace {
         prompt_token_ids: Vec<u32>,
         prompt_positions: Vec<usize>,
+        // Retained only inside this ignored test so the output-projection row
+        // diagnostic can use the exact pre-logits `result_norm`. It is never
+        // printed and is not part of production inference state.
+        result_norm: Vec<f32>,
         final_prompt_hidden: NumericSummary,
         final_prompt_logits: LogitSummary,
         first_generated_token: u32,
@@ -2837,6 +2843,95 @@ mod qwen25_bounded_diagnostic {
         print_logits("second_decode.final_logits", &trace.second_decode.logits);
     }
 
+    fn diagnose_q6_k_output_rows(
+        engine: &InferenceEngine,
+        result_norm: &[f32],
+    ) -> Result<(), String> {
+        const N_EMBD: usize = 1536;
+        const VOCAB_SIZE: usize = 151_936;
+        const ROW_IDS_AND_REFERENCE: [(usize, f64); 2] = [
+            (59, 20.24774933),
+            (220, 19.75674248),
+        ];
+
+        assert_eq!(result_norm.len(), N_EMBD);
+        let descriptor = engine
+            .data_source
+            .get_descriptor("output.weight")
+            .map_err(|error| format!("output.weight descriptor lookup failed: {error}"))?
+            .clone();
+        assert_eq!(descriptor.ggml_type, GgmlType::Q6_K);
+        assert_eq!(descriptor.dimensions.as_slice(), &[N_EMBD as u64, VOCAB_SIZE as u64]);
+
+        let blocks_per_row = N_EMBD / QK_K;
+        let row_bytes = blocks_per_row * BLOCK_SIZE_Q6_K;
+        assert_eq!(blocks_per_row, 6);
+        assert_eq!(row_bytes, 1260);
+        assert_eq!(
+            descriptor.byte_length,
+            Some((row_bytes * VOCAB_SIZE) as u64),
+            "output.weight byte length must match Q6_K row geometry"
+        );
+
+        println!(
+            "output_projection.descriptor name={} type={} dimensions={:?} row_bytes={}",
+            descriptor.name,
+            descriptor.ggml_type.name(),
+            descriptor.dimensions,
+            row_bytes
+        );
+        print_numeric("result_norm", &summarize(result_norm));
+
+        for &(row_id, llama_cpp_reference) in &ROW_IDS_AND_REFERENCE {
+            let byte_offset = (row_id * row_bytes) as u64;
+            let row = engine
+                .data_source
+                .read_tensor_range_by_descriptor(&descriptor, byte_offset, row_bytes as u64)
+                .map_err(|error| {
+                    format!(
+                        "failed to read output.weight row {} (offset {}, length {}): {}",
+                        row_id, byte_offset, row_bytes, error
+                    )
+                })?;
+            assert_eq!(row.len(), row_bytes);
+
+            let mut dequantized = [0.0f32; N_EMBD];
+            quant::dequantize_row_q6_k(&row, N_EMBD, &mut dequantized)
+                .map_err(|error| format!("Q6_K dequantization failed for row {}: {}", row_id, error))?;
+            let mut dequantized_dot = 0.0f32;
+            for index in 0..N_EMBD {
+                dequantized_dot += dequantized[index] * result_norm[index];
+            }
+
+            // matvec_q6_k with a one-row [out, in] shape reaches the existing
+            // fused q6_k_row_dot implementation without exposing or changing
+            // that private production helper.
+            let mut fused_output = [0.0f32; 1];
+            quant::matvec_q6_k(&row, &[1, N_EMBD], result_norm, &mut fused_output)
+                .map_err(|error| format!("fused Q6_K path failed for row {}: {}", row_id, error))?;
+            let fused_dot = fused_output[0];
+
+            let dequantized_abs_error = (dequantized_dot as f64 - llama_cpp_reference).abs();
+            let fused_abs_error = (fused_dot as f64 - llama_cpp_reference).abs();
+            println!("output_projection.row_id = {}", row_id);
+            println!("output_projection.dequantized_dot = {:?}", dequantized_dot);
+            println!("output_projection.fused_dot = {:?}", fused_dot);
+            println!(
+                "output_projection.llama_cpp_reference = {:?}",
+                llama_cpp_reference
+            );
+            println!(
+                "output_projection.dequantized_abs_error = {:?}",
+                dequantized_abs_error
+            );
+            println!(
+                "output_projection.fused_abs_error = {:?}",
+                fused_abs_error
+            );
+        }
+        Ok(())
+    }
+
     fn ensure_trace_capacity(
         kv_cache: &mut KvCache,
         required_tokens: usize,
@@ -2910,6 +3005,7 @@ mod qwen25_bounded_diagnostic {
         }
 
         // Boundary 1: final prompt hidden is captured before output projection.
+        let result_norm = hidden.clone();
         let final_prompt_hidden = summarize(&hidden);
         let mut logits = vec![0.0f32; vocab_size];
         model.compute_logits(
@@ -2987,6 +3083,7 @@ mod qwen25_bounded_diagnostic {
         let trace = BoundedTrace {
             prompt_token_ids: prompt_tokens.to_vec(),
             prompt_positions: (0..prompt_len).collect::<Vec<usize>>(),
+            result_norm,
             final_prompt_hidden,
             final_prompt_logits,
             first_generated_token,
@@ -3063,5 +3160,7 @@ mod qwen25_bounded_diagnostic {
         let trace = run_bounded_trace(&mut engine, &EXPECTED_PROMPT_TOKENS)
             .expect("bounded Qwen2.5 numerical trace");
         print_trace(&trace);
+        diagnose_q6_k_output_rows(&engine, &trace.result_norm)
+            .expect("Q6_K output projection row diagnostic");
     }
 }
