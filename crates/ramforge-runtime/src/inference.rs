@@ -1943,6 +1943,321 @@ pub(crate) mod tests {
         assert_eq!(t1, t2);
     }
 
+    // ------------------------------------------------------------------
+    // GQA (grouped-query attention) fixture: n_heads > n_kv_heads.
+    // Mirrors Qwen2.5-style ratios (e.g. 12 Q heads / 2 KV heads = 6:1).
+    // Uses F32 weights (no quantization) so any divergence isolates to the
+    // attention/GQA/RoPE/KV-cache path rather than to dequant math.
+    // ------------------------------------------------------------------
+
+    struct GqaFixtureWeights {
+        embd: Vec<f32>,
+        output_norm: Vec<f32>,
+        attn_norm: Vec<f32>,
+        attn_q: Vec<f32>,        // ggml [n_embd, q_dim]
+        attn_k: Vec<f32>,        // ggml [n_embd, kv_dim]
+        attn_v: Vec<f32>,        // ggml [n_embd, kv_dim]
+        attn_output: Vec<f32>,   // ggml [q_dim, n_embd]
+        ffn_norm: Vec<f32>,
+        ffn_gate: Vec<f32>,      // ggml [n_embd, ffn]
+        ffn_up: Vec<f32>,        // ggml [n_embd, ffn]
+        ffn_down: Vec<f32>,      // ggml [ffn, n_embd]
+    }
+
+    const GQA_N_EMBD: usize = 8;
+    const GQA_N_HEADS: usize = 4;
+    const GQA_N_KV_HEADS: usize = 2;
+    const GQA_HEAD_DIM: usize = 2;
+    const GQA_FFN: usize = 16;
+    const GQA_VOCAB: usize = 16;
+
+    fn gqa_weights() -> GqaFixtureWeights {
+        let w = |n: usize, seed: u32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let s = seed.wrapping_mul(2654435761).wrapping_add((i as u32).wrapping_mul(224682251));
+                    0.01 * ((s as i32 & 0x3f) as f32 - 20.0)
+                })
+                .collect()
+        };
+        GqaFixtureWeights {
+            embd: w(GQA_VOCAB * GQA_N_EMBD, 1),
+            output_norm: vec![1.0; GQA_N_EMBD],
+            attn_norm: vec![1.0; GQA_N_EMBD],
+            attn_q: w(GQA_N_EMBD * GQA_N_EMBD, 2),
+            attn_k: w(GQA_N_EMBD * (GQA_N_KV_HEADS * GQA_HEAD_DIM), 3),
+            attn_v: w(GQA_N_EMBD * (GQA_N_KV_HEADS * GQA_HEAD_DIM), 4),
+            attn_output: w((GQA_N_HEADS * GQA_HEAD_DIM) * GQA_N_EMBD, 5),
+            ffn_norm: vec![1.0; GQA_N_EMBD],
+            ffn_gate: w(GQA_N_EMBD * GQA_FFN, 6),
+            ffn_up: w(GQA_N_EMBD * GQA_FFN, 7),
+            ffn_down: w(GQA_FFN * GQA_N_EMBD, 8),
+        }
+    }
+
+    fn create_gqa_gguf() -> NamedTempFile {
+        fn write_string<W: Write>(w: &mut W, s: &str) {
+            w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
+            w.write_all(s.as_bytes()).unwrap();
+        }
+        fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_f32<W: Write>(w: &mut W, v: f32) { w.write_all(&v.to_le_bytes()).unwrap(); }
+
+        let w = gqa_weights();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&11u64.to_le_bytes());
+        buf.extend_from_slice(&15u64.to_le_bytes());
+
+        let mut add_kv = |key: &str, val_type: u32, mut write_val: WriteValFn<'_>| {
+            write_string(&mut buf, key);
+            write_u32(&mut buf, val_type);
+            write_val(&mut buf);
+        };
+        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "qwen2")));
+        add_kv("qwen2.vocab_size", 4, Box::new(|b| write_u32(b, GQA_VOCAB as u32)));
+        add_kv("qwen2.context_length", 4, Box::new(|b| write_u32(b, 64)));
+        add_kv("qwen2.embedding_length", 4, Box::new(|b| write_u32(b, GQA_N_EMBD as u32)));
+        add_kv("qwen2.block_count", 4, Box::new(|b| write_u32(b, 1)));
+        add_kv("qwen2.feed_forward_length", 4, Box::new(|b| write_u32(b, GQA_FFN as u32)));
+        add_kv("qwen2.attention.head_count", 4, Box::new(|b| write_u32(b, GQA_N_HEADS as u32)));
+        add_kv("qwen2.attention.head_count_kv", 4, Box::new(|b| write_u32(b, GQA_N_KV_HEADS as u32)));
+        add_kv("qwen2.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
+        add_kv("qwen2.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
+        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
+        add_kv("tokenizer.ggml.tokens", 9, Box::new(|b| {
+            write_u32(b, 8); write_u64(b, GQA_VOCAB as u64);
+            for tok in ["<unk>","<s>","</s>","▁hi","▁there","a","b","c","d","e","f","g","h","i","j","k"] {
+                write_string(b, tok);
+            }
+        }));
+        add_kv("tokenizer.ggml.scores", 9, Box::new(|b| {
+            write_u32(b, 6); write_u64(b, GQA_VOCAB as u64);
+            for _ in 0..GQA_VOCAB { write_f32(b, 0.0); }
+        }));
+        add_kv("tokenizer.ggml.token_type", 9, Box::new(|b| {
+            write_u32(b, 4); write_u64(b, GQA_VOCAB as u64);
+            for t in [2u32,3,3,1,1,1,1,1,1,1,1,1,1,1,1,1] { write_u32(b, t); }
+        }));
+        add_kv("tokenizer.ggml.bos_token_id", 4, Box::new(|b| write_u32(b, 1)));
+
+        let q_dim = GQA_N_HEADS * GQA_HEAD_DIM;
+        let kv_dim = GQA_N_KV_HEADS * GQA_HEAD_DIM;
+        let defs: Vec<(&str, Vec<u64>)> = vec![
+            ("token_embd.weight", vec![GQA_N_EMBD as u64, GQA_VOCAB as u64]),
+            ("output_norm.weight", vec![GQA_N_EMBD as u64]),
+            ("blk.0.attn_norm.weight", vec![GQA_N_EMBD as u64]),
+            ("blk.0.attn_q.weight", vec![GQA_N_EMBD as u64, q_dim as u64]),
+            ("blk.0.attn_k.weight", vec![GQA_N_EMBD as u64, kv_dim as u64]),
+            ("blk.0.attn_v.weight", vec![GQA_N_EMBD as u64, kv_dim as u64]),
+            ("blk.0.attn_output.weight", vec![q_dim as u64, GQA_N_EMBD as u64]),
+            ("blk.0.ffn_norm.weight", vec![GQA_N_EMBD as u64]),
+            ("blk.0.ffn_gate.weight", vec![GQA_N_EMBD as u64, GQA_FFN as u64]),
+            ("blk.0.ffn_up.weight", vec![GQA_N_EMBD as u64, GQA_FFN as u64]),
+            ("blk.0.ffn_down.weight", vec![GQA_FFN as u64, GQA_N_EMBD as u64]),
+        ];
+
+        let mut offset = 0u64;
+        for (name, dims) in &defs {
+            write_string(&mut buf, name);
+            write_u32(&mut buf, dims.len() as u32);
+            for d in dims { write_u64(&mut buf, *d); }
+            write_u32(&mut buf, 0);
+            write_u64(&mut buf, offset);
+            let elems: u64 = dims.iter().product();
+            offset += elems * 4;
+        }
+
+        let pos = buf.len() as u64;
+        let aligned = ramforge_core::model::align_offset(pos, 32);
+        buf.extend(vec![0u8; (aligned - pos) as usize]);
+
+        let mut push = |data: &[f32]| { for v in data { buf.extend_from_slice(&v.to_le_bytes()); } };
+        push(&w.embd);
+        push(&w.output_norm);
+        push(&w.attn_norm);
+        push(&w.attn_q);
+        push(&w.attn_k);
+        push(&w.attn_v);
+        push(&w.attn_output);
+        push(&w.ffn_norm);
+        push(&w.ffn_gate);
+        push(&w.ffn_up);
+        push(&w.ffn_down);
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&buf).unwrap();
+        tmp.flush().unwrap();
+        tmp
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reference_forward_gqa(
+        w: &GqaFixtureWeights,
+        token: usize,
+        pos: usize,
+        k_hist: &mut Vec<f32>,
+        v_hist: &mut Vec<f32>,
+        eps: f32,
+    ) -> Vec<f32> {
+        let rmsnorm = |x: &[f32], wt: &[f32]| -> Vec<f32> {
+            let mean: f32 = x.iter().map(|v| v*v).sum::<f32>() / x.len() as f32;
+            let rms = (mean + eps).sqrt();
+            (0..x.len()).map(|i| x[i]/rms*wt[i]).collect()
+        };
+        let matvec = |wt: &[f32], in_dim: usize, out_dim: usize, x: &[f32]| -> Vec<f32> {
+            (0..out_dim).map(|o| (0..in_dim).map(|i| wt[o*in_dim+i]*x[i]).sum()).collect()
+        };
+        let rope_single = |x: &mut [f32], pos: usize| {
+            let dim = GQA_HEAD_DIM;
+            let half = dim/2;
+            for j in 0..half {
+                let theta = 10000.0f32.powf(-2.0*j as f32/dim as f32) * pos as f32;
+                let (c,s) = (theta.cos(), theta.sin());
+                let a = x[j]; let b = x[j+half];
+                x[j] = a*c - b*s;
+                x[j+half] = a*s + b*c;
+            }
+        };
+
+        let n_embd = GQA_N_EMBD;
+        let n_heads = GQA_N_HEADS;
+        let n_kv = GQA_N_KV_HEADS;
+        let hd = GQA_HEAD_DIM;
+        let kv_dim = n_kv*hd;
+        let q_dim = n_heads*hd;
+
+        let mut hidden: Vec<f32> = (0..n_embd).map(|i| w.embd[token*n_embd+i]).collect();
+        let tmp = rmsnorm(&hidden, &w.attn_norm);
+
+        let mut q = matvec(&w.attn_q, n_embd, q_dim, &tmp);
+        let mut k = matvec(&w.attn_k, n_embd, kv_dim, &tmp);
+        let v = matvec(&w.attn_v, n_embd, kv_dim, &tmp);
+
+        for h in 0..n_heads { rope_single(&mut q[h*hd..(h+1)*hd], pos); }
+        for h in 0..n_kv   { rope_single(&mut k[h*hd..(h+1)*hd], pos); }
+
+        let total = pos+1;
+        let k_at = |p: usize| -> &[f32] {
+            if p < pos { &k_hist[p*kv_dim..p*kv_dim+kv_dim] } else { &k }
+        };
+        let v_at = |p: usize| -> &[f32] {
+            if p < pos { &v_hist[p*kv_dim..p*kv_dim+kv_dim] } else { &v }
+        };
+
+        let mut attn_out = vec![0.0f32; q_dim];
+        for h in 0..n_heads {
+            let kv_h = h * n_kv / n_heads;
+            let qh = &q[h*hd..(h+1)*hd];
+            let mut scores = vec![0.0f32; total];
+            for p in 0..total {
+                let kp = k_at(p);
+                let kh = &kp[kv_h*hd..(kv_h+1)*hd];
+                scores[p] = (0..hd).map(|i| qh[i]*kh[i]).sum::<f32>()/(hd as f32).sqrt();
+            }
+            let max = scores.iter().fold(f32::NEG_INFINITY, |a,&b| a.max(b));
+            let mut sum = 0.0;
+            for s in scores.iter_mut() { *s = (*s-max).exp(); sum += *s; }
+            for s in scores.iter_mut() { *s /= sum; }
+            for p in 0..total {
+                let vp = v_at(p);
+                let vh = &vp[kv_h*hd..(kv_h+1)*hd];
+                for i in 0..hd { attn_out[h*hd+i] += scores[p]*vh[i]; }
+            }
+        }
+
+        let proj = matvec(&w.attn_output, q_dim, n_embd, &attn_out);
+        for i in 0..n_embd { hidden[i] += proj[i]; }
+
+        k_hist.extend_from_slice(&k);
+        v_hist.extend_from_slice(&v);
+
+        let tmp = rmsnorm(&hidden, &w.ffn_norm);
+        let gate = matvec(&w.ffn_gate, n_embd, GQA_FFN, &tmp);
+        let up = matvec(&w.ffn_up, n_embd, GQA_FFN, &tmp);
+        let mut gu = vec![0.0; GQA_FFN];
+        for i in 0..GQA_FFN {
+            let g = gate[i];
+            gu[i] = (g/(1.0+(-g).exp())) * up[i];
+        }
+        let out = matvec(&w.ffn_down, GQA_FFN, n_embd, &gu);
+        for i in 0..n_embd { hidden[i] += out[i]; }
+
+        rmsnorm(&hidden, &w.output_norm)
+    }
+
+    #[test]
+    fn test_gqa_forward_matches_scalar_reference() {
+        let tmp = create_gqa_gguf();
+        let mut engine =
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8*1024*1024).unwrap();
+        assert_eq!(engine.config().head_count, GQA_N_HEADS);
+        assert_eq!(engine.config().head_count_kv, GQA_N_KV_HEADS);
+        assert_eq!(engine.config().head_dim, GQA_HEAD_DIM);
+        assert!(!engine.model.attn_bias_present);
+
+        let w = gqa_weights();
+        let eps = engine.config().rms_eps;
+
+        let mut ref_k: Vec<f32> = Vec::new();
+        let mut ref_v: Vec<f32> = Vec::new();
+
+        let mut kv = crate::kv_cache::KvCache::new(
+            engine.config().block_count,
+            engine.config().head_count_kv,
+            engine.config().head_dim,
+            4,
+        ).unwrap();
+        let budget: &mut MemoryBudget = &mut engine.budget;
+        let mut stats = crate::residency::ResidencyStats::new(engine.model.total_weight_bytes);
+        let model = &engine.model;
+        let backend = &engine.backend;
+        let ds = &engine.data_source;
+
+        let mut logits = vec![0.0f32; GQA_VOCAB];
+        const EPS: f32 = 2e-4;
+
+        for (token, pos) in [(3usize,0usize),(7usize,1usize),(11usize,2usize)] {
+            budget.with_temp("tmp:hidden", (GQA_N_EMBD*4) as u64, |budget| {
+                let mut hidden = vec![0.0f32; GQA_N_EMBD];
+                model.forward_single_streaming(
+                    token as u32, pos,
+                    &mut kv, backend, ds, budget, &mut stats,
+                    &mut hidden,
+                )?;
+                model.compute_logits(&hidden, backend, ds, budget, &mut logits)?;
+
+                let ref_h = reference_forward_gqa(&w, token, pos, &mut ref_k, &mut ref_v, eps);
+                for i in 0..GQA_N_EMBD {
+                    assert!(
+                        (hidden[i]-ref_h[i]).abs() < EPS,
+                        "pos {} hidden[{}]: model {} vs ref {}", pos, i, hidden[i], ref_h[i]
+                    );
+                }
+                for o in 0..GQA_VOCAB {
+                    let ref_logit: f32 = (0..GQA_N_EMBD).map(|i| w.embd[o*GQA_N_EMBD+i]*ref_h[i]).sum();
+                    assert!(
+                        (logits[o]-ref_logit).abs() < EPS,
+                        "pos {} logit[{}]: model {} vs ref {}", pos, o, logits[o], ref_logit
+                    );
+                }
+                Ok::<(), String>(())
+            }).unwrap();
+            assert_eq!(kv.seq_len(), pos+1, "seq_len after pos {}", pos);
+            assert_eq!(kv.get_k(0).len(), (pos+1)*GQA_N_KV_HEADS*GQA_HEAD_DIM);
+        }
+
+        let mut engine2 =
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8*1024*1024).unwrap();
+        let sampler = crate::sampling::Sampler::greedy();
+        let (t1,_) = engine2.generate("hi",5,&sampler).unwrap();
+        let (t2,_) = engine2.generate("hi",5,&sampler).unwrap();
+        assert_eq!(t1.len(), 5);
+        assert_eq!(t1, t2);
+    }
+
     // ----- Generation outcome / stop-reason diagnostics (Issue 2) ----------
 
     #[test]

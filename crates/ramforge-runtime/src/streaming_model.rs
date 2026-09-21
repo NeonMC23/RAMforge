@@ -732,6 +732,15 @@ impl StreamingLlamaModel {
             let mut gate_silu = vec![0.0f32; ffn_dim];
             let mut gate_up = vec![0.0f32; ffn_dim];
             let mut ffn_out = vec![0.0f32; n_embd];
+            // Stage K/V for every layer so they can be appended to the KV
+            // cache only AFTER every layer has consumed the prior seq_len
+            // history. Writing a layer's own K/V into the cache while later
+            // layers still need to run would leak future tokens across
+            // layers: later layers' attention would "see" an earlier layer's
+            // freshly-written K/V as history even though it belongs to the
+            // SAME token position.
+            let mut staged_k: Vec<Vec<f32>> = Vec::with_capacity(cfg.block_count);
+            let mut staged_v: Vec<Vec<f32>> = Vec::with_capacity(cfg.block_count);
             self.profiler
                 .record_since(ProfileEvent::Allocation, allocation_started);
 
@@ -775,6 +784,8 @@ impl StreamingLlamaModel {
                     self.profiler
                         .record_since(ProfileEvent::LayerCompute, compute_started);
                     result?;
+                    staged_k.push(k_tmp.clone());
+                    staged_v.push(v_tmp.clone());
                     continue;
                 }
 
@@ -819,6 +830,8 @@ impl StreamingLlamaModel {
                     self.profiler.record_layer_release();
                     return Err(error);
                 }
+                staged_k.push(k_tmp.clone());
+                staged_v.push(v_tmp.clone());
 
                 let layer_bytes = layer.total_resident_bytes();
                 let insert_result = {
@@ -860,6 +873,13 @@ impl StreamingLlamaModel {
                         return Err(error);
                     }
                 }
+            }
+
+            // Commit all per-layer K/V for the current token atomically:
+            // this avoids leaking a shallow layer's K/V into a deeper
+            // layer's attention on the same forward pass.
+            for (layer_idx, (k, v)) in staged_k.iter().zip(staged_v.iter()).enumerate() {
+                kv_cache.append(layer_idx, k, v)?;
             }
 
             kv_cache.increment_seq_len();
@@ -958,11 +978,13 @@ impl StreamingLlamaModel {
             cfg.rope_freq_base,
         );
 
-        kv_cache.append(layer_idx, k_tmp, v_tmp)?;
-
-        // History holds `seq_len` previous tokens; the freshly appended
-        // current-token K/V is passed separately so attention can read the
-        // cache prefix in place (no concatenated copy).
+        // History holds `seq_len` previous tokens (BEFORE this token's K/V
+        // are appended). The current token's K/V is passed separately to
+        // attention and MUST be appended to the cache for ALL layers
+        // simultaneously after the whole per-token block loop finishes —
+        // appending mid-loop would leak early layers' new-K/V into later
+        // layers' attention, which is how information bleeds across the
+        // wrong depth.
         let hist_len = kv_cache.seq_len();
         let attn_out = crate::ops::attention(
             q_tmp,
@@ -3142,6 +3164,93 @@ mod tests {
             err
         );
         assert_eq!(budget.used_bytes(), before);
+    }
+
+    #[test]
+    fn test_q4_0_parallel_matvec_matches_scalar_at_qwen2_5_q_shape() {
+        // Reproduce the Qwen2.5-1.5B Q-projection shape (in=1536, out=1536,
+        // which exceeds QUANT_PARALLEL_ROW_THRESHOLD=128 so the row-parallel
+        // dispatcher is exercised). Compare against a reference that
+        // dequantizes each row and dots with x in scalar order. Any
+        // partition or offset bug would manifest as a discrepancy here.
+        use ramforge_core::quant::{BLOCK_SIZE_Q4_0, QK4_0};
+        let in_dim = 1536usize;
+        let out_dim = 1536usize;
+        assert_eq!(in_dim % QK4_0, 0);
+        let blocks_per_row = in_dim / QK4_0;
+        let row_bytes = blocks_per_row * BLOCK_SIZE_Q4_0;
+        let mut seed: u32 = 0xC0FFEE;
+        let mut raw = vec![0u8; out_dim * row_bytes];
+        for r in 0..out_dim {
+            let mut s = seed;
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let off = r * row_bytes;
+            for b in 0..blocks_per_row {
+                // d: pseudorandom scale in [0.05, 0.5)
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let d: f32 = 0.05 + ((s >> 8) as f32 / (1u32 << 24) as f32) * 0.45;
+                let d_bits = half::f16::from_f32(d).to_bits().to_le_bytes();
+                raw[off + b * BLOCK_SIZE_Q4_0] = d_bits[0];
+                raw[off + b * BLOCK_SIZE_Q4_0 + 1] = d_bits[1];
+                for j in 0..16 {
+                    s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let lo = (s & 0x0F) as u8;
+                    let hi = ((s >> 4) & 0x0F) as u8;
+                    raw[off + b * BLOCK_SIZE_Q4_0 + 2 + j] = lo | (hi << 4);
+                }
+            }
+        }
+        let w = TensorData::from_bytes(
+            GgmlType::Q4_0,
+            vec![in_dim as u64, out_dim as u64],
+            (in_dim * out_dim) as u64,
+            raw.clone(),
+        )
+        .unwrap();
+
+        // Deterministic x vector
+        let mut x = vec![0.0f32; in_dim];
+        for i in 0..in_dim {
+            x[i] = ((i as f32) * 0.0137 - 0.5).sin() * 0.7;
+        }
+
+        // Reference: dequant each row via BlockQ4_0, then scalar dot
+        use ramforge_core::quant::BlockQ4_0;
+        let mut ref_y = vec![0.0f32; out_dim];
+        for r in 0..out_dim {
+            let mut dot = 0.0f32;
+            for b in 0..blocks_per_row {
+                let block_start = r * row_bytes + b * BLOCK_SIZE_Q4_0;
+                let blk = BlockQ4_0::from_bytes(&raw[block_start..block_start + BLOCK_SIZE_Q4_0])
+                    .unwrap();
+                let mut dq = [0f32; 32];
+                blk.dequantize(&mut dq);
+                for j in 0..32 {
+                    dot += dq[j] * x[b * 32 + j];
+                }
+            }
+            ref_y[r] = dot;
+        }
+
+        let profiler = Profiler::default();
+        // Use 4 threads to force parallel partitioning.
+        let backend = crate::backend::CpuBackend::with_threads(4);
+        let mut y = vec![0.0f32; out_dim];
+        matvec_backend(&backend, &profiler, &w, &x, &mut y).unwrap();
+
+        // Compare with generous tolerance to absorb FMADD reordering
+        let mut max_abs = 0.0f32;
+        for r in 0..out_dim {
+            let diff = (y[r] - ref_y[r]).abs();
+            if diff > max_abs {
+                max_abs = diff;
+            }
+        }
+        assert!(
+            max_abs < 1e-2,
+            "parallel Q4_0 matvec diverges from scalar reference (max_abs={}, ref0={}, got0={})",
+            max_abs, ref_y[0], y[0]
+        );
     }
 
     #[test]

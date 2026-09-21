@@ -49,12 +49,12 @@ pub const ARCHITECTURES: &[ArchitectureCapability] = &[
     },
     ArchitectureCapability {
         name: "qwen2",
-        aliases: &[],
+        aliases: &["qwen2.5"],
         inspect: true,
         plan: true,
         tokenizer: "bpe",
         run: RunSupport::Supported,
-        notes: "dense qwen2 transformer, including validated Q/K/V biases",
+        notes: "dense qwen2 transformer (including qwen2.5), including validated Q/K/V biases",
     },
     ArchitectureCapability {
         name: "mistral",

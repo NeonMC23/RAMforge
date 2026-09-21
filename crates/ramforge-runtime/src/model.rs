@@ -82,6 +82,8 @@ impl LlamaConfig {
                         ramforge_core::MetadataValue::Float64(f) => return Some(*f as f32),
                         ramforge_core::MetadataValue::UInt32(u) => return Some(*u as f32),
                         ramforge_core::MetadataValue::Int32(i) => return Some(*i as f32),
+                        ramforge_core::MetadataValue::UInt64(u) => return Some(*u as f32),
+                        ramforge_core::MetadataValue::Int64(i) => return Some(*i as f32),
                         _ => {}
                     }
                 }
