@@ -464,6 +464,8 @@ pub struct TuiApp {
     pub advanced_read_coalescing: OverrideChoice,
     pub advanced_grouped_buffer: OverrideChoice,
     pub preference_editing: bool,
+    pub max_tokens_editing: bool,
+    pub max_tokens_edit_backup: Option<(String, usize)>,
     pub calibration_index: usize,
     pub calibration_complete: bool,
     pub calibration_tasks: Vec<CalibrationTaskView>,
@@ -501,6 +503,8 @@ impl Default for TuiApp {
             advanced_read_coalescing: OverrideChoice::PlannerDefault,
             advanced_grouped_buffer: OverrideChoice::PlannerDefault,
             preference_editing: false,
+            max_tokens_editing: false,
+            max_tokens_edit_backup: None,
             calibration_index: 0,
             calibration_complete: false,
             calibration_tasks: Vec::new(),
@@ -598,12 +602,7 @@ impl TuiApp {
             Screen::LoadPlan => InputContext::LoadPlanPath,
             Screen::ModelInput => InputContext::ModelPath,
             Screen::Preferences if self.preference_editing => InputContext::PreferenceValue,
-            Screen::ReviewConfig
-                if self.preference_editing
-                    || (self.menu_index == 0 && self.custom_max_tokens_focused()) =>
-            {
-                InputContext::CustomMaxTokens
-            }
+            Screen::ReviewConfig if self.max_tokens_editing => InputContext::CustomMaxTokens,
             Screen::GenerationInput => InputContext::GenerationPrompt,
             Screen::SavePlan => InputContext::SavePlanPath,
             Screen::ExportPath => InputContext::ExportPath,
@@ -752,6 +751,8 @@ impl TuiApp {
                 self.generation_result = None;
                 self.screen = Screen::ReviewConfig;
                 self.menu_index = 1;
+                self.max_tokens_editing = false;
+                self.max_tokens_edit_backup = None;
                 self.error = None;
             }
             Err(error) => self.show_error(error, Screen::PlanReview),
@@ -890,6 +891,11 @@ impl TuiApp {
 
     pub fn max_tokens(&self) -> usize {
         self.lab.max_tokens
+    }
+
+    /// Display helper for the custom max-tokens editor footer.
+    pub fn max_max_tokens_capped_for_display(&self) -> usize {
+        self.max_max_tokens()
     }
 
     pub fn selected_run(&self, id: u64) -> Option<&RunRecord> {
@@ -1327,49 +1333,91 @@ impl TuiApp {
     }
 
     fn handle_review_config(&mut self, command: UiCommand) -> Option<AppAction> {
-        // Items: max_tokens row, start button, back button  (3 lines; max_tokens row itself cycles preset)
-        let count = 4;
+        // Editing the custom max-tokens field? Route keystrokes directly,
+        // mirroring the edit/confirm/cancel contract used for custom RAM
+        // in handle_preferences.
+        if self.max_tokens_editing {
+            match command {
+                UiCommand::Character(character) if character.is_ascii_digit() => {
+                    self.edit_custom_max_tokens_character(character)
+                }
+                UiCommand::Backspace => self.edit_custom_max_tokens_backspace(),
+                UiCommand::Enter => {
+                    // Confirm: validate and commit, or surface a validation error.
+                    match self.commit_custom_max_tokens() {
+                        Ok(()) => {
+                            self.max_tokens_editing = false;
+                            self.max_tokens_edit_backup = None;
+                        }
+                        Err(error) => self.error = Some(error),
+                    }
+                }
+                UiCommand::Back => {
+                    // Cancel: restore prior value and stop editing.
+                    self.cancel_custom_max_tokens_edit();
+                }
+                UiCommand::Up => {
+                    // Commit (validation error keeps edit mode); move up.
+                    if self.commit_custom_max_tokens().is_ok() {
+                        self.max_tokens_editing = false;
+                        self.max_tokens_edit_backup = None;
+                        self.move_menu_up(self.review_config_item_count());
+                    }
+                }
+                UiCommand::Down => {
+                    if self.commit_custom_max_tokens().is_ok() {
+                        self.max_tokens_editing = false;
+                        self.max_tokens_edit_backup = None;
+                        self.move_menu_down(self.review_config_item_count());
+                    }
+                }
+                // Left/Right are intentionally ignored while editing (consistent
+                // with other single-line text inputs).
+                _ => {}
+            }
+            return None;
+        }
+
+        let count = self.review_config_item_count();
         match command {
             UiCommand::Up => self.move_menu_up(count),
             UiCommand::Down => self.move_menu_down(count),
             UiCommand::Left | UiCommand::Right if self.menu_index == 0 => {
                 let dir = command == UiCommand::Right;
-                let len = MaxTokensPreset::ALL.len();
-                if dir {
-                    self.lab.max_tokens_preset_index = (self.lab.max_tokens_preset_index + 1) % len;
-                } else {
-                    self.lab.max_tokens_preset_index =
-                        (self.lab.max_tokens_preset_index + len - 1) % len;
-                }
-                let p = MaxTokensPreset::ALL[self.lab.max_tokens_preset_index];
-                if let Some(v) = p.value() {
-                    self.lab.max_tokens = v;
-                } else {
-                    // Custom: start editing
-                    self.preference_editing = true;
-                }
+                self.cycle_max_tokens_preset(dir);
             }
             UiCommand::Back => {
+                self.max_tokens_editing = false;
+                self.max_tokens_edit_backup = None;
                 self.active_runtime = None;
                 self.screen = Screen::PlanValid;
                 self.menu_index = 0;
             }
             UiCommand::Enter if self.menu_index == 0 => {
                 if self.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1 {
-                    self.preference_editing = true;
+                    // Enter on Custom… enters edit mode (consistent with RAM custom).
+                    self.start_custom_max_tokens_edit();
                 } else {
-                    // cycle
-                    self.cycle_max_tokens();
+                    self.cycle_max_tokens_preset(true);
                 }
             }
             UiCommand::Enter if self.menu_index == 1 => {
-                // Go to prompt input
+                // Refuse to leave review config with a zero/invalid max_tokens.
+                if self.lab.max_tokens == 0 {
+                    self.error = Some(TuiError::Input {
+                        field: "max tokens",
+                        message: "select a preset or enter a positive custom value".to_string(),
+                    });
+                    return None;
+                }
                 self.prompt_input.clear();
                 self.lab.prompt_input_before_run.clear();
                 self.screen = Screen::GenerationInput;
                 self.menu_index = 0;
             }
             UiCommand::Enter => {
+                self.max_tokens_editing = false;
+                self.max_tokens_edit_backup = None;
                 self.active_runtime = None;
                 self.screen = Screen::PlanValid;
                 self.menu_index = 0;
@@ -1379,11 +1427,130 @@ impl TuiApp {
         None
     }
 
-    fn cycle_max_tokens(&mut self) {
-        let len = MaxTokensPreset::ALL.len();
-        self.lab.max_tokens_preset_index = (self.lab.max_tokens_preset_index + 1) % len;
-        if let Some(v) = MaxTokensPreset::ALL[self.lab.max_tokens_preset_index].value() {
+    fn review_config_item_count(&self) -> usize {
+        3
+    }
+
+    fn max_max_tokens(&self) -> usize {
+        // If the runtime is active, bound by the model's context length.
+        // Otherwise fall back to a generous sanity cap; generate_impl will
+        // enforce context_length at call time.
+        self.active_runtime
+            .as_ref()
+            .map(|rt| rt.config().context_length.saturating_sub(1).max(1))
+            .unwrap_or(1_000_000)
+    }
+
+    fn start_custom_max_tokens_edit(&mut self) {
+        // Snapshot the current (input, value) so Escape can restore exactly.
+        self.max_tokens_edit_backup = Some((
+            self.lab.custom_max_tokens_input.clone(),
+            self.lab.max_tokens,
+        ));
+        // Seed the input with the current numeric value when empty AND a
+        // positive value exists, so the user isn't faced with a blank field
+        // when editing a previously committed custom value. We deliberately
+        // do NOT seed "0" since leading-zero input is rejected.
+        if self.lab.custom_max_tokens_input.is_empty() && self.lab.max_tokens > 0 {
+            self.lab.custom_max_tokens_input = self.lab.max_tokens.to_string();
+        }
+        self.max_tokens_editing = true;
+    }
+
+    fn cancel_custom_max_tokens_edit(&mut self) {
+        if let Some((prev_input, prev_value)) = self.max_tokens_edit_backup.take() {
+            self.lab.custom_max_tokens_input = prev_input;
+            self.lab.max_tokens = prev_value;
+        }
+        self.max_tokens_editing = false;
+    }
+
+    fn edit_custom_max_tokens_character(&mut self, character: char) {
+        // Reject anything that would overflow the sanity cap once parsed.
+        let candidate: String = self
+            .lab
+            .custom_max_tokens_input
+            .chars()
+            .chain(std::iter::once(character))
+            .collect();
+        // Refuse to push a leading '0' (would produce "012" which parses but
+        // is confusing). A single "0" is also rejected at commit time.
+        if self.lab.custom_max_tokens_input.is_empty() && character == '0' {
+            return;
+        }
+        if let Ok(v) = candidate.parse::<usize>() {
+            if v <= self.max_max_tokens() {
+                self.lab.custom_max_tokens_input = candidate;
+                self.lab.max_tokens = v;
+            }
+        }
+    }
+
+    fn edit_custom_max_tokens_backspace(&mut self) {
+        self.lab.custom_max_tokens_input.pop();
+        if let Ok(v) = self.lab.custom_max_tokens_input.parse::<usize>() {
             self.lab.max_tokens = v;
+        } else if self.lab.custom_max_tokens_input.is_empty() {
+            self.lab.max_tokens = 0;
+        }
+    }
+
+    fn commit_custom_max_tokens(&mut self) -> Result<(), TuiError> {
+        let input = self.lab.custom_max_tokens_input.trim().to_string();
+        if input.is_empty() {
+            return Err(TuiError::Input {
+                field: "max tokens",
+                message: "a positive integer is required for custom max tokens".to_string(),
+            });
+        }
+        let value = input.parse::<usize>().map_err(|_| TuiError::Input {
+            field: "max tokens",
+            message: format!("\"{input}\" is not a valid positive integer for max tokens"),
+        })?;
+        if value == 0 {
+            return Err(TuiError::Input {
+                field: "max tokens",
+                message: "max tokens must be greater than zero".to_string(),
+            });
+        }
+        let cap = self.max_max_tokens();
+        if value > cap {
+            return Err(TuiError::Input {
+                field: "max tokens",
+                message: format!(
+                    "max tokens exceeds the available bound ({cap}); choose a smaller value"
+                ),
+            });
+        }
+        self.lab.max_tokens = value;
+        self.lab.custom_max_tokens_input = value.to_string();
+        Ok(())
+    }
+
+    fn cycle_max_tokens_preset(&mut self, forward: bool) {
+        let len = MaxTokensPreset::ALL.len();
+        // Preserve any existing custom input when navigating away from Custom,
+        // mirroring how sync_ram_from_input preserves custom_ram_input.
+        if self.custom_max_tokens_focused() {
+            // custom value stays in custom_max_tokens_input for re-entry.
+        }
+        if forward {
+            self.lab.max_tokens_preset_index = (self.lab.max_tokens_preset_index + 1) % len;
+        } else {
+            self.lab.max_tokens_preset_index = (self.lab.max_tokens_preset_index + len - 1) % len;
+        }
+        let p = MaxTokensPreset::ALL[self.lab.max_tokens_preset_index];
+        if let Some(v) = p.value() {
+            self.lab.max_tokens = v;
+        } else {
+            // On Custom preset, restore the previously entered custom value
+            // if one was stored; otherwise leave at zero (Enter will be
+            // required before generation, giving a clear validation error).
+            if let Ok(v) = self.lab.custom_max_tokens_input.parse::<usize>() {
+                self.lab.max_tokens = v;
+            } else {
+                self.lab.max_tokens = 0;
+            }
         }
     }
 
@@ -1929,18 +2096,6 @@ impl TuiApp {
             }
             _ => {}
         }
-        // Handle custom max tokens editing when on review config
-        if self.screen == Screen::ReviewConfig
-            && self.menu_index == 0
-            && self.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1
-        {
-            if character.is_ascii_digit() {
-                self.lab.custom_max_tokens_input.push(character);
-                if let Ok(v) = self.lab.custom_max_tokens_input.parse::<usize>() {
-                    self.lab.max_tokens = v;
-                }
-            }
-        }
     }
 
     fn edit_preference_backspace(&mut self) {
@@ -1956,17 +2111,6 @@ impl TuiApp {
                 self.advanced_cache_capacity_input.pop();
             }
             _ => {}
-        }
-        if self.screen == Screen::ReviewConfig
-            && self.menu_index == 0
-            && self.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1
-        {
-            self.lab.custom_max_tokens_input.pop();
-            if let Ok(v) = self.lab.custom_max_tokens_input.parse::<usize>() {
-                self.lab.max_tokens = v;
-            } else if self.lab.custom_max_tokens_input.is_empty() {
-                self.lab.max_tokens = 0;
-            }
         }
     }
 }
@@ -2496,4 +2640,190 @@ mod tests {
         app.handle(UiCommand::Quit);
         assert!(app.should_quit);
     }
+
+    // ----- Custom max-tokens input (Issue 1) ---------------------------------
+
+    fn review_config_with_custom_max_tokens() -> TuiApp {
+        let mut app = TuiApp::default();
+        app.screen = Screen::ReviewConfig;
+        app.menu_index = 0;
+        app.lab.max_tokens_preset_index = MaxTokensPreset::ALL.len() - 1; // Custom
+        app.lab.max_tokens = 0;
+        app.lab.custom_max_tokens_input.clear();
+        app.max_tokens_editing = false;
+        app.max_tokens_edit_backup = None;
+        app
+    }
+
+    #[test]
+    fn custom_max_tokens_requires_enter_to_edit() {
+        let mut app = review_config_with_custom_max_tokens();
+        // Typing before Enter does nothing (matches Custom RAM behavior).
+        assert_eq!(app.active_input_context(), InputContext::None);
+        app.handle(UiCommand::Character('5'));
+        assert!(app.lab.custom_max_tokens_input.is_empty());
+        assert_eq!(app.lab.max_tokens, 0);
+        // Enter enters edit mode.
+        app.handle(UiCommand::Enter);
+        assert!(app.max_tokens_editing);
+        assert_eq!(app.active_input_context(), InputContext::CustomMaxTokens);
+    }
+
+    #[test]
+    fn custom_max_tokens_accepts_digits_updates_value() {
+        let mut app = review_config_with_custom_max_tokens();
+        app.handle(UiCommand::Enter);
+        // Seeded with current value (0 -> here we want empty; after Enter on
+        // empty custom input it stays empty, which is correct since max=0
+        // would be invalid). Let's type 2 then 5 -> "25"
+        app.handle(UiCommand::Character('2'));
+        app.handle(UiCommand::Character('5'));
+        assert_eq!(app.lab.custom_max_tokens_input, "25");
+        assert_eq!(app.lab.max_tokens, 25);
+        // Non-digit characters are ignored in the editor.
+        app.handle(UiCommand::Character('a'));
+        app.handle(UiCommand::Character('-'));
+        assert_eq!(app.lab.custom_max_tokens_input, "25");
+    }
+
+    #[test]
+    fn custom_max_tokens_rejects_leading_zero() {
+        let mut app = review_config_with_custom_max_tokens();
+        app.handle(UiCommand::Enter);
+        app.handle(UiCommand::Character('0'));
+        assert!(app.lab.custom_max_tokens_input.is_empty());
+    }
+
+    #[test]
+    fn custom_max_tokens_backspace_and_escape_restore() {
+        let mut app = review_config_with_custom_max_tokens();
+        // Start at T32 (index 3).
+        app.lab.max_tokens_preset_index = 3;
+        app.lab.max_tokens = 32;
+        app.lab.custom_max_tokens_input.clear();
+        // Right-cycling lands on Custom (3->4->5->6). Since no prior custom
+        // input exists, max_tokens becomes 0 until the user confirms a value.
+        app.handle(UiCommand::Right); // -> T64
+        app.handle(UiCommand::Right); // -> T128
+        app.handle(UiCommand::Right); // -> Custom
+        assert_eq!(
+            app.lab.max_tokens_preset_index,
+            MaxTokensPreset::ALL.len() - 1
+        );
+        assert!(!app.max_tokens_editing);
+        assert_eq!(app.lab.max_tokens, 0);
+        // Enter to edit (seeds with current value; user types 999).
+        app.handle(UiCommand::Enter);
+        assert!(app.max_tokens_editing);
+        app.handle(UiCommand::Character('9'));
+        app.handle(UiCommand::Character('9'));
+        app.handle(UiCommand::Character('9'));
+        assert_eq!(app.lab.max_tokens, 999);
+        // Escape cancels, restoring the value captured at edit-start (0 here
+        // because the field was empty when Enter was pressed).
+        app.handle(UiCommand::Back);
+        assert!(!app.max_tokens_editing);
+        assert_eq!(app.lab.max_tokens, 0);
+        // Type 42, backspace once removes one character.
+        app.handle(UiCommand::Enter);
+        app.handle(UiCommand::Character('4'));
+        app.handle(UiCommand::Character('2'));
+        assert_eq!(app.lab.max_tokens, 42);
+        app.handle(UiCommand::Backspace);
+        assert_eq!(app.lab.custom_max_tokens_input, "4");
+        assert_eq!(app.lab.max_tokens, 4);
+        // Escape restores the value that was in the field when Enter
+        // started THIS edit (empty/0 because we started with a cleared
+        // field from the cancel above).
+        app.handle(UiCommand::Back);
+        assert_eq!(app.lab.custom_max_tokens_input, "");
+        assert_eq!(app.lab.max_tokens, 0);
+    }
+
+    #[test]
+    fn custom_max_tokens_enter_confirms_empty_rejected() {
+        let mut app = review_config_with_custom_max_tokens();
+        app.handle(UiCommand::Enter);
+        // Pressing Enter on empty input yields validation error, stays editing.
+        app.handle(UiCommand::Enter);
+        assert!(app.max_tokens_editing);
+        assert!(matches!(app.error, Some(TuiError::Input { .. })));
+        // Type 16, Enter confirms, exits edit mode, value is preserved.
+        app.error = None;
+        app.handle(UiCommand::Character('1'));
+        app.handle(UiCommand::Character('6'));
+        app.handle(UiCommand::Enter);
+        assert!(!app.max_tokens_editing);
+        assert!(app.error.is_none());
+        assert_eq!(app.lab.max_tokens, 16);
+    }
+
+    #[test]
+    fn custom_max_tokens_propagates_to_generate_action() {
+        let mut app = review_config_with_custom_max_tokens();
+        app.handle(UiCommand::Enter);
+        app.handle(UiCommand::Character('7'));
+        app.handle(UiCommand::Enter); // confirm -> 7
+                                      // Move down to "Enter prompt and run"
+        app.handle(UiCommand::Down);
+        app.handle(UiCommand::Enter);
+        assert_eq!(app.screen, Screen::GenerationInput);
+        app.handle(UiCommand::Character('h'));
+        app.handle(UiCommand::Character('i'));
+        let action = app.handle(UiCommand::Enter);
+        assert_eq!(action, Some(AppAction::GeneratePrompt("hi".to_string(), 7)));
+    }
+
+    #[test]
+    fn custom_max_tokens_zero_is_rejected_at_generation() {
+        let mut app = review_config_with_custom_max_tokens();
+        // Without editing, max_tokens stays 0; Enter on "Enter prompt" must
+        // refuse to proceed.
+        app.menu_index = 1;
+        assert!(app.handle(UiCommand::Enter).is_none());
+        assert!(matches!(app.error, Some(TuiError::Input { .. })));
+        assert_eq!(app.screen, Screen::ReviewConfig);
+    }
+
+    #[test]
+    fn left_right_cycles_presets_without_auto_editing() {
+        let mut app = review_config_with_custom_max_tokens();
+        // Start at T32 (index 3).
+        app.lab.max_tokens_preset_index = 3;
+        app.lab.max_tokens = 32;
+        app.max_tokens_editing = false;
+        app.handle(UiCommand::Right); // 3 -> 4 (T64)
+        assert_eq!(app.lab.max_tokens_preset_index, 4);
+        assert_eq!(app.lab.max_tokens, 64);
+        app.handle(UiCommand::Right); // 4 -> 5 (T128)
+        assert_eq!(app.lab.max_tokens_preset_index, 5);
+        assert_eq!(app.lab.max_tokens, 128);
+        // Cycle to Custom — should NOT auto-edit (mismatch with prior behavior
+        // where Right entered edit automatically).
+        app.handle(UiCommand::Right); // 5 -> 6 (Custom)
+        assert_eq!(
+            app.lab.max_tokens_preset_index,
+            MaxTokensPreset::ALL.len() - 1
+        );
+        assert!(!app.max_tokens_editing);
+        // Left goes back to the previous numeric preset (T128).
+        app.handle(UiCommand::Left);
+        assert_eq!(app.lab.max_tokens, 128);
+        assert!(!app.max_tokens_editing);
+    }
+
+    #[test]
+    fn up_down_moves_during_edit_commit_on_valid_value() {
+        let mut app = review_config_with_custom_max_tokens();
+        app.handle(UiCommand::Enter);
+        app.handle(UiCommand::Character('8'));
+        app.handle(UiCommand::Down);
+        assert!(!app.max_tokens_editing);
+        assert_eq!(app.lab.max_tokens, 8);
+        assert_eq!(app.menu_index, 1);
+    }
+
+    // Runtime-side StopReason/EOS/state-reset tests live in
+    // ramforge-runtime/src/inference.rs (tests with the deterministic
+    // tiny-LLaMA fixture).
 }

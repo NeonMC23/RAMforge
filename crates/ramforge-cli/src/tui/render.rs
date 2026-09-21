@@ -561,6 +561,61 @@ fn render_generation_result(app: &TuiApp, output: &mut String) {
         field(output, "Max tokens", &g.max_tokens.to_string());
         field(
             output,
+            "Stop reason",
+            g.stop_reason.as_deref().unwrap_or("Unavailable"),
+        );
+        field(
+            output,
+            "EOS token ID",
+            match g.eos_token_id {
+                Some(id) => id.to_string(),
+                None if g.eos_token_id_metadata_available => "Unavailable".to_string(),
+                None => "<missing from GGUF metadata>".to_string(),
+            }
+            .as_str(),
+        );
+        field(
+            output,
+            "EOS encountered",
+            if g.eos_encountered { "Yes" } else { "No" },
+        );
+        if let Some(ctx) = g.context_length {
+            field(output, "Model context length", &ctx.to_string());
+        }
+        field(
+            output,
+            "State reset (KV/history/sampler)",
+            &format!(
+                "kv={} history={} sampler_stateless={}",
+                if g.kv_cache_reset { "fresh" } else { "stale" },
+                if g.token_history_reset {
+                    "fresh"
+                } else {
+                    "stale"
+                },
+                g.sampler_stateless,
+            ),
+        );
+        if !g.generated_token_ids_sample.is_empty() {
+            let sample = g
+                .generated_token_ids_sample
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let truncated = if g.generated_token_ids_sample_truncated {
+                " (truncated)"
+            } else {
+                ""
+            };
+            field(
+                output,
+                "Generated token IDs (sample)",
+                &format!("[{sample}]{}", truncated),
+            );
+        }
+        field(
+            output,
             "Tokens/sec (overall)",
             g.tokens_per_second_overall
                 .map(|v| format!("{v:.3}"))
@@ -902,27 +957,35 @@ fn render_review_config(app: &TuiApp, runtime_config: Option<&RuntimeConfig>, ou
         calibration_level_label(app.calibration_level()),
     );
     let _ = writeln!(output);
-    preference_line(
-        output,
-        app.menu_index == 0,
-        "Max tokens",
-        if app.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1 {
-            if app.lab.custom_max_tokens_input.is_empty() {
-                "<custom>"
-            } else {
-                &app.lab.custom_max_tokens_input
-            }
+    let max_tokens_value = if app.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1 {
+        if app.max_tokens_editing {
+            format!("{}_", app.lab.custom_max_tokens_input)
+        } else if app.lab.custom_max_tokens_input.is_empty() {
+            "<custom>".to_string()
         } else {
-            MaxTokensPreset::ALL[app.lab.max_tokens_preset_index].label()
-        },
-    );
+            app.lab.custom_max_tokens_input.clone()
+        }
+    } else {
+        MaxTokensPreset::ALL[app.lab.max_tokens_preset_index]
+            .label()
+            .to_string()
+    };
+    preference_line(output, app.menu_index == 0, "Max tokens", &max_tokens_value);
     menu_line(output, app.menu_index == 1, "Enter prompt and run");
     menu_line(output, app.menu_index == 2, "Back to plan");
     let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "Use Left/Right to change the max-tokens preset. Enter cycles presets."
-    );
+    if app.max_tokens_editing {
+        let _ = writeln!(
+            output,
+            "Editing custom max tokens: positive integer up to {}. Enter confirms, Esc cancels.",
+            app.max_max_tokens_capped_for_display(),
+        );
+    } else {
+        let _ = writeln!(
+            output,
+            "Use Left/Right to change the max-tokens preset. Enter on Custom… edits the value."
+        );
+    }
 }
 
 fn render_run_history(app: &TuiApp, output: &mut String) {
@@ -1419,11 +1482,8 @@ fn footer(app: &TuiApp) -> &'static str {
         Screen::Preferences if app.accepts_text() => {
             "Type value  Enter/Esc Finish editing  Up/Down Move  Ctrl-C Quit"
         }
-        Screen::ReviewConfig
-            if app.menu_index == 0
-                && app.lab.max_tokens_preset_index == MaxTokensPreset::ALL.len() - 1 =>
-        {
-            "Type number  Enter/Esc Finish editing  Up/Down Move  Ctrl-C Quit"
+        Screen::ReviewConfig if app.max_tokens_editing => {
+            "Type digits  Enter Confirm  Esc Cancel  Up/Down Move  Ctrl-C Quit"
         }
         Screen::Analyzing | Screen::PlanValidation | Screen::RuntimeActivation => {
             "Please wait  Ctrl-C Quit"

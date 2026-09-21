@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ramforge_core::datasource::IoProfile;
-use ramforge_runtime::inference::{GenerationProfile, TensorReadProfile};
+use ramforge_runtime::inference::{GenerationOutcome, GenerationProfile, TensorReadProfile};
 use ramforge_runtime::memory_report::MemoryReport;
 use ramforge_runtime::profile::ProfileSnapshot;
 use ramforge_runtime::runtime_config::RuntimeConfig;
@@ -69,6 +69,45 @@ pub struct DiagnosticResult {
     pub observations: Vec<String>,
 }
 
+/// Static snapshot of why generation stopped and whether state was reset.
+/// Populated from `GenerationOutcome` so UI/JSON consumers can distinguish
+/// EOS stops from max-token stops and see when EOS metadata is unavailable.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GenerationStopInfo {
+    pub stop_reason: String,
+    pub configured_max_tokens: usize,
+    pub context_length: usize,
+    pub generated_tokens: usize,
+    pub eos_token_id: Option<u32>,
+    pub eos_token_id_metadata_available: bool,
+    pub eos_encountered: bool,
+    pub token_ids_sample: Vec<u32>,
+    pub token_ids_sample_truncated: bool,
+    pub kv_cache_reset: bool,
+    pub token_history_reset: bool,
+    pub sampler_stateless: bool,
+}
+
+impl GenerationStopInfo {
+    pub fn from_outcome(outcome: &GenerationOutcome) -> Self {
+        let truncated = outcome.generated_token_ids.len() > outcome.token_ids_sample.len();
+        Self {
+            stop_reason: outcome.stop_reason.label().to_string(),
+            configured_max_tokens: outcome.configured_max_tokens,
+            context_length: outcome.context_length,
+            generated_tokens: outcome.generated_token_ids.len(),
+            eos_token_id: outcome.eos_token_id,
+            eos_token_id_metadata_available: outcome.eos_token_id.is_some(),
+            eos_encountered: outcome.eos_encountered,
+            token_ids_sample: outcome.token_ids_sample.clone(),
+            token_ids_sample_truncated: truncated,
+            kv_cache_reset: outcome.kv_cache_reset,
+            token_history_reset: outcome.token_history_reset,
+            sampler_stateless: outcome.sampler_is_stateless,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GenerationDiagnostics {
     pub total_elapsed_seconds: f64,
@@ -78,6 +117,16 @@ pub struct GenerationDiagnostics {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub max_tokens: usize,
+    pub stop_reason: Option<String>,
+    pub eos_token_id: Option<u32>,
+    pub eos_token_id_metadata_available: bool,
+    pub eos_encountered: bool,
+    pub context_length: Option<usize>,
+    pub generated_token_ids_sample: Vec<u32>,
+    pub generated_token_ids_sample_truncated: bool,
+    pub kv_cache_reset: bool,
+    pub token_history_reset: bool,
+    pub sampler_stateless: bool,
     pub tokens_per_second_overall: Option<f64>,
     pub tokens_per_second_generated: Option<f64>,
     pub prompt_forwards: u64,
@@ -240,6 +289,7 @@ pub struct DiagnosticInputs<'a> {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub max_tokens: usize,
+    pub stop_info: Option<GenerationStopInfo>,
     pub calibration_level_label: String,
     pub calibration_identifier: Option<String>,
     pub calibration_applied_ids: Vec<String>,
@@ -299,6 +349,7 @@ pub fn build_diagnostic_result(inputs: DiagnosticInputs<'_>) -> DiagnosticResult
         tensor_type_bytes.insert(name.clone(), *bytes);
     }
 
+    let stop_info = inputs.stop_info.as_ref();
     let generation = GenerationDiagnostics {
         total_elapsed_seconds: total_elapsed,
         wall_elapsed_seconds: wall,
@@ -307,6 +358,22 @@ pub fn build_diagnostic_result(inputs: DiagnosticInputs<'_>) -> DiagnosticResult
         prompt_tokens: inputs.prompt_tokens,
         generated_tokens: inputs.generated_tokens,
         max_tokens: inputs.max_tokens,
+        stop_reason: stop_info.map(|s| s.stop_reason.clone()),
+        eos_token_id: stop_info.and_then(|s| s.eos_token_id),
+        eos_token_id_metadata_available: stop_info
+            .map(|s| s.eos_token_id_metadata_available)
+            .unwrap_or(false),
+        eos_encountered: stop_info.map(|s| s.eos_encountered).unwrap_or(false),
+        context_length: stop_info.map(|s| s.context_length),
+        generated_token_ids_sample: stop_info
+            .map(|s| s.token_ids_sample.clone())
+            .unwrap_or_default(),
+        generated_token_ids_sample_truncated: stop_info
+            .map(|s| s.token_ids_sample_truncated)
+            .unwrap_or(false),
+        kv_cache_reset: stop_info.map(|s| s.kv_cache_reset).unwrap_or(false),
+        token_history_reset: stop_info.map(|s| s.token_history_reset).unwrap_or(false),
+        sampler_stateless: stop_info.map(|s| s.sampler_stateless).unwrap_or(false),
         tokens_per_second_overall,
         tokens_per_second_generated,
         prompt_forwards: run.prompt_forwards,
@@ -392,7 +459,7 @@ pub fn build_diagnostic_result(inputs: DiagnosticInputs<'_>) -> DiagnosticResult
         consumed_by_planning: inputs.calibration_consumed,
     };
 
-    let observations = derive_observations(
+    let mut observations = derive_observations(
         &generation,
         &cpu_compute,
         &memory,
@@ -400,6 +467,38 @@ pub fn build_diagnostic_result(inputs: DiagnosticInputs<'_>) -> DiagnosticResult
         &io_diag,
         &layers,
     );
+    if let Some(si) = inputs.stop_info.as_ref() {
+        observations.push(format!(
+            "Generation stopped due to: {} (generated {}/{} tokens).",
+            si.stop_reason, si.generated_tokens, si.configured_max_tokens,
+        ));
+        if !si.eos_token_id_metadata_available {
+            observations.push(
+                "GGUF metadata did not provide tokenizer.ggml.eos_token_id; EOS detection \
+                 was unavailable, so generation can only stop at max_tokens or context_length."
+                    .to_string(),
+            );
+        } else if si.eos_encountered {
+            observations.push(format!(
+                "EOS token (id={}) was encountered during sampling.",
+                si.eos_token_id.unwrap_or(0)
+            ));
+        }
+        if si.sampler_stateless {
+            observations.push(
+                "Sampler (greedy) carries no per-run state; no stale sampler data can leak \
+                 between generations."
+                    .to_string(),
+            );
+        }
+        if si.kv_cache_reset && si.token_history_reset {
+            observations.push(
+                "KV cache and per-run token history were freshly initialized; no prompt \
+                 tokens or generated tokens were duplicated across runs."
+                    .to_string(),
+            );
+        }
+    }
 
     DiagnosticResult {
         schema_version: DIAGNOSTIC_SCHEMA_VERSION,

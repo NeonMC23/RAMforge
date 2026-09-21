@@ -270,9 +270,25 @@ fn run_inference(
     });
     writeln!(stdout)?;
     stdout.flush()?;
-    let (gen_tokens, _gen_text) = generation.map_err(|e| anyhow::anyhow!(e))?;
+    let outcome = generation.map_err(|e| anyhow::anyhow!(e))?;
 
-    eprintln!("Generated {} tokens", gen_tokens.len());
+    let eos_label = match outcome.eos_token_id {
+        Some(id) => id.to_string(),
+        None => "<unavailable>".to_string(),
+    };
+    eprintln!("Generated {} tokens", outcome.generated_token_ids.len());
+    eprintln!(
+        "Stop reason: {} (eos_id={}, eos_encountered={}, configured_max_tokens={}, context_length={})",
+        outcome.stop_reason.label(),
+        eos_label,
+        outcome.eos_encountered,
+        outcome.configured_max_tokens,
+        outcome.context_length,
+    );
+    eprintln!(
+        "State reset: kv_cache_reset={} token_history_reset={} sampler_stateless={}",
+        outcome.kv_cache_reset, outcome.token_history_reset, outcome.sampler_is_stateless,
+    );
 
     if verbose {
         eprintln!(

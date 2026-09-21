@@ -14,6 +14,7 @@ use ramforge_runtime::calibration::{
     CalibrationLimits, CalibrationPlan, CalibrationRunner, CalibrationTaskProgressState,
 };
 use ramforge_runtime::discovery::StorageDiscovery;
+use ramforge_runtime::inference::GenerationOutcome;
 use ramforge_runtime::orchestration::RuntimeOrchestrator;
 use ramforge_runtime::plan_persistence::{
     PersistedExecutionPlan, PersistedPlanCompatibilityContext, PlanPersistenceError,
@@ -21,7 +22,7 @@ use ramforge_runtime::plan_persistence::{
 use ramforge_runtime::sampling::Sampler;
 
 use app::{AppAction, CalibrationTaskView, Screen, TuiApp, TuiError};
-use diagnostics::{build_diagnostic_result, export_run_json, DiagnosticInputs};
+use diagnostics::{build_diagnostic_result, export_run_json, DiagnosticInputs, GenerationStopInfo};
 use terminal::TerminalSession;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -375,18 +376,21 @@ fn generate_prompt(
         runtime_config = runtime.runtime_config().clone();
         generated_token_count_pre = result
             .as_ref()
-            .map(|(tokens, _)| tokens.len())
+            .map(|outcome| outcome.generated_token_ids.len())
             .unwrap_or(profile.runtime.tokens as usize);
         emit_generation_summary(
             runtime,
             &profile,
             prompt_token_count,
             generated_token_count_pre,
+            result.as_ref().ok(),
             elapsed,
         );
     }
     let elapsed = started.elapsed();
     let generated_token_count = generated_token_count_pre;
+
+    let stop_info = result.as_ref().map(GenerationStopInfo::from_outcome).ok();
 
     let diag = build_diagnostic_result(DiagnosticInputs {
         runtime_config: &runtime_config,
@@ -397,6 +401,7 @@ fn generate_prompt(
         prompt_tokens: prompt_token_count,
         generated_tokens: generated_token_count,
         max_tokens,
+        stop_info,
         calibration_level_label: calibration_label,
         calibration_identifier,
         calibration_applied_ids,
@@ -406,7 +411,7 @@ fn generate_prompt(
     phase_atom.store(2, std::sync::atomic::Ordering::Relaxed);
 
     match result {
-        Ok((_tokens, generated_text)) => Ok((prompt_token_count, generated_text, diag)),
+        Ok(outcome) => Ok((prompt_token_count, outcome.generated_text, diag)),
         Err(e) => Err(TuiError::Generation(e)),
     }
 }
@@ -461,6 +466,7 @@ fn emit_generation_summary(
     profile: &ramforge_runtime::inference::GenerationProfile,
     prompt_token_count: usize,
     generated_token_count: usize,
+    outcome: Option<&GenerationOutcome>,
     elapsed: Duration,
 ) {
     let runtime_profile = &profile.runtime;
@@ -522,6 +528,31 @@ fn emit_generation_summary(
         profile.ramforge_peak_bytes,
         profile.ramforge_budget_bytes,
     );
+    if let Some(out) = outcome {
+        let eos_label = match out.eos_token_id {
+            Some(id) => id.to_string(),
+            None => "<unavailable: GGUF metadata tokenizer.ggml.eos_token_id missing>".to_string(),
+        };
+        let sample = out
+            .token_ids_sample
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = write!(
+            stderr,
+            "stop_reason={} configured_max_tokens={} context_length={} eos_token_id={} eos_encountered={} kv_cache_reset={} token_history_reset={} sampler_stateless={} token_ids_sample=[{}]\r\n",
+            out.stop_reason.label(),
+            out.configured_max_tokens,
+            out.context_length,
+            eos_label,
+            out.eos_encountered,
+            out.kv_cache_reset,
+            out.token_history_reset,
+            out.sampler_is_stateless,
+            sample,
+        );
+    }
     let _ = stderr.flush();
 }
 

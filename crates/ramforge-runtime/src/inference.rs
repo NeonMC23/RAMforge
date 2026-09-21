@@ -87,6 +87,71 @@ fn validate_runtime_config_for_host(runtime_config: &RuntimeConfig) -> Result<()
     Ok(())
 }
 
+/// Precise reason generation exited the decode loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The EOS token (from GGUF `tokenizer.ggml.eos_token_id`) was sampled.
+    Eos,
+    /// Exactly `max_tokens` generated tokens were produced (upper bound reached).
+    MaxTokens,
+    /// Generation would have exceeded the model's `context_length`.
+    ContextLength,
+}
+
+impl StopReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Eos => "eos",
+            Self::MaxTokens => "max_tokens",
+            Self::ContextLength => "context_length",
+        }
+    }
+}
+
+/// Outcome of a single `generate_with_callback` invocation. Exposes the data
+/// callers need to distinguish EOS-vs-max-token stops and verify state
+/// resets between runs. Bounded so it cannot grow unboundedly for long
+/// generations.
+#[derive(Debug, Clone)]
+pub struct GenerationOutcome {
+    /// All generated token IDs (not including BOS, prompt, or EOS).
+    pub generated_token_ids: Vec<u32>,
+    /// Decoded text emitted via `on_text` plus trailing bytes flushed by
+    /// `decoder.finish()`.
+    pub generated_text: String,
+    /// Number of prompt tokens fed into the forward pass.
+    pub prompt_tokens: usize,
+    /// Configured upper bound of tokens to generate (the caller's `max_tokens`).
+    pub configured_max_tokens: usize,
+    /// Model `context_length` (context cap, not a hardcoded generation limit).
+    pub context_length: usize,
+    /// Why the loop stopped.
+    pub stop_reason: StopReason,
+    /// EOS token ID from GGUF `tokenizer.ggml.eos_token_id`, or `None` when
+    /// the GGUF metadata did not provide one. When `None`, EOS cannot be
+    /// detected (generation will always stop on `max_tokens` or context).
+    pub eos_token_id: Option<u32>,
+    /// Whether the EOS token was actually encountered during the run.
+    /// Always `false` when `eos_token_id` is `None`.
+    pub eos_encountered: bool,
+    /// Bounded prefix of `generated_token_ids` for diagnostics (never
+    /// contains the EOS id). The full list is in `generated_token_ids`.
+    pub token_ids_sample: Vec<u32>,
+    /// KV cache was dropped/recreated at the start of the run.
+    pub kv_cache_reset: bool,
+    /// Per-run token history (generated_token_ids/decoder) is local to the
+    /// call; this is always `true` and reported so callers can assert
+    /// state-reset invariants explicitly.
+    pub token_history_reset: bool,
+    /// Sampler is constructed fresh by the caller and is itself stateless
+    /// for greedy sampling. Reported so callers can verify no stale sampler
+    /// state leaks between runs.
+    pub sampler_is_stateless: bool,
+}
+
+/// Maximum number of generated token IDs included in `token_ids_sample`.
+pub const TOKEN_ID_SAMPLE_LIMIT: usize = 64;
+
 impl InferenceEngine {
     /// Construct the legacy/manual execution path. Its behavior is unchanged:
     /// all available CPU threads are exposed to the existing backend, the
@@ -254,29 +319,44 @@ impl InferenceEngine {
         sampler: &Sampler,
     ) -> Result<(Vec<u32>, String), String> {
         self.generate_with_callback(prompt, max_tokens, sampler, |_| Ok(()))
+            .map(|outcome| (outcome.generated_token_ids, outcome.generated_text))
     }
 
     /// Generate while emitting newly decodable text as soon as tokens permit.
     /// Diagnostic/profile output remains the caller's responsibility, so the
     /// callback receives generated text only.
+    ///
+    /// Returns a `GenerationOutcome` describing the run, including a precise
+    /// `StopReason`, the EOS token ID from GGUF metadata (when available),
+    /// and bounded diagnostics for state-reset verification.
     pub fn generate_with_callback<F>(
         &mut self,
         prompt: &str,
         max_tokens: usize,
         sampler: &Sampler,
         mut on_text: F,
-    ) -> Result<(Vec<u32>, String), String>
+    ) -> Result<GenerationOutcome, String>
     where
         F: FnMut(&str) -> Result<(), String>,
     {
         // Explicit reset of any previous run's KV and cached-layer state.
         self.clear_kv_cache();
+        let kv_cache_reset = true; // we just called clear_kv_cache() above
         self.model.clear_layer_cache(&mut self.budget)?;
         self.model.reset_profile();
         self.data_source.reset_io_profile();
         let profiler = self.model.profiler.clone();
         let total_started = profiler.start();
-        let result = self.generate_impl(prompt, max_tokens, sampler, &mut on_text);
+        let sampler_stateless =
+            sampler.temperature <= 0.0 && sampler.top_k.is_none() && sampler.top_p.is_none();
+        let result = self.generate_impl(
+            prompt,
+            max_tokens,
+            sampler,
+            &mut on_text,
+            kv_cache_reset,
+            sampler_stateless,
+        );
         let cache_clear_result = self.model.clear_layer_cache(&mut self.budget);
         if cache_clear_result.is_ok() {
             self.residency_stats
@@ -304,7 +384,9 @@ impl InferenceEngine {
         max_tokens: usize,
         sampler: &Sampler,
         on_text: &mut F,
-    ) -> Result<(Vec<u32>, String), String>
+        kv_cache_reset: bool,
+        sampler_stateless: bool,
+    ) -> Result<GenerationOutcome, String>
     where
         F: FnMut(&str) -> Result<(), String>,
     {
@@ -382,6 +464,8 @@ impl InferenceEngine {
         let mut generated_text = String::new();
         let mut decoder = tokenizer.decoder();
         let mut current_pos = prompt_tokens.len();
+        let mut stop_reason = StopReason::MaxTokens;
+        let mut eos_encountered = false;
 
         let budget = &mut self.budget;
         let run_result: Result<(), String> =
@@ -435,6 +519,8 @@ impl InferenceEngine {
 
                         if let Some(eos) = eos_id {
                             if next_token == eos {
+                                eos_encountered = true;
+                                stop_reason = StopReason::Eos;
                                 break;
                             }
                         }
@@ -448,9 +534,17 @@ impl InferenceEngine {
                             generated_text.push_str(&decoded);
                         }
 
-                        let needs_next_logits = generation_index + 1 < max_tokens
-                            && current_pos + 1 < context_length;
-                        if !needs_next_logits {
+                        let more_tokens_requested = generation_index + 1 < max_tokens;
+                        let room_in_context = current_pos + 1 < context_length;
+                        if !more_tokens_requested {
+                            stop_reason = StopReason::MaxTokens;
+                            profiler.record_since(ProfileEvent::TokenLatency, token_started);
+                            profiler.record_token();
+                            profiler.record_terminal_forward_skipped();
+                            break;
+                        }
+                        if !room_in_context {
+                            stop_reason = StopReason::ContextLength;
                             profiler.record_since(ProfileEvent::TokenLatency, token_started);
                             profiler.record_token();
                             profiler.record_terminal_forward_skipped();
@@ -505,6 +599,7 @@ impl InferenceEngine {
                         profiler.record_token();
 
                         if current_pos >= context_length {
+                            stop_reason = StopReason::ContextLength;
                             break;
                         }
                     }
@@ -538,7 +633,27 @@ impl InferenceEngine {
         );
 
         debug_assert_eq!(generated_text, self.tokenizer.decode(&generated_tokens));
-        Ok((generated_tokens, generated_text))
+
+        let token_ids_sample: Vec<u32> = generated_tokens
+            .iter()
+            .copied()
+            .take(TOKEN_ID_SAMPLE_LIMIT)
+            .collect();
+
+        Ok(GenerationOutcome {
+            generated_token_ids: generated_tokens,
+            generated_text,
+            prompt_tokens: prompt_tokens.len(),
+            configured_max_tokens: max_tokens,
+            context_length,
+            stop_reason,
+            eos_token_id: eos_id,
+            eos_encountered,
+            token_ids_sample,
+            kv_cache_reset,
+            token_history_reset: true,
+            sampler_is_stateless: sampler_stateless,
+        })
     }
 
     pub fn config(&self) -> &LlamaConfig {
@@ -854,14 +969,14 @@ pub(crate) mod tests {
         engine.set_profiling(true);
         let sampler = crate::sampling::Sampler::greedy();
         let mut streamed = String::new();
-        let (tokens, text) = engine
+        let outcome = engine
             .generate_with_callback("hello", 3, &sampler, |piece| {
                 streamed.push_str(piece);
                 Ok(())
             })
             .unwrap();
-        assert_eq!(tokens.len(), 3);
-        assert_eq!(streamed, text);
+        assert_eq!(outcome.generated_token_ids.len(), 3);
+        assert_eq!(streamed, outcome.generated_text);
 
         let profile = engine.generation_profile();
         assert_eq!(profile.runtime.tokens, 3);
@@ -1826,5 +1941,289 @@ pub(crate) mod tests {
         let (t2, _) = engine2.generate("hello", 4, &sampler).unwrap();
         assert_eq!(t1.len(), 4);
         assert_eq!(t1, t2);
+    }
+
+    // ----- Generation outcome / stop-reason diagnostics (Issue 2) ----------
+
+    #[test]
+    fn outcome_reports_max_tokens_stop_and_state_reset() {
+        let tmp = create_tiny_llama_gguf();
+        let mut engine =
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let sampler = crate::sampling::Sampler::greedy();
+        let outcome = engine
+            .generate_with_callback("hello", 3, &sampler, |_| Ok(()))
+            .unwrap();
+        assert_eq!(outcome.configured_max_tokens, 3);
+        assert_eq!(outcome.generated_token_ids.len(), 3);
+        assert_eq!(outcome.stop_reason, StopReason::MaxTokens);
+        assert_eq!(outcome.eos_token_id, Some(2));
+        assert!(!outcome.eos_encountered);
+        assert!(outcome.kv_cache_reset);
+        assert!(outcome.token_history_reset);
+        assert!(outcome.sampler_is_stateless);
+        assert_eq!(
+            outcome.prompt_tokens,
+            engine.tokenizer.encode("hello", true).len()
+        );
+        assert_eq!(outcome.context_length, engine.config().context_length);
+        assert_eq!(outcome.token_ids_sample.len(), 3);
+        assert!(!outcome.token_ids_sample.contains(&2)); // EOS must not appear
+    }
+
+    #[test]
+    fn greedy_runs_are_deterministic_not_an_error() {
+        let tmp = create_tiny_llama_gguf();
+        let mut engine =
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let sampler = crate::sampling::Sampler::greedy();
+        let a = engine
+            .generate_with_callback("hello", 4, &sampler, |_| Ok(()))
+            .unwrap();
+        let b = engine
+            .generate_with_callback("hello", 4, &sampler, |_| Ok(()))
+            .unwrap();
+        assert_eq!(a.generated_token_ids, b.generated_token_ids);
+        assert_eq!(a.generated_text, b.generated_text);
+        assert_eq!(a.stop_reason, StopReason::MaxTokens);
+        assert_eq!(b.stop_reason, StopReason::MaxTokens);
+        // Both runs report state reset (no leak between runs).
+        assert!(a.kv_cache_reset && b.kv_cache_reset);
+        assert!(a.token_history_reset && b.token_history_reset);
+    }
+
+    #[test]
+    fn outcome_surfaces_eos_metadata_from_tokenizer() {
+        let tmp = create_tiny_llama_gguf();
+        let engine = InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        // The tiny llama fixture sets tokenizer.ggml.eos_token_id = 2.
+        assert_eq!(engine.tokenizer.eos_id, Some(2));
+    }
+
+    #[test]
+    fn outcome_marks_missing_eos_metadata_via_none() {
+        // When GGUF metadata lacks eos_token_id the engine still runs and
+        // reports eos_token_id = None; EOS cannot be encountered because
+        // there is nothing to compare against.
+        use std::io::Write;
+        fn write_string<W: Write>(w: &mut W, s: &str) {
+            w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
+            w.write_all(s.as_bytes()).unwrap();
+        }
+        fn write_u32<W: Write>(w: &mut W, v: u32) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
+        fn write_u64<W: Write>(w: &mut W, v: u64) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
+        fn write_f32<W: Write>(w: &mut W, v: f32) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&11u64.to_le_bytes()); // tensor count
+        buf.extend_from_slice(&15u64.to_le_bytes()); // metadata count (no eos)
+        let mut add_kv = |key: &str, val_type: u32, write_val: Box<dyn FnOnce(&mut Vec<u8>)>| {
+            write_string(&mut buf, key);
+            write_u32(&mut buf, val_type);
+            write_val(&mut buf);
+        };
+        add_kv(
+            "general.architecture",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
+        add_kv("llama.vocab_size", 4, Box::new(|b| write_u32(b, 16)));
+        add_kv("llama.context_length", 4, Box::new(|b| write_u32(b, 32)));
+        add_kv("llama.embedding_length", 4, Box::new(|b| write_u32(b, 8)));
+        add_kv("llama.block_count", 4, Box::new(|b| write_u32(b, 1)));
+        add_kv(
+            "llama.feed_forward_length",
+            4,
+            Box::new(|b| write_u32(b, 16)),
+        );
+        add_kv(
+            "llama.attention.head_count",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.head_count_kv",
+            4,
+            Box::new(|b| write_u32(b, 2)),
+        );
+        add_kv(
+            "llama.attention.layer_norm_rms_epsilon",
+            6,
+            Box::new(|b| write_f32(b, 1e-5)),
+        );
+        add_kv(
+            "llama.rope.freq_base",
+            6,
+            Box::new(|b| write_f32(b, 10000.0)),
+        );
+        add_kv(
+            "tokenizer.ggml.model",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
+        add_kv(
+            "tokenizer.ggml.tokens",
+            9,
+            Box::new(|b| {
+                write_u32(b, 8);
+                write_u64(b, 16);
+                for tok in [
+                    "<unk>", "<s>", "</s>", "▁hello", "▁world", "hello", "world", "!", "▁", "a",
+                    "b", "c", "d", "e", "f", "g",
+                ] {
+                    write_string(b, tok);
+                }
+            }),
+        );
+        add_kv(
+            "tokenizer.ggml.scores",
+            9,
+            Box::new(|b| {
+                write_u32(b, 6);
+                write_u64(b, 16);
+                for _ in 0..16 {
+                    write_f32(b, 0.0);
+                }
+            }),
+        );
+        add_kv(
+            "tokenizer.ggml.token_type",
+            9,
+            Box::new(|b| {
+                write_u32(b, 5);
+                write_u64(b, 16);
+                for t in [2, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] {
+                    write_u32(b, t);
+                }
+            }),
+        );
+        add_kv(
+            "tokenizer.ggml.bos_token_id",
+            4,
+            Box::new(|b| write_u32(b, 1)),
+        );
+        // Intentionally omit eos_token_id to simulate missing metadata.
+
+        // Copy tensor layout from create_tiny_llama_gguf.
+        let tensor_defs = vec![
+            ("token_embd.weight", vec![8u64, 16u64], 0u32),
+            ("output_norm.weight", vec![8], 0),
+            ("blk.0.attn_norm.weight", vec![8], 0),
+            ("blk.0.attn_q.weight", vec![8, 8], 0),
+            ("blk.0.attn_k.weight", vec![8, 8], 0),
+            ("blk.0.attn_v.weight", vec![8, 8], 0),
+            ("blk.0.attn_output.weight", vec![8, 8], 0),
+            ("blk.0.ffn_norm.weight", vec![8], 0),
+            ("blk.0.ffn_gate.weight", vec![8, 16], 0),
+            ("blk.0.ffn_up.weight", vec![8, 16], 0),
+            ("blk.0.ffn_down.weight", vec![16, 8], 0),
+        ];
+        let mut offset = 0u64;
+        for (name, dims, ty) in &tensor_defs {
+            write_string(&mut buf, name);
+            write_u32(&mut buf, dims.len() as u32);
+            for d in dims {
+                write_u64(&mut buf, *d);
+            }
+            write_u32(&mut buf, *ty);
+            write_u64(&mut buf, offset);
+            let elems: u64 = dims.iter().product();
+            offset += elems * 4;
+        }
+        let pos = buf.len() as u64;
+        let aligned = ramforge_core::model::align_offset(pos, 32);
+        buf.extend(vec![0u8; (aligned - pos) as usize]);
+        for _ in 0..16 {
+            for _ in 0..8 {
+                buf.extend_from_slice(&(0.1f32).to_le_bytes());
+            }
+        }
+        for _ in 0..8 {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        for _ in 0..8 {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        for _ in 0..8 * 8 {
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        for _ in 0..8 * 8 {
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        for _ in 0..8 * 8 {
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        for _ in 0..8 * 8 {
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        for _ in 0..8 {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        for _ in 0..16 * 8 {
+            buf.extend_from_slice(&0.1f32.to_le_bytes());
+        }
+        for _ in 0..16 * 8 {
+            buf.extend_from_slice(&0.1f32.to_le_bytes());
+        }
+        for _ in 0..8 * 16 {
+            buf.extend_from_slice(&0.1f32.to_le_bytes());
+        }
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&buf).unwrap();
+        tmp.flush().unwrap();
+
+        // Missing eos_token_id means Tokenizer construction currently fills
+        // eos_id = None. Verify we build the engine without EOS metadata and
+        // that generation reports it explicitly.
+        let gguf = ramforge_core::parse_gguf_file(tmp.path()).unwrap();
+        let tok = ramforge_core::tokenizer::Tokenizer::from_gguf(&gguf).unwrap();
+        assert_eq!(tok.eos_id, None, "fixture must omit eos_token_id");
+
+        let mut engine =
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let sampler = crate::sampling::Sampler::greedy();
+        let outcome = engine
+            .generate_with_callback("hello", 2, &sampler, |_| Ok(()))
+            .unwrap();
+        assert!(outcome.eos_token_id.is_none());
+        assert!(!outcome.eos_encountered);
+        // Without EOS metadata we always stop at max_tokens (or context_length).
+        assert_eq!(outcome.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn second_generation_on_same_engine_reports_clean_reset() {
+        let tmp = create_tiny_llama_gguf();
+        let mut engine =
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
+        let sampler = crate::sampling::Sampler::greedy();
+        let a = engine
+            .generate_with_callback("hello", 2, &sampler, |_| Ok(()))
+            .unwrap();
+        let b = engine
+            .generate_with_callback("hello", 2, &sampler, |_| Ok(()))
+            .unwrap();
+        assert!(a.kv_cache_reset && b.kv_cache_reset);
+        assert!(a.token_history_reset && b.token_history_reset);
+        assert_eq!(a.generated_token_ids, b.generated_token_ids);
+        // No duplicate KV charges after two runs.
+        assert_eq!(
+            engine
+                .budget
+                .allocations()
+                .keys()
+                .filter(|k| k.as_str() == "kv_cache")
+                .count(),
+            1
+        );
     }
 }
