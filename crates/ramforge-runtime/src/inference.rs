@@ -2843,6 +2843,19 @@ mod qwen25_bounded_diagnostic {
         print_logits("second_decode.final_logits", &trace.second_decode.logits);
     }
 
+    fn print_result_norm_checkpoints(result_norm: &[f32]) {
+        const CHECKPOINT_INDICES: [usize; 20] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 31, 32, 63, 64, 127, 128, 255, 256, 511, 512,
+            1023, 1535,
+        ];
+
+        assert!(result_norm.len() > 1535);
+        for &index in &CHECKPOINT_INDICES {
+            println!("result_norm.checkpoint.index = {}", index);
+            println!("result_norm.checkpoint.value = {:?}", result_norm[index]);
+        }
+    }
+
     fn diagnose_q6_k_output_rows(
         engine: &InferenceEngine,
         result_norm: &[f32],
@@ -3312,6 +3325,7 @@ mod qwen25_bounded_diagnostic {
         let trace = run_bounded_trace(&mut engine, &EXPECTED_PROMPT_TOKENS)
             .expect("bounded Qwen2.5 numerical trace");
         print_trace(&trace);
+        print_result_norm_checkpoints(&trace.result_norm);
         diagnose_q6_k_output_rows(&engine, &trace.result_norm)
             .expect("Q6_K output projection row diagnostic");
         diagnose_raw_q6_k_output_rows(&engine)
