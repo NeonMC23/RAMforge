@@ -1719,6 +1719,126 @@ mod tests {
         assert!((y[0] - y_ref[0]).abs() < 1e-3);
     }
 
+    fn make_diagnostic_q4_0_row(blocks: usize) -> Vec<u8> {
+        const SCALES: [u16; 8] = [
+            0x3C00, // 1.0
+            0x3800, // 0.5
+            0x3A00, // 0.75
+            0x4000, // 2.0
+            0xBC00, // -1.0
+            0x3400, // 0.25
+            0x3E00, // 1.5
+            0xB800, // -0.5
+        ];
+
+        let mut row = Vec::with_capacity(blocks * BLOCK_SIZE_Q4_0);
+        for block_index in 0..blocks {
+            let mut quants = [0u8; 16];
+            for (j, quant) in quants.iter_mut().enumerate() {
+                let low = ((j * 5 + block_index * 3 + 1) & 0x0F) as u8;
+                let high = ((j * 7 + block_index * 11 + 9) & 0x0F) as u8;
+                *quant = low | (high << 4);
+            }
+            row.extend_from_slice(&q4_0_test_block(
+                SCALES[block_index % SCALES.len()],
+                quants,
+            ));
+        }
+        row
+    }
+
+    fn make_diagnostic_input(pattern: &str, length: usize) -> Vec<f32> {
+        match pattern {
+            "constant" => vec![1.25; length],
+            "ramp" => (0..length)
+                .map(|index| index as f32 * 0.125 - 2.0)
+                .collect(),
+            "alternating" => (0..length)
+                .map(|index| if index % 2 == 0 { 1.5 } else { -0.75 })
+                .collect(),
+            "pseudo_random" => {
+                let mut state = 0x1234_5678u32;
+                (0..length)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(1_664_525)
+                            .wrapping_add(1_013_904_223);
+                        let unit = (state >> 8) as f32 / 16_777_215.0;
+                        unit * 2.0 - 1.0
+                    })
+                    .collect()
+            }
+            other => panic!("unknown diagnostic input pattern {other}"),
+        }
+    }
+
+    fn compare_q4_0_fused_with_reference(
+        shape: &str,
+        pattern: &str,
+        row_bytes: &[u8],
+        n_elements: usize,
+        x: &[f32],
+    ) {
+        let mut dequantized = vec![0.0f32; n_elements];
+        dequantize_row_q4_0(row_bytes, n_elements, &mut dequantized).unwrap();
+
+        // This is the previous materialization path's scalar accumulation:
+        // dequantized row order and input order are both strictly 0..n-1.
+        let mut reference = 0.0f32;
+        for index in 0..n_elements {
+            reference += dequantized[index] * x[index];
+        }
+
+        let fused = q4_0_row_dot(row_bytes, n_elements / QK4_0, x);
+        let absolute_difference = (fused - reference).abs();
+        let scale = reference.abs().max(fused.abs()).max(1.0);
+        // The fused loop interleaves low/high nibbles while the materialized
+        // reference accumulates the dequantized row linearly. Allow only a
+        // tight f32 accumulation-order difference, not a kernel/layout error.
+        let tolerance = 1.0e-5f32 + 1.0e-6f32 * scale;
+
+        println!(
+            "Q4_0 A/B shape={} pattern={} reference={:?} fused={:?} abs_diff={:?} tolerance={:?}",
+            shape, pattern, reference, fused, absolute_difference, tolerance
+        );
+        assert!(
+            absolute_difference <= tolerance,
+            "Q4_0 fused/reference mismatch: shape={}, pattern={}, reference={:?}, fused={:?}, abs_diff={:?}, tolerance={:?}",
+            shape,
+            pattern,
+            reference,
+            fused,
+            absolute_difference,
+            tolerance
+        );
+    }
+
+    #[test]
+    fn test_q4_0_fused_row_dot_matches_dequantize_reference_patterns_and_qwen_shape() {
+        const PATTERNS: [&str; 4] = ["constant", "ramp", "alternating", "pseudo_random"];
+        assert_eq!(48 * QK4_0, 1536);
+
+        for &(shape, blocks) in &[
+            ("four_blocks", 4usize),
+            ("qwen2_5_projection", 48usize),
+        ] {
+            let n_elements = blocks * QK4_0;
+            let row_bytes = make_diagnostic_q4_0_row(blocks);
+            assert_eq!(row_bytes.len(), blocks * BLOCK_SIZE_Q4_0);
+
+            for pattern in PATTERNS {
+                let x = make_diagnostic_input(pattern, n_elements);
+                compare_q4_0_fused_with_reference(
+                    shape,
+                    pattern,
+                    &row_bytes,
+                    n_elements,
+                    &x,
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_quantized_matvec_q8_0() {
         let d_fp16: u16 = 0x3C00;
