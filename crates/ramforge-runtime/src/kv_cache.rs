@@ -166,35 +166,20 @@ impl KvCache {
     }
 
     /// Read an explicit committed K position range `[start, end)`.
-    pub fn get_k_range(
-        &self,
-        layer: usize,
-        start: usize,
-        end: usize,
-    ) -> Result<&[f32], String> {
+    pub fn get_k_range(&self, layer: usize, start: usize, end: usize) -> Result<&[f32], String> {
         self.validate_read_range(layer, start, end)?;
         let width = self.n_kv_heads * self.head_dim;
         Ok(&self.k_caches[layer][start * width..end * width])
     }
 
     /// Read an explicit committed V position range `[start, end)`.
-    pub fn get_v_range(
-        &self,
-        layer: usize,
-        start: usize,
-        end: usize,
-    ) -> Result<&[f32], String> {
+    pub fn get_v_range(&self, layer: usize, start: usize, end: usize) -> Result<&[f32], String> {
         self.validate_read_range(layer, start, end)?;
         let width = self.n_kv_heads * self.head_dim;
         Ok(&self.v_caches[layer][start * width..end * width])
     }
 
-    fn validate_read_range(
-        &self,
-        layer: usize,
-        start: usize,
-        end: usize,
-    ) -> Result<(), String> {
+    fn validate_read_range(&self, layer: usize, start: usize, end: usize) -> Result<(), String> {
         if layer >= self.n_layers {
             return Err(format!("layer {} out of bounds", layer));
         }

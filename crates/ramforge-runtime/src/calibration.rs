@@ -206,8 +206,7 @@ pub struct CalibrationLimits {
 impl CalibrationLimits {
     pub fn conservative(user: &UserProfile) -> Self {
         let memory = (user.ram_budget_bytes / 32)
-            .max(64 * 1024)
-            .min(8 * 1024 * 1024)
+            .clamp(64 * 1024, 8 * 1024 * 1024)
             .min(user.ram_budget_bytes);
         Self {
             max_memory_bytes: memory,
@@ -1174,7 +1173,7 @@ fn make_quantized_row(format: CalibrationQuantization, elements: usize) -> Optio
             (QK_K, block)
         }
     };
-    if elements == 0 || elements % elements_per_block != 0 {
+    if elements == 0 || !elements.is_multiple_of(elements_per_block) {
         return None;
     }
     let mut row = Vec::with_capacity(elements / elements_per_block * block.len());

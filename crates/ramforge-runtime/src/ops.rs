@@ -15,16 +15,8 @@ pub fn apply_rope(
     n_kv_heads: usize,
     freq_base: f32,
 ) {
-    ramforge_core::compute::rope_reference(
-        q,
-        k,
-        pos,
-        head_dim,
-        n_heads,
-        n_kv_heads,
-        freq_base,
-    )
-    .expect("model RoPE tensors must satisfy their declared dimensions");
+    ramforge_core::compute::rope_reference(q, k, pos, head_dim, n_heads, n_kv_heads, freq_base)
+        .expect("model RoPE tensors must satisfy their declared dimensions");
 }
 
 /// Compute single-token causal attention over cached history plus current K/V.

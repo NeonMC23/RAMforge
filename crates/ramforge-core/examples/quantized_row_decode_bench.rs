@@ -99,12 +99,20 @@ struct BenchResult {
     reallocation_calls: u64,
 }
 
-fn main() {
-    assert!(
-        !cfg!(debug_assertions),
-        "run this microbenchmark with cargo run --release"
-    );
+#[cfg(not(debug_assertions))]
+const _: () = assert!(
+    !cfg!(debug_assertions),
+    "run this microbenchmark with cargo run --release"
+);
 
+#[cfg(debug_assertions)]
+fn require_release_build() {
+    panic!("run this microbenchmark with cargo run --release");
+}
+
+fn main() {
+    #[cfg(debug_assertions)]
+    require_release_build();
     let q4_0 = build_workload(QK4_0, BLOCK_SIZE_Q4_0, make_q4_0_block);
     let q8_0 = build_workload(QK8_0, BLOCK_SIZE_Q8_0, make_q8_0_block);
     let q4_k = build_workload(QK_K, BLOCK_SIZE_Q4_K, make_q4_k_block);
@@ -185,7 +193,7 @@ fn build_workload(
     block_size: usize,
     mut make_block: impl FnMut(usize) -> Vec<u8>,
 ) -> Workload {
-    assert_eq!(ELEMENTS_PER_ROW % elements_per_block, 0);
+    assert!(ELEMENTS_PER_ROW.is_multiple_of(elements_per_block));
     let blocks_per_row = ELEMENTS_PER_ROW / elements_per_block;
     let row_bytes = blocks_per_row * block_size;
     let mut bytes = Vec::with_capacity(ROWS * row_bytes);
@@ -333,7 +341,7 @@ fn dequantize_row_q8_0_reference(
     n_elements: usize,
     out: &mut [f32],
 ) -> Result<(), DataSourceError> {
-    if n_elements % QK8_0 != 0 {
+    if !n_elements.is_multiple_of(QK8_0) {
         return Err(DataSourceError::General(format!(
             "Q8_0 row size {} not divisible by block size {}",
             n_elements, QK8_0
@@ -466,7 +474,7 @@ fn make_q8_k_block(seed: usize) -> Vec<u8> {
         *quant = (((seed * 19 + index * 13) % 127) as i16 - 63) as i8;
         bytes.push(*quant as u8);
     }
-    for group in quants.chunks_exact(16) {
+    for group in quants.as_chunks::<16>().0 {
         let sum: i16 = group.iter().map(|value| *value as i16).sum();
         bytes.extend_from_slice(&sum.to_le_bytes());
     }

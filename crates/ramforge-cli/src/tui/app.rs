@@ -1364,12 +1364,10 @@ impl TuiApp {
                         self.move_menu_up(self.review_config_item_count());
                     }
                 }
-                UiCommand::Down => {
-                    if self.commit_custom_max_tokens().is_ok() {
-                        self.max_tokens_editing = false;
-                        self.max_tokens_edit_backup = None;
-                        self.move_menu_down(self.review_config_item_count());
-                    }
+                UiCommand::Down if self.commit_custom_max_tokens().is_ok() => {
+                    self.max_tokens_editing = false;
+                    self.max_tokens_edit_backup = None;
+                    self.move_menu_down(self.review_config_item_count());
                 }
                 // Left/Right are intentionally ignored while editing (consistent
                 // with other single-line text inputs).
@@ -2127,9 +2125,9 @@ fn phase_to_u64(phase: GenerationPhase) -> u64 {
 fn normalize_memory_input(bytes: u64) -> String {
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
-    if bytes % GIB == 0 {
+    if bytes.is_multiple_of(GIB) {
         format!("{}GiB", bytes / GIB)
-    } else if bytes % MIB == 0 {
+    } else if bytes.is_multiple_of(MIB) {
         format!("{}MiB", bytes / MIB)
     } else {
         format!("{bytes}B")
@@ -2274,9 +2272,11 @@ mod tests {
 
     #[test]
     fn load_plan_requests_exact_path_and_recovers_from_errors() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::LoadPlan;
-        app.load_path_input = "relative/plan.rfp".to_string();
+        let mut app = TuiApp {
+            screen: Screen::LoadPlan,
+            load_path_input: "relative/plan.rfp".to_string(),
+            ..TuiApp::default()
+        };
         assert_eq!(
             app.handle(UiCommand::Enter),
             Some(AppAction::LoadPlan(PathBuf::from("relative/plan.rfp")))
@@ -2337,9 +2337,11 @@ mod tests {
 
     #[test]
     fn loaded_plan_model_context_requests_compatibility_analysis() {
-        let mut app = TuiApp::default();
-        app.model_flow = ModelFlow::LoadedPlan;
-        app.screen = Screen::Analyzing;
+        let mut app = TuiApp {
+            model_flow: ModelFlow::LoadedPlan,
+            screen: Screen::Analyzing,
+            ..TuiApp::default()
+        };
         assert_eq!(
             app.model_path_validation_finished(Ok(())),
             Some(AppAction::AnalyzeLoadedPlan)
@@ -2349,9 +2351,11 @@ mod tests {
 
     #[test]
     fn preference_left_and_right_change_horizontal_options() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Preferences;
-        app.menu_index = 1;
+        let mut app = TuiApp {
+            screen: Screen::Preferences,
+            menu_index: 1,
+            ..TuiApp::default()
+        };
         assert_eq!(app.mode, OperatingMode::BalancedNormal);
         app.handle(UiCommand::Right);
         assert_eq!(app.mode, OperatingMode::MaximumPerformance);
@@ -2362,9 +2366,11 @@ mod tests {
 
     #[test]
     fn preference_text_editing_requires_explicit_enter() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Preferences;
-        app.menu_index = 0;
+        let mut app = TuiApp {
+            screen: Screen::Preferences,
+            menu_index: 0,
+            ..TuiApp::default()
+        };
         assert_eq!(app.ram_input, "1GiB");
         // Navigate to Custom RAM preset first. Starting at index 1 (1 GiB), need 6 Rights.
         for _ in 0..6 {
@@ -2385,10 +2391,12 @@ mod tests {
 
     #[test]
     fn preference_changes_use_existing_profile_contracts_without_clamping() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Preferences;
-        app.ram_input = "2GiB".to_string();
-        app.menu_index = 1;
+        let mut app = TuiApp {
+            screen: Screen::Preferences,
+            ram_input: "2GiB".to_string(),
+            menu_index: 1,
+            ..TuiApp::default()
+        };
         app.handle(UiCommand::Enter);
         assert_eq!(app.mode, OperatingMode::MaximumPerformance);
         app.menu_index = 3; // Analyze (3rd index in non-advanced mode with Test preset)
@@ -2401,12 +2409,14 @@ mod tests {
 
     #[test]
     fn advanced_preferences_are_passed_to_user_profile_validation() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Preferences;
-        app.ram_input = "1GiB".to_string();
-        app.mode = OperatingMode::Advanced;
-        app.advanced_thread_input = "0".to_string();
-        app.menu_index = 8; // Analyze in advanced mode (after Test preset entry)
+        let mut app = TuiApp {
+            screen: Screen::Preferences,
+            ram_input: "1GiB".to_string(),
+            mode: OperatingMode::Advanced,
+            advanced_thread_input: "0".to_string(),
+            menu_index: 8, // Analyze in advanced mode (after Test preset entry)
+            ..TuiApp::default()
+        };
         assert!(app.handle(UiCommand::Enter).is_none());
         assert!(matches!(app.error.as_ref(), Some(TuiError::Input { .. })));
         assert_eq!(app.screen, Screen::Preferences);
@@ -2414,10 +2424,12 @@ mod tests {
 
     #[test]
     fn calibration_selection_is_explicit() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::CalibrationSelect;
-        app.user_profile = Some(UserProfile::new(1024, OperatingMode::BalancedNormal));
-        app.menu_index = 0;
+        let mut app = TuiApp {
+            screen: Screen::CalibrationSelect,
+            user_profile: Some(UserProfile::new(1024, OperatingMode::BalancedNormal)),
+            menu_index: 0,
+            ..TuiApp::default()
+        };
         assert_eq!(app.handle(UiCommand::Enter), Some(AppAction::CreatePlan));
         assert_eq!(
             app.user_profile.as_ref().unwrap().calibration_level,
@@ -2438,8 +2450,10 @@ mod tests {
 
     #[test]
     fn calibration_failure_returns_to_a_structured_error_state() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Calibrating;
+        let mut app = TuiApp {
+            screen: Screen::Calibrating,
+            ..TuiApp::default()
+        };
         app.calibration_finished(
             Err(TuiError::Calibration(CalibrationError::InvalidPlan(
                 "test failure",
@@ -2454,8 +2468,10 @@ mod tests {
 
     #[test]
     fn planner_failure_returns_to_a_structured_error_state() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Analyzing;
+        let mut app = TuiApp {
+            screen: Screen::Analyzing,
+            ..TuiApp::default()
+        };
         app.planning_finished(Err(TuiError::Planning(OrchestrationError::Planning(
             ramforge_runtime::planner::PlannerError::Infeasible(
                 ramforge_runtime::planner::FeasibilityRejection::ModelNotExecutable,
@@ -2467,26 +2483,30 @@ mod tests {
 
     #[test]
     fn incompatible_loaded_plan_cannot_request_compilation() {
-        let mut app = TuiApp::default();
-        app.plan_origin = PlanOrigin::LoadedPlan;
-        app.compatibility_report = Some(PlanCompatibilityReport {
-            state: PlanCompatibility::Incompatible,
-            reasons: Vec::new(),
-        });
-        app.screen = Screen::PlanReview;
+        let mut app = TuiApp {
+            plan_origin: PlanOrigin::LoadedPlan,
+            compatibility_report: Some(PlanCompatibilityReport {
+                state: PlanCompatibility::Incompatible,
+                reasons: Vec::new(),
+            }),
+            screen: Screen::PlanReview,
+            ..TuiApp::default()
+        };
         assert!(app.handle(UiCommand::Enter).is_none());
         assert_eq!(app.screen, Screen::PlanCompatibility);
     }
 
     #[test]
     fn compatible_loaded_plan_requires_explicit_compilation() {
-        let mut app = TuiApp::default();
-        app.plan_origin = PlanOrigin::LoadedPlan;
-        app.compatibility_report = Some(PlanCompatibilityReport {
-            state: PlanCompatibility::Valid,
-            reasons: Vec::new(),
-        });
-        app.screen = Screen::PlanReview;
+        let mut app = TuiApp {
+            plan_origin: PlanOrigin::LoadedPlan,
+            compatibility_report: Some(PlanCompatibilityReport {
+                state: PlanCompatibility::Valid,
+                reasons: Vec::new(),
+            }),
+            screen: Screen::PlanReview,
+            ..TuiApp::default()
+        };
         assert_eq!(app.handle(UiCommand::Enter), Some(AppAction::ValidatePlan));
         assert_eq!(app.screen, Screen::PlanValidation);
         assert!(app.active_runtime.is_none());
@@ -2500,14 +2520,16 @@ mod tests {
 
     #[test]
     fn recalibration_recommendation_never_starts_calibration_automatically() {
-        let mut app = TuiApp::default();
-        app.plan_origin = PlanOrigin::LoadedPlan;
-        app.compatibility_report = Some(PlanCompatibilityReport {
-            state: PlanCompatibility::CompatibleRecalibrationRecommended,
-            reasons: Vec::new(),
-        });
-        app.screen = Screen::PlanCompatibility;
-        app.menu_index = 1;
+        let mut app = TuiApp {
+            plan_origin: PlanOrigin::LoadedPlan,
+            compatibility_report: Some(PlanCompatibilityReport {
+                state: PlanCompatibility::CompatibleRecalibrationRecommended,
+                reasons: Vec::new(),
+            }),
+            screen: Screen::PlanCompatibility,
+            menu_index: 1,
+            ..TuiApp::default()
+        };
         assert!(app.handle(UiCommand::Enter).is_none());
         assert_eq!(app.screen, Screen::Preferences);
         assert!(app.calibration_result.is_none());
@@ -2515,8 +2537,10 @@ mod tests {
 
     #[test]
     fn compiler_failure_stays_recoverable_on_plan_review() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::PlanValidation;
+        let mut app = TuiApp {
+            screen: Screen::PlanValidation,
+            ..TuiApp::default()
+        };
         app.plan_validation_finished(Err(TuiError::Input {
             field: "compiler",
             message: "rejected".to_string(),
@@ -2527,8 +2551,10 @@ mod tests {
 
     #[test]
     fn successful_validation_does_not_generate_and_preserves_explicit_save() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::PlanValidation;
+        let mut app = TuiApp {
+            screen: Screen::PlanValidation,
+            ..TuiApp::default()
+        };
         app.plan_validation_finished(Ok(()));
         assert_eq!(app.screen, Screen::PlanValid);
         assert!(app.active_runtime.is_none());
@@ -2545,8 +2571,10 @@ mod tests {
 
     #[test]
     fn runtime_activation_is_an_explicit_post_validation_action() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::PlanValid;
+        let mut app = TuiApp {
+            screen: Screen::PlanValid,
+            ..TuiApp::default()
+        };
         assert_eq!(
             app.handle(UiCommand::Enter),
             Some(AppAction::ActivateRuntime)
@@ -2557,8 +2585,10 @@ mod tests {
 
     #[test]
     fn runtime_construction_errors_are_distinct_and_recoverable() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::RuntimeActivation;
+        let mut app = TuiApp {
+            screen: Screen::RuntimeActivation,
+            ..TuiApp::default()
+        };
         app.runtime_activation_finished(Err(TuiError::RuntimeConstruction(
             OrchestrationError::RuntimeSourceUnavailable,
         )));
@@ -2573,8 +2603,10 @@ mod tests {
 
     #[test]
     fn prompt_submission_is_the_only_generation_action() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::GenerationInput;
+        let mut app = TuiApp {
+            screen: Screen::GenerationInput,
+            ..TuiApp::default()
+        };
         assert_eq!(app.active_input_context(), InputContext::GenerationPrompt);
         app.handle(UiCommand::Character('H'));
         app.handle(UiCommand::Character('i'));
@@ -2594,9 +2626,11 @@ mod tests {
 
     #[test]
     fn generation_result_and_error_paths_are_recoverable() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::GenerationRunning;
-        app.prompt_input = "submitted".to_string();
+        let mut app = TuiApp {
+            screen: Screen::GenerationRunning,
+            prompt_input: "submitted".to_string(),
+            ..TuiApp::default()
+        };
         app.generation_finished(Ok(SinglePromptResult {
             generated_text: "result".to_string(),
             generated_token_count: 1,
@@ -2622,8 +2656,10 @@ mod tests {
 
     #[test]
     fn persistence_failure_stays_on_save_screen() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::SavePlan;
+        let mut app = TuiApp {
+            screen: Screen::SavePlan,
+            ..TuiApp::default()
+        };
         app.save_finished(Err(TuiError::DestinationExists(PathBuf::from(
             "/tmp/existing.rfp",
         ))));
@@ -2644,9 +2680,11 @@ mod tests {
     // ----- Custom max-tokens input (Issue 1) ---------------------------------
 
     fn review_config_with_custom_max_tokens() -> TuiApp {
-        let mut app = TuiApp::default();
-        app.screen = Screen::ReviewConfig;
-        app.menu_index = 0;
+        let mut app = TuiApp {
+            screen: Screen::ReviewConfig,
+            menu_index: 0,
+            ..TuiApp::default()
+        };
         app.lab.max_tokens_preset_index = MaxTokensPreset::ALL.len() - 1; // Custom
         app.lab.max_tokens = 0;
         app.lab.custom_max_tokens_input.clear();

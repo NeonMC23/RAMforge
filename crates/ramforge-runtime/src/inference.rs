@@ -673,6 +673,7 @@ pub(crate) mod tests {
 
     /// Boxed value-writer closure used by the GGUF test fixtures.
     type WriteValFn<'a> = Box<dyn FnMut(&mut Vec<u8>) + 'a>;
+    type WriteOnceValFn = Box<dyn FnOnce(&mut Vec<u8>)>;
 
     // Create a tiny deterministic LLaMA model for testing
     // Config: vocab 16, n_embd 8, n_layer 1, n_head 2, head_dim 4, ffn 16
@@ -1737,7 +1738,7 @@ pub(crate) mod tests {
     /// Mirrors the intended semantics: ggml [in,out] matvec, bias AFTER
     /// projection, half-split RoPE, causal attention over KV history,
     /// SwiGLU FFN, RMSNorm. Returns the post-output-norm hidden state.
-    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    #[allow(clippy::too_many_arguments)]
     fn reference_forward_biased(
         w: &Qwen2FixtureWeights,
         token: usize,
@@ -1749,38 +1750,56 @@ pub(crate) mod tests {
         let rmsnorm = |x: &[f32], wt: &[f32]| -> Vec<f32> {
             let mean: f32 = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
             let rms = (mean + eps).sqrt();
-            (0..x.len()).map(|i| x[i] / rms * wt[i]).collect()
+            x.iter()
+                .zip(wt)
+                .map(|(value, weight)| *value / rms * *weight)
+                .collect()
         };
         let matvec = |wt: &[f32], in_dim: usize, out_dim: usize, x: &[f32]| -> Vec<f32> {
-            (0..out_dim)
-                .map(|o| (0..in_dim).map(|i| wt[o * in_dim + i] * x[i]).sum())
+            wt.chunks_exact(in_dim)
+                .take(out_dim)
+                .map(|row| {
+                    row.iter()
+                        .zip(x)
+                        .map(|(weight, value)| *weight * *value)
+                        .sum()
+                })
                 .collect()
         };
         let rope_ref = |x: &mut [f32], pos: usize| {
             let dim = 4;
-            for head in 0..2 {
-                let off = head * dim;
-                for j in 0..dim / 2 {
+            for head in x.chunks_exact_mut(dim) {
+                let (first_half, second_half) = head.split_at_mut(dim / 2);
+                for (j, (first, second)) in first_half
+                    .iter_mut()
+                    .zip(second_half.iter_mut())
+                    .enumerate()
+                {
                     let theta = 10000.0f32.powf(-2.0 * j as f32 / dim as f32) * pos as f32;
                     let (c, s) = (theta.cos(), theta.sin());
-                    let (a, b) = (x[off + j], x[off + j + dim / 2]);
-                    x[off + j] = a * c - b * s;
-                    x[off + j + dim / 2] = a * s + b * c;
+                    let (a, b) = (*first, *second);
+                    *first = a * c - b * s;
+                    *second = a * s + b * c;
                 }
             }
         };
 
-        let mut hidden: Vec<f32> = (0..8).map(|i| w.embd[token * 8 + i]).collect();
+        let mut hidden = w.embd[token * 8..(token + 1) * 8].to_vec();
         let tmp = rmsnorm(&hidden, &w.attn_norm);
 
         // Projections + biases (bias added AFTER matvec, before RoPE).
         let mut q = matvec(&w.attn_q, 8, 8, &tmp);
         let mut k = matvec(&w.attn_k, 8, 8, &tmp);
         let mut v = matvec(&w.attn_v, 8, 8, &tmp);
-        for i in 0..8 {
-            q[i] += w.bias_q[i];
-            k[i] += w.bias_k[i];
-            v[i] += w.bias_v[i];
+        for (((q, k), v), (bias_q, (bias_k, bias_v))) in q
+            .iter_mut()
+            .zip(k.iter_mut())
+            .zip(v.iter_mut())
+            .zip(w.bias_q.iter().zip(w.bias_k.iter().zip(&w.bias_v)))
+        {
+            *q += *bias_q;
+            *k += *bias_k;
+            *v += *bias_v;
         }
         rope_ref(&mut q, pos);
         rope_ref(&mut k, pos);
@@ -1802,35 +1821,45 @@ pub(crate) mod tests {
             }
         };
         let mut attn_out = vec![0.0f32; 8];
-        for h in 0..2 {
-            let qh = &q[h * 4..h * 4 + 4];
+        for (head, (qh, output)) in q
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(attn_out.as_chunks_mut::<4>().0.iter_mut())
+            .enumerate()
+        {
             let mut scores = vec![0.0f32; total];
-            for p in 0..total {
+            for (p, score) in scores.iter_mut().enumerate() {
                 let kp = k_at(p);
-                let kh = &kp[h * 4..h * 4 + 4];
-                scores[p] = (0..4).map(|i| qh[i] * kh[i]).sum::<f32>() / 2.0; // sqrt(4)
+                let kh = &kp[head * 4..head * 4 + 4];
+                *score = qh
+                    .iter()
+                    .zip(kh)
+                    .map(|(query, key)| query * key)
+                    .sum::<f32>()
+                    / 2.0; // sqrt(4)
             }
             let max = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
             let mut sum = 0.0;
-            for s in scores.iter_mut() {
-                *s = (*s - max).exp();
-                sum += *s;
+            for score in &mut scores {
+                *score = (*score - max).exp();
+                sum += *score;
             }
-            for s in scores.iter_mut() {
-                *s /= sum;
+            for score in &mut scores {
+                *score /= sum;
             }
-            for p in 0..total {
+            for (p, &score) in scores.iter().enumerate() {
                 let vp = v_at(p);
-                let vh = &vp[h * 4..h * 4 + 4];
-                for i in 0..4 {
-                    attn_out[h * 4 + i] += scores[p] * vh[i];
+                let vh = &vp[head * 4..head * 4 + 4];
+                for (output, value) in output.iter_mut().zip(vh) {
+                    *output += score * *value;
                 }
             }
         }
 
         let attn_proj = matvec(&w.attn_output, 8, 8, &attn_out);
-        for i in 0..8 {
-            hidden[i] += attn_proj[i];
+        for (hidden_value, projection) in hidden.iter_mut().zip(&attn_proj) {
+            *hidden_value += *projection;
         }
 
         // KV history append happens after use (matches model ordering:
@@ -1842,13 +1871,12 @@ pub(crate) mod tests {
         let gate = matvec(&w.ffn_gate, 8, 16, &tmp);
         let up = matvec(&w.ffn_up, 8, 16, &tmp);
         let mut gu = vec![0.0f32; 16];
-        for i in 0..16 {
-            let gv = gate[i];
-            gu[i] = (gv / (1.0 + (-gv).exp())) * up[i];
+        for ((output, &gate_value), &up_value) in gu.iter_mut().zip(&gate).zip(&up) {
+            *output = (gate_value / (1.0 + (-gate_value).exp())) * up_value;
         }
         let ffn_out = matvec(&w.ffn_down, 16, 8, &gu);
-        for i in 0..8 {
-            hidden[i] += ffn_out[i];
+        for (hidden_value, output) in hidden.iter_mut().zip(&ffn_out) {
+            *hidden_value += *output;
         }
 
         rmsnorm(&hidden, &w.output_norm)
@@ -1905,19 +1933,26 @@ pub(crate) mod tests {
 
                     let ref_hidden =
                         reference_forward_biased(&w, token, pos, &mut ref_k, &mut ref_v, eps);
-                    for i in 0..8 {
+                    for (i, (&actual, &expected)) in hidden.iter().zip(&ref_hidden).enumerate() {
                         assert!(
-                            (hidden[i] - ref_hidden[i]).abs() < eps_ln,
+                            (actual - expected).abs() < eps_ln,
                             "pos {} hidden[{}]: model {} vs reference {}",
                             pos,
                             i,
-                            hidden[i],
-                            ref_hidden[i]
+                            actual,
+                            expected
                         );
                     }
-                    for (o, &logit) in logits.iter().enumerate() {
-                        let ref_logit: f32 =
-                            (0..8).map(|i| w.embd[o * 8 + i] * ref_hidden[i]).sum();
+                    for (o, (&logit, weights)) in logits
+                        .iter()
+                        .zip(w.embd.as_chunks::<8>().0.iter())
+                        .enumerate()
+                    {
+                        let ref_logit: f32 = weights
+                            .iter()
+                            .zip(&ref_hidden)
+                            .map(|(weight, hidden)| *weight * *hidden)
+                            .sum();
                         assert!(
                             (logit - ref_logit).abs() < eps_ln,
                             "pos {} logit[{}]: model {} vs reference {}",
@@ -1954,14 +1989,14 @@ pub(crate) mod tests {
         embd: Vec<f32>,
         output_norm: Vec<f32>,
         attn_norm: Vec<f32>,
-        attn_q: Vec<f32>,        // ggml [n_embd, q_dim]
-        attn_k: Vec<f32>,        // ggml [n_embd, kv_dim]
-        attn_v: Vec<f32>,        // ggml [n_embd, kv_dim]
-        attn_output: Vec<f32>,   // ggml [q_dim, n_embd]
+        attn_q: Vec<f32>,      // ggml [n_embd, q_dim]
+        attn_k: Vec<f32>,      // ggml [n_embd, kv_dim]
+        attn_v: Vec<f32>,      // ggml [n_embd, kv_dim]
+        attn_output: Vec<f32>, // ggml [q_dim, n_embd]
         ffn_norm: Vec<f32>,
-        ffn_gate: Vec<f32>,      // ggml [n_embd, ffn]
-        ffn_up: Vec<f32>,        // ggml [n_embd, ffn]
-        ffn_down: Vec<f32>,      // ggml [ffn, n_embd]
+        ffn_gate: Vec<f32>, // ggml [n_embd, ffn]
+        ffn_up: Vec<f32>,   // ggml [n_embd, ffn]
+        ffn_down: Vec<f32>, // ggml [ffn, n_embd]
     }
 
     const GQA_N_EMBD: usize = 8;
@@ -1975,7 +2010,9 @@ pub(crate) mod tests {
         let w = |n: usize, seed: u32| -> Vec<f32> {
             (0..n)
                 .map(|i| {
-                    let s = seed.wrapping_mul(2654435761).wrapping_add((i as u32).wrapping_mul(224682251));
+                    let s = seed
+                        .wrapping_mul(2654435761)
+                        .wrapping_add((i as u32).wrapping_mul(224682251));
                     0.01 * ((s as i32 & 0x3f) as f32 - 20.0)
                 })
                 .collect()
@@ -2000,9 +2037,15 @@ pub(crate) mod tests {
             w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
             w.write_all(s.as_bytes()).unwrap();
         }
-        fn write_u32<W: Write>(w: &mut W, v: u32) { w.write_all(&v.to_le_bytes()).unwrap(); }
-        fn write_u64<W: Write>(w: &mut W, v: u64) { w.write_all(&v.to_le_bytes()).unwrap(); }
-        fn write_f32<W: Write>(w: &mut W, v: f32) { w.write_all(&v.to_le_bytes()).unwrap(); }
+        fn write_u32<W: Write>(w: &mut W, v: u32) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
+        fn write_u64<W: Write>(w: &mut W, v: u64) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
+        fn write_f32<W: Write>(w: &mut W, v: f32) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
 
         let w = gqa_weights();
         let mut buf = Vec::new();
@@ -2016,54 +2059,139 @@ pub(crate) mod tests {
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
         };
-        add_kv("general.architecture", 8, Box::new(|b| write_string(b, "qwen2")));
-        add_kv("qwen2.vocab_size", 4, Box::new(|b| write_u32(b, GQA_VOCAB as u32)));
+        add_kv(
+            "general.architecture",
+            8,
+            Box::new(|b| write_string(b, "qwen2")),
+        );
+        add_kv(
+            "qwen2.vocab_size",
+            4,
+            Box::new(|b| write_u32(b, GQA_VOCAB as u32)),
+        );
         add_kv("qwen2.context_length", 4, Box::new(|b| write_u32(b, 64)));
-        add_kv("qwen2.embedding_length", 4, Box::new(|b| write_u32(b, GQA_N_EMBD as u32)));
+        add_kv(
+            "qwen2.embedding_length",
+            4,
+            Box::new(|b| write_u32(b, GQA_N_EMBD as u32)),
+        );
         add_kv("qwen2.block_count", 4, Box::new(|b| write_u32(b, 1)));
-        add_kv("qwen2.feed_forward_length", 4, Box::new(|b| write_u32(b, GQA_FFN as u32)));
-        add_kv("qwen2.attention.head_count", 4, Box::new(|b| write_u32(b, GQA_N_HEADS as u32)));
-        add_kv("qwen2.attention.head_count_kv", 4, Box::new(|b| write_u32(b, GQA_N_KV_HEADS as u32)));
-        add_kv("qwen2.attention.layer_norm_rms_epsilon", 6, Box::new(|b| write_f32(b, 1e-5)));
-        add_kv("qwen2.rope.freq_base", 6, Box::new(|b| write_f32(b, 10000.0)));
-        add_kv("tokenizer.ggml.model", 8, Box::new(|b| write_string(b, "llama")));
-        add_kv("tokenizer.ggml.tokens", 9, Box::new(|b| {
-            write_u32(b, 8); write_u64(b, GQA_VOCAB as u64);
-            for tok in ["<unk>","<s>","</s>","▁hi","▁there","a","b","c","d","e","f","g","h","i","j","k"] {
-                write_string(b, tok);
-            }
-        }));
-        add_kv("tokenizer.ggml.scores", 9, Box::new(|b| {
-            write_u32(b, 6); write_u64(b, GQA_VOCAB as u64);
-            for _ in 0..GQA_VOCAB { write_f32(b, 0.0); }
-        }));
-        add_kv("tokenizer.ggml.token_type", 9, Box::new(|b| {
-            write_u32(b, 4); write_u64(b, GQA_VOCAB as u64);
-            for t in [2u32,3,3,1,1,1,1,1,1,1,1,1,1,1,1,1] { write_u32(b, t); }
-        }));
-        add_kv("tokenizer.ggml.bos_token_id", 4, Box::new(|b| write_u32(b, 1)));
+        add_kv(
+            "qwen2.feed_forward_length",
+            4,
+            Box::new(|b| write_u32(b, GQA_FFN as u32)),
+        );
+        add_kv(
+            "qwen2.attention.head_count",
+            4,
+            Box::new(|b| write_u32(b, GQA_N_HEADS as u32)),
+        );
+        add_kv(
+            "qwen2.attention.head_count_kv",
+            4,
+            Box::new(|b| write_u32(b, GQA_N_KV_HEADS as u32)),
+        );
+        add_kv(
+            "qwen2.attention.layer_norm_rms_epsilon",
+            6,
+            Box::new(|b| write_f32(b, 1e-5)),
+        );
+        add_kv(
+            "qwen2.rope.freq_base",
+            6,
+            Box::new(|b| write_f32(b, 10000.0)),
+        );
+        add_kv(
+            "tokenizer.ggml.model",
+            8,
+            Box::new(|b| write_string(b, "llama")),
+        );
+        add_kv(
+            "tokenizer.ggml.tokens",
+            9,
+            Box::new(|b| {
+                write_u32(b, 8);
+                write_u64(b, GQA_VOCAB as u64);
+                for tok in [
+                    "<unk>", "<s>", "</s>", "▁hi", "▁there", "a", "b", "c", "d", "e", "f", "g",
+                    "h", "i", "j", "k",
+                ] {
+                    write_string(b, tok);
+                }
+            }),
+        );
+        add_kv(
+            "tokenizer.ggml.scores",
+            9,
+            Box::new(|b| {
+                write_u32(b, 6);
+                write_u64(b, GQA_VOCAB as u64);
+                for _ in 0..GQA_VOCAB {
+                    write_f32(b, 0.0);
+                }
+            }),
+        );
+        add_kv(
+            "tokenizer.ggml.token_type",
+            9,
+            Box::new(|b| {
+                write_u32(b, 4);
+                write_u64(b, GQA_VOCAB as u64);
+                for t in [2u32, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] {
+                    write_u32(b, t);
+                }
+            }),
+        );
+        add_kv(
+            "tokenizer.ggml.bos_token_id",
+            4,
+            Box::new(|b| write_u32(b, 1)),
+        );
 
         let q_dim = GQA_N_HEADS * GQA_HEAD_DIM;
         let kv_dim = GQA_N_KV_HEADS * GQA_HEAD_DIM;
         let defs: Vec<(&str, Vec<u64>)> = vec![
-            ("token_embd.weight", vec![GQA_N_EMBD as u64, GQA_VOCAB as u64]),
+            (
+                "token_embd.weight",
+                vec![GQA_N_EMBD as u64, GQA_VOCAB as u64],
+            ),
             ("output_norm.weight", vec![GQA_N_EMBD as u64]),
             ("blk.0.attn_norm.weight", vec![GQA_N_EMBD as u64]),
             ("blk.0.attn_q.weight", vec![GQA_N_EMBD as u64, q_dim as u64]),
-            ("blk.0.attn_k.weight", vec![GQA_N_EMBD as u64, kv_dim as u64]),
-            ("blk.0.attn_v.weight", vec![GQA_N_EMBD as u64, kv_dim as u64]),
-            ("blk.0.attn_output.weight", vec![q_dim as u64, GQA_N_EMBD as u64]),
+            (
+                "blk.0.attn_k.weight",
+                vec![GQA_N_EMBD as u64, kv_dim as u64],
+            ),
+            (
+                "blk.0.attn_v.weight",
+                vec![GQA_N_EMBD as u64, kv_dim as u64],
+            ),
+            (
+                "blk.0.attn_output.weight",
+                vec![q_dim as u64, GQA_N_EMBD as u64],
+            ),
             ("blk.0.ffn_norm.weight", vec![GQA_N_EMBD as u64]),
-            ("blk.0.ffn_gate.weight", vec![GQA_N_EMBD as u64, GQA_FFN as u64]),
-            ("blk.0.ffn_up.weight", vec![GQA_N_EMBD as u64, GQA_FFN as u64]),
-            ("blk.0.ffn_down.weight", vec![GQA_FFN as u64, GQA_N_EMBD as u64]),
+            (
+                "blk.0.ffn_gate.weight",
+                vec![GQA_N_EMBD as u64, GQA_FFN as u64],
+            ),
+            (
+                "blk.0.ffn_up.weight",
+                vec![GQA_N_EMBD as u64, GQA_FFN as u64],
+            ),
+            (
+                "blk.0.ffn_down.weight",
+                vec![GQA_FFN as u64, GQA_N_EMBD as u64],
+            ),
         ];
 
         let mut offset = 0u64;
         for (name, dims) in &defs {
             write_string(&mut buf, name);
             write_u32(&mut buf, dims.len() as u32);
-            for d in dims { write_u64(&mut buf, *d); }
+            for d in dims {
+                write_u64(&mut buf, *d);
+            }
             write_u32(&mut buf, 0);
             write_u64(&mut buf, offset);
             let elems: u64 = dims.iter().product();
@@ -2074,7 +2202,11 @@ pub(crate) mod tests {
         let aligned = ramforge_core::model::align_offset(pos, 32);
         buf.extend(vec![0u8; (aligned - pos) as usize]);
 
-        let mut push = |data: &[f32]| { for v in data { buf.extend_from_slice(&v.to_le_bytes()); } };
+        let mut push = |data: &[f32]| {
+            for v in data {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        };
         push(&w.embd);
         push(&w.output_norm);
         push(&w.attn_norm);
@@ -2103,22 +2235,38 @@ pub(crate) mod tests {
         eps: f32,
     ) -> Vec<f32> {
         let rmsnorm = |x: &[f32], wt: &[f32]| -> Vec<f32> {
-            let mean: f32 = x.iter().map(|v| v*v).sum::<f32>() / x.len() as f32;
+            let mean: f32 = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
             let rms = (mean + eps).sqrt();
-            (0..x.len()).map(|i| x[i]/rms*wt[i]).collect()
+            x.iter()
+                .zip(wt)
+                .map(|(value, weight)| *value / rms * *weight)
+                .collect()
         };
         let matvec = |wt: &[f32], in_dim: usize, out_dim: usize, x: &[f32]| -> Vec<f32> {
-            (0..out_dim).map(|o| (0..in_dim).map(|i| wt[o*in_dim+i]*x[i]).sum()).collect()
+            wt.chunks_exact(in_dim)
+                .take(out_dim)
+                .map(|row| {
+                    row.iter()
+                        .zip(x)
+                        .map(|(weight, value)| *weight * *value)
+                        .sum()
+                })
+                .collect()
         };
         let rope_single = |x: &mut [f32], pos: usize| {
             let dim = GQA_HEAD_DIM;
-            let half = dim/2;
-            for j in 0..half {
-                let theta = 10000.0f32.powf(-2.0*j as f32/dim as f32) * pos as f32;
-                let (c,s) = (theta.cos(), theta.sin());
-                let a = x[j]; let b = x[j+half];
-                x[j] = a*c - b*s;
-                x[j+half] = a*s + b*c;
+            let half = dim / 2;
+            let (first_half, second_half) = x.split_at_mut(half);
+            for (j, (first, second)) in first_half
+                .iter_mut()
+                .zip(second_half.iter_mut())
+                .enumerate()
+            {
+                let theta = 10000.0f32.powf(-2.0 * j as f32 / dim as f32) * pos as f32;
+                let (c, s) = (theta.cos(), theta.sin());
+                let (a, b) = (*first, *second);
+                *first = a * c - b * s;
+                *second = a * s + b * c;
             }
         };
 
@@ -2126,50 +2274,79 @@ pub(crate) mod tests {
         let n_heads = GQA_N_HEADS;
         let n_kv = GQA_N_KV_HEADS;
         let hd = GQA_HEAD_DIM;
-        let kv_dim = n_kv*hd;
-        let q_dim = n_heads*hd;
+        let kv_dim = n_kv * hd;
+        let q_dim = n_heads * hd;
 
-        let mut hidden: Vec<f32> = (0..n_embd).map(|i| w.embd[token*n_embd+i]).collect();
+        let mut hidden = w.embd[token * n_embd..(token + 1) * n_embd].to_vec();
         let tmp = rmsnorm(&hidden, &w.attn_norm);
 
         let mut q = matvec(&w.attn_q, n_embd, q_dim, &tmp);
         let mut k = matvec(&w.attn_k, n_embd, kv_dim, &tmp);
         let v = matvec(&w.attn_v, n_embd, kv_dim, &tmp);
 
-        for h in 0..n_heads { rope_single(&mut q[h*hd..(h+1)*hd], pos); }
-        for h in 0..n_kv   { rope_single(&mut k[h*hd..(h+1)*hd], pos); }
+        for head in q.chunks_exact_mut(hd) {
+            rope_single(head, pos);
+        }
+        for head in k.chunks_exact_mut(hd) {
+            rope_single(head, pos);
+        }
 
-        let total = pos+1;
+        let total = pos + 1;
         let k_at = |p: usize| -> &[f32] {
-            if p < pos { &k_hist[p*kv_dim..p*kv_dim+kv_dim] } else { &k }
+            if p < pos {
+                &k_hist[p * kv_dim..p * kv_dim + kv_dim]
+            } else {
+                &k
+            }
         };
         let v_at = |p: usize| -> &[f32] {
-            if p < pos { &v_hist[p*kv_dim..p*kv_dim+kv_dim] } else { &v }
+            if p < pos {
+                &v_hist[p * kv_dim..p * kv_dim + kv_dim]
+            } else {
+                &v
+            }
         };
 
         let mut attn_out = vec![0.0f32; q_dim];
-        for h in 0..n_heads {
+        for (h, (qh, output)) in q
+            .chunks_exact(hd)
+            .zip(attn_out.chunks_exact_mut(hd))
+            .enumerate()
+        {
             let kv_h = h * n_kv / n_heads;
-            let qh = &q[h*hd..(h+1)*hd];
             let mut scores = vec![0.0f32; total];
-            for p in 0..total {
+            for (p, score) in scores.iter_mut().enumerate() {
                 let kp = k_at(p);
-                let kh = &kp[kv_h*hd..(kv_h+1)*hd];
-                scores[p] = (0..hd).map(|i| qh[i]*kh[i]).sum::<f32>()/(hd as f32).sqrt();
+                let kh = &kp[kv_h * hd..(kv_h + 1) * hd];
+                *score = qh
+                    .iter()
+                    .zip(kh)
+                    .map(|(query, key)| query * key)
+                    .sum::<f32>()
+                    / (hd as f32).sqrt();
             }
-            let max = scores.iter().fold(f32::NEG_INFINITY, |a,&b| a.max(b));
+            let max = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
             let mut sum = 0.0;
-            for s in scores.iter_mut() { *s = (*s-max).exp(); sum += *s; }
-            for s in scores.iter_mut() { *s /= sum; }
-            for p in 0..total {
+            for score in &mut scores {
+                *score = (*score - max).exp();
+                sum += *score;
+            }
+            for score in &mut scores {
+                *score /= sum;
+            }
+            for (p, &score) in scores.iter().enumerate() {
                 let vp = v_at(p);
-                let vh = &vp[kv_h*hd..(kv_h+1)*hd];
-                for i in 0..hd { attn_out[h*hd+i] += scores[p]*vh[i]; }
+                let vh = &vp[kv_h * hd..(kv_h + 1) * hd];
+                for (output, value) in output.iter_mut().zip(vh) {
+                    *output += score * *value;
+                }
             }
         }
 
         let proj = matvec(&w.attn_output, q_dim, n_embd, &attn_out);
-        for i in 0..n_embd { hidden[i] += proj[i]; }
+        for (hidden_value, projection) in hidden.iter_mut().zip(&proj) {
+            *hidden_value += *projection;
+        }
 
         k_hist.extend_from_slice(&k);
         v_hist.extend_from_slice(&v);
@@ -2178,12 +2355,13 @@ pub(crate) mod tests {
         let gate = matvec(&w.ffn_gate, n_embd, GQA_FFN, &tmp);
         let up = matvec(&w.ffn_up, n_embd, GQA_FFN, &tmp);
         let mut gu = vec![0.0; GQA_FFN];
-        for i in 0..GQA_FFN {
-            let g = gate[i];
-            gu[i] = (g/(1.0+(-g).exp())) * up[i];
+        for ((output, &gate_value), &up_value) in gu.iter_mut().zip(&gate).zip(&up) {
+            *output = (gate_value / (1.0 + (-gate_value).exp())) * up_value;
         }
         let out = matvec(&w.ffn_down, GQA_FFN, n_embd, &gu);
-        for i in 0..n_embd { hidden[i] += out[i]; }
+        for (hidden_value, output) in hidden.iter_mut().zip(&out) {
+            *hidden_value += *output;
+        }
 
         rmsnorm(&hidden, &w.output_norm)
     }
@@ -2192,7 +2370,7 @@ pub(crate) mod tests {
     fn test_gqa_forward_matches_scalar_reference() {
         let tmp = create_gqa_gguf();
         let mut engine =
-            InferenceEngine::new(tmp.path().to_str().unwrap(), 8*1024*1024).unwrap();
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
         assert_eq!(engine.config().head_count, GQA_N_HEADS);
         assert_eq!(engine.config().head_count_kv, GQA_N_KV_HEADS);
         assert_eq!(engine.config().head_dim, GQA_HEAD_DIM);
@@ -2209,7 +2387,8 @@ pub(crate) mod tests {
             engine.config().head_count_kv,
             engine.config().head_dim,
             4,
-        ).unwrap();
+        )
+        .unwrap();
         let budget: &mut MemoryBudget = &mut engine.budget;
         let mut stats = crate::residency::ResidencyStats::new(engine.model.total_weight_bytes);
         let model = &engine.model;
@@ -2219,41 +2398,64 @@ pub(crate) mod tests {
         let mut logits = vec![0.0f32; GQA_VOCAB];
         const EPS: f32 = 2e-4;
 
-        for (token, pos) in [(3usize,0usize),(7usize,1usize),(11usize,2usize)] {
-            budget.with_temp("tmp:hidden", (GQA_N_EMBD*4) as u64, |budget| {
-                let mut hidden = vec![0.0f32; GQA_N_EMBD];
-                model.forward_single_streaming(
-                    token as u32, pos,
-                    &mut kv, backend, ds, budget, &mut stats,
-                    &mut hidden,
-                )?;
-                model.compute_logits(&hidden, backend, ds, budget, &mut logits)?;
+        for (token, pos) in [(3usize, 0usize), (7usize, 1usize), (11usize, 2usize)] {
+            budget
+                .with_temp("tmp:hidden", (GQA_N_EMBD * 4) as u64, |budget| {
+                    let mut hidden = vec![0.0f32; GQA_N_EMBD];
+                    model.forward_single_streaming(
+                        token as u32,
+                        pos,
+                        &mut kv,
+                        backend,
+                        ds,
+                        budget,
+                        &mut stats,
+                        &mut hidden,
+                    )?;
+                    model.compute_logits(&hidden, backend, ds, budget, &mut logits)?;
 
-                let ref_h = reference_forward_gqa(&w, token, pos, &mut ref_k, &mut ref_v, eps);
-                for i in 0..GQA_N_EMBD {
-                    assert!(
-                        (hidden[i]-ref_h[i]).abs() < EPS,
-                        "pos {} hidden[{}]: model {} vs ref {}", pos, i, hidden[i], ref_h[i]
-                    );
-                }
-                for o in 0..GQA_VOCAB {
-                    let ref_logit: f32 = (0..GQA_N_EMBD).map(|i| w.embd[o*GQA_N_EMBD+i]*ref_h[i]).sum();
-                    assert!(
-                        (logits[o]-ref_logit).abs() < EPS,
-                        "pos {} logit[{}]: model {} vs ref {}", pos, o, logits[o], ref_logit
-                    );
-                }
-                Ok::<(), String>(())
-            }).unwrap();
-            assert_eq!(kv.seq_len(), pos+1, "seq_len after pos {}", pos);
-            assert_eq!(kv.get_k(0).len(), (pos+1)*GQA_N_KV_HEADS*GQA_HEAD_DIM);
+                    let ref_h = reference_forward_gqa(&w, token, pos, &mut ref_k, &mut ref_v, eps);
+                    for (i, (&actual, &expected)) in hidden.iter().zip(&ref_h).enumerate() {
+                        assert!(
+                            (actual - expected).abs() < EPS,
+                            "pos {} hidden[{}]: model {} vs ref {}",
+                            pos,
+                            i,
+                            actual,
+                            expected
+                        );
+                    }
+                    for (o, (&logit, weights)) in logits
+                        .iter()
+                        .zip(w.embd.as_chunks::<GQA_N_EMBD>().0.iter())
+                        .enumerate()
+                    {
+                        let ref_logit: f32 = weights
+                            .iter()
+                            .zip(&ref_h)
+                            .map(|(weight, hidden)| *weight * *hidden)
+                            .sum();
+                        assert!(
+                            (logit - ref_logit).abs() < EPS,
+                            "pos {} logit[{}]: model {} vs ref {}",
+                            pos,
+                            o,
+                            logit,
+                            ref_logit
+                        );
+                    }
+                    Ok::<(), String>(())
+                })
+                .unwrap();
+            assert_eq!(kv.seq_len(), pos + 1, "seq_len after pos {}", pos);
+            assert_eq!(kv.get_k(0).len(), (pos + 1) * GQA_N_KV_HEADS * GQA_HEAD_DIM);
         }
 
         let mut engine2 =
-            InferenceEngine::new(tmp.path().to_str().unwrap(), 8*1024*1024).unwrap();
+            InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
         let sampler = crate::sampling::Sampler::greedy();
-        let (t1,_) = engine2.generate("hi",5,&sampler).unwrap();
-        let (t2,_) = engine2.generate("hi",5,&sampler).unwrap();
+        let (t1, _) = engine2.generate("hi", 5, &sampler).unwrap();
+        let (t2, _) = engine2.generate("hi", 5, &sampler).unwrap();
         assert_eq!(t1.len(), 5);
         assert_eq!(t1, t2);
     }
@@ -2340,7 +2542,7 @@ pub(crate) mod tests {
         buf.extend_from_slice(&3u32.to_le_bytes());
         buf.extend_from_slice(&11u64.to_le_bytes()); // tensor count
         buf.extend_from_slice(&15u64.to_le_bytes()); // metadata count (no eos)
-        let mut add_kv = |key: &str, val_type: u32, write_val: Box<dyn FnOnce(&mut Vec<u8>)>| {
+        let mut add_kv = |key: &str, val_type: u32, write_val: WriteOnceValFn| {
             write_string(&mut buf, key);
             write_u32(&mut buf, val_type);
             write_val(&mut buf);
@@ -2545,8 +2747,8 @@ pub(crate) mod tests {
 
 #[cfg(test)]
 mod autoregressive_invariants {
-    use super::*;
     use super::tests::create_tiny_llama_gguf;
+    use super::*;
 
     // ---------- Autoregressive decode KV/position invariants ----------
     //
@@ -2586,26 +2788,45 @@ mod autoregressive_invariants {
         let prompt = "hi";
         let prompt_tokens = engine.tokenizer.encode(prompt, true);
         let n = prompt_tokens.len();
-        assert!(n >= 1, "prompt must tokenize to at least one token (got {})", n);
+        assert!(
+            n >= 1,
+            "prompt must tokenize to at least one token (got {})",
+            n
+        );
 
         let mut kv = crate::kv_cache::KvCache::new(
-            n_layers, n_kv_heads, head_dim, /*max_seq_len=*/ n + 8,
-        ).unwrap();
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            /*max_seq_len=*/ n + 8,
+        )
+        .unwrap();
 
         let mut hidden = vec![0.0f32; n_embd];
         for (pos, &tid) in prompt_tokens.iter().enumerate() {
             // Before-forward snapshot: seq_len must equal pos.
             assert_eq!(
-                kv.seq_len(), pos,
+                kv.seq_len(),
+                pos,
                 "before prompt forward pos={}, kv.seq_len() must be pos",
                 pos,
             );
-            model.forward_single_streaming(
-                tid, pos, &mut kv, backend, ds, budget, &mut stats, &mut hidden,
-            ).unwrap();
+            model
+                .forward_single_streaming(
+                    tid,
+                    pos,
+                    &mut kv,
+                    backend,
+                    ds,
+                    budget,
+                    &mut stats,
+                    &mut hidden,
+                )
+                .unwrap();
             // After forward: seq_len incremented by one.
             assert_eq!(
-                kv.seq_len(), pos + 1,
+                kv.seq_len(),
+                pos + 1,
                 "after prompt forward pos={}, kv.seq_len() must be pos+1",
                 pos,
             );
@@ -2614,12 +2835,16 @@ mod autoregressive_invariants {
                 assert_eq!(
                     kv.get_k(li).len(),
                     (pos + 1) * kv_dim,
-                    "layer {} K length wrong after prompt pos={}", li, pos,
+                    "layer {} K length wrong after prompt pos={}",
+                    li,
+                    pos,
                 );
                 assert_eq!(
                     kv.get_v(li).len(),
                     (pos + 1) * kv_dim,
-                    "layer {} V length wrong after prompt pos={}", li, pos,
+                    "layer {} V length wrong after prompt pos={}",
+                    li,
+                    pos,
                 );
             }
         }
@@ -2631,26 +2856,38 @@ mod autoregressive_invariants {
             let pos = n + step;
             assert_eq!(kv.seq_len(), pos, "before decode step {}", step);
 
-            model.compute_logits(&hidden, backend, ds, budget, &mut logits).unwrap();
+            model
+                .compute_logits(&hidden, backend, ds, budget, &mut logits)
+                .unwrap();
             let next = crate::sampling::Sampler::greedy().sample(&logits);
 
             // Feed the sampled token forward at position `pos`.
-            model.forward_single_streaming(
-                next, pos, &mut kv, backend, ds, budget, &mut stats, &mut hidden,
-            ).unwrap();
+            model
+                .forward_single_streaming(
+                    next,
+                    pos,
+                    &mut kv,
+                    backend,
+                    ds,
+                    budget,
+                    &mut stats,
+                    &mut hidden,
+                )
+                .unwrap();
             assert_eq!(kv.seq_len(), pos + 1, "after decode step {}", step);
             for li in 0..n_layers {
                 assert_eq!(kv.get_k(li).len(), (pos + 1) * kv_dim);
                 assert_eq!(kv.get_v(li).len(), (pos + 1) * kv_dim);
             }
-            // Decode consumed exactly the previously sampled token
-            // (recorded here for diagnostic; no cross-step duplication).
-            if let Some(prev) = last_token {
-                assert!(
-                    true, // no hard equality assertion: repeats aren't a bug in this test
-                    "step {} fed token {} (previous {})", step, next, prev,
-                );
-            }
+            // Every sampled token must be a valid vocabulary index before it
+            // can become the next decode input. Repeated tokens are valid.
+            assert!(
+                next < model.config.vocab_size as u32,
+                "step {} sampled invalid token {} (previous {:?})",
+                step,
+                next,
+                last_token,
+            );
             last_token = Some(next);
         }
     }
@@ -2667,19 +2904,20 @@ mod autoregressive_invariants {
         let mut engine =
             InferenceEngine::new(tmp.path().to_str().unwrap(), 8 * 1024 * 1024).unwrap();
         let sampler = crate::sampling::Sampler::greedy();
-        // Use a prompt whose encoding is a single known token so we can
-        // assert the first generated id is NOT that token (unless greedy
-        // legitimately chooses it, which we do not hard-assert).
+        // Use an empty text prompt whose required BOS token is the single
+        // prompt token, so the first decode position is unambiguous. The
+        // sampled token may legitimately equal BOS, which we do not reject.
         let outcome = engine
-            .generate_with_callback("x", 3, &sampler, |_| Ok(()))
+            .generate_with_callback("", 3, &sampler, |_| Ok(()))
             .unwrap();
         assert_eq!(outcome.prompt_tokens, 1);
         assert_eq!(outcome.generated_token_ids.len(), 3);
-        // After the run the engine must have cleared its transient KV
-        // allocation back to zero (kv_cache is released at end of run).
+        // A successful run keeps the KV cache and its matching charge for
+        // explicit reuse/reset by the next generation call.
+        assert!(engine.kv_cache.is_some());
         assert!(
-            !engine.budget.allocations().contains_key("kv_cache"),
-            "kv_cache charge must be released after a generation run"
+            engine.budget.allocations().contains_key("kv_cache"),
+            "successful generation must retain its KV cache charge"
         );
     }
 }
@@ -2705,26 +2943,27 @@ mod qwen25_bounded_diagnostic {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     const RAW_PROMPT: &str = "hi, what's 2+2=?";
-    const EXPECTED_PROMPT_TOKENS: [u32; 9] =
-        [6023, 11, 1128, 594, 220, 17, 10, 17, 19884];
+    const EXPECTED_PROMPT_TOKENS: [u32; 9] = [6023, 11, 1128, 594, 220, 17, 10, 17, 19884];
     const TRACE_DECODE_STEPS: usize = 2;
     const QWEN25_LAYER_COUNT: usize = 28;
     static LAYER_HIDDEN_EMISSIONS: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn qwen25_layer_hook_dispatch_typechecks_without_model() {
-        type LayerHookDispatch = for<'model, 'kv, 'backend, 'data, 'budget, 'stats, 'hidden> fn(
-            &'model StreamingLlamaModel,
-            u32,
-            usize,
-            &'kv mut KvCache,
-            &'backend CpuBackend,
-            &'data GgufDataSource,
-            &'budget mut MemoryBudget,
-            &'stats mut ResidencyStats,
-            &'hidden mut [f32],
-            fn(usize, &[f32]),
-        ) -> Result<(), String>;
+        type LayerHookDispatch =
+            for<'model, 'kv, 'backend, 'data, 'budget, 'stats, 'hidden> fn(
+                &'model StreamingLlamaModel,
+                u32,
+                usize,
+                &'kv mut KvCache,
+                &'backend CpuBackend,
+                &'data GgufDataSource,
+                &'budget mut MemoryBudget,
+                &'stats mut ResidencyStats,
+                &'hidden mut [f32],
+                fn(usize, &[f32]),
+            )
+                -> Result<(), String>;
 
         let _dispatch: LayerHookDispatch =
             StreamingLlamaModel::forward_single_streaming_with_layer_hook::<CpuBackend>;
@@ -2838,10 +3077,19 @@ mod qwen25_bounded_diagnostic {
         println!("prompt.positions = {:?}", trace.prompt_positions);
         print_numeric("prompt.final_hidden", &trace.final_prompt_hidden);
         print_logits("prompt.final_logits", &trace.final_prompt_logits);
-        println!("prompt.first_generated_token = {}", trace.first_generated_token);
+        println!(
+            "prompt.first_generated_token = {}",
+            trace.first_generated_token
+        );
 
-        println!("first_decode.input_token_id = {}", trace.first_decode.input_token_id);
-        println!("first_decode.position_id = {}", trace.first_decode.position_id);
+        println!(
+            "first_decode.input_token_id = {}",
+            trace.first_decode.input_token_id
+        );
+        println!(
+            "first_decode.position_id = {}",
+            trace.first_decode.position_id
+        );
         println!(
             "first_decode.kv_seq_len_before = {}",
             trace.first_decode.kv_seq_len_before
@@ -2852,10 +3100,19 @@ mod qwen25_bounded_diagnostic {
         );
         print_numeric("first_decode.final_hidden", &trace.first_decode.hidden);
         print_logits("first_decode.final_logits", &trace.first_decode.logits);
-        println!("first_decode.second_generated_token = {}", trace.second_generated_token);
+        println!(
+            "first_decode.second_generated_token = {}",
+            trace.second_generated_token
+        );
 
-        println!("second_decode.input_token_id = {}", trace.second_decode.input_token_id);
-        println!("second_decode.position_id = {}", trace.second_decode.position_id);
+        println!(
+            "second_decode.input_token_id = {}",
+            trace.second_decode.input_token_id
+        );
+        println!(
+            "second_decode.position_id = {}",
+            trace.second_decode.position_id
+        );
         println!(
             "second_decode.kv_seq_len_before = {}",
             trace.second_decode.kv_seq_len_before
@@ -2870,8 +3127,7 @@ mod qwen25_bounded_diagnostic {
 
     fn print_result_norm_checkpoints(result_norm: &[f32]) {
         const CHECKPOINT_INDICES: [usize; 20] = [
-            0, 1, 2, 3, 4, 5, 6, 7, 31, 32, 63, 64, 127, 128, 255, 256, 511, 512,
-            1023, 1535,
+            0, 1, 2, 3, 4, 5, 6, 7, 31, 32, 63, 64, 127, 128, 255, 256, 511, 512, 1023, 1535,
         ];
 
         assert!(result_norm.len() > 1535);
@@ -2916,10 +3172,7 @@ mod qwen25_bounded_diagnostic {
     ) -> Result<(), String> {
         const N_EMBD: usize = 1536;
         const VOCAB_SIZE: usize = 151_936;
-        const ROW_IDS_AND_REFERENCE: [(usize, f64); 2] = [
-            (59, 20.24774933),
-            (220, 19.75674248),
-        ];
+        const ROW_IDS_AND_REFERENCE: [(usize, f64); 2] = [(59, 20.24774933), (220, 19.75674248)];
 
         assert_eq!(result_norm.len(), N_EMBD);
         let descriptor = engine
@@ -2928,7 +3181,10 @@ mod qwen25_bounded_diagnostic {
             .map_err(|error| format!("output.weight descriptor lookup failed: {error}"))?
             .clone();
         assert_eq!(descriptor.ggml_type, GgmlType::Q6_K);
-        assert_eq!(descriptor.dimensions.as_slice(), &[N_EMBD as u64, VOCAB_SIZE as u64]);
+        assert_eq!(
+            descriptor.dimensions.as_slice(),
+            &[N_EMBD as u64, VOCAB_SIZE as u64]
+        );
 
         let blocks_per_row = N_EMBD / QK_K;
         let row_bytes = blocks_per_row * BLOCK_SIZE_Q6_K;
@@ -2963,12 +3219,14 @@ mod qwen25_bounded_diagnostic {
             assert_eq!(row.len(), row_bytes);
 
             let mut dequantized = [0.0f32; N_EMBD];
-            quant::dequantize_row_q6_k(&row, N_EMBD, &mut dequantized)
-                .map_err(|error| format!("Q6_K dequantization failed for row {}: {}", row_id, error))?;
-            let mut dequantized_dot = 0.0f32;
-            for index in 0..N_EMBD {
-                dequantized_dot += dequantized[index] * result_norm[index];
-            }
+            quant::dequantize_row_q6_k(&row, N_EMBD, &mut dequantized).map_err(|error| {
+                format!("Q6_K dequantization failed for row {}: {}", row_id, error)
+            })?;
+            let dequantized_dot: f32 = dequantized
+                .iter()
+                .zip(result_norm)
+                .map(|(weight, value)| *weight * *value)
+                .sum();
 
             // matvec_q6_k with a one-row [out, in] shape reaches the existing
             // fused q6_k_row_dot implementation without exposing or changing
@@ -2991,10 +3249,7 @@ mod qwen25_bounded_diagnostic {
                 "output_projection.dequantized_abs_error = {:?}",
                 dequantized_abs_error
             );
-            println!(
-                "output_projection.fused_abs_error = {:?}",
-                fused_abs_error
-            );
+            println!("output_projection.fused_abs_error = {:?}", fused_abs_error);
         }
         Ok(())
     }
@@ -3029,13 +3284,22 @@ mod qwen25_bounded_diagnostic {
             .clone();
         assert_eq!(descriptor.name, "output.weight");
         assert_eq!(descriptor.ggml_type, GgmlType::Q6_K);
-        assert_eq!(descriptor.dimensions.as_slice(), &[N_EMBD as u64, VOCAB_SIZE as u64]);
-        assert_eq!(descriptor.byte_length, Some((VOCAB_SIZE * ROW_BYTES) as u64));
+        assert_eq!(
+            descriptor.dimensions.as_slice(),
+            &[N_EMBD as u64, VOCAB_SIZE as u64]
+        );
+        assert_eq!(
+            descriptor.byte_length,
+            Some((VOCAB_SIZE * ROW_BYTES) as u64)
+        );
         assert_eq!(N_EMBD / QK_K, 6);
         assert_eq!((N_EMBD / QK_K) * BLOCK_SIZE_Q6_K, ROW_BYTES);
 
         let data_start_offset = engine.data_source.model().data_start_offset;
-        println!("output_projection.raw_q6k.tensor_name = {}", descriptor.name);
+        println!(
+            "output_projection.raw_q6k.tensor_name = {}",
+            descriptor.name
+        );
         println!(
             "output_projection.raw_q6k.ggml_type = {}",
             descriptor.ggml_type.name()
@@ -3080,11 +3344,7 @@ mod qwen25_bounded_diagnostic {
 
             let row = engine
                 .data_source
-                .read_tensor_range_by_descriptor(
-                    &descriptor,
-                    row_offset as u64,
-                    ROW_BYTES as u64,
-                )
+                .read_tensor_range_by_descriptor(&descriptor, row_offset as u64, ROW_BYTES as u64)
                 .map_err(|error| {
                     format!(
                         "failed to read output.weight row {} at offset {}: {}",
@@ -3093,22 +3353,21 @@ mod qwen25_bounded_diagnostic {
                 })?;
             assert_eq!(row.len(), ROW_BYTES);
 
-            let first_block = quant::BlockQ6K::from_bytes(&row[..BLOCK_SIZE_Q6_K])
-                .map_err(|error| format!("failed to decode row {} first Q6_K block: {}", row_id, error))?;
+            let first_block =
+                quant::BlockQ6K::from_bytes(&row[..BLOCK_SIZE_Q6_K]).map_err(|error| {
+                    format!(
+                        "failed to decode row {} first Q6_K block: {}",
+                        row_id, error
+                    )
+                })?;
             let d_bits = u16::from_le_bytes([row[208], row[209]]);
             let mut first_block_decoded = [0.0f32; QK_K];
             first_block.dequantize(&mut first_block_decoded);
             let digest = fnv1a64(&row);
 
             println!("output_projection.raw_q6k.row_id = {}", row_id);
-            println!(
-                "output_projection.raw_q6k.byte_offset = {}",
-                row_offset
-            );
-            println!(
-                "output_projection.raw_q6k.byte_length = {}",
-                row.len()
-            );
+            println!("output_projection.raw_q6k.byte_offset = {}", row_offset);
+            println!("output_projection.raw_q6k.byte_length = {}", row.len());
             println!(
                 "output_projection.raw_q6k.absolute_file_offset = {}",
                 absolute_file_offset
@@ -3117,9 +3376,7 @@ mod qwen25_bounded_diagnostic {
                 "output_projection.raw_q6k.absolute_data_offset = {}",
                 absolute_data_offset
             );
-            println!(
-                "output_projection.raw_q6k.fnv1a64 = 0x{digest:016x}"
-            );
+            println!("output_projection.raw_q6k.fnv1a64 = 0x{digest:016x}");
             println!(
                 "output_projection.raw_q6k.first32_hex = {}",
                 hex_bytes(&row[..32])
@@ -3136,9 +3393,7 @@ mod qwen25_bounded_diagnostic {
                 "output_projection.raw_q6k.first_block.scales = {:?}",
                 first_block.scales
             );
-            println!(
-                "output_projection.raw_q6k.first_block.d_f16_bits = 0x{d_bits:04x}"
-            );
+            println!("output_projection.raw_q6k.first_block.d_f16_bits = 0x{d_bits:04x}");
             println!(
                 "output_projection.raw_q6k.first_block.d_f32 = {:?}",
                 first_block.d
@@ -3198,7 +3453,10 @@ mod qwen25_bounded_diagnostic {
             n_layers, QWEN25_LAYER_COUNT,
             "Qwen2.5 layer checkpoint requires 28 layers"
         );
-        assert_eq!(n_embd, 1536, "Qwen2.5 layer checkpoint requires embedding size 1536");
+        assert_eq!(
+            n_embd, 1536,
+            "Qwen2.5 layer checkpoint requires embedding size 1536"
+        );
 
         // Match the normal generation lifetime: initial KV capacity equals the
         // prompt length, then grows only when the first/second decode needs it.
@@ -3256,13 +3514,7 @@ mod qwen25_bounded_diagnostic {
         let result_norm = hidden.clone();
         let final_prompt_hidden = summarize(&hidden);
         let mut logits = vec![0.0f32; vocab_size];
-        model.compute_logits(
-            &hidden,
-            backend,
-            data_source,
-            budget,
-            &mut logits,
-        )?;
+        model.compute_logits(&hidden, backend, data_source, budget, &mut logits)?;
         let final_prompt_logits = summarize_logits(&logits);
         let sampler = Sampler::greedy();
         let first_generated_token = sampler.sample(&logits);
@@ -3270,12 +3522,7 @@ mod qwen25_bounded_diagnostic {
         // Boundary 2: feed the first greedy token at position N.
         let first_position_id = prompt_len;
         let first_kv_before = kv_cache.seq_len();
-        ensure_trace_capacity(
-            &mut kv_cache,
-            first_kv_before + 1,
-            needed_len,
-            budget,
-        )?;
+        ensure_trace_capacity(&mut kv_cache, first_kv_before + 1, needed_len, budget)?;
         model.forward_single_streaming(
             first_generated_token,
             first_position_id,
@@ -3288,25 +3535,14 @@ mod qwen25_bounded_diagnostic {
         )?;
         let first_kv_after = kv_cache.seq_len();
         let first_hidden = summarize(&hidden);
-        model.compute_logits(
-            &hidden,
-            backend,
-            data_source,
-            budget,
-            &mut logits,
-        )?;
+        model.compute_logits(&hidden, backend, data_source, budget, &mut logits)?;
         let first_logits = summarize_logits(&logits);
         let second_generated_token = sampler.sample(&logits);
 
         // Boundary 3: feed the second greedy token at position N+1.
         let second_position_id = prompt_len + 1;
         let second_kv_before = kv_cache.seq_len();
-        ensure_trace_capacity(
-            &mut kv_cache,
-            second_kv_before + 1,
-            needed_len,
-            budget,
-        )?;
+        ensure_trace_capacity(&mut kv_cache, second_kv_before + 1, needed_len, budget)?;
         model.forward_single_streaming(
             second_generated_token,
             second_position_id,
@@ -3319,13 +3555,7 @@ mod qwen25_bounded_diagnostic {
         )?;
         let second_kv_after = kv_cache.seq_len();
         let second_hidden = summarize(&hidden);
-        model.compute_logits(
-            &hidden,
-            backend,
-            data_source,
-            budget,
-            &mut logits,
-        )?;
+        model.compute_logits(&hidden, backend, data_source, budget, &mut logits)?;
         let second_logits = summarize_logits(&logits);
 
         let trace = BoundedTrace {
@@ -3383,15 +3613,8 @@ mod qwen25_bounded_diagnostic {
 
         // One CPU thread is intentional: it removes parallel-dispatch
         // differences while retaining the normal Q4_0 execution path.
-        let runtime_config = RuntimeConfig::new(
-            1,
-            ram_budget_bytes,
-            false,
-            0,
-            true,
-            true,
-        )
-        .expect("valid one-thread diagnostic runtime configuration");
+        let runtime_config = RuntimeConfig::new(1, ram_budget_bytes, false, 0, true, true)
+            .expect("valid one-thread diagnostic runtime configuration");
         let mut engine = InferenceEngine::new_with_runtime_config(&model_path, runtime_config)
             .expect("load Qwen2.5 Q4_0 diagnostic model");
 
@@ -3411,7 +3634,6 @@ mod qwen25_bounded_diagnostic {
         print_result_norm_checkpoints(&trace.result_norm);
         diagnose_q6_k_output_rows(&engine, &trace.result_norm)
             .expect("Q6_K output projection row diagnostic");
-        diagnose_raw_q6_k_output_rows(&engine)
-            .expect("raw Q6_K output projection row diagnostic");
+        diagnose_raw_q6_k_output_rows(&engine).expect("raw Q6_K output projection row diagnostic");
     }
 }

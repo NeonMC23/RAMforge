@@ -870,9 +870,9 @@ pub fn matvec_q4_0_row_range(
         )));
     }
     let row_count = row_count.unwrap_or(out_dim - row_start);
-    let row_end = row_start.checked_add(row_count).ok_or_else(|| {
-        DataSourceError::General("Q4_0 row range overflow".to_string())
-    })?;
+    let row_end = row_start
+        .checked_add(row_count)
+        .ok_or_else(|| DataSourceError::General("Q4_0 row range overflow".to_string()))?;
     if row_end > out_dim || y.len() != row_count {
         return Err(DataSourceError::General(format!(
             "Q4_0 row range {}..{} requires local y length {}, got {} for out_dim {}",
@@ -1168,9 +1168,9 @@ pub fn matvec_q6_k_row_range(
         )));
     }
     let row_count = row_count.unwrap_or(out_dim - row_start);
-    let row_end = row_start.checked_add(row_count).ok_or_else(|| {
-        DataSourceError::General("Q6_K row range overflow".to_string())
-    })?;
+    let row_end = row_start
+        .checked_add(row_count)
+        .ok_or_else(|| DataSourceError::General("Q6_K row range overflow".to_string()))?;
     if row_end > out_dim || y.len() != row_count {
         return Err(DataSourceError::General(format!(
             "Q6_K row range {}..{} requires local y length {}, got {} for out_dim {}",
@@ -1765,10 +1765,7 @@ mod tests {
                 let high = ((j * 7 + block_index * 11 + 9) & 0x0F) as u8;
                 *quant = low | (high << 4);
             }
-            row.extend_from_slice(&q4_0_test_block(
-                SCALES[block_index % SCALES.len()],
-                quants,
-            ));
+            row.extend_from_slice(&q4_0_test_block(SCALES[block_index % SCALES.len()], quants));
         }
         row
     }
@@ -1786,9 +1783,7 @@ mod tests {
                 let mut state = 0x1234_5678u32;
                 (0..length)
                     .map(|_| {
-                        state = state
-                            .wrapping_mul(1_664_525)
-                            .wrapping_add(1_013_904_223);
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                         let unit = (state >> 8) as f32 / 16_777_215.0;
                         unit * 2.0 - 1.0
                     })
@@ -1844,23 +1839,14 @@ mod tests {
         const PATTERNS: [&str; 4] = ["constant", "ramp", "alternating", "pseudo_random"];
         assert_eq!(48 * QK4_0, 1536);
 
-        for &(shape, blocks) in &[
-            ("four_blocks", 4usize),
-            ("qwen2_5_projection", 48usize),
-        ] {
+        for &(shape, blocks) in &[("four_blocks", 4usize), ("qwen2_5_projection", 48usize)] {
             let n_elements = blocks * QK4_0;
             let row_bytes = make_diagnostic_q4_0_row(blocks);
             assert_eq!(row_bytes.len(), blocks * BLOCK_SIZE_Q4_0);
 
             for pattern in PATTERNS {
                 let x = make_diagnostic_input(pattern, n_elements);
-                compare_q4_0_fused_with_reference(
-                    shape,
-                    pattern,
-                    &row_bytes,
-                    n_elements,
-                    &x,
-                );
+                compare_q4_0_fused_with_reference(shape, pattern, &row_bytes, n_elements, &x);
             }
         }
     }
@@ -2001,10 +1987,7 @@ mod tests {
         let mut raw = Vec::new();
         for row in 0..3 {
             raw.extend_from_slice(&0x3c00u16.to_le_bytes());
-            raw.extend(std::iter::repeat_n(
-                (0x88u8).wrapping_add(row as u8),
-                16,
-            ));
+            raw.extend(std::iter::repeat_n((0x88u8).wrapping_add(row as u8), 16));
         }
         let x = vec![1.0f32; QK4_0];
         let mut full = vec![0.0f32; 3];

@@ -648,12 +648,11 @@ impl PersistedExecutionPlan {
                 PlanReasonCode::CalibrationObservationsApplied
                     | PlanReasonCode::CalibrationNotRequested
                     | PlanReasonCode::CalibrationNotApplicable
-            ) {
-                if calibration_reason.replace(reason.code).is_some() {
-                    return Err(PlanPersistenceError::InvalidPlan {
-                        field: "multiple calibration reason codes",
-                    });
-                }
+            ) && calibration_reason.replace(reason.code).is_some()
+            {
+                return Err(PlanPersistenceError::InvalidPlan {
+                    field: "multiple calibration reason codes",
+                });
             }
         }
         let calibration_reason = calibration_reason.ok_or(PlanPersistenceError::InvalidPlan {

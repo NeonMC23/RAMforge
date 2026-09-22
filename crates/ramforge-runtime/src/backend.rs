@@ -181,7 +181,10 @@ impl ComputeBackend for CpuBackend {
         let out_dim = w_shape[1];
 
         let required_weights = in_dim.checked_mul(out_dim).ok_or_else(|| {
-            format!("backend matvec shape size overflow for ggml layout {:?}", w_shape)
+            format!(
+                "backend matvec shape size overflow for ggml layout {:?}",
+                w_shape
+            )
         })?;
         if x.len() != in_dim || y.len() != out_dim || w.len() < required_weights {
             return Err(format!(

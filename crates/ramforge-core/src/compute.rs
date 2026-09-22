@@ -45,14 +45,19 @@ impl MatrixShape {
         Self { input, output }
     }
 
-    pub fn validate(&self, weights_len: usize, x_len: usize, y_len: usize) -> Result<(), ComputeError> {
+    pub fn validate(
+        &self,
+        weights_len: usize,
+        x_len: usize,
+        y_len: usize,
+    ) -> Result<(), ComputeError> {
         let expected_weights = self
             .input
             .checked_mul(self.output)
             .ok_or_else(|| ComputeError("matrix weight size overflow".to_string()))?;
         if weights_len != expected_weights || x_len != self.input || y_len != self.output {
             return Err(ComputeError(format!(
-                "matvec arity/shape mismatch: shape [input={}, output={}] requires weights exactly {}, x {}, y {}; got weights {}, x {}, y {}",
+                "matvec arity mismatch: shape [input={}, output={}] requires weights exactly {}, x {}, y {}; got weights {}, x {}, y {}",
                 self.input,
                 self.output,
                 expected_weights,
@@ -290,7 +295,9 @@ pub fn rms_norm_reference(
         )));
     }
     if !epsilon.is_finite() || epsilon < 0.0 {
-        return Err(ComputeError("RMSNorm epsilon must be finite and non-negative".to_string()));
+        return Err(ComputeError(
+            "RMSNorm epsilon must be finite and non-negative".to_string(),
+        ));
     }
     let mut sum_squares = 0.0f32;
     for &value in input {
@@ -336,11 +343,7 @@ pub fn silu_reference(input: &[f32], output: &mut [f32]) -> Result<(), ComputeEr
 
 /// SwiGLU reference: `SiLU(gate) * up`, with both inputs and output
 /// materialized in the caller's buffers.
-pub fn swiglu_reference(
-    gate: &[f32],
-    up: &[f32],
-    output: &mut [f32],
-) -> Result<(), ComputeError> {
+pub fn swiglu_reference(gate: &[f32], up: &[f32], output: &mut [f32]) -> Result<(), ComputeError> {
     validate_elementwise(gate, up, output)?;
     for index in 0..gate.len() {
         let value = gate[index];
@@ -351,7 +354,9 @@ pub fn swiglu_reference(
 
 pub fn softmax_reference(values: &mut [f32]) -> Result<(), ComputeError> {
     if values.is_empty() {
-        return Err(ComputeError("softmax requires a non-empty vector".to_string()));
+        return Err(ComputeError(
+            "softmax requires a non-empty vector".to_string(),
+        ));
     }
     let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
@@ -360,7 +365,9 @@ pub fn softmax_reference(values: &mut [f32]) -> Result<(), ComputeError> {
         sum += *value;
     }
     if !sum.is_finite() || sum == 0.0 {
-        return Err(ComputeError("softmax normalization is not finite".to_string()));
+        return Err(ComputeError(
+            "softmax normalization is not finite".to_string(),
+        ));
     }
     for value in values.iter_mut() {
         *value /= sum;
@@ -381,13 +388,19 @@ pub fn rope_reference(
     theta: f32,
 ) -> Result<(), ComputeError> {
     if head_dim == 0 || !head_dim.is_multiple_of(2) {
-        return Err(ComputeError("RoPE head dimension must be non-zero and even".to_string()));
+        return Err(ComputeError(
+            "RoPE head dimension must be non-zero and even".to_string(),
+        ));
     }
     if query_heads == 0 || kv_heads == 0 {
-        return Err(ComputeError("RoPE requires non-zero query and KV head counts".to_string()));
+        return Err(ComputeError(
+            "RoPE requires non-zero query and KV head counts".to_string(),
+        ));
     }
     if !theta.is_finite() || theta <= 0.0 {
-        return Err(ComputeError("RoPE frequency base must be finite and positive".to_string()));
+        return Err(ComputeError(
+            "RoPE frequency base must be finite and positive".to_string(),
+        ));
     }
     let q_width = query_heads
         .checked_mul(head_dim)
@@ -406,10 +419,18 @@ pub fn rope_reference(
         )));
     }
     for head in 0..query_heads {
-        rope_head(&mut q[head * head_dim..(head + 1) * head_dim], position, theta);
+        rope_head(
+            &mut q[head * head_dim..(head + 1) * head_dim],
+            position,
+            theta,
+        );
     }
     for head in 0..kv_heads {
-        rope_head(&mut k[head * head_dim..(head + 1) * head_dim], position, theta);
+        rope_head(
+            &mut k[head * head_dim..(head + 1) * head_dim],
+            position,
+            theta,
+        );
     }
     Ok(())
 }
@@ -530,8 +551,13 @@ mod tests {
     fn f32_matvec_uses_explicit_input_output_shape() {
         let weights = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut output = [0.0; 2];
-        matvec_f32_reference(&weights, MatrixShape::new(3, 2), &[1.0, 1.0, 1.0], &mut output)
-            .unwrap();
+        matvec_f32_reference(
+            &weights,
+            MatrixShape::new(3, 2),
+            &[1.0, 1.0, 1.0],
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(output, [6.0, 15.0]);
     }
 
@@ -613,17 +639,13 @@ mod tests {
                 *byte = 0x11u8.wrapping_add(row as u8);
             }
         }
-        let q4_x = (0..32).map(|index| index as f32 * 0.03125).collect::<Vec<_>>();
+        let q4_x = (0..32)
+            .map(|index| index as f32 * 0.03125)
+            .collect::<Vec<_>>();
         let mut q4_reference = vec![0.0f32; 3];
         let mut q4_optimized = vec![0.0f32; 3];
-        quantized_matvec_reference(
-            GgmlType::Q4_0,
-            &q4_raw,
-            q4_shape,
-            &q4_x,
-            &mut q4_reference,
-        )
-        .unwrap();
+        quantized_matvec_reference(GgmlType::Q4_0, &q4_raw, q4_shape, &q4_x, &mut q4_reference)
+            .unwrap();
         quant::matvec_q4_0(&q4_raw, &[3, 32], &q4_x, &mut q4_optimized).unwrap();
         for (reference, optimized) in q4_reference.iter().zip(q4_optimized.iter()) {
             assert!((reference - optimized).abs() < 1e-3);
@@ -649,14 +671,8 @@ mod tests {
             .collect::<Vec<_>>();
         let mut q6_reference = vec![0.0f32; 2];
         let mut q6_optimized = vec![0.0f32; 2];
-        quantized_matvec_reference(
-            GgmlType::Q6_K,
-            &q6_raw,
-            q6_shape,
-            &q6_x,
-            &mut q6_reference,
-        )
-        .unwrap();
+        quantized_matvec_reference(GgmlType::Q6_K, &q6_raw, q6_shape, &q6_x, &mut q6_reference)
+            .unwrap();
         quant::matvec_q6_k(&q6_raw, &[2, 256], &q6_x, &mut q6_optimized).unwrap();
         for (reference, optimized) in q6_reference.iter().zip(q6_optimized.iter()) {
             assert!((reference - optimized).abs() < 1e-3);
@@ -665,19 +681,10 @@ mod tests {
 
     #[test]
     fn quantized_reference_covers_every_materialized_format() {
-        type Kernel = fn(
-            &[u8],
-            &[usize],
-            &[f32],
-            &mut [f32],
-        ) -> Result<(), crate::error::DataSourceError>;
+        type Kernel =
+            fn(&[u8], &[usize], &[f32], &mut [f32]) -> Result<(), crate::error::DataSourceError>;
 
-        fn compare(
-            ggml_type: GgmlType,
-            input: usize,
-            block: Vec<u8>,
-            kernel: Kernel,
-        ) {
+        fn compare(ggml_type: GgmlType, input: usize, block: Vec<u8>, kernel: Kernel) {
             let output = 2usize;
             let raw = block.repeat(output);
             let x = (0..input)

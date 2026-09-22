@@ -15,9 +15,9 @@
 //! `MemoryBudget`. It does NOT include total process RSS or OS page cache.
 
 pub(crate) mod accounting;
-pub(crate) mod compute_dispatch;
 pub mod backend;
 pub mod calibration;
+pub(crate) mod compute_dispatch;
 pub mod discovery;
 pub mod inference;
 pub mod kv_cache;
@@ -25,8 +25,8 @@ pub mod layer;
 pub(crate) mod layer_cache;
 pub(crate) mod layer_read;
 pub mod memory_report;
-pub mod model_executor;
 pub mod model;
+pub mod model_executor;
 pub mod ops;
 pub mod orchestration;
 pub mod persistent;

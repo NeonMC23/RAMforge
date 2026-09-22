@@ -23,9 +23,9 @@
 //! ```
 
 use crate::backend::ComputeBackend;
+use crate::compute_dispatch::{matvec_backend, tensor_f32_view};
 use crate::kv_cache::KvCache;
 use crate::model::LlamaConfig;
-use crate::compute_dispatch::{matvec_backend, tensor_f32_view};
 use crate::profile::Profiler;
 use ramforge_core::tensor::TensorData;
 
@@ -119,7 +119,10 @@ impl ModelExecutor {
         let dequant_started = profiler.start();
         let attn_norm_f32 = tensor_f32_view(&layer.attn_norm)
             .map_err(|e| format!("failed to decode attn_norm of layer {}: {}", layer_idx, e))?;
-        profiler.record_since(crate::profile::ProfileEvent::Dequantization, dequant_started);
+        profiler.record_since(
+            crate::profile::ProfileEvent::Dequantization,
+            dequant_started,
+        );
         backend.rmsnorm(hidden, attn_norm_f32.as_ref(), cfg.rms_eps, tmp);
 
         matvec_backend(backend, profiler, &layer.attn_q, tmp, q_tmp)?;
@@ -139,7 +142,10 @@ impl ModelExecutor {
                 let bv = tensor_f32_view(bv).map_err(|e| {
                     format!("failed to decode attn_v.bias of layer {}: {}", layer_idx, e)
                 })?;
-                profiler.record_since(crate::profile::ProfileEvent::Dequantization, dequant_started);
+                profiler.record_since(
+                    crate::profile::ProfileEvent::Dequantization,
+                    dequant_started,
+                );
                 for (value, bias) in q_tmp.iter_mut().zip(bq.iter()) {
                     *value += *bias;
                 }
@@ -172,15 +178,7 @@ impl ModelExecutor {
         let k_history = kv_cache.get_k_range(layer_idx, 0, hist_len)?;
         let v_history = kv_cache.get_v_range(layer_idx, 0, hist_len)?;
         let attn_out = crate::ops::attention(
-            q_tmp,
-            k_history,
-            v_history,
-            k_tmp,
-            v_tmp,
-            hist_len,
-            n_heads,
-            n_kv_heads,
-            head_dim,
+            q_tmp, k_history, v_history, k_tmp, v_tmp, hist_len, n_heads, n_kv_heads, head_dim,
         );
 
         matvec_backend(backend, profiler, &layer.attn_output, &attn_out, attn_proj)?;
@@ -191,7 +189,10 @@ impl ModelExecutor {
         let dequant_started = profiler.start();
         let ffn_norm_f32 = tensor_f32_view(&layer.ffn_norm)
             .map_err(|e| format!("failed to decode ffn_norm of layer {}: {}", layer_idx, e))?;
-        profiler.record_since(crate::profile::ProfileEvent::Dequantization, dequant_started);
+        profiler.record_since(
+            crate::profile::ProfileEvent::Dequantization,
+            dequant_started,
+        );
         backend.rmsnorm(hidden, ffn_norm_f32.as_ref(), cfg.rms_eps, tmp);
 
         matvec_backend(backend, profiler, &layer.ffn_gate, tmp, gate)?;

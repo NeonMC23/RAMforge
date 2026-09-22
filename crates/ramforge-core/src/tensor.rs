@@ -620,13 +620,10 @@ impl TensorData {
         match self {
             Self::F32 { data, shape, .. }
             | Self::F16 { data, shape, .. }
-            | Self::BF16 { data, shape, .. } => matvec_f32_reference(
-                data,
-                MatrixShape::new(shape[0], shape[1]),
-                x,
-                y,
-            )
-            .map_err(|error| DataSourceError::General(error.to_string())),
+            | Self::BF16 { data, shape, .. } => {
+                matvec_f32_reference(data, MatrixShape::new(shape[0], shape[1]), x, y)
+                    .map_err(|error| DataSourceError::General(error.to_string()))
+            }
             Self::Q4_0(qt)
             | Self::Q8_0(qt)
             | Self::Q4_K(qt)

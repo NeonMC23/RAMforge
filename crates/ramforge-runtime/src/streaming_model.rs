@@ -20,6 +20,9 @@ use crate::accounting::{
     LayerMemoryEstimate,
 };
 use crate::backend::ComputeBackend;
+pub(crate) use crate::compute_dispatch::{
+    matvec_backend, quantized_matvec_dispatch, tensor_f32_view,
+};
 use crate::kv_cache::KvCache;
 use crate::layer::{group_layers, LayerDescriptor, PersistentDescriptors};
 use crate::layer_cache::{InsertOutcome, LayerCache};
@@ -27,11 +30,13 @@ use crate::layer_read::{build_layer_read_plan, LayerReadPlan, PlannedReadRange};
 use crate::model::{validate_required_tensors, LlamaConfig};
 use crate::model_executor::ModelExecutor;
 pub use crate::model_executor::StreamingLayerWeights;
-pub(crate) use crate::compute_dispatch::{matvec_backend, quantized_matvec_dispatch, tensor_f32_view};
 use crate::persistent::{row_bytes_for, should_keep_resident, PersistentWeight};
 use crate::profile::{ProfileEvent, Profiler};
 use crate::residency::ResidencyStats;
 use crate::runtime_config::RuntimeConfig;
+
+#[cfg(test)]
+type TestLayerHiddenHook = fn(usize, &[f32]);
 
 #[derive(Debug)]
 pub struct StreamingLlamaModel {
@@ -54,7 +59,7 @@ pub struct StreamingLlamaModel {
     grouped_read_buffer_reuse_enabled: bool,
     pub(crate) profiler: Profiler,
     #[cfg(test)]
-    test_layer_hidden_hook: Mutex<Option<fn(usize, &[f32])>>,
+    test_layer_hidden_hook: Mutex<Option<TestLayerHiddenHook>>,
 }
 
 impl StreamingLlamaModel {
@@ -279,7 +284,7 @@ impl StreamingLlamaModel {
         budget: &mut MemoryBudget,
         stats: &mut ResidencyStats,
         final_hidden: &mut [f32],
-        layer_hook: fn(usize, &[f32]),
+        layer_hook: TestLayerHiddenHook,
     ) -> Result<(), String> {
         *self
             .test_layer_hidden_hook
@@ -816,7 +821,7 @@ impl StreamingLlamaModel {
                     self.profiler
                         .record_since(ProfileEvent::LayerCompute, compute_started);
                     result?;
-// Exact test-only boundary: ModelExecutor has completed
+                    // Exact test-only boundary: ModelExecutor has completed
                     // the layer residual/FFN output, and the next layer has
                     // not yet consumed `hidden`.
                     #[cfg(test)]
@@ -2897,22 +2902,20 @@ mod tests {
         let row_bytes = blocks_per_row * BLOCK_SIZE_Q4_0;
         let mut seed: u32 = 0xC0FFEE;
         let mut raw = vec![0u8; out_dim * row_bytes];
-        for r in 0..out_dim {
+        for row in raw.chunks_exact_mut(row_bytes) {
             let mut s = seed;
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-            let off = r * row_bytes;
-            for b in 0..blocks_per_row {
+            for block in row.as_chunks_mut::<BLOCK_SIZE_Q4_0>().0.iter_mut() {
                 // d: pseudorandom scale in [0.05, 0.5)
                 s = s.wrapping_mul(1664525).wrapping_add(1013904223);
                 let d: f32 = 0.05 + ((s >> 8) as f32 / (1u32 << 24) as f32) * 0.45;
                 let d_bits = half::f16::from_f32(d).to_bits().to_le_bytes();
-                raw[off + b * BLOCK_SIZE_Q4_0] = d_bits[0];
-                raw[off + b * BLOCK_SIZE_Q4_0 + 1] = d_bits[1];
-                for j in 0..16 {
+                block[..2].copy_from_slice(&d_bits);
+                for byte in &mut block[2..] {
                     s = s.wrapping_mul(1664525).wrapping_add(1013904223);
                     let lo = (s & 0x0F) as u8;
                     let hi = ((s >> 4) & 0x0F) as u8;
-                    raw[off + b * BLOCK_SIZE_Q4_0 + 2 + j] = lo | (hi << 4);
+                    *byte = lo | (hi << 4);
                 }
             }
         }
@@ -2926,8 +2929,8 @@ mod tests {
 
         // Deterministic x vector
         let mut x = vec![0.0f32; in_dim];
-        for i in 0..in_dim {
-            x[i] = ((i as f32) * 0.0137 - 0.5).sin() * 0.7;
+        for (i, value) in x.iter_mut().enumerate() {
+            *value = ((i as f32) * 0.0137 - 0.5).sin() * 0.7;
         }
 
         // Authoritative storage-independent reference: decode one complete
@@ -2951,8 +2954,8 @@ mod tests {
 
         // Compare with generous tolerance to absorb FMADD reordering
         let mut max_abs = 0.0f32;
-        for r in 0..out_dim {
-            let diff = (y[r] - ref_y[r]).abs();
+        for (actual, expected) in y.iter().zip(&ref_y) {
+            let diff = (actual - expected).abs();
             if diff > max_abs {
                 max_abs = diff;
             }
@@ -2960,7 +2963,9 @@ mod tests {
         assert!(
             max_abs < 1e-2,
             "parallel Q4_0 matvec diverges from scalar reference (max_abs={}, ref0={}, got0={})",
-            max_abs, ref_y[0], y[0]
+            max_abs,
+            ref_y[0],
+            y[0]
         );
     }
 
@@ -2972,18 +2977,15 @@ mod tests {
         let out_dim = 129usize;
         let row_bytes = BLOCK_SIZE_Q6_K;
         let mut raw = vec![0u8; out_dim * row_bytes];
-        for row in 0..out_dim {
-            let offset = row * row_bytes;
-            for index in 0..128 {
-                raw[offset + index] = (index as u8).wrapping_add(row as u8);
+        for (row, row_bytes) in raw.chunks_exact_mut(row_bytes).enumerate() {
+            for (index, byte) in row_bytes[..128].iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_add(row as u8);
             }
-            for index in 0..64 {
-                raw[offset + 128 + index] = (index as u8).wrapping_mul(3);
+            for (index, byte) in row_bytes[128..192].iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(3);
             }
-            for index in 0..16 {
-                raw[offset + 192 + index] = 1;
-            }
-            raw[offset + 208..offset + 210].copy_from_slice(&0x3c00u16.to_le_bytes());
+            row_bytes[192..208].fill(1);
+            row_bytes[208..210].copy_from_slice(&0x3c00u16.to_le_bytes());
         }
         let tensor = TensorData::from_bytes(
             GgmlType::Q6_K,
@@ -3161,12 +3163,8 @@ fn make_q4_0_matrix(out_dim: usize, in_dim: usize, seed: u32) -> (Vec<u8>, [usiz
     let row_bytes_len = blocks_per_row * BLOCK_SIZE_Q4_0;
     let mut bytes = vec![0u8; out_dim * row_bytes_len];
     let mut s = seed;
-    for r in 0..out_dim {
-        fill_q4_0_row(
-            &mut bytes[r * row_bytes_len..(r + 1) * row_bytes_len],
-            blocks_per_row,
-            &mut s,
-        );
+    for row in bytes.chunks_exact_mut(row_bytes_len) {
+        fill_q4_0_row(row, blocks_per_row, &mut s);
     }
     (bytes, [out_dim, in_dim])
 }
@@ -3178,12 +3176,8 @@ fn make_q6_k_matrix(out_dim: usize, in_dim: usize, seed: u32) -> (Vec<u8>, [usiz
     let row_bytes_len = blocks_per_row * BLOCK_SIZE_Q6_K;
     let mut bytes = vec![0u8; out_dim * row_bytes_len];
     let mut s = seed;
-    for r in 0..out_dim {
-        fill_q6_k_row(
-            &mut bytes[r * row_bytes_len..(r + 1) * row_bytes_len],
-            blocks_per_row,
-            &mut s,
-        );
+    for row in bytes.chunks_exact_mut(row_bytes_len) {
+        fill_q6_k_row(row, blocks_per_row, &mut s);
     }
     (bytes, [out_dim, in_dim])
 }
@@ -3232,27 +3226,31 @@ fn make_q6_k_td(raw: Vec<u8>, out_dim: usize, in_dim: usize) -> TensorData {
     })
 }
 
+#[derive(Clone, Copy)]
 #[allow(dead_code)]
-fn bench_q4_0_for_threads(
-    out_dim: usize,
-    in_dim: usize,
+struct QuantizedMatvecBenchConfig<'a> {
+    /// Matrix shape in the runtime's [out, in] convention.
+    shape: [usize; 2],
     threads: usize,
-    iters: usize,
-    raw: &[u8],
-    _w_shape: &[usize; 2],
-    x: &[f32],
-    reference_y: &[f32],
-    label: &str,
-) {
+    iterations: usize,
+    raw: &'a [u8],
+    x: &'a [f32],
+    reference_y: &'a [f32],
+    label: &'a str,
+}
+
+#[allow(dead_code)]
+fn bench_q4_0_for_threads(config: QuantizedMatvecBenchConfig<'_>) {
     use std::time::Instant;
-    let backend = crate::backend::CpuBackend::with_threads(threads);
+    let [out_dim, in_dim] = config.shape;
+    let backend = crate::backend::CpuBackend::with_threads(config.threads);
     let profiler = Profiler::default();
 
     // Warm up + correctness check.
     let mut y = vec![0.0f32; out_dim];
-    let td = make_q4_0_td(raw.to_vec(), out_dim, in_dim);
-    quantized_matvec_dispatch(&backend, &td, x, &mut y, &profiler).expect("warmup failed");
-    let err = max_abs_diff(&y, reference_y);
+    let td = make_q4_0_td(config.raw.to_vec(), out_dim, in_dim);
+    quantized_matvec_dispatch(&backend, &td, config.x, &mut y, &profiler).expect("warmup failed");
+    let err = max_abs_diff(&y, config.reference_y);
 
     // Reuse the same raw bytes across iterations; per-iter we must hand the
     // dispatch a fresh TensorData because QuantizedTensor owns its bytes. We
@@ -3261,18 +3259,19 @@ fn bench_q4_0_for_threads(
     // resident). In real inference the TensorData is loaded once per layer.
     let mut total = std::time::Duration::ZERO;
     let mut best = std::time::Duration::from_secs(u64::MAX);
-    for _ in 0..iters {
+    for _ in 0..config.iterations {
         y.fill(0.0);
-        let td = make_q4_0_td(raw.to_vec(), out_dim, in_dim);
+        let td = make_q4_0_td(config.raw.to_vec(), out_dim, in_dim);
         let t0 = Instant::now();
-        quantized_matvec_dispatch(&backend, &td, x, &mut y, &profiler).expect("bench iter failed");
+        quantized_matvec_dispatch(&backend, &td, config.x, &mut y, &profiler)
+            .expect("bench iter failed");
         let elapsed = t0.elapsed();
         total += elapsed;
         if elapsed < best {
             best = elapsed;
         }
     }
-    let avg = total / iters as u32;
+    let avg = total / config.iterations as u32;
     let flops = (out_dim as f64) * (in_dim as f64) * 2.0; // multiplies + adds per output
     let avg_secs = avg.as_secs_f64();
     let gflops = if avg_secs > 0.0 {
@@ -3280,10 +3279,10 @@ fn bench_q4_0_for_threads(
     } else {
         0.0
     };
-    let weight_mb = raw.len() as f64 / (1024.0 * 1024.0);
+    let weight_mb = config.raw.len() as f64 / (1024.0 * 1024.0);
     println!(
         "  [Q4_0 {:>18}] threads={:<2} iters={:<3} avg={:>10.3?} best={:>10.3?} throughput={:>7.2} GFLOP/s weight={:>6.2} MiB max|err|={:.2e}",
-        label, threads, iters, avg, best, gflops, weight_mb, err
+        config.label, config.threads, config.iterations, avg, best, gflops, weight_mb, err
     );
 }
 
@@ -3310,7 +3309,7 @@ fn quantized_matvec_bench() {
     println!("\n=== Q4_0 quantized matvec microbenchmark (scalar baseline + thread scaling) ===");
     for (label, out_dim, in_dim) in shapes {
         let (out_dim, in_dim) = (*out_dim, *in_dim);
-        let (raw, _w_shape) = make_q4_0_matrix(
+        let (raw, shape) = make_q4_0_matrix(
             out_dim,
             in_dim,
             0x12345678 ^ (out_dim as u32).wrapping_mul(31) ^ (in_dim as u32),
@@ -3335,40 +3334,28 @@ fn quantized_matvec_bench() {
         } else {
             200
         };
-        bench_q4_0_for_threads(
-            out_dim,
-            in_dim,
-            1,
-            iters,
-            &raw,
-            &[out_dim, in_dim],
-            &x,
-            &y_ref,
+        let benchmark = QuantizedMatvecBenchConfig {
+            shape,
+            threads: 1,
+            iterations: iters,
+            raw: &raw,
+            x: &x,
+            reference_y: &y_ref,
             label,
-        );
-        for t in [2, 4, 8, 9] {
-            bench_q4_0_for_threads(
-                out_dim,
-                in_dim,
-                t,
-                iters,
-                &raw,
-                &[out_dim, in_dim],
-                &x,
-                &y_ref,
-                label,
-            );
+        };
+        bench_q4_0_for_threads(benchmark);
+        for threads in [2, 4, 8, 9] {
+            bench_q4_0_for_threads(QuantizedMatvecBenchConfig {
+                threads,
+                ..benchmark
+            });
         }
     }
 
     println!("\n=== Q6_K quantized matvec microbenchmark (scalar + parallel) ===");
     for (label, out_dim, in_dim) in shapes {
         let out_dim = *out_dim;
-        let in_dim = if *in_dim % QK_K == 0 {
-            *in_dim
-        } else {
-            (*in_dim + QK_K - 1) / QK_K * QK_K
-        };
+        let in_dim = (*in_dim).div_ceil(QK_K) * QK_K;
         let (raw, _w_shape) = make_q6_k_matrix(
             out_dim,
             in_dim,

@@ -12,8 +12,8 @@ use rayon::prelude::*;
 use ramforge_core::{
     quant::{
         matvec_q2_k, matvec_q3_k, matvec_q4_0_row_range, matvec_q4_k, matvec_q5_k,
-        matvec_q6_k_row_range, matvec_q8_0, matvec_q8_k, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q6_K,
-        QK4_0, QK_K,
+        matvec_q6_k_row_range, matvec_q8_0, matvec_q8_k, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q6_K, QK4_0,
+        QK_K,
     },
     tensor::TensorData,
     types::GgmlType,
@@ -67,8 +67,8 @@ pub(crate) fn matvec_backend<B: ComputeBackend>(
 ///   * 128×1536 and larger: parallel dispatch produces measurable speedup
 ///     (≈1.3–2.0× at 2 threads in the sandbox; higher core counts scale
 ///     further on real hardware).
-/// Real Qwen2.5-1.5B layer shapes are 1536 / 8960 / 151936 rows — all well
-/// above this threshold and parallelize cleanly.
+///     Real Qwen2.5-1.5B layer shapes are 1536 / 8960 / 151936 rows — all well
+///     above this threshold and parallelize cleanly.
 const QUANT_PARALLEL_ROW_THRESHOLD: usize = 128;
 
 /// Split `out_dim` rows into `n_chunks` contiguous (start, count) ranges
@@ -97,7 +97,7 @@ pub(crate) fn quantized_matvec_dispatch<B: ComputeBackend>(
     /// Returns (raw_data, kernel_shape=[out, in]) for a quantized tensor if
     /// it matches one of the row-parallel kernels, otherwise None to fall
     /// back to the compact format-specific dispatcher below.
-    fn as_quantized_view<'a>(td: &'a TensorData) -> Option<(GgmlType, &'a [u8], [usize; 2])> {
+    fn as_quantized_view(td: &TensorData) -> Option<(GgmlType, &[u8], [usize; 2])> {
         let (qt, ty) = match td {
             TensorData::Q4_0(qt) => (qt, GgmlType::Q4_0),
             TensorData::Q6_K(qt) => (qt, GgmlType::Q6_K),
@@ -250,4 +250,3 @@ fn optimized_quantized_matvec(td: &TensorData, x: &[f32], y: &mut [f32]) -> Resu
     };
     result.map_err(|error| error.to_string())
 }
-

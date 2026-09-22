@@ -641,8 +641,6 @@ pub fn next_run_id(history: &[RunRecord]) -> u64 {
 pub fn format_seconds(seconds: f64) -> String {
     if seconds.is_nan() || seconds <= 0.0 {
         "0.000 s".to_string()
-    } else if seconds < 0.001 {
-        format!("{:.3} ms", seconds * 1000.0)
     } else if seconds < 1.0 {
         format!("{:.3} ms", seconds * 1000.0)
     } else if seconds < 120.0 {

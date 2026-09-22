@@ -283,7 +283,6 @@ fn generate_prompt(
 ) -> Result<(usize, String, diagnostics::DiagnosticResult), TuiError> {
     // Pull out the data we need from app before borrowing runtime.
     let prompt_token_count;
-    let calibration_label;
     let calibration_identifier;
     let calibration_applied_ids;
     let calibration_consumed;
@@ -322,7 +321,7 @@ fn generate_prompt(
     gen_atom.store(0, std::sync::atomic::Ordering::Relaxed);
     phase_atom.store(0, std::sync::atomic::Ordering::Relaxed);
 
-    calibration_label = app::calibration_level_label(app.calibration_level()).to_string();
+    let calibration_label = app::calibration_level_label(app.calibration_level()).to_string();
     let cal = app.calibration_result.as_ref().map(|c| {
         let applied = app
             .execution_plan
