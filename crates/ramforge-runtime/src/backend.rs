@@ -3,6 +3,10 @@
 //! - AVX2 SIMD for x86_64 with scalar fallback (runtime-detected)
 //! - Configurable threading via rayon
 //!
+//! The backend owns dispatch and parallelism, not model mathematics. Scalar
+//! operations delegate to `ramforge_core::compute`; optimized paths are
+//! equivalence-tested against that contract.
+//!
 //! ## Matrix layout convention (GGML/GGUF)
 //!
 //! `matvec` follows the single explicit ggml convention:
@@ -133,7 +137,13 @@ fn matvec_rows_parallel(use_simd: bool, w: &[f32], in_dim: usize, x: &[f32], y: 
         if use_simd {
             *yo = simd::dot_f32_avx2(row, x);
         } else {
-            *yo = simd::dot_f32_scalar(row, x);
+            ramforge_core::compute::matvec_f32_reference(
+                row,
+                ramforge_core::compute::MatrixShape::new(in_dim, 1),
+                x,
+                std::slice::from_mut(yo),
+            )
+            .expect("threaded scalar backend row shape must be valid");
         }
     });
 }
@@ -170,7 +180,10 @@ impl ComputeBackend for CpuBackend {
         let in_dim = w_shape[0];
         let out_dim = w_shape[1];
 
-        if x.len() != in_dim || y.len() != out_dim || w.len() < in_dim * out_dim {
+        let required_weights = in_dim.checked_mul(out_dim).ok_or_else(|| {
+            format!("backend matvec shape size overflow for ggml layout {:?}", w_shape)
+        })?;
+        if x.len() != in_dim || y.len() != out_dim || w.len() < required_weights {
             return Err(format!(
                 "backend matvec arity mismatch (ggml layout [in, out]): shape {:?} implies in={}, out={}, but got w.len()={}, x.len()={}, y.len()={}",
                 w_shape,
@@ -190,61 +203,40 @@ impl ComputeBackend for CpuBackend {
         } else if self.use_simd {
             simd::matvec_f32_avx2(w, out_dim, in_dim, x, y);
         } else {
-            for o in 0..out_dim {
-                let mut sum = 0.0;
-                let row_offset = o * in_dim;
-                for i in 0..in_dim {
-                    sum += w[row_offset + i] * x[i];
-                }
-                y[o] = sum;
-            }
+            ramforge_core::compute::matvec_f32_reference(
+                w,
+                ramforge_core::compute::MatrixShape::new(in_dim, out_dim),
+                x,
+                y,
+            )
+            .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
 
     fn rmsnorm(&self, x: &[f32], weight: &[f32], eps: f32, y: &mut [f32]) {
-        let mut sum = 0.0f32;
-        for &v in x {
-            sum += v * v;
-        }
-        let mean = sum / (x.len() as f32);
-        let rms = (mean + eps).sqrt();
-        for i in 0..x.len() {
-            y[i] = x[i] / rms * weight.get(i).copied().unwrap_or(1.0);
-        }
+        ramforge_core::compute::rms_norm_reference(x, weight, eps, y)
+            .expect("backend RMSNorm input dimensions must match");
     }
 
     fn add(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
-        for i in 0..a.len().min(b.len()).min(out.len()) {
-            out[i] = a[i] + b[i];
-        }
+        ramforge_core::compute::add_reference(a, b, out)
+            .expect("backend add input dimensions must match");
     }
 
     fn mul(&self, a: &[f32], b: &[f32], out: &mut [f32]) {
-        for i in 0..a.len().min(b.len()).min(out.len()) {
-            out[i] = a[i] * b[i];
-        }
+        ramforge_core::compute::mul_reference(a, b, out)
+            .expect("backend multiply input dimensions must match");
     }
 
     fn silu(&self, x: &[f32], out: &mut [f32]) {
-        for i in 0..x.len().min(out.len()) {
-            let v = x[i];
-            out[i] = v / (1.0 + (-v).exp());
-        }
+        ramforge_core::compute::silu_reference(x, out)
+            .expect("backend SiLU input dimensions must match");
     }
 
     fn softmax(&self, x: &mut [f32]) {
-        let max = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let mut sum = 0.0f32;
-        for v in x.iter_mut() {
-            *v = (*v - max).exp();
-            sum += *v;
-        }
-        if sum > 0.0 {
-            for v in x.iter_mut() {
-                *v /= sum;
-            }
-        }
+        ramforge_core::compute::softmax_reference(x)
+            .expect("backend softmax input must be non-empty");
     }
 }
 

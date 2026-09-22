@@ -835,10 +835,12 @@ pub fn matvec_q4_0(
     matvec_q4_0_row_range(w_bytes, w_shape, x, y, 0, None)
 }
 
-/// Compute `y[row_start..row_start + row_count]` for a contiguous range of Q4_0
-/// rows. Used by the threaded dispatcher to partition work across threads.
-/// All shape/arity validation matches `matvec_q4_0`; `row_end = None` means
-/// "all rows" (i.e. `out_dim`).
+/// Compute a contiguous Q4_0 output-row range.
+///
+/// `y` is a local output slice: `y[0]` receives the result for `row_start`.
+/// `row_count = None` means all rows from `row_start` through `out_dim`.
+/// This local-slice contract is what lets the threaded dispatcher pass a
+/// disjoint output subslice without adding the absolute row index twice.
 pub fn matvec_q4_0_row_range(
     w_bytes: &[u8],
     w_shape: &[usize],
@@ -854,12 +856,31 @@ pub fn matvec_q4_0_row_range(
     }
     let out_dim = w_shape[0];
     let in_dim = w_shape[1];
-    if x.len() != in_dim || y.len() != out_dim {
+    if x.len() != in_dim {
         return Err(DataSourceError::General(format!(
-            "matvec shape mismatch: W {:?}, x {}, y {}",
+            "matvec input shape mismatch: W {:?}, x {}",
             w_shape,
-            x.len(),
-            y.len()
+            x.len()
+        )));
+    }
+    if row_start > out_dim {
+        return Err(DataSourceError::General(format!(
+            "Q4_0 row start {} exceeds out_dim {}",
+            row_start, out_dim
+        )));
+    }
+    let row_count = row_count.unwrap_or(out_dim - row_start);
+    let row_end = row_start.checked_add(row_count).ok_or_else(|| {
+        DataSourceError::General("Q4_0 row range overflow".to_string())
+    })?;
+    if row_end > out_dim || y.len() != row_count {
+        return Err(DataSourceError::General(format!(
+            "Q4_0 row range {}..{} requires local y length {}, got {} for out_dim {}",
+            row_start,
+            row_end,
+            row_count,
+            y.len(),
+            out_dim
         )));
     }
     if in_dim % QK4_0 != 0 {
@@ -877,14 +898,6 @@ pub fn matvec_q4_0_row_range(
             w_bytes.len()
         )));
     }
-    let row_end = row_start.saturating_add(row_count.unwrap_or(out_dim - row_start));
-    if row_end > out_dim {
-        return Err(DataSourceError::General(format!(
-            "Q4_0 row range {}..{} exceeds out_dim {}",
-            row_start, row_end, out_dim
-        )));
-    }
-
     for i in row_start..row_end {
         let rb = i * row_bytes;
         y[i - row_start] = q4_0_row_dot(&w_bytes[rb..rb + row_bytes], blocks_per_row, x);
@@ -1124,6 +1137,8 @@ pub fn matvec_q6_k(
     matvec_q6_k_row_range(w_bytes, w_shape, x, y, 0, None)
 }
 
+/// Compute a contiguous Q6_K output-row range into a local `y` slice.
+/// `y[0]` corresponds to `row_start`; `None` means through `out_dim`.
 pub fn matvec_q6_k_row_range(
     w_bytes: &[u8],
     w_shape: &[usize],
@@ -1139,12 +1154,31 @@ pub fn matvec_q6_k_row_range(
     }
     let out_dim = w_shape[0];
     let in_dim = w_shape[1];
-    if x.len() != in_dim || y.len() != out_dim {
+    if x.len() != in_dim {
         return Err(DataSourceError::General(format!(
-            "matvec shape mismatch: W {:?}, x {}, y {}",
+            "matvec input shape mismatch: W {:?}, x {}",
             w_shape,
-            x.len(),
-            y.len()
+            x.len()
+        )));
+    }
+    if row_start > out_dim {
+        return Err(DataSourceError::General(format!(
+            "Q6_K row start {} exceeds out_dim {}",
+            row_start, out_dim
+        )));
+    }
+    let row_count = row_count.unwrap_or(out_dim - row_start);
+    let row_end = row_start.checked_add(row_count).ok_or_else(|| {
+        DataSourceError::General("Q6_K row range overflow".to_string())
+    })?;
+    if row_end > out_dim || y.len() != row_count {
+        return Err(DataSourceError::General(format!(
+            "Q6_K row range {}..{} requires local y length {}, got {} for out_dim {}",
+            row_start,
+            row_end,
+            row_count,
+            y.len(),
+            out_dim
         )));
     }
     if in_dim % QK_K != 0 {
@@ -1162,14 +1196,6 @@ pub fn matvec_q6_k_row_range(
             w_bytes.len()
         )));
     }
-    let row_end = row_start.saturating_add(row_count.unwrap_or(out_dim - row_start));
-    if row_end > out_dim {
-        return Err(DataSourceError::General(format!(
-            "Q6_K row range {}..{} exceeds out_dim {}",
-            row_start, row_end, out_dim
-        )));
-    }
-
     for i in row_start..row_end {
         let rb = i * row_bytes;
         y[i - row_start] = q6_k_row_dot(&w_bytes[rb..rb + row_bytes], blocks_per_row, x)?;
@@ -1968,5 +1994,39 @@ mod tests {
         let mut y = vec![0.0f32; 2];
         matvec_q8_k(&w_bytes, &[2, 256], &x, &mut y).unwrap();
         assert!((y[0] - 256.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn q4_0_row_range_uses_local_output_indexing() {
+        let mut raw = Vec::new();
+        for row in 0..3 {
+            raw.extend_from_slice(&0x3c00u16.to_le_bytes());
+            raw.extend(std::iter::repeat((0x88u8).wrapping_add(row as u8)).take(16));
+        }
+        let x = vec![1.0f32; QK4_0];
+        let mut full = vec![0.0f32; 3];
+        matvec_q4_0(&raw, &[3, QK4_0], &x, &mut full).unwrap();
+
+        let mut local = vec![-999.0f32; 1];
+        matvec_q4_0_row_range(&raw, &[3, QK4_0], &x, &mut local, 2, Some(1)).unwrap();
+        assert_eq!(local[0], full[2]);
+        assert!(matvec_q4_0_row_range(&raw, &[3, QK4_0], &x, &mut local, 3, Some(1)).is_err());
+    }
+
+    #[test]
+    fn q6_k_row_range_uses_local_output_indexing_without_oob() {
+        let mut raw = vec![0u8; 3 * BLOCK_SIZE_Q6_K];
+        for row in 0..3 {
+            let offset = row * BLOCK_SIZE_Q6_K + 208;
+            raw[offset..offset + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        }
+        let x = vec![1.0f32; QK_K];
+        let mut full = vec![0.0f32; 3];
+        matvec_q6_k(&raw, &[3, QK_K], &x, &mut full).unwrap();
+
+        let mut local = vec![-999.0f32; 1];
+        matvec_q6_k_row_range(&raw, &[3, QK_K], &x, &mut local, 2, Some(1)).unwrap();
+        assert_eq!(local[0], full[2]);
+        assert!(matvec_q6_k_row_range(&raw, &[3, QK_K], &x, &mut local, 3, Some(1)).is_err());
     }
 }

@@ -2690,10 +2690,13 @@ mod autoregressive_invariants {
 #[cfg(test)]
 mod qwen25_bounded_diagnostic {
     use super::*;
+    use crate::backend::CpuBackend;
     use crate::kv_cache::KvCache;
     use crate::residency::ResidencyStats;
     use crate::runtime_config::RuntimeConfig;
     use crate::sampling::Sampler;
+    use crate::streaming_model::StreamingLlamaModel;
+    use ramforge_core::datasource::GgufDataSource;
     use ramforge_core::memory::MemoryBudget;
     use ramforge_core::quant::{self, BLOCK_SIZE_Q6_K, QK_K};
     use ramforge_core::types::GgmlType;
@@ -2707,6 +2710,25 @@ mod qwen25_bounded_diagnostic {
     const TRACE_DECODE_STEPS: usize = 2;
     const QWEN25_LAYER_COUNT: usize = 28;
     static LAYER_HIDDEN_EMISSIONS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn qwen25_layer_hook_dispatch_typechecks_without_model() {
+        type LayerHookDispatch = for<'model, 'kv, 'backend, 'data, 'budget, 'stats, 'hidden> fn(
+            &'model StreamingLlamaModel,
+            u32,
+            usize,
+            &'kv mut KvCache,
+            &'backend CpuBackend,
+            &'data GgufDataSource,
+            &'budget mut MemoryBudget,
+            &'stats mut ResidencyStats,
+            &'hidden mut [f32],
+            fn(usize, &[f32]),
+        ) -> Result<(), String>;
+
+        let _dispatch: LayerHookDispatch =
+            StreamingLlamaModel::forward_single_streaming_with_layer_hook::<CpuBackend>;
+    }
 
     #[derive(Debug, Clone)]
     struct NumericSummary {
@@ -3188,10 +3210,9 @@ mod qwen25_bounded_diagnostic {
         let mut hidden = vec![0.0f32; n_embd];
         for (position_id, &token_id) in prompt_tokens.iter().enumerate() {
             if position_id + 1 == prompt_tokens.len() {
-                // The test-only hook is invoked inside the existing
-                // forward_layer path immediately after each layer's residual
-                // and FFN output has been written to `hidden`, before the next
-                // layer starts. It consumes one borrowed layer vector at a
+                // The test-only hook is invoked inside ModelExecutor
+                // immediately after each layer's residual and FFN output has
+                // been written to `hidden`, before the next layer starts. It consumes one borrowed layer vector at a
                 // time and never retains the activations.
                 LAYER_HIDDEN_EMISSIONS.store(0, AtomicOrdering::Relaxed);
                 model.forward_single_streaming_with_layer_hook(

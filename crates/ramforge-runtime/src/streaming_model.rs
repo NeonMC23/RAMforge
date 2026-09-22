@@ -10,14 +10,10 @@ use std::sync::Mutex;
 use ramforge_core::{
     datasource::GgufDataSource,
     memory::MemoryBudget,
-    quant::{
-        matvec_q4_0_row_range, matvec_q6_k_row_range, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q6_K, QK4_0, QK_K,
-    },
+    quant::{BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q6_K, QK4_0, QK_K},
     tensor::{decode_tensor_to_f32, QuantizedTensor, TensorData},
     types::GgmlType,
 };
-
-use rayon::prelude::*;
 
 use crate::accounting::{
     estimate_grouped_layer_memory, estimate_layer_memory, tensor_load_charge_bytes,
@@ -29,49 +25,13 @@ use crate::layer::{group_layers, LayerDescriptor, PersistentDescriptors};
 use crate::layer_cache::{InsertOutcome, LayerCache};
 use crate::layer_read::{build_layer_read_plan, LayerReadPlan, PlannedReadRange};
 use crate::model::{validate_required_tensors, LlamaConfig};
+use crate::model_executor::ModelExecutor;
+pub use crate::model_executor::StreamingLayerWeights;
+pub(crate) use crate::compute_dispatch::{matvec_backend, quantized_matvec_dispatch, tensor_f32_view};
 use crate::persistent::{row_bytes_for, should_keep_resident, PersistentWeight};
 use crate::profile::{ProfileEvent, Profiler};
 use crate::residency::ResidencyStats;
 use crate::runtime_config::RuntimeConfig;
-
-#[derive(Debug, Clone)]
-pub struct StreamingLayerWeights {
-    pub attn_norm: TensorData,
-    pub attn_q: TensorData,
-    pub attn_k: TensorData,
-    pub attn_v: TensorData,
-    pub attn_output: TensorData,
-    pub ffn_norm: TensorData,
-    pub ffn_gate: TensorData,
-    pub ffn_up: TensorData,
-    pub ffn_down: TensorData,
-    /// Optional qwen2-style Q/K/V biases (applied after the matvec, before
-    /// RoPE insertion into the KV cache). Either all three are present or
-    /// none – partial sets are rejected at load time.
-    pub attn_q_bias: Option<TensorData>,
-    pub attn_k_bias: Option<TensorData>,
-    pub attn_v_bias: Option<TensorData>,
-}
-
-impl StreamingLayerWeights {
-    pub fn total_resident_bytes(&self) -> u64 {
-        let bias_bytes = [&self.attn_q_bias, &self.attn_k_bias, &self.attn_v_bias]
-            .iter()
-            .filter_map(|b| b.as_ref())
-            .map(|b| b.resident_bytes() as u64)
-            .sum::<u64>();
-        self.attn_norm.resident_bytes() as u64
-            + self.attn_q.resident_bytes() as u64
-            + self.attn_k.resident_bytes() as u64
-            + self.attn_v.resident_bytes() as u64
-            + self.attn_output.resident_bytes() as u64
-            + self.ffn_norm.resident_bytes() as u64
-            + self.ffn_gate.resident_bytes() as u64
-            + self.ffn_up.resident_bytes() as u64
-            + self.ffn_down.resident_bytes() as u64
-            + bias_bytes
-    }
-}
 
 #[derive(Debug)]
 pub struct StreamingLlamaModel {
@@ -321,8 +281,6 @@ impl StreamingLlamaModel {
         final_hidden: &mut [f32],
         layer_hook: fn(usize, &[f32]),
     ) -> Result<(), String> {
-        eprintln!("ACTUAL_FORWARD_WITH_LAYER_HOOK_ENTERED");
-        println!("LAYER_HOOK_ENTRY");
         *self
             .test_layer_hidden_hook
             .lock()
@@ -344,14 +302,6 @@ impl StreamingLlamaModel {
     }
 
     #[cfg(test)]
-    fn test_layer_hidden_hook_enabled(&self) -> bool {
-        self.test_layer_hidden_hook
-            .lock()
-            .map(|hook| hook.is_some())
-            .unwrap_or(false)
-    }
-
-    #[cfg(test)]
     fn emit_test_layer_hidden(&self, layer_idx: usize, hidden: &[f32]) {
         let hook = self
             .test_layer_hidden_hook
@@ -359,7 +309,6 @@ impl StreamingLlamaModel {
             .ok()
             .and_then(|hook| *hook);
         if let Some(hook) = hook {
-            println!("LAYER_HOOK_CALLBACK layer={}", layer_idx);
             hook(layer_idx, hidden);
         }
     }
@@ -735,9 +684,29 @@ impl StreamingLlamaModel {
         stats: &mut ResidencyStats,
         final_hidden: &mut [f32],
     ) -> Result<(), String> {
-        #[cfg(test)]
-        eprintln!("ACTUAL_PROMPT_FORWARD_FUNCTION_ENTERED");
         let cfg = &self.config;
+        if pos != kv_cache.seq_len() {
+            return Err(format!(
+                "KV position/history mismatch: position {} requires cache history {}, got {}",
+                pos,
+                pos,
+                kv_cache.seq_len()
+            ));
+        }
+        if kv_cache.n_layers != cfg.block_count
+            || kv_cache.n_kv_heads != cfg.head_count_kv
+            || kv_cache.head_dim != cfg.head_dim
+        {
+            return Err(format!(
+                "KV cache dimensions do not match model: cache layers={}, kv_heads={}, head_dim={}; model layers={}, kv_heads={}, head_dim={}",
+                kv_cache.n_layers,
+                kv_cache.n_kv_heads,
+                kv_cache.head_dim,
+                cfg.block_count,
+                cfg.head_count_kv,
+                cfg.head_dim
+            ));
+        }
         let n_embd = cfg.embedding_length;
         if final_hidden.len() != n_embd {
             return Err(format!(
@@ -808,10 +777,6 @@ impl StreamingLlamaModel {
                 .record_since(ProfileEvent::Allocation, allocation_started);
 
             for layer_idx in 0..cfg.block_count {
-                #[cfg(test)]
-                if layer_idx == 0 && self.test_layer_hidden_hook_enabled() {
-                    println!("LAYER_HOOK_LAYER_0");
-                }
                 let compute_started = self.profiler.start();
                 let cached_result = {
                     let mut cache = self
@@ -819,7 +784,7 @@ impl StreamingLlamaModel {
                         .lock()
                         .map_err(|_| "layer cache lock poisoned".to_string())?;
                     let result = cache.with_entry(layer_idx, |layer| {
-                        Self::forward_layer(
+                        ModelExecutor::execute_layer(
                             layer,
                             layer_idx,
                             pos,
@@ -851,7 +816,7 @@ impl StreamingLlamaModel {
                     self.profiler
                         .record_since(ProfileEvent::LayerCompute, compute_started);
                     result?;
-                    // Exact test-only boundary: forward_layer has completed
+// Exact test-only boundary: ModelExecutor has completed
                     // the layer residual/FFN output, and the next layer has
                     // not yet consumed `hidden`.
                     #[cfg(test)]
@@ -872,7 +837,7 @@ impl StreamingLlamaModel {
                 self.profiler.record_layer_load();
 
                 let compute_started = self.profiler.start();
-                let layer_result = Self::forward_layer(
+                let layer_result = ModelExecutor::execute_layer(
                     &layer,
                     layer_idx,
                     pos,
@@ -902,7 +867,7 @@ impl StreamingLlamaModel {
                     self.profiler.record_layer_release();
                     return Err(error);
                 }
-                // Exact test-only boundary: forward_layer has completed the
+                // Exact test-only boundary: ModelExecutor has completed the
                 // layer residual/FFN output before the next layer starts.
                 #[cfg(test)]
                 self.emit_test_layer_hidden(layer_idx, &hidden);
@@ -970,136 +935,6 @@ impl StreamingLlamaModel {
         })
     }
 
-    /// One transformer block over pre-allocated scratch buffers.
-    /// All matvecs honor the explicit ggml layout of `layer` tensors.
-    #[allow(clippy::too_many_arguments)]
-    fn forward_layer<B: ComputeBackend>(
-        layer: &StreamingLayerWeights,
-        layer_idx: usize,
-        pos: usize,
-        kv_cache: &mut KvCache,
-        backend: &B,
-        cfg: &LlamaConfig,
-        profiler: &Profiler,
-        hidden: &mut [f32],
-        tmp: &mut [f32],
-        q_tmp: &mut [f32],
-        k_tmp: &mut [f32],
-        v_tmp: &mut [f32],
-        attn_proj: &mut [f32],
-        gate: &mut [f32],
-        up: &mut [f32],
-        gate_silu: &mut [f32],
-        gate_up: &mut [f32],
-        ffn_out: &mut [f32],
-    ) -> Result<(), String> {
-        let n_embd = cfg.embedding_length;
-        let n_heads = cfg.head_count;
-        let n_kv_heads = cfg.head_count_kv;
-        let head_dim = cfg.head_dim;
-
-        // attn_norm
-        let dequant_started = profiler.start();
-        let attn_norm_f32 = tensor_f32_view(&layer.attn_norm)
-            .map_err(|e| format!("failed to decode attn_norm of layer {}: {}", layer_idx, e))?;
-        profiler.record_since(ProfileEvent::Dequantization, dequant_started);
-        backend.rmsnorm(hidden, attn_norm_f32.as_ref(), cfg.rms_eps, tmp);
-
-        matvec_backend(backend, profiler, &layer.attn_q, tmp, q_tmp)?;
-        matvec_backend(backend, profiler, &layer.attn_k, tmp, k_tmp)?;
-        matvec_backend(backend, profiler, &layer.attn_v, tmp, v_tmp)?;
-
-        // qwen2-style Q/K/V biases: added to the fresh projections BEFORE
-        // RoPE and KV-cache insertion (matches llama.cpp/HF qwen2 ordering).
-        // Partial sets are rejected at layer load; this match is defensive.
-        match (&layer.attn_q_bias, &layer.attn_k_bias, &layer.attn_v_bias) {
-            (None, None, None) => {}
-            (Some(bq), Some(bk), Some(bv)) => {
-                let dequant_started = profiler.start();
-                let bq = tensor_f32_view(bq).map_err(|e| {
-                    format!("failed to decode attn_q.bias of layer {}: {}", layer_idx, e)
-                })?;
-                let bk = tensor_f32_view(bk).map_err(|e| {
-                    format!("failed to decode attn_k.bias of layer {}: {}", layer_idx, e)
-                })?;
-                let bv = tensor_f32_view(bv).map_err(|e| {
-                    format!("failed to decode attn_v.bias of layer {}: {}", layer_idx, e)
-                })?;
-                profiler.record_since(ProfileEvent::Dequantization, dequant_started);
-                for (x, b) in q_tmp.iter_mut().zip(bq.iter()) {
-                    *x += *b;
-                }
-                for (x, b) in k_tmp.iter_mut().zip(bk.iter()) {
-                    *x += *b;
-                }
-                for (x, b) in v_tmp.iter_mut().zip(bv.iter()) {
-                    *x += *b;
-                }
-            }
-            _ => {
-                return Err(format!(
-                    "internal error: incomplete Q/K/V bias set survived load of layer {}",
-                    layer_idx
-                ))
-            }
-        }
-
-        crate::ops::apply_rope(
-            q_tmp,
-            k_tmp,
-            pos,
-            head_dim,
-            n_heads,
-            n_kv_heads,
-            cfg.rope_freq_base,
-        );
-
-        // History holds `seq_len` previous tokens (BEFORE this token's K/V
-        // are appended). The current token's K/V is passed separately to
-        // attention and MUST be appended to the cache for ALL layers
-        // simultaneously after the whole per-token block loop finishes —
-        // appending mid-loop would leak early layers' new-K/V into later
-        // layers' attention, which is how information bleeds across the
-        // wrong depth.
-        let hist_len = kv_cache.seq_len();
-        let attn_out = crate::ops::attention(
-            q_tmp,
-            kv_cache.get_k(layer_idx),
-            kv_cache.get_v(layer_idx),
-            k_tmp,
-            v_tmp,
-            hist_len,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-        );
-
-        matvec_backend(backend, profiler, &layer.attn_output, &attn_out, attn_proj)?;
-        for i in 0..n_embd {
-            hidden[i] += attn_proj[i];
-        }
-
-        // ffn_norm
-        let dequant_started = profiler.start();
-        let ffn_norm_f32 = tensor_f32_view(&layer.ffn_norm)
-            .map_err(|e| format!("failed to decode ffn_norm of layer {}: {}", layer_idx, e))?;
-        profiler.record_since(ProfileEvent::Dequantization, dequant_started);
-        backend.rmsnorm(hidden, ffn_norm_f32.as_ref(), cfg.rms_eps, tmp);
-
-        matvec_backend(backend, profiler, &layer.ffn_gate, tmp, gate)?;
-        matvec_backend(backend, profiler, &layer.ffn_up, tmp, up)?;
-
-        backend.silu(gate, gate_silu);
-        backend.mul(gate_silu, up, gate_up);
-
-        matvec_backend(backend, profiler, &layer.ffn_down, gate_up, ffn_out)?;
-        for i in 0..n_embd {
-            hidden[i] += ffn_out[i];
-        }
-
-        Ok(())
-    }
-
     fn logits_workspace_min_bytes(&self) -> Result<u64, String> {
         let weight = self.output.as_ref().unwrap_or(&self.token_embd);
         let PersistentWeight::Streamed(descriptor) = weight else {
@@ -1157,6 +992,16 @@ impl StreamingLlamaModel {
                 result
             }
         }
+    }
+}
+
+fn persistent_f32_view<'a>(
+    weight: &'a PersistentWeight,
+    data_source: &GgufDataSource,
+) -> Result<Cow<'a, [f32]>, String> {
+    match weight {
+        PersistentWeight::Resident(tensor) => tensor_f32_view(tensor),
+        PersistentWeight::Streamed(_) => weight.to_f32_vec(data_source).map(Cow::Owned),
     }
 }
 
@@ -1453,211 +1298,6 @@ fn validate_qkv_bias(
 
 /// Borrow already-decoded float storage and allocate only when a compact
 /// quantized tensor must be expanded for a non-matvec operation.
-fn tensor_f32_view(tensor: &TensorData) -> Result<Cow<'_, [f32]>, String> {
-    if let Some((data, _)) = tensor.as_f32_slice() {
-        Ok(Cow::Borrowed(data))
-    } else {
-        tensor
-            .to_f32_vec()
-            .map(Cow::Owned)
-            .map_err(|error| error.to_string())
-    }
-}
-
-/// Persistent streamed weights necessarily produce owned decoded storage;
-/// resident decoded floats can be borrowed for the duration of the operation.
-fn persistent_f32_view<'a>(
-    weight: &'a PersistentWeight,
-    data_source: &GgufDataSource,
-) -> Result<Cow<'a, [f32]>, String> {
-    match weight {
-        PersistentWeight::Resident(tensor) => tensor_f32_view(tensor),
-        PersistentWeight::Streamed(_) => weight.to_f32_vec(data_source).map(Cow::Owned),
-    }
-}
-
-/// Matvec dispatch under the single explicit ggml layout (`shape = [in, out]`):
-/// resident F32 data goes through the SIMD/threaded compute backend; all other
-/// types use the compact block-wise kernels (no full F32 expansion, no
-/// orientation guessing).
-fn matvec_backend<B: ComputeBackend>(
-    backend: &B,
-    profiler: &Profiler,
-    td: &TensorData,
-    x: &[f32],
-    y: &mut [f32],
-) -> Result<(), String> {
-    if let Some((data, shape)) = td.as_f32_slice() {
-        let started = profiler.start();
-        let result = backend.matvec(data, shape, x, y);
-        profiler.record_since(ProfileEvent::FloatMatvec, started);
-        result
-    } else {
-        let started = profiler.start();
-        let result = quantized_matvec_dispatch(backend, td, x, y, profiler);
-        profiler.record_since(ProfileEvent::QuantizedMatvec, started);
-        result
-    }
-}
-
-/// Minimum output rows (out_dim) before we hand Q4_0 / Q6_K work to the
-/// backend thread pool. Below this threshold we keep the fused scalar
-/// kernel and avoid Rayon pool/spawn overhead.
-///
-/// Derived from the `quantized_matvec_bench` microbenchmark in this file:
-///   * 32×1536 and 64×1536 (in_dim=1536): no measurable speedup at 2/4/8/9
-///     threads; best-case times match the scalar path to noise.
-///   * 128×1536 and larger: parallel dispatch produces measurable speedup
-///     (≈1.3–2.0× at 2 threads in the sandbox; higher core counts scale
-///     further on real hardware).
-/// Real Qwen2.5-1.5B layer shapes are 1536 / 8960 / 151936 rows — all well
-/// above this threshold and parallelize cleanly.
-const QUANT_PARALLEL_ROW_THRESHOLD: usize = 128;
-
-/// Split `out_dim` rows into `n_chunks` contiguous (start, count) ranges
-/// with at most one row of imbalance across chunks.
-fn make_row_chunks(out_dim: usize, n_chunks: usize) -> Vec<(usize, usize)> {
-    let n = n_chunks.min(out_dim).max(1);
-    let base = out_dim / n;
-    let extra = out_dim % n;
-    let mut out = Vec::with_capacity(n);
-    let mut cursor = 0usize;
-    for i in 0..n {
-        let count = base + if i < extra { 1 } else { 0 };
-        out.push((cursor, count));
-        cursor += count;
-    }
-    out
-}
-
-fn quantized_matvec_dispatch<B: ComputeBackend>(
-    backend: &B,
-    td: &TensorData,
-    x: &[f32],
-    y: &mut [f32],
-    profiler: &Profiler,
-) -> Result<(), String> {
-    /// Returns (raw_data, kernel_shape=[out, in]) for a quantized tensor if
-    /// it matches one of the row-parallel kernels, otherwise None to fall
-    /// back to the generic `td.matvec` path.
-    fn as_quantized_view<'a>(td: &'a TensorData) -> Option<(GgmlType, &'a [u8], [usize; 2])> {
-        let (qt, ty) = match td {
-            TensorData::Q4_0(qt) => (qt, GgmlType::Q4_0),
-            TensorData::Q6_K(qt) => (qt, GgmlType::Q6_K),
-            _ => return None,
-        };
-        if qt.shape.len() != 2 {
-            return None;
-        }
-        // ggml [in, out] → kernel layout [out, in]
-        Some((ty, &qt.raw_data, [qt.shape[1], qt.shape[0]]))
-    }
-
-    match as_quantized_view(td) {
-        Some((GgmlType::Q4_0, raw, [out_dim, in_dim])) => {
-            // Counters follow the same [in, out] semantics as before.
-            let blocks = (out_dim as u64).saturating_mul((in_dim / QK4_0) as u64);
-            let weight_bytes = blocks.saturating_mul(BLOCK_SIZE_Q4_0 as u64);
-            profiler.record_q4_0_matvec(out_dim as u64, in_dim as u64, blocks, weight_bytes);
-
-            let w_shape = [out_dim, in_dim];
-            let n_threads = backend.num_threads();
-            let parallelize = n_threads > 1 && out_dim >= QUANT_PARALLEL_ROW_THRESHOLD;
-            if parallelize {
-                // Split the output rows into n_threads contiguous ranges and
-                // run each range through the fused scalar kernel on the
-                // backend's bounded Rayon pool. No per-row heap allocation;
-                // x and raw_data are shared read-only.
-                //
-                // SAFETY: Row ranges are non-overlapping by construction
-                // (`make_row_chunks` partitions [0, out_dim)), so each worker
-                // writes to a disjoint y subslice. We hand out raw pointers
-                // because Rayon's `into_par_iter().try_for_each` requires a
-                // `Fn` (not `FnMut`) closure and would otherwise forbid
-                // capturing an outer `&mut [f32]`.
-                let blocks_per_row = in_dim / QK4_0;
-                let row_bytes = blocks_per_row * BLOCK_SIZE_Q4_0;
-                let ranges = make_row_chunks(out_dim, n_threads);
-                // SAFETY: row ranges are non-overlapping partitions of
-                // [0, out_dim), so each worker writes to a disjoint y subslice
-                // and reads a disjoint w subslice. We transmit the base
-                // addresses as usizes because raw pointers are neither Send
-                // nor Sync; the addresses remain valid for the whole call
-                // since both `y` and `raw` outlive the worker pool scope.
-                let y_addr = y.as_mut_ptr() as usize;
-                let raw_addr = raw.as_ptr() as usize;
-                backend.in_worker_pool(move || {
-                    ranges.into_par_iter().try_for_each(
-                        |(row_start, row_count)| -> Result<(), String> {
-                            let w_offset = row_start * row_bytes;
-                            let w_sub = unsafe {
-                                std::slice::from_raw_parts(
-                                    (raw_addr + w_offset) as *const u8,
-                                    row_count * row_bytes,
-                                )
-                            };
-                            let y_sub = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    (y_addr + row_start * std::mem::size_of::<f32>()) as *mut f32,
-                                    row_count,
-                                )
-                            };
-                            let sub_shape = [row_count, in_dim];
-                            matvec_q4_0_row_range(w_sub, &sub_shape, x, y_sub, 0, None)
-                                .map_err(|e| e.to_string())
-                        },
-                    )
-                })?;
-                Ok(())
-            } else {
-                matvec_q4_0_row_range(raw, &w_shape, x, y, 0, None).map_err(|e| e.to_string())
-            }
-        }
-        Some((GgmlType::Q6_K, raw, [out_dim, in_dim])) => {
-            let w_shape = [out_dim, in_dim];
-            let n_threads = backend.num_threads();
-            let parallelize = n_threads > 1 && out_dim >= QUANT_PARALLEL_ROW_THRESHOLD;
-            if parallelize {
-                let blocks_per_row = in_dim / QK_K;
-                let row_bytes = blocks_per_row * BLOCK_SIZE_Q6_K;
-                let ranges = make_row_chunks(out_dim, n_threads);
-                // SAFETY: same disjoint-range reasoning as the Q4_0 branch.
-                let y_addr = y.as_mut_ptr() as usize;
-                let raw_addr = raw.as_ptr() as usize;
-                backend.in_worker_pool(move || {
-                    ranges.into_par_iter().try_for_each(
-                        |(row_start, row_count)| -> Result<(), String> {
-                            let w_offset = row_start * row_bytes;
-                            let w_sub = unsafe {
-                                std::slice::from_raw_parts(
-                                    (raw_addr + w_offset) as *const u8,
-                                    row_count * row_bytes,
-                                )
-                            };
-                            let y_sub = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    (y_addr + row_start * std::mem::size_of::<f32>()) as *mut f32,
-                                    row_count,
-                                )
-                            };
-                            let sub_shape = [row_count, in_dim];
-                            matvec_q6_k_row_range(w_sub, &sub_shape, x, y_sub, 0, None)
-                                .map_err(|e| e.to_string())
-                        },
-                    )
-                })?;
-                Ok(())
-            } else {
-                matvec_q6_k_row_range(raw, &w_shape, x, y, 0, None).map_err(|e| e.to_string())
-            }
-        }
-        _ => {
-            // Other quantized types: original scalar path unchanged.
-            td.matvec(x, y).map_err(|e| e.to_string())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3290,23 +2930,18 @@ mod tests {
             x[i] = ((i as f32) * 0.0137 - 0.5).sin() * 0.7;
         }
 
-        // Reference: dequant each row via BlockQ4_0, then scalar dot
-        use ramforge_core::quant::BlockQ4_0;
+        // Authoritative storage-independent reference: decode one complete
+        // output row through ramforge-core's quant block decoders, then use
+        // deterministic scalar F32 accumulation.
         let mut ref_y = vec![0.0f32; out_dim];
-        for r in 0..out_dim {
-            let mut dot = 0.0f32;
-            for b in 0..blocks_per_row {
-                let block_start = r * row_bytes + b * BLOCK_SIZE_Q4_0;
-                let blk = BlockQ4_0::from_bytes(&raw[block_start..block_start + BLOCK_SIZE_Q4_0])
-                    .unwrap();
-                let mut dq = [0f32; 32];
-                blk.dequantize(&mut dq);
-                for j in 0..32 {
-                    dot += dq[j] * x[b * 32 + j];
-                }
-            }
-            ref_y[r] = dot;
-        }
+        ramforge_core::compute::quantized_matvec_reference(
+            GgmlType::Q4_0,
+            &raw,
+            ramforge_core::compute::MatrixShape::new(in_dim, out_dim),
+            &x,
+            &mut ref_y,
+        )
+        .unwrap();
 
         let profiler = Profiler::default();
         // Use 4 threads to force parallel partitioning.
@@ -3327,6 +2962,55 @@ mod tests {
             "parallel Q4_0 matvec diverges from scalar reference (max_abs={}, ref0={}, got0={})",
             max_abs, ref_y[0], y[0]
         );
+    }
+
+    #[test]
+    fn test_q6_k_parallel_matvec_matches_scalar_at_row_partition_boundaries() {
+        use ramforge_core::quant::{BLOCK_SIZE_Q6_K, QK_K};
+
+        let in_dim = QK_K;
+        let out_dim = 129usize;
+        let row_bytes = BLOCK_SIZE_Q6_K;
+        let mut raw = vec![0u8; out_dim * row_bytes];
+        for row in 0..out_dim {
+            let offset = row * row_bytes;
+            for index in 0..128 {
+                raw[offset + index] = (index as u8).wrapping_add(row as u8);
+            }
+            for index in 0..64 {
+                raw[offset + 128 + index] = (index as u8).wrapping_mul(3);
+            }
+            for index in 0..16 {
+                raw[offset + 192 + index] = 1;
+            }
+            raw[offset + 208..offset + 210].copy_from_slice(&0x3c00u16.to_le_bytes());
+        }
+        let tensor = TensorData::from_bytes(
+            GgmlType::Q6_K,
+            vec![in_dim as u64, out_dim as u64],
+            (in_dim * out_dim) as u64,
+            raw,
+        )
+        .unwrap();
+        let x = (0..in_dim)
+            .map(|index| (index as f32 * 0.011).cos())
+            .collect::<Vec<_>>();
+        let profiler = Profiler::default();
+        let scalar = crate::backend::CpuBackend::scalar();
+        let parallel = crate::backend::CpuBackend::with_threads(4);
+        let mut scalar_y = vec![0.0f32; out_dim];
+        let mut parallel_y = vec![0.0f32; out_dim];
+        matvec_backend(&scalar, &profiler, &tensor, &x, &mut scalar_y).unwrap();
+        matvec_backend(&parallel, &profiler, &tensor, &x, &mut parallel_y).unwrap();
+        for (row, (expected, actual)) in scalar_y.iter().zip(parallel_y.iter()).enumerate() {
+            assert!(
+                (expected - actual).abs() < 1e-5,
+                "Q6_K parallel row {} differs: scalar {}, parallel {}",
+                row,
+                expected,
+                actual
+            );
+        }
     }
 
     #[test]
@@ -3631,13 +3315,16 @@ fn quantized_matvec_bench() {
             in_dim,
             0x12345678 ^ (out_dim as u32).wrapping_mul(31) ^ (in_dim as u32),
         );
-        let backend = crate::backend::CpuBackend::scalar();
-        let profiler = Profiler::default();
         let x = random_x(in_dim, 0xC0FFEE);
         let mut y_ref = vec![0.0f32; out_dim];
-        let ref_td = make_q4_0_td(raw.clone(), out_dim, in_dim);
-        quantized_matvec_dispatch(&backend, &ref_td, &x, &mut y_ref, &profiler)
-            .expect("reference failed");
+        ramforge_core::compute::quantized_matvec_reference(
+            GgmlType::Q4_0,
+            &raw,
+            ramforge_core::compute::MatrixShape::new(in_dim, out_dim),
+            &x,
+            &mut y_ref,
+        )
+        .expect("reference failed");
 
         let iters = if out_dim >= 100_000 {
             5
@@ -3687,13 +3374,16 @@ fn quantized_matvec_bench() {
             in_dim,
             0xA5A5A5 ^ (out_dim as u32).wrapping_mul(131) ^ (in_dim as u32),
         );
-        let backend = crate::backend::CpuBackend::scalar();
-        let profiler = Profiler::default();
         let x = random_x(in_dim, 0xDEADBEEF);
         let mut y_ref = vec![0.0f32; out_dim];
-        let ref_td = make_q6_k_td(raw.clone(), out_dim, in_dim);
-        quantized_matvec_dispatch(&backend, &ref_td, &x, &mut y_ref, &profiler)
-            .expect("q6_k reference failed");
+        ramforge_core::compute::quantized_matvec_reference(
+            GgmlType::Q6_K,
+            &raw,
+            ramforge_core::compute::MatrixShape::new(in_dim, out_dim),
+            &x,
+            &mut y_ref,
+        )
+        .expect("q6_k reference failed");
 
         let iters = if out_dim >= 100_000 {
             5

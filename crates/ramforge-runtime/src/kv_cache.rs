@@ -1,7 +1,14 @@
-//! KV cache for autoregressive generation
+//! KV cache for autoregressive generation.
+//!
+//! Each layer stores K and V in the explicit layout
+//! `[position][kv_head][head_dim]`. `seq_len` is the number of committed
+//! historical positions, so a forward at position `p` must read history
+//! `[0, p)` and append its current K/V at slot `p` only after all layers have
+//! consumed that history. Prompt and decode use the same append/read contract;
+//! only the caller's token-position schedule differs.
 //!
 //! Explicitly represented, grows as tokens are generated, avoids recomputing
-//! previous tokens, accounts for memory usage in RAMforge budget.
+//! previous tokens, and accounts for memory usage in RAMforge's budget.
 
 use ramforge_core::error::MemoryError;
 use ramforge_core::memory::MemoryBudget;
@@ -108,8 +115,11 @@ impl KvCache {
         budget.allocate("kv_cache", self.total_bytes() as u64)
     }
 
-    /// Append K and V for a new token at current seq_len position
-    /// k and v are [n_kv_heads * head_dim] each
+    /// Append K and V for the current token at position `seq_len`.
+    ///
+    /// `k` and `v` are one position in `[kv_head][head_dim]` layout. The
+    /// cache does not advance `seq_len` here because the caller must append
+    /// every layer before committing the next history length.
     pub fn append(&mut self, layer: usize, k: &[f32], v: &[f32]) -> Result<(), String> {
         if layer >= self.n_layers {
             return Err(format!("layer {} out of bounds", layer));
@@ -139,17 +149,62 @@ impl KvCache {
         self.seq_len += 1;
     }
 
-    /// Get K cache for a layer up to current seq_len (flattened)
+    /// Get committed K history `[0, seq_len)` for a layer, flattened as
+    /// `[position][kv_head][head_dim]`.
     pub fn get_k(&self, layer: usize) -> &[f32] {
         let expected = self.n_kv_heads * self.head_dim;
         let len = self.seq_len * expected;
         &self.k_caches[layer][..len]
     }
 
+    /// Get committed V history `[0, seq_len)` for a layer, flattened as
+    /// `[position][kv_head][head_dim]`.
     pub fn get_v(&self, layer: usize) -> &[f32] {
         let expected = self.n_kv_heads * self.head_dim;
         let len = self.seq_len * expected;
         &self.v_caches[layer][..len]
+    }
+
+    /// Read an explicit committed K position range `[start, end)`.
+    pub fn get_k_range(
+        &self,
+        layer: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<&[f32], String> {
+        self.validate_read_range(layer, start, end)?;
+        let width = self.n_kv_heads * self.head_dim;
+        Ok(&self.k_caches[layer][start * width..end * width])
+    }
+
+    /// Read an explicit committed V position range `[start, end)`.
+    pub fn get_v_range(
+        &self,
+        layer: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<&[f32], String> {
+        self.validate_read_range(layer, start, end)?;
+        let width = self.n_kv_heads * self.head_dim;
+        Ok(&self.v_caches[layer][start * width..end * width])
+    }
+
+    fn validate_read_range(
+        &self,
+        layer: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<(), String> {
+        if layer >= self.n_layers {
+            return Err(format!("layer {} out of bounds", layer));
+        }
+        if start > end || end > self.seq_len {
+            return Err(format!(
+                "KV read range {}..{} is outside committed history 0..{}",
+                start, end, self.seq_len
+            ));
+        }
+        Ok(())
     }
 
     pub fn seq_len(&self) -> usize {
@@ -180,6 +235,19 @@ mod tests {
         cache.increment_seq_len();
         assert_eq!(cache.seq_len(), 1);
         assert_eq!(cache.get_k(0).len(), 8);
+    }
+
+    #[test]
+    fn test_kv_cache_explicit_read_ranges() {
+        let mut cache = KvCache::new(1, 1, 2, 4).unwrap();
+        cache.append(0, &[1.0, 2.0], &[3.0, 4.0]).unwrap();
+        cache.increment_seq_len();
+        cache.append(0, &[5.0, 6.0], &[7.0, 8.0]).unwrap();
+        cache.increment_seq_len();
+        assert_eq!(cache.get_k_range(0, 1, 2).unwrap(), &[5.0, 6.0]);
+        assert_eq!(cache.get_v_range(0, 0, 2).unwrap(), &[3.0, 4.0, 7.0, 8.0]);
+        assert!(cache.get_k_range(0, 0, 3).is_err());
+        assert!(cache.get_v_range(1, 0, 1).is_err());
     }
 
     #[test]

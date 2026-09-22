@@ -20,6 +20,7 @@
 
 #![allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
 
+use crate::compute::{matvec_f32_reference, quantized_matvec_reference, MatrixShape};
 use crate::error::DataSourceError;
 use crate::quant;
 use crate::types::GgmlType;
@@ -291,9 +292,9 @@ impl QuantizedTensor {
     ///
     /// Explicit GGML/GGUF convention: `shape = [in_features, out_features]` and
     /// `raw_data` stores `out_features` contiguous rows of `in_features`
-    /// quantized elements. The kernels dequantize block-by-block; the working
-    /// set never exceeds one block — the entire tensor is never expanded to
-    /// F32. Any arity/layout mismatch is a hard error (no silent fallbacks).
+    /// quantized elements. The authoritative reference decodes one complete
+    /// output row at a time; the entire tensor is never expanded to F32. Any
+    /// arity/layout mismatch is a hard error (no silent fallbacks).
     pub fn matvec(&self, x: &[f32], y: &mut [f32]) -> Result<(), DataSourceError> {
         if self.shape.len() != 2 {
             return Err(DataSourceError::General(format!(
@@ -315,20 +316,14 @@ impl QuantizedTensor {
             )));
         }
 
-        match self.ggml_type {
-            GgmlType::Q4_0 => quant::matvec_q4_0(&self.raw_data, &[out_dim, in_dim], x, y),
-            GgmlType::Q8_0 => quant::matvec_q8_0(&self.raw_data, &[out_dim, in_dim], x, y),
-            GgmlType::Q4_K => quant::matvec_q4_k(&self.raw_data, &[out_dim, in_dim], x, y),
-            GgmlType::Q5_K => quant::matvec_q5_k(&self.raw_data, &[out_dim, in_dim], x, y),
-            GgmlType::Q6_K => quant::matvec_q6_k(&self.raw_data, &[out_dim, in_dim], x, y),
-            GgmlType::Q2_K => quant::matvec_q2_k(&self.raw_data, &[out_dim, in_dim], x, y),
-            GgmlType::Q3_K => quant::matvec_q3_k(&self.raw_data, &[out_dim, in_dim], x, y),
-            GgmlType::Q8_K => quant::matvec_q8_k(&self.raw_data, &[out_dim, in_dim], x, y),
-            _ => Err(DataSourceError::General(format!(
-                "unsupported quantized matvec type {}",
-                self.ggml_type.name()
-            ))),
-        }
+        quantized_matvec_reference(
+            self.ggml_type,
+            &self.raw_data,
+            MatrixShape::new(in_dim, out_dim),
+            x,
+            y,
+        )
+        .map_err(|error| DataSourceError::General(error.to_string()))
     }
 }
 
@@ -616,11 +611,22 @@ impl TensorData {
     /// (`in` contiguous). Arity mismatches are hard errors — no orientation
     /// guessing, no silent transposed fallbacks.
     pub fn matvec(&self, x: &[f32], y: &mut [f32]) -> Result<(), DataSourceError> {
+        if self.shape().len() != 2 {
+            return Err(DataSourceError::General(format!(
+                "matvec expects a 2D tensor, got shape {:?}",
+                self.shape()
+            )));
+        }
         match self {
-            Self::F32 { data, shape, .. } => matvec_f32_ggml(data, shape, x, y, "F32"),
-            Self::F16 { data, shape, .. } | Self::BF16 { data, shape, .. } => {
-                matvec_f32_ggml(data, shape, x, y, "F16/BF16")
-            }
+            Self::F32 { data, shape, .. }
+            | Self::F16 { data, shape, .. }
+            | Self::BF16 { data, shape, .. } => matvec_f32_reference(
+                data,
+                MatrixShape::new(shape[0], shape[1]),
+                x,
+                y,
+            )
+            .map_err(|error| DataSourceError::General(error.to_string())),
             Self::Q4_0(qt)
             | Self::Q8_0(qt)
             | Self::Q4_K(qt)
@@ -719,58 +725,6 @@ impl TensorData {
             | Self::Q8_K(qt) => qt.dequantize_to_f32(),
         }
     }
-}
-
-/// F32 matvec under the explicit GGML/GGUF layout:
-/// `shape = [in, out]`, `data` is row-major `[out][in]` (`in` contiguous).
-/// Strict arity: `x.len() == shape[0]`, `y.len() == shape[1]`.
-fn matvec_f32_ggml(
-    data: &[f32],
-    shape: &[usize],
-    x: &[f32],
-    y: &mut [f32],
-    label: &str,
-) -> Result<(), DataSourceError> {
-    if shape.len() != 2 {
-        return Err(DataSourceError::General(format!(
-            "{} matvec expects 2D weight, got shape {:?}",
-            label, shape
-        )));
-    }
-    let in_dim = shape[0];
-    let out_dim = shape[1];
-    if x.len() != in_dim || y.len() != out_dim {
-        return Err(DataSourceError::General(format!(
-            "{} matvec arity mismatch (ggml layout [in, out]): W {:?} implies in={}, out={}, but got x.len()={}, y.len()={}",
-            label,
-            shape,
-            in_dim,
-            out_dim,
-            x.len(),
-            y.len()
-        )));
-    }
-    let needed = out_dim
-        .checked_mul(in_dim)
-        .ok_or_else(|| DataSourceError::General("matvec shape overflow".to_string()))?;
-    if data.len() < needed {
-        return Err(DataSourceError::General(format!(
-            "{} tensor truncated: need {} f32 elements for {:?}, have {}",
-            label,
-            needed,
-            shape,
-            data.len()
-        )));
-    }
-    for (o, yi) in y.iter_mut().enumerate() {
-        let row = &data[o * in_dim..o * in_dim + in_dim];
-        let mut sum = 0.0;
-        for (i, &wi) in row.iter().enumerate() {
-            sum += wi * x[i];
-        }
-        *yi = sum;
-    }
-    Ok(())
 }
 
 /// Decode one contiguous row of `num_elements` values of any supported type

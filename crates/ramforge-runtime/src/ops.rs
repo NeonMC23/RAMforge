@@ -1,16 +1,11 @@
-//! Core ops for transformer: RoPE, attention
+//! Model-independent operation adapters.
+//!
+//! The numerical definitions live in `ramforge_core::compute`, which has no
+//! storage, streaming, budget, or runtime dependencies. This module preserves
+//! the runtime's historical infallible operation API and translates the
+//! validated reference-core results at the model boundary.
 
-/// Apply RoPE to query and key vectors
-///
-/// q and k are [n_heads * head_dim] or [head_dim] for single head.
-/// We apply RoPE per head with position `pos` and base `freq_base`.
-///
-/// Convention (M6.1 fix): the llama/qwen2 "half-split" rotary scheme used
-/// by HF Transformers and llama.cpp (rope NORMAL / GPT-NeoX style):
-/// for each head, element `j` rotates with element `j + head_dim/2`,
-/// with theta_j = pos * freq_base^(-2j/head_dim). This replaces the
-/// earlier GPT-J/interleaved adjacent-pair convention, which is *not*
-/// what llama/qwen2 GGUF weights are trained/converted for.
+/// Apply half-split llama/Qwen RoPE to Q and K.
 pub fn apply_rope(
     q: &mut [f32],
     k: &mut [f32],
@@ -20,47 +15,19 @@ pub fn apply_rope(
     n_kv_heads: usize,
     freq_base: f32,
 ) {
-    // For each head in q
-    for head in 0..n_heads {
-        let offset = head * head_dim;
-        rope_single(&mut q[offset..offset + head_dim], pos, freq_base);
-    }
-    for head in 0..n_kv_heads {
-        let offset = head * head_dim;
-        rope_single(&mut k[offset..offset + head_dim], pos, freq_base);
-    }
+    ramforge_core::compute::rope_reference(
+        q,
+        k,
+        pos,
+        head_dim,
+        n_heads,
+        n_kv_heads,
+        freq_base,
+    )
+    .expect("model RoPE tensors must satisfy their declared dimensions");
 }
 
-/// Half-split (llama/qwen2) RoPE for one head of `dim` elements:
-/// pairs (x[j], x[j + dim/2]) are rotated by theta_j. Position 0 is the
-/// identity. Even/odd `dim` (dim must be even) leaves no unpaired slots.
-fn rope_single(x: &mut [f32], pos: usize, freq_base: f32) {
-    let dim = x.len();
-    let half = dim / 2;
-    for j in 0..half {
-        let theta = freq_base.powf(-2.0f32 * (j as f32) / (dim as f32)) * (pos as f32);
-        let cos = theta.cos();
-        let sin = theta.sin();
-        let x0 = x[j];
-        let x1 = x[j + half];
-        x[j] = x0 * cos - x1 * sin;
-        x[j + half] = x0 * sin + x1 * cos;
-    }
-}
-
-/// Compute attention for a single token over `hist` cached K/V plus the
-/// current token's K/V — without materializing a concatenated copy.
-///
-/// - `q`: `[n_heads * head_dim]`
-/// - `k_hist`/`v_hist`: cached prefix, `[hist_len * n_kv_heads * head_dim]` flattened
-/// - `k_new`/`v_new`: current token, `[n_kv_heads * head_dim]` each
-///
-/// Position `p < hist_len` reads from the cache slices; position `hist_len`
-/// reads the current-token vectors. The only allocations are one `scores`
-/// vector (`hist_len + 1`, reused across heads) plus the output.
-///
-/// Returns output `[n_heads * head_dim]`.
-#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+/// Compute single-token causal attention over cached history plus current K/V.
 pub fn attention(
     q: &[f32],
     k_hist: &[f32],
@@ -72,82 +39,18 @@ pub fn attention(
     n_kv_heads: usize,
     head_dim: usize,
 ) -> Vec<f32> {
-    let kv_dim = n_kv_heads * head_dim;
-    let total = hist_len + 1;
-    debug_assert_eq!(k_new.len(), kv_dim);
-    debug_assert_eq!(v_new.len(), kv_dim);
-    debug_assert!(k_hist.len() >= hist_len * kv_dim);
-    debug_assert!(v_hist.len() >= hist_len * kv_dim);
-
-    // K/V accessor for position `pos` without copying the cache prefix.
-    let k_at = |pos: usize| -> &[f32] {
-        if pos < hist_len {
-            let off = pos * kv_dim;
-            &k_hist[off..off + kv_dim]
-        } else {
-            k_new
-        }
-    };
-    let v_at = |pos: usize| -> &[f32] {
-        if pos < hist_len {
-            let off = pos * kv_dim;
-            &v_hist[off..off + kv_dim]
-        } else {
-            v_new
-        }
-    };
-
-    let mut output = vec![0.0f32; n_heads * head_dim];
-    if n_heads == 0 {
-        return output;
-    }
-    let mut scores = vec![0.0f32; total];
-
-    for h in 0..n_heads {
-        let q_offset = h * head_dim;
-        let q_head = &q[q_offset..q_offset + head_dim];
-
-        let kv_h = if n_kv_heads == 0 {
-            0
-        } else {
-            h * n_kv_heads / n_heads
-        };
-
-        for pos in 0..total {
-            let k_pos = k_at(pos);
-            let k_head = &k_pos[kv_h * head_dim..kv_h * head_dim + head_dim];
-            let mut dot = 0.0f32;
-            for i in 0..head_dim {
-                dot += q_head[i] * k_head[i];
-            }
-            dot /= (head_dim as f32).sqrt();
-            scores[pos] = dot;
-        }
-
-        // Softmax
-        let max = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let mut sum = 0.0f32;
-        for s in scores.iter_mut() {
-            *s = (*s - max).exp();
-            sum += *s;
-        }
-        for s in scores.iter_mut() {
-            *s /= sum;
-        }
-
-        // Weighted sum of V
-        let out_offset = h * head_dim;
-        for pos in 0..total {
-            let v_pos = v_at(pos);
-            let v_head = &v_pos[kv_h * head_dim..kv_h * head_dim + head_dim];
-            let weight = scores[pos];
-            for i in 0..head_dim {
-                output[out_offset + i] += weight * v_head[i];
-            }
-        }
-    }
-
-    output
+    ramforge_core::compute::attention_reference(
+        q,
+        k_hist,
+        v_hist,
+        k_new,
+        v_new,
+        hist_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+    )
+    .expect("model attention tensors must satisfy their declared dimensions")
 }
 
 #[cfg(test)]
@@ -155,215 +58,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rope_position_zero_is_identity() {
-        // Position 0 must be the identity under the half-split convention
-        // (theta_j = 0 for all j) for multiple head sizes.
-        for dim in [4usize, 8, 16] {
-            let orig: Vec<f32> = (0..dim).map(|i| 0.25 + 0.5 * i as f32).collect();
-            let mut q = orig.clone();
-            let mut k = orig.clone();
-            apply_rope(&mut q, &mut k, 0, dim, 1, 1, 10000.0);
-            assert_eq!(q, orig, "dim {}", dim);
-            assert_eq!(k, orig, "dim {}", dim);
-        }
-    }
-
-    #[test]
-    fn test_rope_half_split_convention_nonzero_position() {
-        // Half-split (llama/qwen2): element j pairs with element j + dim/2.
-        // With position != 0 and a non-symmetric vector, this must equal the
-        // manual half-split formula and MUST NOT equal the GPT-J/interleaved
-        // adjacent-pair formula.
-        let dim = 8usize;
-        let half = dim / 2;
-        let base = 10000.0f32;
-        let pos = 3usize;
-        let orig: Vec<f32> = (0..dim).map(|i| 0.1 + 0.3 * i as f32).collect();
-
-        // Manual half-split reference.
-        let mut half_split = orig.clone();
-        for j in 0..half {
-            let theta = base.powf(-2.0f32 * (j as f32) / (dim as f32)) * (pos as f32);
-            let (c, s) = (theta.cos(), theta.sin());
-            let (a, b) = (orig[j], orig[j + half]);
-            half_split[j] = a * c - b * s;
-            half_split[j + half] = a * s + b * c;
-        }
-
-        // Manual adjacent-pair (GPT-J/interleaved) reference – the OLD,
-        // incorrect convention for llama/qwen2.
-        let mut adjacent = orig.clone();
-        for i in (0..dim).step_by(2) {
-            let theta = base.powf(-2.0f32 * (i as f32 / 2.0) / (dim as f32)) * (pos as f32);
-            let (c, s) = (theta.cos(), theta.sin());
-            let (a, b) = (orig[i], orig[i + 1]);
-            adjacent[i] = a * c - b * s;
-            adjacent[i + 1] = a * s + b * c;
-        }
-
-        let mut q = orig.clone();
-        let mut k = orig.clone();
-        apply_rope(&mut q, &mut k, pos, dim, 1, 1, base);
-
-        for i in 0..dim {
-            assert!(
-                (q[i] - half_split[i]).abs() < 1e-5,
-                "q[{}] = {}, half-split reference {}",
-                i,
-                q[i],
-                half_split[i]
-            );
-            assert!((k[i] - half_split[i]).abs() < 1e-5);
-        }
-        // Guard against regression to the adjacent convention: at least one
-        // element must differ meaningfully between the two schemes.
-        let max_diff = (0..dim)
-            .map(|i| (q[i] - adjacent[i]).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff > 0.05,
-            "implementation must differ from the interleaved convention (max diff {})",
-            max_diff
-        );
-    }
-
-    #[test]
-    fn test_rope_pairing_discriminator_sparse_vector() {
-        // Sparse activations at two partner positions make the pairing
-        // observable directly: only (x[1], x[1 + dim/2]) may interact.
-        let dim = 8usize;
-        let half = dim / 2;
-        let base = 10000.0f32;
-        let pos = 1usize;
-
-        let mut x = vec![0.0f32; dim];
-        x[1] = 1.0;
-        x[1 + half] = 2.0;
-
-        let theta = base.powf(-2.0f32 / (dim as f32)); // j = 1
-        let (c, s) = (theta.cos(), theta.sin());
-
-        let mut q = x.clone();
-        let mut k = x.clone();
-        apply_rope(&mut q, &mut k, pos, dim, 1, 1, base);
-
-        // Half-split expects: q[1] = 1*c - 2*s ; q[1+half] = 1*s + 2*c.
-        assert!((q[1] - (1.0 * c - 2.0 * s)).abs() < 1e-6);
-        assert!((q[1 + half] - (1.0 * s + 2.0 * c)).abs() < 1e-6);
-        // Every other slot stays zero (no adjacent leakage).
-        for (i, &v) in q.iter().enumerate() {
-            if i != 1 && i != 1 + half {
-                assert_eq!(v, 0.0, "leakage at {}", i);
-            }
-        }
-    }
-
-    #[test]
-    fn test_rope_multi_head_uses_per_head_block() {
-        // Two heads of dim 4: each head's rotation must be confined to its
-        // own head_dim block with the same theta schedule.
-        let head_dim = 4usize;
-        let base = 10000.0f32;
-        let pos = 5usize;
-        let mut q = vec![0.0f32; 8];
-        q[0] = 1.0; // head 0, j=0
-        q[head_dim] = 1.0; // head 1, j=0
+    fn runtime_rope_adapter_preserves_reference_identity_at_position_zero() {
+        let mut q = vec![1.0, 2.0, 3.0, 4.0];
         let mut k = q.clone();
-        apply_rope(&mut q, &mut k, pos, head_dim, 2, 2, base);
-
-        let theta = pos as f32; // base^0 * pos
-        let (c, s) = (theta.cos(), theta.sin());
-        // head0: (0, 0+2)
-        assert!((q[0] - c).abs() < 1e-5);
-        assert!((q[2] - s).abs() < 1e-5);
-        // head1: (4, 4+2)
-        assert!((q[4] - c).abs() < 1e-5);
-        assert!((q[6] - s).abs() < 1e-5);
-        assert!(q[1].abs() < 1e-6 && q[3].abs() < 1e-6);
+        apply_rope(&mut q, &mut k, 0, 4, 1, 1, 10_000.0);
+        assert_eq!(q, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(k, q);
     }
 
     #[test]
-    fn test_attention_zero_heads_preserves_empty_output() {
-        assert!(attention(&[], &[], &[], &[], &[], 0, 0, 0, 1).is_empty());
-    }
-
-    #[test]
-    fn test_attention_simple() {
-        // Single head, head_dim 2, single (new) position, no history
-        let q = vec![1.0, 0.0];
-        let k_hist: Vec<f32> = Vec::new();
-        let v_hist: Vec<f32> = Vec::new();
-        let k_new = vec![1.0, 0.0];
-        let v_new = vec![5.0, 6.0];
-        let out = attention(&q, &k_hist, &v_hist, &k_new, &v_new, 0, 1, 1, 2);
-        // Q dot K =1, softmax single =1, output = V
-        assert_eq!(out, vec![5.0, 6.0]);
-    }
-
-    #[test]
-    fn test_attention_with_history_no_copy() {
-        // 1 head, head_dim 1, hist_len 2 + current => compare against a naive
-        // concatenated reference implementation.
-        let q = vec![1.0f32];
-        // history positions: k=2.0 v=10.0 ; k=3.0 v=20.0
-        let k_hist = vec![2.0f32, 3.0];
-        let v_hist = vec![10.0f32, 20.0];
-        let k_new = vec![4.0f32]; // current
-        let v_new = vec![30.0f32];
-
-        let out = attention(&q, &k_hist, &v_hist, &k_new, &v_new, 2, 1, 1, 1);
-
-        // Naive reference over the concatenated prefix.
-        let ks = [2.0f32, 3.0, 4.0];
-        let vs = [10.0f32, 20.0, 30.0];
-        let mut scores = [0.0f32; 3];
-        for (p, s) in scores.iter_mut().enumerate() {
-            *s = (q[0] * ks[p]) / 1.0f32.sqrt();
-        }
-        let max = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let mut sum = 0.0f32;
-        for s in scores.iter_mut() {
-            *s = (*s - max).exp();
-            sum += *s;
-        }
-        let mut expected = 0.0f32;
-        for p in 0..3 {
-            expected += (scores[p] / sum) * vs[p];
-        }
-        assert!(
-            (out[0] - expected).abs() < 1e-5,
-            "out={} expected={}",
-            out[0],
-            expected
+    fn runtime_attention_adapter_uses_reference_gqa_mapping() {
+        let result = attention(
+            &[1.0, 0.0, 0.0, 1.0],
+            &[],
+            &[],
+            &[1.0, 0.0],
+            &[2.0, 3.0],
+            0,
+            2,
+            1,
+            2,
         );
-    }
-
-    #[test]
-    fn test_attention_reused_scores_are_independent_per_head() {
-        // Two heads deliberately produce different score distributions. A
-        // scratch vector reused across heads must be fully overwritten.
-        let q = [1.0f32, 2.0];
-        let k_hist = [1.0f32, 3.0];
-        let v_hist = [10.0f32, 100.0];
-        let k_new = [2.0f32, 1.0];
-        let v_new = [20.0f32, 200.0];
-
-        let out = attention(&q, &k_hist, &v_hist, &k_new, &v_new, 1, 2, 2, 1);
-        let weighted_two = |score0: f32, score1: f32, value0: f32, value1: f32| {
-            let max = score0.max(score1);
-            let mut weight0 = (score0 - max).exp();
-            let mut weight1 = (score1 - max).exp();
-            let sum = weight0 + weight1;
-            weight0 /= sum;
-            weight1 /= sum;
-            let mut output = 0.0;
-            output += weight0 * value0;
-            output += weight1 * value1;
-            output
-        };
-        let expected_head0 = weighted_two(1.0, 2.0, 10.0, 20.0);
-        let expected_head1 = weighted_two(6.0, 2.0, 100.0, 200.0);
-
-        assert_eq!(out, vec![expected_head0, expected_head1]);
+        assert_eq!(result, [2.0, 3.0, 2.0, 3.0]);
     }
 }

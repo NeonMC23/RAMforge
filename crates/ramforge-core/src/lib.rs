@@ -18,11 +18,13 @@
 //! - `memory`: `MemoryBudget` and human size parsing (`parse_memory_size`)
 //! - `cache`: strict bounded LRU cache with byte-exact accounting
 //! - `datasource`: file-backed tensor access without loading the entire model
+//! - `compute`: storage-independent reference numerical operations
 //!
 //! RAMforge-managed memory is defined as memory explicitly tracked via
 //! `MemoryBudget`. It does NOT include total process RSS or OS page cache.
 
 pub mod cache;
+pub mod compute;
 pub mod datasource;
 pub mod error;
 pub mod gguf;
@@ -34,6 +36,7 @@ pub mod tokenizer;
 pub mod types;
 
 pub use cache::{BoundedCache, CacheStats};
+pub use compute::{ComputeError, MatrixShape};
 pub use datasource::GgufDataSource;
 pub use error::{CacheError, DataSourceError, GgufError, MemoryError, ParseSizeError, Result};
 pub use gguf::parse_gguf_file;

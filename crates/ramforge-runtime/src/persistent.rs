@@ -116,7 +116,9 @@ impl PersistentWeight {
     /// `y = W * x` where W is this persistent weight (ggml layout
     /// `[in, out]`; x.len() == in, y.len() == out).
     ///
-    /// - Resident: compact matvec in memory (block-wise for quantized).
+    /// - Resident: compact matvec in memory (the scalar quantized utility
+    ///   decodes one output row at a time; the streaming model's dispatch
+    ///   retains the fused block-wise path).
     /// - Streamed: row-chunked pass over the file; the chunk buffer is
     ///   budget-charged and bounded by `min(16 MiB, available/share)`.
     pub fn matvec_into(
