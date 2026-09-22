@@ -866,9 +866,8 @@ fn decode_f32(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceErr
         )));
     }
     let mut out = Vec::with_capacity(num_elements as usize);
-    for chunk in bytes[..expected].chunks_exact(4) {
-        let arr: [u8; 4] = chunk.try_into().unwrap();
-        out.push(f32::from_le_bytes(arr));
+    for chunk in bytes[..expected].as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Ok(out)
 }
@@ -883,9 +882,8 @@ fn decode_f16(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceErr
         )));
     }
     let mut out = Vec::with_capacity(num_elements as usize);
-    for chunk in bytes[..expected].chunks_exact(2) {
-        let arr: [u8; 2] = chunk.try_into().unwrap();
-        let bits = u16::from_le_bytes(arr);
+    for chunk in bytes[..expected].as_chunks::<2>().0 {
+        let bits = u16::from_le_bytes(*chunk);
         out.push(f16_to_f32(bits));
     }
     Ok(out)
@@ -901,9 +899,8 @@ fn decode_bf16(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceEr
         )));
     }
     let mut out = Vec::with_capacity(num_elements as usize);
-    for chunk in bytes[..expected].chunks_exact(2) {
-        let arr: [u8; 2] = chunk.try_into().unwrap();
-        let bits = u16::from_le_bytes(arr);
+    for chunk in bytes[..expected].as_chunks::<2>().0 {
+        let bits = u16::from_le_bytes(*chunk);
         out.push(bf16_to_f32(bits));
     }
     Ok(out)

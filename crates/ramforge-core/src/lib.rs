@@ -36,7 +36,7 @@ pub mod tokenizer;
 pub mod types;
 
 pub use cache::{BoundedCache, CacheStats};
-pub use compute::{ComputeError, MatrixShape};
+pub use compute::{AttentionConfig, ComputeError, MatrixShape};
 pub use datasource::GgufDataSource;
 pub use error::{CacheError, DataSourceError, GgufError, MemoryError, ParseSizeError, Result};
 pub use gguf::parse_gguf_file;

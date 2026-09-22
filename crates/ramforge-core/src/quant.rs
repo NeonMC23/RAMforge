@@ -2001,7 +2001,10 @@ mod tests {
         let mut raw = Vec::new();
         for row in 0..3 {
             raw.extend_from_slice(&0x3c00u16.to_le_bytes());
-            raw.extend(std::iter::repeat((0x88u8).wrapping_add(row as u8)).take(16));
+            raw.extend(std::iter::repeat_n(
+                (0x88u8).wrapping_add(row as u8),
+                16,
+            ));
         }
         let x = vec![1.0f32; QK4_0];
         let mut full = vec![0.0f32; 3];

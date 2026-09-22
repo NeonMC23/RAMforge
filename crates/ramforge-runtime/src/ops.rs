@@ -28,6 +28,11 @@ pub fn apply_rope(
 }
 
 /// Compute single-token causal attention over cached history plus current K/V.
+///
+/// This compatibility adapter keeps the runtime's existing explicit operation
+/// signature; the storage-independent core receives the same values through
+/// `AttentionConfig`.
+#[allow(clippy::too_many_arguments)]
 pub fn attention(
     q: &[f32],
     k_hist: &[f32],
@@ -45,10 +50,7 @@ pub fn attention(
         v_hist,
         k_new,
         v_new,
-        hist_len,
-        n_heads,
-        n_kv_heads,
-        head_dim,
+        ramforge_core::compute::AttentionConfig::new(hist_len, n_heads, n_kv_heads, head_dim),
     )
     .expect("model attention tensors must satisfy their declared dimensions")
 }

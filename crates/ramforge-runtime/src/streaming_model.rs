@@ -3394,6 +3394,7 @@ fn quantized_matvec_bench() {
         } else {
             200
         };
+        let profiler = Profiler::default();
         for threads in [1, 2, 4, 8, 9] {
             let be = crate::backend::CpuBackend::with_threads(threads);
             let mut y = vec![0.0f32; out_dim];

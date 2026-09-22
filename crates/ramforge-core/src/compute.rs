@@ -67,6 +67,34 @@ impl MatrixShape {
     }
 }
 
+/// Explicit dimensions and history for one-token causal attention.
+///
+/// K/V tensors use `[history_position][kv_head][head_dim]` layout, while Q and
+/// the current K/V use `[head][head_dim]` layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionConfig {
+    pub history_len: usize,
+    pub query_heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+}
+
+impl AttentionConfig {
+    pub const fn new(
+        history_len: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        Self {
+            history_len,
+            query_heads,
+            kv_heads,
+            head_dim,
+        }
+    }
+}
+
 /// Scalar F32 matrix-vector multiplication. Accumulation is deliberately F32
 /// and proceeds in increasing input-index order.
 pub fn matvec_f32_reference(
@@ -100,7 +128,7 @@ pub fn matvec_f32_reference_row_range(
 ) -> Result<(), ComputeError> {
     if row_start
         .checked_add(row_count)
-        .map_or(true, |end| end > shape.output)
+        .is_none_or(|end| end > shape.output)
     {
         return Err(ComputeError(format!(
             "row range {}..{} exceeds output dimension {}",
@@ -134,14 +162,14 @@ pub fn matvec_f32_reference_row_range(
             weights.len()
         )));
     }
-    for local_row in 0..row_count {
+    for (local_row, output) in y.iter_mut().enumerate() {
         let output_index = row_start + local_row;
         let row = &weights[output_index * shape.input..(output_index + 1) * shape.input];
         let mut sum = 0.0f32;
-        for input_index in 0..shape.input {
-            sum += row[input_index] * x[input_index];
+        for (&weight, &input) in row.iter().zip(x.iter()) {
+            sum += weight * input;
         }
-        y[local_row] = sum;
+        *output = sum;
     }
     Ok(())
 }
@@ -206,7 +234,7 @@ pub fn quantized_row_bytes(ggml_type: GgmlType, input: usize) -> Result<usize, C
             )))
         }
     };
-    if input % qk != 0 {
+    if !input.is_multiple_of(qk) {
         return Err(ComputeError(format!(
             "{} input dimension {} is not divisible by block width {}",
             ggml_type.name(),
@@ -352,7 +380,7 @@ pub fn rope_reference(
     kv_heads: usize,
     theta: f32,
 ) -> Result<(), ComputeError> {
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return Err(ComputeError("RoPE head dimension must be non-zero and even".to_string()));
     }
     if query_heads == 0 || kv_heads == 0 {
@@ -407,17 +435,20 @@ pub fn attention_reference(
     v_history: &[f32],
     k_current: &[f32],
     v_current: &[f32],
-    history_len: usize,
-    query_heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
+    config: AttentionConfig,
 ) -> Result<Vec<f32>, ComputeError> {
+    let AttentionConfig {
+        history_len,
+        query_heads,
+        kv_heads,
+        head_dim,
+    } = config;
     if query_heads == 0 || kv_heads == 0 || head_dim == 0 {
         return Err(ComputeError(
             "attention requires non-zero query heads, KV heads, and head dimension".to_string(),
         ));
     }
-    if query_heads % kv_heads != 0 {
+    if !query_heads.is_multiple_of(kv_heads) {
         return Err(ComputeError(format!(
             "GQA requires query_heads {} to be divisible by kv_heads {}",
             query_heads, kv_heads
@@ -564,10 +595,7 @@ mod tests {
             &[],
             &[1.0, 0.0],
             &[2.0, 3.0],
-            0,
-            2,
-            1,
-            2,
+            AttentionConfig::new(0, 2, 1, 2),
         )
         .unwrap();
         assert_eq!(output.len(), 4);

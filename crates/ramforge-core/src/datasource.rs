@@ -981,8 +981,10 @@ mod tests {
         let direct = ds.read_f32_tensor_by_descriptor(desc).unwrap();
         let raw = ds.read_tensor_by_descriptor(desc).unwrap();
         let reference: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         assert_eq!(
             direct
