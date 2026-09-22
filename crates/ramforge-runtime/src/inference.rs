@@ -2856,6 +2856,31 @@ mod qwen25_bounded_diagnostic {
         }
     }
 
+    fn print_layer_hidden_diagnostic(layer_idx: usize, hidden: &[f32]) {
+        const N_EMBD: usize = 1536;
+        const CHECKPOINT_INDICES: [usize; 4] = [0, 255, 1023, 1535];
+
+        assert_eq!(hidden.len(), N_EMBD);
+        let mut sum = 0.0f64;
+        let mut l2_squared = 0.0f64;
+        for &value in hidden {
+            let value = value as f64;
+            sum += value;
+            l2_squared += value * value;
+        }
+
+        println!("layer_hidden.layer = {}", layer_idx);
+        println!("layer_hidden.length = {}", hidden.len());
+        println!("layer_hidden.sum = {:?}", sum);
+        println!("layer_hidden.l2_norm = {:?}", l2_squared.sqrt());
+        for &index in &CHECKPOINT_INDICES {
+            println!(
+                "layer_hidden.checkpoint.{} = {:?}",
+                index, hidden[index]
+            );
+        }
+    }
+
     fn diagnose_q6_k_output_rows(
         engine: &InferenceEngine,
         result_norm: &[f32],
@@ -3140,6 +3165,8 @@ mod qwen25_bounded_diagnostic {
         let head_dim = model.config.head_dim;
         let prompt_len = prompt_tokens.len();
         let needed_len = prompt_len + TRACE_DECODE_STEPS;
+        assert_eq!(n_layers, 28, "Qwen2.5 layer checkpoint requires 28 layers");
+        assert_eq!(n_embd, 1536, "Qwen2.5 layer checkpoint requires embedding size 1536");
 
         // Match the normal generation lifetime: initial KV capacity equals the
         // prompt length, then grows only when the first/second decode needs it.
@@ -3150,16 +3177,35 @@ mod qwen25_bounded_diagnostic {
 
         let mut hidden = vec![0.0f32; n_embd];
         for (position_id, &token_id) in prompt_tokens.iter().enumerate() {
-            model.forward_single_streaming(
-                token_id,
-                position_id,
-                &mut kv_cache,
-                backend,
-                data_source,
-                budget,
-                &mut residency_stats,
-                &mut hidden,
-            )?;
+            if position_id + 1 == prompt_tokens.len() {
+                // The test-only hook is invoked inside the existing
+                // forward_layer path immediately after each layer's residual
+                // and FFN output has been written to `hidden`, before the next
+                // layer starts. It consumes one borrowed layer vector at a
+                // time and never retains the activations.
+                model.forward_single_streaming_with_layer_hook(
+                    token_id,
+                    position_id,
+                    &mut kv_cache,
+                    backend,
+                    data_source,
+                    budget,
+                    &mut residency_stats,
+                    &mut hidden,
+                    print_layer_hidden_diagnostic,
+                )?;
+            } else {
+                model.forward_single_streaming(
+                    token_id,
+                    position_id,
+                    &mut kv_cache,
+                    backend,
+                    data_source,
+                    budget,
+                    &mut residency_stats,
+                    &mut hidden,
+                )?;
+            }
         }
         if kv_cache.seq_len() != prompt_len {
             return Err(format!(

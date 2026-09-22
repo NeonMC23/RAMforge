@@ -93,6 +93,8 @@ pub struct StreamingLlamaModel {
     read_coalescing_enabled: bool,
     grouped_read_buffer_reuse_enabled: bool,
     pub(crate) profiler: Profiler,
+    #[cfg(test)]
+    test_layer_hidden_hook: Mutex<Option<fn(usize, &[f32])>>,
 }
 
 impl StreamingLlamaModel {
@@ -300,7 +302,55 @@ impl StreamingLlamaModel {
             read_coalescing_enabled,
             grouped_read_buffer_reuse_enabled,
             profiler,
+            #[cfg(test)]
+            test_layer_hidden_hook: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_single_streaming_with_layer_hook<B: ComputeBackend>(
+        &self,
+        token_id: u32,
+        pos: usize,
+        kv_cache: &mut KvCache,
+        backend: &B,
+        data_source: &GgufDataSource,
+        budget: &mut MemoryBudget,
+        stats: &mut ResidencyStats,
+        final_hidden: &mut [f32],
+        layer_hook: fn(usize, &[f32]),
+    ) -> Result<(), String> {
+        *self
+            .test_layer_hidden_hook
+            .lock()
+            .map_err(|_| "test layer hidden hook lock poisoned".to_string())? = Some(layer_hook);
+        let result = self.forward_single_streaming(
+            token_id,
+            pos,
+            kv_cache,
+            backend,
+            data_source,
+            budget,
+            stats,
+            final_hidden,
+        );
+        if let Ok(mut hook) = self.test_layer_hidden_hook.lock() {
+            *hook = None;
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn emit_test_layer_hidden(&self, layer_idx: usize, hidden: &[f32]) {
+        let hook = self
+            .test_layer_hidden_hook
+            .lock()
+            .ok()
+            .and_then(|hook| *hook);
+        if let Some(hook) = hook {
+            hook(layer_idx, hidden);
+        }
     }
 
     pub(crate) fn set_profiling(&self, enabled: bool) {
@@ -784,6 +834,8 @@ impl StreamingLlamaModel {
                     self.profiler
                         .record_since(ProfileEvent::LayerCompute, compute_started);
                     result?;
+                    #[cfg(test)]
+                    self.emit_test_layer_hidden(layer_idx, &hidden);
                     staged_k.push(k_tmp.clone());
                     staged_v.push(v_tmp.clone());
                     continue;
@@ -830,6 +882,8 @@ impl StreamingLlamaModel {
                     self.profiler.record_layer_release();
                     return Err(error);
                 }
+                #[cfg(test)]
+                self.emit_test_layer_hidden(layer_idx, &hidden);
                 staged_k.push(k_tmp.clone());
                 staged_v.push(v_tmp.clone());
 
