@@ -321,6 +321,7 @@ impl StreamingLlamaModel {
         final_hidden: &mut [f32],
         layer_hook: fn(usize, &[f32]),
     ) -> Result<(), String> {
+        eprintln!("ACTUAL_FORWARD_WITH_LAYER_HOOK_ENTERED");
         println!("LAYER_HOOK_ENTRY");
         *self
             .test_layer_hidden_hook
@@ -734,6 +735,8 @@ impl StreamingLlamaModel {
         stats: &mut ResidencyStats,
         final_hidden: &mut [f32],
     ) -> Result<(), String> {
+        #[cfg(test)]
+        eprintln!("ACTUAL_PROMPT_FORWARD_FUNCTION_ENTERED");
         let cfg = &self.config;
         let n_embd = cfg.embedding_length;
         if final_hidden.len() != n_embd {
