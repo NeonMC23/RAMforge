@@ -321,6 +321,7 @@ impl StreamingLlamaModel {
         final_hidden: &mut [f32],
         layer_hook: fn(usize, &[f32]),
     ) -> Result<(), String> {
+        println!("LAYER_HOOK_ENTRY");
         *self
             .test_layer_hidden_hook
             .lock()
@@ -342,6 +343,14 @@ impl StreamingLlamaModel {
     }
 
     #[cfg(test)]
+    fn test_layer_hidden_hook_enabled(&self) -> bool {
+        self.test_layer_hidden_hook
+            .lock()
+            .map(|hook| hook.is_some())
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
     fn emit_test_layer_hidden(&self, layer_idx: usize, hidden: &[f32]) {
         let hook = self
             .test_layer_hidden_hook
@@ -349,6 +358,7 @@ impl StreamingLlamaModel {
             .ok()
             .and_then(|hook| *hook);
         if let Some(hook) = hook {
+            println!("LAYER_HOOK_CALLBACK layer={}", layer_idx);
             hook(layer_idx, hidden);
         }
     }
@@ -795,6 +805,10 @@ impl StreamingLlamaModel {
                 .record_since(ProfileEvent::Allocation, allocation_started);
 
             for layer_idx in 0..cfg.block_count {
+                #[cfg(test)]
+                if layer_idx == 0 && self.test_layer_hidden_hook_enabled() {
+                    println!("LAYER_HOOK_LAYER_0");
+                }
                 let compute_started = self.profiler.start();
                 let cached_result = {
                     let mut cache = self
