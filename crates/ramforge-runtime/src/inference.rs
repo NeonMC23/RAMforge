@@ -2699,11 +2699,14 @@ mod qwen25_bounded_diagnostic {
     use ramforge_core::types::GgmlType;
     use std::cmp::Ordering;
     use std::env;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     const RAW_PROMPT: &str = "hi, what's 2+2=?";
     const EXPECTED_PROMPT_TOKENS: [u32; 9] =
         [6023, 11, 1128, 594, 220, 17, 10, 17, 19884];
     const TRACE_DECODE_STEPS: usize = 2;
+    const QWEN25_LAYER_COUNT: usize = 28;
+    static LAYER_HIDDEN_EMISSIONS: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug, Clone)]
     struct NumericSummary {
@@ -2860,6 +2863,12 @@ mod qwen25_bounded_diagnostic {
         const N_EMBD: usize = 1536;
         const CHECKPOINT_INDICES: [usize; 4] = [0, 255, 1023, 1535];
 
+        assert!(layer_idx < QWEN25_LAYER_COUNT);
+        let emission_index = LAYER_HIDDEN_EMISSIONS.fetch_add(1, AtomicOrdering::Relaxed);
+        assert_eq!(
+            emission_index, layer_idx,
+            "layer checkpoints must be emitted once in layer order"
+        );
         assert_eq!(hidden.len(), N_EMBD);
         let mut sum = 0.0f64;
         let mut l2_squared = 0.0f64;
@@ -2874,10 +2883,8 @@ mod qwen25_bounded_diagnostic {
         println!("layer_hidden.sum = {:?}", sum);
         println!("layer_hidden.l2_norm = {:?}", l2_squared.sqrt());
         for &index in &CHECKPOINT_INDICES {
-            println!(
-                "layer_hidden.checkpoint.{} = {:?}",
-                index, hidden[index]
-            );
+            println!("layer_hidden.checkpoint.index = {}", index);
+            println!("layer_hidden.checkpoint.value = {:?}", hidden[index]);
         }
     }
 
@@ -3165,7 +3172,10 @@ mod qwen25_bounded_diagnostic {
         let head_dim = model.config.head_dim;
         let prompt_len = prompt_tokens.len();
         let needed_len = prompt_len + TRACE_DECODE_STEPS;
-        assert_eq!(n_layers, 28, "Qwen2.5 layer checkpoint requires 28 layers");
+        assert_eq!(
+            n_layers, QWEN25_LAYER_COUNT,
+            "Qwen2.5 layer checkpoint requires 28 layers"
+        );
         assert_eq!(n_embd, 1536, "Qwen2.5 layer checkpoint requires embedding size 1536");
 
         // Match the normal generation lifetime: initial KV capacity equals the
@@ -3183,6 +3193,7 @@ mod qwen25_bounded_diagnostic {
                 // and FFN output has been written to `hidden`, before the next
                 // layer starts. It consumes one borrowed layer vector at a
                 // time and never retains the activations.
+                LAYER_HIDDEN_EMISSIONS.store(0, AtomicOrdering::Relaxed);
                 model.forward_single_streaming_with_layer_hook(
                     token_id,
                     position_id,
@@ -3194,6 +3205,11 @@ mod qwen25_bounded_diagnostic {
                     &mut hidden,
                     print_layer_hidden_diagnostic,
                 )?;
+                assert_eq!(
+                    LAYER_HIDDEN_EMISSIONS.load(AtomicOrdering::Relaxed),
+                    QWEN25_LAYER_COUNT,
+                    "the prompt layer hook must emit exactly one checkpoint per layer"
+                );
             } else {
                 model.forward_single_streaming(
                     token_id,

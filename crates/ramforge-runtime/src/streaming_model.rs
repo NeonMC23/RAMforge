@@ -834,6 +834,9 @@ impl StreamingLlamaModel {
                     self.profiler
                         .record_since(ProfileEvent::LayerCompute, compute_started);
                     result?;
+                    // Exact test-only boundary: forward_layer has completed
+                    // the layer residual/FFN output, and the next layer has
+                    // not yet consumed `hidden`.
                     #[cfg(test)]
                     self.emit_test_layer_hidden(layer_idx, &hidden);
                     staged_k.push(k_tmp.clone());
@@ -882,6 +885,8 @@ impl StreamingLlamaModel {
                     self.profiler.record_layer_release();
                     return Err(error);
                 }
+                // Exact test-only boundary: forward_layer has completed the
+                // layer residual/FFN output before the next layer starts.
                 #[cfg(test)]
                 self.emit_test_layer_hidden(layer_idx, &hidden);
                 staged_k.push(k_tmp.clone());
