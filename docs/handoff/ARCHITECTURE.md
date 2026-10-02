@@ -1,6 +1,6 @@
 # Current architecture
 
-This document describes the code that exists now. ForgeCore references at the end are proposed boundaries, not current modules.
+This document describes the code that exists now. The legacy RAMforge path remains the primary historical execution description; Phase 2 additionally adds the current `forgecore` adapter module and explicit CLI backend selection. The later ForgeCore boundaries described at the end remain future work.
 
 ## System flow
 

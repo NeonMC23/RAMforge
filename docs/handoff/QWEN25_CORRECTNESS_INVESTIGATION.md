@@ -4,7 +4,7 @@
 
 This document records the available Qwen2.5 numerical evidence without claiming llama.cpp compatibility. The external llama.cpp checkout and the Qwen2.5 model payload are not available in the current workspace. The values below are therefore separated into repository facts, recorded observations, hypotheses, and unknowns.
 
-**Conclusion:** the current RAMforge numerical inference path is not trustworthy for the target Qwen2.5 model. The failure is observed before ordinary autoregressive quality can be judged: the recorded investigation found a discrepancy in the numerical path and a direct output-projection discrepancy for Q6_K rows. The surrounding GGUF/storage/planning/accounting infrastructure remains useful, but the numerical core should be rebuilt and independently validated as the proposed **ForgeCore**.
+**Conclusion:** the current RAMforge numerical inference path is not trustworthy for the target Qwen2.5 model. The failure is observed before ordinary autoregressive quality can be judged: the recorded investigation found a discrepancy in the numerical path and a direct output-projection discrepancy for Q6_K rows. The surrounding GGUF/storage/planning/accounting infrastructure remains useful, but the numerical core should be rebuilt and independently validated behind the **ForgeCore** boundary. Phase 2 implements only the pinned CPU adapter; it does not claim full numerical migration.
 
 This is not a claim that every listed operator is individually wrong, and it is not a claim that RAMforge cannot execute any model. It is a stop-ship conclusion for treating this Qwen2.5 result as compatible with an external reference.
 

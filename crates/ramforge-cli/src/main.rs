@@ -1,5 +1,6 @@
-use clap::{Parser, Subcommand};
-use ramforge_core::{parse_gguf_file, parse_memory_size, GgufModel};
+use clap::{Parser, Subcommand, ValueEnum};
+use ramforge_core::{parse_gguf_file, parse_memory_size, GgufModel, Tokenizer};
+use ramforge_runtime::{ForgeCoreContextOptions, ForgeCoreModel, ForgeCoreModelOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -13,6 +14,15 @@ use std::time::{Duration, Instant};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum InferenceBackend {
+    /// Existing RAMforge custom CPU engine; retained as the default reference path.
+    Legacy,
+    /// ForgeCore/libllama CPU model/context/batch/decode/logits path.
+    #[value(name = "forgecore", alias = "forge-core")]
+    ForgeCore,
 }
 
 #[derive(Subcommand)]
@@ -45,7 +55,7 @@ enum Commands {
     },
     /// Show explicit architecture, tokenizer, and quantization capabilities
     Support,
-    /// Run real inference (CPU, supported dense architectures, out-of-core streaming)
+    /// Run real inference; select the legacy or explicit ForgeCore CPU backend
     Run {
         /// Path to the GGUF model file
         model: PathBuf,
@@ -57,6 +67,10 @@ enum Commands {
         /// Prompt text
         #[arg(long)]
         prompt: String,
+
+        /// Explicit inference backend; legacy remains the default comparison path
+        #[arg(long, value_enum, default_value_t = InferenceBackend::Legacy)]
+        backend: InferenceBackend,
 
         /// Maximum tokens to generate
         #[arg(long, default_value_t = 32)]
@@ -113,6 +127,7 @@ fn main() {
             model,
             ram,
             prompt,
+            backend,
             max_tokens,
             temperature,
             top_k,
@@ -125,6 +140,7 @@ fn main() {
                 model,
                 ram,
                 prompt,
+                backend,
                 max_tokens,
                 temperature,
                 top_k,
@@ -175,6 +191,7 @@ fn run_inference(
     model_path: PathBuf,
     ram_str: String,
     prompt: String,
+    backend: InferenceBackend,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -185,6 +202,22 @@ fn run_inference(
 ) -> anyhow::Result<()> {
     let ram_bytes = parse_memory_size(&ram_str)
         .map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
+
+    if matches!(backend, InferenceBackend::ForgeCore) {
+        return run_forgecore_inference(
+            model_path,
+            ram_str,
+            ram_bytes,
+            prompt,
+            max_tokens,
+            temperature,
+            top_k,
+            top_p,
+            verbose,
+            profile,
+            memory_report,
+        );
+    }
 
     // Diagnostics to stderr
     eprintln!("RAMforge – Usable Out-of-Core Inference");
@@ -348,6 +381,192 @@ fn run_inference(
     }
 
     eprintln!();
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_forgecore_inference(
+    model_path: PathBuf,
+    ram_str: String,
+    ram_bytes: u64,
+    prompt: String,
+    max_tokens: usize,
+    temperature: f32,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    verbose: bool,
+    profile: bool,
+    memory_report: bool,
+) -> anyhow::Result<()> {
+    let model_load_started = Instant::now();
+    let gguf = parse_gguf_file(&model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let tokenizer = Tokenizer::from_gguf(&gguf).map_err(|error| anyhow::anyhow!(error))?;
+    let mut prompt_tokens = tokenizer.encode(&prompt, true);
+    if prompt_tokens.is_empty() {
+        if let Some(bos) = tokenizer.bos_id {
+            prompt_tokens.push(bos);
+        } else {
+            return Err(anyhow::anyhow!(
+                "prompt produced no tokens and the GGUF has no BOS token"
+            ));
+        }
+    }
+
+    // The explicit ForgeCore backend is the only owner of model execution in
+    // this branch. RAMforge still owns prompt tokenization and sampling.
+    let model = ForgeCoreModel::load_with_options(&model_path, ForgeCoreModelOptions::default())
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let metadata = model.metadata().clone();
+    if tokenizer.vocab_size() != metadata.vocab_size as usize {
+        return Err(anyhow::anyhow!(
+            "RAMforge tokenizer vocabulary {} does not match ForgeCore vocabulary {}",
+            tokenizer.vocab_size(),
+            metadata.vocab_size
+        ));
+    }
+
+    let mut session = model
+        .open_context(ForgeCoreContextOptions::default())
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let context_length = session.context_length() as usize;
+    if prompt_tokens.len() > context_length {
+        return Err(anyhow::anyhow!(
+            "prompt has {} tokens but ForgeCore context length is {}",
+            prompt_tokens.len(),
+            context_length
+        ));
+    }
+
+    let load_elapsed = model_load_started.elapsed();
+    let mut logits = session
+        .decode_tokens(&prompt_tokens, 0)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let sampler = ramforge_runtime::sampling::Sampler::new(temperature, top_k, top_p);
+    let eos_id = tokenizer.eos_id;
+    let mut decoder = tokenizer.decoder();
+    let mut generated_token_ids = Vec::new();
+    let mut stop_reason = if max_tokens == 0 {
+        "max_tokens"
+    } else {
+        "context_length"
+    };
+
+    eprintln!("RAMforge – ForgeCore CPU inference");
+    eprintln!("========================================================");
+    eprintln!("Model: {}", model_path.display());
+    eprintln!(
+        "RAM budget: {} ({} bytes; planning/diagnostics only for ForgeCore)",
+        ram_str, ram_bytes
+    );
+    eprintln!("Prompt: {:?}", prompt);
+    eprintln!("Prompt tokens: {}", prompt_tokens.len());
+    eprintln!("Max tokens: {}", max_tokens);
+    eprintln!("Temperature: {}", temperature);
+    if let Some(k) = top_k {
+        eprintln!("Top-k: {}", k);
+    }
+    if let Some(p) = top_p {
+        eprintln!("Top-p: {}", p);
+    }
+    eprintln!("Execution backend: ForgeCore/libllama CPU");
+    eprintln!(
+        "Model metadata: params={}, vocab={}, context={}, embedding={}, layers={}, heads={}, kv_heads={}",
+        metadata.n_params,
+        metadata.vocab_size,
+        metadata.context_length,
+        metadata.embedding_length,
+        metadata.layer_count,
+        metadata.head_count,
+        metadata.kv_head_count
+    );
+    eprintln!("Model description: {}", metadata.description);
+    eprintln!("ForgeCore model load: {}", format_duration(load_elapsed));
+    eprintln!(
+        "Accounting note: ForgeCore native allocations, KV state, and backend memory are not measured by RAMforge's Phase-2 MemoryBudget"
+    );
+    eprintln!();
+
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write!(stdout, "Assistant: ")?;
+    stdout.flush()?;
+
+    for _generation_index in 0..max_tokens {
+        let current_length = prompt_tokens
+            .len()
+            .checked_add(generated_token_ids.len())
+            .ok_or_else(|| anyhow::anyhow!("generation token count overflow"))?;
+        if current_length >= context_length {
+            stop_reason = "context_length";
+            break;
+        }
+
+        let next_token = sampler.sample(logits.values());
+        if Some(next_token) == eos_id {
+            stop_reason = "eos";
+            break;
+        }
+        generated_token_ids.push(next_token);
+        let piece = decoder.push(next_token);
+        if !piece.is_empty() {
+            write!(stdout, "{piece}")?;
+            stdout.flush()?;
+        }
+
+        if generated_token_ids.len() >= max_tokens {
+            stop_reason = "max_tokens";
+            break;
+        }
+        let next_position = prompt_tokens
+            .len()
+            .checked_add(generated_token_ids.len())
+            .and_then(|length| length.checked_sub(1))
+            .ok_or_else(|| anyhow::anyhow!("next token position overflow"))?;
+        let next_position = u32::try_from(next_position)
+            .map_err(|_| anyhow::anyhow!("next token position exceeds ForgeCore's u32 limit"))?;
+        logits = session
+            .decode_token(next_token, next_position)
+            .map_err(|error| anyhow::anyhow!(error))?;
+    }
+
+    let trailing = decoder.finish();
+    if !trailing.is_empty() {
+        write!(stdout, "{trailing}")?;
+    }
+    writeln!(stdout)?;
+    stdout.flush()?;
+
+    eprintln!("Generated {} tokens", generated_token_ids.len());
+    eprintln!(
+        "Stop reason: {} (eos_id={}, context_length={})",
+        stop_reason,
+        eos_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<unavailable>".to_string()),
+        context_length
+    );
+    if verbose {
+        eprintln!(
+            "ForgeCore session: context_length={} vocab={} CPU threads={}",
+            session.context_length(),
+            session.vocab_size(),
+            session.context_options().n_threads
+        );
+        eprintln!(
+            "RAMforge retained: GGUF inspection, tokenizer, sampler, diagnostics, and planning/accounting infrastructure"
+        );
+    }
+    if profile {
+        eprintln!(
+            "Profile unavailable for ForgeCore backend: Phase 2 exposes no native I/O, kernel, residency, or RAMforge MemoryBudget counters"
+        );
+    }
+    if memory_report {
+        eprintln!(
+            "Memory report unavailable for ForgeCore backend: native model/context/KV/backend allocations are intentionally not claimed by RAMforge"
+        );
+    }
 
     Ok(())
 }

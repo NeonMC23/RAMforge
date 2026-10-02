@@ -10,7 +10,8 @@ This directory is the transfer package for a new developer or agent arriving wit
 4. [QWEN25_CORRECTNESS_INVESTIGATION.md](QWEN25_CORRECTNESS_INVESTIGATION.md) — the numerical-divergence evidence and its limits.
 5. [REBUILD_PLAN.md](REBUILD_PLAN.md) — the proposed ForgeCore replacement plan.
 6. [VALIDATION.md](VALIDATION.md) — commands, results, diagnostic entry points, and unavailable evidence.
-7. [REPOSITORY_TRANSFER.md](REPOSITORY_TRANSFER.md) — how to start a new repository/session without losing the useful infrastructure or historical evidence.
+7. [PHASE_2_ENGINEERING_REPORT.md](PHASE_2_ENGINEERING_REPORT.md) — the implemented pinned ForgeCore adapter and validation record.
+8. [REPOSITORY_TRANSFER.md](REPOSITORY_TRANSFER.md) — how to start a new repository/session without losing the useful infrastructure or historical evidence.
 
 ## Evidence labels
 
@@ -24,6 +25,6 @@ This directory is the transfer package for a new developer or agent arriving wit
 
 The current RAMforge inference engine is **not considered numerically trustworthy for Qwen2.5-1.5B** based on the collected evidence. The infrastructure around it remains valuable. The next project should rebuild the numerical core as **ForgeCore** while preserving the validated infrastructure where appropriate.
 
-ForgeCore is a proposed name and architecture. There is no `ForgeCore` implementation in this repository.
+Phase 2 now has a real RAMforge adapter in `crates/ramforge-runtime/src/forgecore.rs` and pins the external ForgeCore `forge-core` package to commit `944bc3ca1ed7e48e2ad897107d9dcda5dd5eedc9`. The adapter owns only the CPU `Model → Context → Batch → decode → Logits` boundary; the legacy `InferenceEngine` and its numerical modules remain available as the default comparison path. Full migration of RAMforge numerical, residency, and out-of-core policy remains future work.
 
 The real-model Qwen2.5 diagnostic is intentionally ignored and was not run during the current documentation handoff. Exact external llama.cpp statistics that are not present in the repository are marked **UNKNOWN** rather than reconstructed or fabricated.

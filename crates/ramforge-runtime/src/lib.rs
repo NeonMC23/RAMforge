@@ -19,6 +19,7 @@ pub mod backend;
 pub mod calibration;
 pub(crate) mod compute_dispatch;
 pub mod discovery;
+pub mod forgecore;
 pub mod inference;
 pub mod kv_cache;
 pub mod layer;
@@ -46,6 +47,10 @@ use ramforge_core::{
     cache::BoundedCache, datasource::GgufDataSource, memory::MemoryBudget, GgufModel,
 };
 
+pub use crate::forgecore::{
+    ForgeCoreAdapterError, ForgeCoreContextOptions, ForgeCoreLogits, ForgeCoreModel,
+    ForgeCoreModelMetadata, ForgeCoreModelOptions, ForgeCoreSession,
+};
 pub use orchestration::{
     OrchestratedRuntime, OrchestrationError, OrchestrationRequest, PlanningSession,
     RuntimeOrchestrator,

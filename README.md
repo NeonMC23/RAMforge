@@ -18,8 +18,38 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 - File-backed tensor access via `GgufDataSource`
 - Real RAM budget enforcement via `MemoryBudget`
 - Bounded LRU cache via `BoundedCache`
-- Real CPU inference with layer streaming
+- Real CPU inference with the retained legacy layer-streaming path
 - Native quantized inference without full F32 expansion
+
+## Phase 2 ForgeCore backend
+
+RAMforge now also exposes an explicit CPU-only ForgeCore path:
+
+```text
+ramforge run MODEL.gguf --ram 8G --prompt "Hello" --backend forgecore
+    → forge_core::Model
+    → forge_core::Context
+    → forge_core::Batch
+    → Context::decode()
+    → forge_core::Logits
+    → RAMforge tokenizer/sampling/output
+```
+
+Use `ramforge run ... --backend forgecore` to select it. The default
+`--backend legacy` path remains available as the comparison/reference
+`InferenceEngine`; ForgeCore failures never fall back to it implicitly. The
+adapter is pinned to ForgeCore commit
+`944bc3ca1ed7e48e2ad897107d9dcda5dd5eedc9` and keeps direct `forge-sys` and
+llama.cpp/ggml FFI out of RAMforge.
+
+Phase 2 does not claim GPU, out-of-core execution, controlled residency,
+ForgeCore-native memory accounting, or migration of the legacy numerical
+modules. RAMforge GGUF inspection, planning, diagnostics, cache, residency,
+and accounting infrastructure remains retained; ForgeCore native allocations
+are reported as unmeasured until a later API supports them. Runtime linking
+follows ForgeCore's native runbook; arrange
+`LD_LIBRARY_PATH=$FORGE_LLAMA_DIR/build/bin` (or an equivalent final-binary
+rpath) for the CPU shared libraries.
 
 ## Capabilities
 

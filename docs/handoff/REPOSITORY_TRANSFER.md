@@ -9,11 +9,11 @@ RAMforge is a Rust workspace for GGUF inspection, budgeted file-backed access, C
 The transfer decision is:
 
 - **Preserve:** GGUF parsing, descriptor/data-source I/O, memory accounting, layer grouping/read plans, persistent-weight policy, layer cache, planner/discovery/capability structures, calibration, plan compiler, runtime configuration, persistence, profiling, diagnostics, CLI/TUI, and the existing test/build baseline.
-- **Rebuild:** the numerical compute/inference core used for trustworthy Qwen2.5 execution. The proposed replacement name is **ForgeCore**.
+- **Rebuild:** the numerical compute/inference core used for trustworthy Qwen2.5 execution. Phase 2 now establishes the pinned **ForgeCore** CPU execution boundary; the broader numerical migration remains phased.
 - **Do not claim:** llama.cpp compatibility, Qwen2.5 numerical parity, real-model output quality, or real-model performance.
 - **Do not change in this handoff:** production code, dependencies, package versions, milestone numbering, current engine behavior, or repository files outside `docs/handoff/`.
 
-ForgeCore is a proposed name and architecture only. There is no ForgeCore implementation in this repository.
+Phase 2 now integrates the external ForgeCore `forge-core` package through a pinned runtime adapter at `crates/ramforge-runtime/src/forgecore.rs`. This is only the CPU model/context/batch/decode/logits boundary; it does not replace `InferenceEngine`, implement residency migration, or claim full numerical/out-of-core migration.
 
 ## Files in this handoff package
 

@@ -4,7 +4,7 @@
 **Scope:** numerical compute/inference core only, unless an interface change is required at a documented seam.  
 **Current repository:** RAMforge remains unchanged by this handoff.
 
-ForgeCore is the proposed name for the replacement numerical core. No ForgeCore implementation exists in the repository. This plan does not authorize production-code edits, dependency additions, version changes, or removal of current RAMforge code.
+ForgeCore is the external numerical owner selected for the phased migration. Phase 2 has now authorized and implemented only the pinned CPU adapter described in `PHASE_2_ENGINEERING_REPORT.md`; this historical plan remains the broader future-migration record and does not authorize removing current RAMforge code.
 
 ## Objective
 

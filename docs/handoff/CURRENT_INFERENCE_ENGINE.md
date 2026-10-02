@@ -1,6 +1,6 @@
 # Current inference engine
 
-This is a technical description of the existing RAMforge inference path. It is not a recommendation that every numerical choice should be retained. The Qwen2.5 evidence in [QWEN25_CORRECTNESS_INVESTIGATION.md](QWEN25_CORRECTNESS_INVESTIGATION.md) is the reason ForgeCore is proposed.
+This is a technical description of the retained legacy RAMforge inference path. It is not a recommendation that every numerical choice should be retained. The Qwen2.5 evidence in [QWEN25_CORRECTNESS_INVESTIGATION.md](QWEN25_CORRECTNESS_INVESTIGATION.md) is the reason the Phase-2 ForgeCore boundary was selected; see [PHASE_2_ENGINEERING_REPORT.md](PHASE_2_ENGINEERING_REPORT.md).
 
 ## Entry points and ownership
 
