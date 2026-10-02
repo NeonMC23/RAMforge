@@ -255,6 +255,12 @@ impl MemoryBudget {
         let _ = self.release(name);
         result
     }
+
+    /// Adapt the existing single host-memory budget to the Phase-3 budget
+    /// representation without changing allocation or enforcement behavior.
+    pub fn resource_budgets(&self) -> crate::resource::ResourceBudgets {
+        crate::resource::ResourceBudgets::from_memory_budget(self)
+    }
 }
 
 /// Parse a human-friendly memory size string into exact bytes

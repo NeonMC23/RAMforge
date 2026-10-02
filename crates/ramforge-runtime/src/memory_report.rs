@@ -3,7 +3,7 @@
 //! RAMforge-managed bytes, process RSS, and system memory are intentionally
 //! reported as separate concepts. MemoryBudget does not control OS page cache.
 
-use ramforge_core::memory::MemoryBudget;
+use ramforge_core::{memory::MemoryBudget, resource::ResourceBudgets};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemoryReport {
@@ -26,6 +26,13 @@ impl MemoryReport {
             system_total_bytes,
             system_available_bytes,
         }
+    }
+
+    /// Expose the configured RAMforge host budget in the Phase-3 domain-aware
+    /// representation.  RSS and OS page cache remain separate facts and are
+    /// not inserted as allocations.
+    pub fn resource_budgets(&self) -> ResourceBudgets {
+        ResourceBudgets::host_ram(self.ramforge_budget_bytes)
     }
 }
 
@@ -86,5 +93,6 @@ mod tests {
         assert_eq!(report.ramforge_current_bytes, 256);
         assert_eq!(report.ramforge_peak_bytes, 256);
         assert_eq!(report.ramforge_budget_bytes, 1024);
+        assert_eq!(report.resource_budgets().host_ram_bytes(), Some(1024));
     }
 }

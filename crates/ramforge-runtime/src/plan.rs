@@ -9,7 +9,12 @@
 //! Planning consumes parsed descriptors and shared runtime accounting rules. It
 //! performs no tensor payload I/O and does not own or mutate inference state.
 
-use ramforge_core::{memory::MemoryBudget, tensor::TensorData, GgufModel};
+use ramforge_core::{
+    memory::MemoryBudget,
+    resource::{ModelId, ResourceAccounting, ResourceAccountingSnapshot, ResourceBudgets},
+    tensor::TensorData,
+    GgufModel,
+};
 
 use crate::accounting::{estimate_layer_memory, tensor_load_charge_bytes};
 use crate::layer::{group_layers, PersistentDescriptors};
@@ -66,6 +71,26 @@ pub struct PlanResult {
     /// Empty generic budget snapshot retained for the existing CLI/API report.
     /// Runtime execution owns a separate authoritative `MemoryBudget`.
     pub budget: MemoryBudget,
+}
+
+impl PlanResult {
+    /// Build the Phase-3 representation snapshot for the same model and host
+    /// budget as this plan.  The snapshot contains GGUF/logical records only;
+    /// it does not claim that backend allocations, VRAM, KV, or graph scratch
+    /// have been measured.
+    pub fn resource_accounting_snapshot(
+        &self,
+        model: &GgufModel,
+    ) -> Result<ResourceAccountingSnapshot, String> {
+        let model_id = ModelId::from_path(&model.path);
+        ResourceAccounting::from_model(
+            model,
+            model_id,
+            ResourceBudgets::host_ram(self.ram_requested),
+        )
+        .and_then(|accounting| accounting.snapshot())
+        .map_err(|error| error.to_string())
+    }
 }
 
 pub fn plan_model(model: &GgufModel, ram_budget_bytes: u64) -> Result<PlanResult, String> {
@@ -373,6 +398,13 @@ mod tests {
         assert!(plan.cache_capacity <= plan.ram_requested);
         assert!(plan.execution_memory.is_none());
         assert!(plan.execution_preflight_error.is_some());
+
+        let representation = plan.resource_accounting_snapshot(&model).unwrap();
+        assert_eq!(representation.resource_count, 0);
+        assert_eq!(
+            representation.budgets.host_ram_bytes(),
+            Some(8 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]

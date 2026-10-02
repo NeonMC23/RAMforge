@@ -19,6 +19,7 @@
 //! - `cache`: strict bounded LRU cache with byte-exact accounting
 //! - `datasource`: file-backed tensor access without loading the entire model
 //! - `compute`: storage-independent reference numerical operations
+//! - `resource`: domain-aware representation and accounting records
 //!
 //! RAMforge-managed memory is defined as memory explicitly tracked via
 //! `MemoryBudget`. It does NOT include total process RSS or OS page cache.
@@ -31,6 +32,7 @@ pub mod gguf;
 pub mod memory;
 pub mod model;
 pub mod quant;
+pub mod resource;
 pub mod tensor;
 pub mod tokenizer;
 pub mod types;
@@ -46,6 +48,14 @@ pub use quant::{
     BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8K, BlockQ8_0,
     BLOCK_SIZE_Q2_K, BLOCK_SIZE_Q3_K, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q4_K, BLOCK_SIZE_Q5_K,
     BLOCK_SIZE_Q6_K, BLOCK_SIZE_Q8_0, BLOCK_SIZE_Q8_K, QK4_0, QK8_0, QK_K,
+};
+pub use resource::{
+    alignment_padding, checked_element_count, classify_tensor_name, measure_logical_tensor_bytes,
+    AllocationId, AllocationRecord, BackendId, ByteMeasurement, ByteTotal, DeviceId,
+    FileBackedRange, GgufTensorMetadata, LayerId, LogicalTensorProperties, MeasurementCertainty,
+    MeasurementProvenance, MemoryDomain, ModelId, ResourceAccounting, ResourceAccountingError,
+    ResourceAccountingSnapshot, ResourceBudgets, ResourceCategory, ResourceId, ResourceKind,
+    ResourceOrigin, ResourceOwner, ResourceRecord, TensorId, WeightScope,
 };
 pub use tensor::{decode_tensor_to_f32, QuantizedTensor, TensorData};
 pub use tokenizer::Tokenizer;
