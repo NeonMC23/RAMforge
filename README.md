@@ -51,6 +51,29 @@ follows ForgeCore's native runbook; arrange
 `LD_LIBRARY_PATH=$FORGE_LLAMA_DIR/build/bin` (or an equivalent final-binary
 rpath) for the CPU shared libraries.
 
+## Phase 4 static device selection
+
+Phase 4 adds a RAMforge-owned static execution boundary without changing the
+legacy default. The safe ForgeCore device registry is exposed through
+`DeviceRegistry::discover()`, with explicit `DeviceId`, `BackendId`,
+`DeviceKind`, capability, selection, and `ExecutionConfig` types. The CLI
+accepts:
+
+```text
+--backend forgecore --device cpu
+--backend forgecore --device id:<device-id>
+--backend forgecore --device backend:<backend-id>:<index>
+```
+
+CPU is selectable and remains first-class. Native GPU/accelerator facts and
+safe free/total memory values are preserved when ForgeCore reports them, but
+the pinned ForgeCore `Model`/`Context` API does not accept a backend/device or
+offload option. Non-CPU selections therefore fail explicitly with no CPU
+fallback. Zero/unavailable VRAM and native allocation values remain unknown;
+device selection is not residency proof. See
+[`docs/handoff/PHASE_4_ENGINEERING_REPORT.md`](docs/handoff/PHASE_4_ENGINEERING_REPORT.md)
+for the boundary and validation record.
+
 ## Capabilities
 
 ### Milestone 1 – GGUF Inspection

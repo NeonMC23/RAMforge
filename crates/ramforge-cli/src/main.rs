@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use ramforge_core::{parse_gguf_file, parse_memory_size, GgufModel, Tokenizer};
-use ramforge_runtime::{ForgeCoreContextOptions, ForgeCoreModel, ForgeCoreModelOptions};
+use ramforge_runtime::{DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreModel};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -20,7 +20,7 @@ struct Cli {
 enum InferenceBackend {
     /// Existing RAMforge custom CPU engine; retained as the default reference path.
     Legacy,
-    /// ForgeCore/libllama CPU model/context/batch/decode/logits path.
+    /// ForgeCore/libllama model/context/batch/decode/logits path (CPU in the pinned API).
     #[value(name = "forgecore", alias = "forge-core")]
     ForgeCore,
 }
@@ -55,7 +55,7 @@ enum Commands {
     },
     /// Show explicit architecture, tokenizer, and quantization capabilities
     Support,
-    /// Run real inference; select the legacy or explicit ForgeCore CPU backend
+    /// Run real inference; select legacy or explicit ForgeCore execution
     Run {
         /// Path to the GGUF model file
         model: PathBuf,
@@ -71,6 +71,10 @@ enum Commands {
         /// Explicit inference backend; legacy remains the default comparison path
         #[arg(long, value_enum, default_value_t = InferenceBackend::Legacy)]
         backend: InferenceBackend,
+
+        /// Static ForgeCore device: cpu, id:<device-id>, or backend:<backend-id>:<ForgeCore-registry-index>
+        #[arg(long, default_value = "cpu")]
+        device: String,
 
         /// Maximum tokens to generate
         #[arg(long, default_value_t = 32)]
@@ -128,6 +132,7 @@ fn main() {
             ram,
             prompt,
             backend,
+            device,
             max_tokens,
             temperature,
             top_k,
@@ -141,6 +146,7 @@ fn main() {
                 ram,
                 prompt,
                 backend,
+                device,
                 max_tokens,
                 temperature,
                 top_k,
@@ -192,6 +198,7 @@ fn run_inference(
     ram_str: String,
     prompt: String,
     backend: InferenceBackend,
+    device: String,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -202,6 +209,9 @@ fn run_inference(
 ) -> anyhow::Result<()> {
     let ram_bytes = parse_memory_size(&ram_str)
         .map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
+    let device_selection = device
+        .parse::<DeviceSelection>()
+        .map_err(|error| anyhow::anyhow!(error))?;
 
     if matches!(backend, InferenceBackend::ForgeCore) {
         return run_forgecore_inference(
@@ -209,6 +219,7 @@ fn run_inference(
             ram_str,
             ram_bytes,
             prompt,
+            device_selection.clone(),
             max_tokens,
             temperature,
             top_k,
@@ -217,6 +228,12 @@ fn run_inference(
             profile,
             memory_report,
         );
+    }
+    if !matches!(device_selection, DeviceSelection::Cpu) {
+        return Err(anyhow::anyhow!(
+            "--device '{}' is only supported with --backend forgecore; legacy execution remains CPU-only",
+            device
+        ));
     }
 
     // Diagnostics to stderr
@@ -391,6 +408,7 @@ fn run_forgecore_inference(
     ram_str: String,
     ram_bytes: u64,
     prompt: String,
+    device: DeviceSelection,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -400,6 +418,18 @@ fn run_forgecore_inference(
     memory_report: bool,
 ) -> anyhow::Result<()> {
     let model_load_started = Instant::now();
+
+    // The explicit ForgeCore backend is the only owner of model execution in
+    // this branch. RAMforge still owns device selection, prompt tokenization,
+    // and sampling; ForgeCore owns native model execution. Resolve the exact
+    // device before parsing/loading so an unavailable request fails directly.
+    let registry = DeviceRegistry::discover();
+    let execution = ExecutionConfig::new(device, 1, None, false)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let model = ForgeCoreModel::load_for_execution(&model_path, execution, &registry)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let metadata = model.metadata().clone();
+
     let gguf = parse_gguf_file(&model_path).map_err(|error| anyhow::anyhow!(error))?;
     let tokenizer = Tokenizer::from_gguf(&gguf).map_err(|error| anyhow::anyhow!(error))?;
     let mut prompt_tokens = tokenizer.encode(&prompt, true);
@@ -412,12 +442,6 @@ fn run_forgecore_inference(
             ));
         }
     }
-
-    // The explicit ForgeCore backend is the only owner of model execution in
-    // this branch. RAMforge still owns prompt tokenization and sampling.
-    let model = ForgeCoreModel::load_with_options(&model_path, ForgeCoreModelOptions::default())
-        .map_err(|error| anyhow::anyhow!(error))?;
-    let metadata = model.metadata().clone();
     if tokenizer.vocab_size() != metadata.vocab_size as usize {
         return Err(anyhow::anyhow!(
             "RAMforge tokenizer vocabulary {} does not match ForgeCore vocabulary {}",
@@ -427,7 +451,7 @@ fn run_forgecore_inference(
     }
 
     let mut session = model
-        .open_context(ForgeCoreContextOptions::default())
+        .open_selected_context()
         .map_err(|error| anyhow::anyhow!(error))?;
     let context_length = session.context_length() as usize;
     if prompt_tokens.len() > context_length {
@@ -452,7 +476,7 @@ fn run_forgecore_inference(
         "context_length"
     };
 
-    eprintln!("RAMforge – ForgeCore CPU inference");
+    eprintln!("RAMforge – ForgeCore static device inference");
     eprintln!("========================================================");
     eprintln!("Model: {}", model_path.display());
     eprintln!(
@@ -469,7 +493,10 @@ fn run_forgecore_inference(
     if let Some(p) = top_p {
         eprintln!("Top-p: {}", p);
     }
-    eprintln!("Execution backend: ForgeCore/libllama CPU");
+    eprintln!(
+        "Execution backend: ForgeCore/libllama ({:?})",
+        model.device().kind
+    );
     eprintln!(
         "Model metadata: params={}, vocab={}, context={}, embedding={}, layers={}, heads={}, kv_heads={}",
         metadata.n_params,
@@ -481,9 +508,38 @@ fn run_forgecore_inference(
         metadata.kv_head_count
     );
     eprintln!("Model description: {}", metadata.description);
+    eprintln!("Selection request: {}", model.execution_config().device);
+    eprintln!(
+        "Selected backend/device: {} / {} ({:?}, registry_index={:?})",
+        model.device().backend_id,
+        model.device().id,
+        model.device().kind,
+        model.device().registry_index
+    );
+    eprintln!("Device description: {}", model.device().description);
+    eprintln!(
+        "Device accounting domain: {} (selection is not proof of residency)",
+        model.device().accounting_domain()
+    );
+    eprintln!(
+        "Device capabilities: model_execution={}, static_offload={}, memory_reporting={}",
+        model.device().capabilities.model_execution,
+        model.device().capabilities.static_model_offload,
+        model.device().capabilities.memory_reporting
+    );
+    eprintln!(
+        "Device memory: total={}, free={}",
+        format_measurement(&model.device().memory_total),
+        format_measurement(&model.device().memory_free)
+    );
     eprintln!("ForgeCore model load: {}", format_duration(load_elapsed));
     eprintln!(
-        "Accounting note: ForgeCore native allocations, KV state, and backend memory are not measured by RAMforge's Phase-2 MemoryBudget"
+        "Actual initialized device: {} ({})",
+        model.device().id,
+        model.device().backend_id
+    );
+    eprintln!(
+        "Accounting note: ForgeCore native allocations, KV state, and backend memory are not measured by RAMforge's Phase-3 resource accounting unless a safe measurement is provided"
     );
     eprintln!();
 
@@ -831,6 +887,18 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.2} KiB ({} bytes)", bytes_f / KIB, bytes)
     } else {
         format!("{} bytes", bytes)
+    }
+}
+
+fn format_measurement(measurement: &ramforge_core::ByteMeasurement) -> String {
+    match measurement.bytes() {
+        Some(bytes) => format!(
+            "{} ({:?}; {})",
+            format_bytes(bytes),
+            measurement.certainty(),
+            measurement.provenance().description()
+        ),
+        None => format!("unknown ({})", measurement.provenance().description()),
     }
 }
 

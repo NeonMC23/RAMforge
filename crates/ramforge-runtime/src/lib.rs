@@ -10,6 +10,7 @@
 //! - CPU inference for llama/qwen2 (F32/F16/BF16 + ggml quant formats),
 //!   out-of-core layer streaming with compact quantized residency
 //! - SIMD (AVX2) + rayon-threaded F32 matvec hot path
+//! - Static ForgeCore device discovery, selection, and capability diagnostics
 //!
 //! RAMforge-managed memory is defined as memory explicitly tracked via
 //! `MemoryBudget`. It does NOT include total process RSS or OS page cache.
@@ -19,6 +20,7 @@ pub mod backend;
 pub mod calibration;
 pub(crate) mod compute_dispatch;
 pub mod discovery;
+pub mod execution;
 pub mod forgecore;
 pub mod inference;
 pub mod kv_cache;
@@ -47,6 +49,10 @@ use ramforge_core::{
     cache::BoundedCache, datasource::GgufDataSource, memory::MemoryBudget, GgufModel,
 };
 
+pub use crate::execution::{
+    CapabilityState, DeviceCapabilities, DeviceInfo, DeviceKind, DeviceRegistry, DeviceSelection,
+    DeviceSelectionError, ExecutionConfig, ExecutionConfigError, SelectedDevice,
+};
 pub use crate::forgecore::{
     ForgeCoreAdapterError, ForgeCoreContextOptions, ForgeCoreLogits, ForgeCoreModel,
     ForgeCoreModelMetadata, ForgeCoreModelOptions, ForgeCoreSession,

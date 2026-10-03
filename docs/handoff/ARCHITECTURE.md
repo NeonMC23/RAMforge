@@ -202,7 +202,15 @@ The tokenizer has no chat-template application. It encodes the prompt text suppl
 - `inspect MODEL [--json]`;
 - `plan MODEL --ram SIZE [--json]`;
 - `support`;
-- `run MODEL --ram SIZE --prompt TEXT [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
+- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
+
+The static Phase-4 device boundary is in `crates/ramforge-runtime/src/execution.rs`.
+`DeviceRegistry::discover()` is a safe ForgeCore snapshot; CPU is selectable,
+while non-CPU entries are explicit discovery facts but currently rejected by
+the adapter because the pinned ForgeCore Model/Context API has no device
+binding. Selection is not residency proof and native allocation/VRAM values
+remain unknown unless ForgeCore reports them safely. See
+[PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md).
 
 `crates/ramforge-cli/src/tui/mod.rs` sequences interactive actions through `RuntimeOrchestrator`, calibration, plan creation/validation, runtime activation, generation, plan save/load, and run export. `tui/app.rs` is the state machine; `tui/render.rs` renders screens; `tui/terminal.rs` parses terminal commands; `tui/diagnostics.rs` defines the diagnostic/run-history schema and JSON export.
 

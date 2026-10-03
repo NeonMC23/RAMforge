@@ -1,14 +1,20 @@
 # Project state
 
-**As-of date:** 2026-09-22.  
+**As-of date:** 2026-10-02.  
 **Repository:** RAMforge workspace at the handoff source checkout.  
 **Status labels:** see [README.md](README.md).
 
+**Phase-4 note:** static ForgeCore device discovery, explicit selection, and
+execution metadata are implemented. The pinned safe ForgeCore Model/Context
+API still cannot bind non-CPU devices, so GPU facts may be discoverable but GPU
+model execution is explicitly unsupported; no CPU fallback is performed. See
+[PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md).
+
 ## What RAMforge is
 
-RAMforge is a local, CPU-oriented GGUF inspection, planning, and inference runtime. Its original purpose is **usable out-of-core inference**: run a model whose complete tensor payload does not fit in the selected RAM budget by treating the model file as backing storage, retaining only selected persistent weights and the active/cacheable transformer layers in memory.
+RAMforge is a local, CPU-oriented GGUF inspection, planning, and inference runtime with an explicit static ForgeCore device-discovery boundary. Its original purpose is **usable out-of-core inference**: run a model whose complete tensor payload does not fit in the selected RAM budget by treating the model file as backing storage, retaining only selected persistent weights and the active/cacheable transformer layers in memory.
 
-The repository describes RAM, VRAM, and storage as a hierarchical memory system, but the current execution registry has no GPU backend. The implemented execution strategy is CPU layer streaming. RAMforge explicitly tracks the memory it owns through `MemoryBudget`; this is not a claim to control process RSS or the operating system page cache.
+The repository describes RAM, VRAM, and storage as a hierarchical memory system. Phase 4 can snapshot native CPU/GPU/accelerator facts through ForgeCore and associate them with separate accounting domains, but the pinned safe ForgeCore Model/Context API has no non-CPU binding, so the implemented model execution strategy remains CPU layer streaming. RAMforge explicitly tracks the memory it owns through `MemoryBudget`; this is not a claim to control process RSS, the operating-system page cache, VRAM, or native backend allocations.
 
 ## Workspace and version assumptions
 
@@ -35,7 +41,8 @@ The following is the repository's milestone history, cross-checked against the c
 - **Accounting hardening:** direct F32 reads, F16/BF16 decoded residency accounting, transactional persistent-weight loading, grouped reads, grouped-buffer reuse, chunked output projection, and chunk-growing KV-cache accounting are implemented and tested.
 - **Compute-layer remodel:** `ramforge_core::compute` now contains storage-independent scalar/reference operations and explicit matrix/attention contracts. Runtime scalar operations delegate to those references and optimized paths have focused equivalence tests. This was a structural boundary improvement, not proof of Qwen2.5 numerical parity; see [CURRENT_INFERENCE_ENGINE.md](CURRENT_INFERENCE_ENGINE.md) and [QWEN25_CORRECTNESS_INVESTIGATION.md](QWEN25_CORRECTNESS_INVESTIGATION.md).
 - **Planning/orchestration:** inspection, machine/storage discovery, model profiles, capability derivation, calibration, deterministic planner output, plan compilation, plan persistence, and runtime activation are implemented.
-- **CLI/TUI diagnostics:** CLI `inspect`, `plan`, `support`, and `run` commands exist. The CLI can emit profile and memory reports. The TUI has planning, calibration, persisted-plan compatibility, generation, diagnostics, run history, and export flows.
+- **Static ForgeCore execution boundary:** `DeviceId`, `BackendId`, `DeviceKind`, `DeviceInfo`, capabilities, `DeviceRegistry`, explicit selection, and `ExecutionConfig` are implemented. CPU is selectable; native non-CPU facts are preserved but rejected for model execution by the pinned ForgeCore adapter because safe Model/Context device binding is absent. Selection is not residency proof.
+- **CLI/TUI diagnostics:** CLI `inspect`, `plan`, `support`, and `run` commands exist. The CLI can emit profile and memory reports, and `run --device` now carries an explicit static ForgeCore selection. The TUI has planning, calibration, persisted-plan compatibility, generation, diagnostics, run history, and export flows; no TUI redesign was made for Phase 4.
 
 ## GGUF and model support
 
@@ -106,7 +113,7 @@ The following infrastructure is implemented with extensive unit/integration cove
 
 ### Incomplete or unsupported
 
-The repository does not implement GPU execution, GPU offload, asynchronous I/O, prefetch/double buffering, HTTP serving, model downloading, MoE execution, speculative decoding, or the additional quantization formats listed as unsupported. `qwen35` is intentionally inspect/plan-only because its hybrid attention/SSM architecture is not the Qwen2 path.
+The repository does not implement GPU model execution or GPU offload (Phase 4 only discovers native facts and rejects unsupported non-CPU binding), asynchronous I/O, prefetch/double buffering, HTTP serving, model downloading, MoE execution, speculative decoding, or the additional quantization formats listed as unsupported. `qwen35` is intentionally inspect/plan-only because its hybrid attention/SSM architecture is not the Qwen2 path.
 
 ## Important commands
 
@@ -122,17 +129,26 @@ cargo run -p ramforge-cli -- inspect MODEL.gguf
 cargo run -p ramforge-cli -- plan MODEL.gguf --ram 8G
 cargo run -p ramforge-cli -- support
 cargo run -p ramforge-cli -- run MODEL.gguf --ram 8G --prompt "Hello" --max-tokens 32 --profile --memory-report
+cargo run -p ramforge-cli -- run MODEL.gguf --ram 8G --backend forgecore --device cpu --prompt "Hello"
 ```
 
 The ignored real-model diagnostic is documented in [VALIDATION.md](VALIDATION.md) and the source doc comment in `crates/ramforge-runtime/src/inference.rs`; do not run it casually.
 
-## Current repository validation snapshot
+## Validation snapshots
 
-**VERIFIED by the final commands run against this checkout with Rust/Cargo 1.98.1:**
+The following results are historical validation for the pre-Phase-4 source
+snapshot, recorded with Rust/Cargo 1.98.1:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo test --workspace`: passed — 44 CLI tests, 112 core tests, 195 runtime tests; **351 passed, 0 failed, 2 ignored**.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
 - `cargo build --workspace --release`: passed.
 
-The current two ignored tests include the expensive real-model Qwen2.5 diagnostic and the quantized microbenchmark. The Qwen2.5 diagnostic was not run for this handoff. See [VALIDATION.md](VALIDATION.md) for the distinction between repository validation and external real-model evidence.
+For the current Phase-4 source, `cargo` and `rustc` are not available on the
+current `PATH`, the historical local toolchain/native locations are absent,
+and no compatible native ForgeCore build is present. Phase-4 formatting,
+compilation, tests, clippy, release build, and native-device execution are
+therefore **not run**. See [PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md)
+for the authoritative Phase-4 validation record. The two historical ignored
+tests include the expensive real-model Qwen2.5 diagnostic and the quantized
+microbenchmark.

@@ -1,14 +1,21 @@
-//! RAMforge's Phase-2 adapter for the pinned ForgeCore API.
+//! RAMforge's safe adapter for the pinned ForgeCore API.
 //!
-//! This module is deliberately small. RAMforge supplies the model path,
-//! token IDs, positions, and sampling policy; ForgeCore owns model loading,
-//! context state, batch construction, decode, and native logits extraction.
-//! No llama.cpp/ggml symbols or numerical model operations belong here.
+//! RAMforge supplies model selection, token IDs, positions, and sampling
+//! policy; ForgeCore owns model loading, context state, batch construction,
+//! decode, device discovery, and native logits extraction. No llama.cpp/ggml
+//! symbols or numerical model operations belong here. Static non-CPU device
+//! selection is represented and rejected explicitly until ForgeCore exposes a
+//! safe model/context device binding.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use forge_core::{BatchBuilder, Context, Model, ModelOptions};
+
+use crate::execution::{
+    CapabilityState, DeviceInfo, DeviceRegistry, DeviceSelection, DeviceSelectionError,
+    ExecutionConfig, ExecutionConfigError,
+};
 
 /// Errors translated at the RAMforge/ForgeCore boundary.
 ///
@@ -18,6 +25,8 @@ use forge_core::{BatchBuilder, Context, Model, ModelOptions};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForgeCoreAdapterError {
     Configuration(String),
+    DeviceSelection(String),
+    UnsupportedDevice(String),
     Model(String),
     Context(String),
     Batch(String),
@@ -29,6 +38,12 @@ impl fmt::Display for ForgeCoreAdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Configuration(message) => write!(formatter, "ForgeCore configuration: {message}"),
+            Self::DeviceSelection(message) => {
+                write!(formatter, "ForgeCore device selection: {message}")
+            },
+            Self::UnsupportedDevice(message) => {
+                write!(formatter, "ForgeCore unsupported device: {message}")
+            },
             Self::Model(message) => write!(formatter, "ForgeCore model: {message}"),
             Self::Context(message) => write!(formatter, "ForgeCore context: {message}"),
             Self::Batch(message) => write!(formatter, "ForgeCore batch: {message}"),
@@ -65,13 +80,17 @@ pub struct ForgeCoreModelMetadata {
 
 /// RAMforge-owned handle for one ForgeCore/libllama model.
 ///
-/// The underlying ForgeCore model is CPU-only in this phase. Cloning this
-/// wrapper only shares ForgeCore's native model; it does not copy weights.
+/// The pinned ForgeCore model/context API currently executes models on CPU.
+/// The selected device is still retained explicitly so diagnostics and future
+/// safe ForgeCore extensions cannot confuse selection with residency. Cloning
+/// this wrapper only shares ForgeCore's native model; it does not copy weights.
 #[derive(Debug, Clone)]
 pub struct ForgeCoreModel {
     model: Model,
     path: PathBuf,
     metadata: ForgeCoreModelMetadata,
+    device: DeviceInfo,
+    execution: ExecutionConfig,
 }
 
 impl ForgeCoreModel {
@@ -84,6 +103,58 @@ impl ForgeCoreModel {
     pub fn load_with_options(
         path: impl AsRef<Path>,
         options: ForgeCoreModelOptions,
+    ) -> Result<Self, ForgeCoreAdapterError> {
+        let mut execution = ExecutionConfig::cpu_default();
+        execution.check_tensors = options.check_tensors;
+        let registry = DeviceRegistry::cpu_only();
+        let selected = registry
+            .select(&DeviceSelection::Cpu)
+            .map_err(|error| ForgeCoreAdapterError::DeviceSelection(error.to_string()))?;
+        Self::load_native(path, options, execution, selected.info().clone())
+    }
+
+    /// Load using an explicit static device selection. The current pinned
+    /// ForgeCore model API can execute only CPU models; non-CPU selections
+    /// fail explicitly rather than being initialized and silently run on CPU.
+    pub fn load_for_execution(
+        path: impl AsRef<Path>,
+        execution: ExecutionConfig,
+        registry: &DeviceRegistry,
+    ) -> Result<Self, ForgeCoreAdapterError> {
+        let selected = match execution.resolve(registry) {
+            Ok(selected) => selected,
+            Err(ExecutionConfigError::DeviceSelection(
+                DeviceSelectionError::DeviceNotSelectable { id, reason },
+            )) if !matches!(&execution.device, &DeviceSelection::Cpu) => {
+                return Err(ForgeCoreAdapterError::UnsupportedDevice(format!(
+                    "selected device {id} is not supported for pinned ForgeCore model execution: {reason}; no CPU fallback"
+                )));
+            }
+            Err(ExecutionConfigError::DeviceSelection(error)) => {
+                return Err(ForgeCoreAdapterError::DeviceSelection(error.to_string()));
+            }
+            Err(error) => return Err(ForgeCoreAdapterError::Configuration(error.to_string())),
+        };
+        if !selected.info().is_cpu()
+            || selected.info().capabilities.model_execution != CapabilityState::Supported
+        {
+            return Err(ForgeCoreAdapterError::UnsupportedDevice(format!(
+                "selected {} ({}) cannot be bound to Model/Context by pinned ForgeCore; no CPU fallback",
+                selected.info().kind,
+                selected.info().id
+            )));
+        }
+        let options = ForgeCoreModelOptions {
+            check_tensors: execution.check_tensors,
+        };
+        Self::load_native(path, options, execution, selected.info().clone())
+    }
+
+    fn load_native(
+        path: impl AsRef<Path>,
+        options: ForgeCoreModelOptions,
+        execution: ExecutionConfig,
+        device: DeviceInfo,
     ) -> Result<Self, ForgeCoreAdapterError> {
         let path = path.as_ref().to_path_buf();
         let mut model_options = ModelOptions::default();
@@ -121,6 +192,8 @@ impl ForgeCoreModel {
             model,
             path,
             metadata,
+            device,
+            execution,
         })
     }
 
@@ -130,6 +203,22 @@ impl ForgeCoreModel {
 
     pub fn metadata(&self) -> &ForgeCoreModelMetadata {
         &self.metadata
+    }
+
+    pub fn device(&self) -> &DeviceInfo {
+        &self.device
+    }
+
+    pub fn execution_config(&self) -> &ExecutionConfig {
+        &self.execution
+    }
+
+    /// Open a context using the selected execution configuration.
+    pub fn open_selected_context(&self) -> Result<ForgeCoreSession, ForgeCoreAdapterError> {
+        self.open_context(ForgeCoreContextOptions {
+            n_ctx: self.execution.context_length,
+            n_threads: self.execution.cpu_thread_count,
+        })
     }
 
     /// Open a single CPU context. The returned session owns a shared model
@@ -237,6 +326,14 @@ impl ForgeCoreSession {
         &self.model
     }
 
+    pub fn device(&self) -> &DeviceInfo {
+        self.model.device()
+    }
+
+    pub fn execution_config(&self) -> &ExecutionConfig {
+        self.model.execution_config()
+    }
+
     pub fn context_options(&self) -> ForgeCoreContextOptions {
         self.options
     }
@@ -319,6 +416,42 @@ impl ForgeCoreSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ramforge_core::{BackendId, ByteMeasurement, DeviceId};
+
+    #[test]
+    fn non_cpu_selection_is_rejected_before_model_load() {
+        let gpu_id = DeviceId::new("test/gpu/0");
+        let registry = DeviceRegistry::from_devices(vec![DeviceInfo {
+            id: gpu_id.clone(),
+            backend_id: BackendId::new("test-gpu"),
+            kind: crate::execution::DeviceKind::Gpu,
+            registry_index: Some(0),
+            name: "test GPU".to_string(),
+            description: "test GPU".to_string(),
+            vendor: None,
+            memory_total: ByteMeasurement::unknown("test"),
+            memory_free: ByteMeasurement::unknown("test"),
+            capabilities: crate::execution::DeviceCapabilities {
+                backend_initialization: crate::execution::CapabilityState::Supported,
+                model_execution: crate::execution::CapabilityState::Unsupported,
+                static_model_offload: crate::execution::CapabilityState::Unsupported,
+                memory_reporting: crate::execution::CapabilityState::Unknown,
+                cpu_thread_configuration: crate::execution::CapabilityState::Unsupported,
+            },
+            available: true,
+            selectable: false,
+            selection_unavailable_reason: Some("test GPU is not supported".to_string()),
+        }]);
+        let execution = ExecutionConfig::new(DeviceSelection::ById(gpu_id), 1, None, false)
+            .expect("execution configuration syntax");
+        let error = ForgeCoreModel::load_for_execution(
+            "/definitely/not/a/model.gguf",
+            execution,
+            &registry,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ForgeCoreAdapterError::UnsupportedDevice(_)));
+    }
 
     #[test]
     fn context_defaults_match_phase_two_cpu_contract() {
