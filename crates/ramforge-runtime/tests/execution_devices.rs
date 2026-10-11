@@ -3,7 +3,7 @@
 //! The test is opt-in because loading a native backend registry is an
 //! environment operation. CPU-only builds are valid and do not fail this
 //! test; a discovered non-CPU device is reported but is not executed because
-//! the pinned safe ForgeCore model API cannot bind one to Model/Context.
+//! RAMforge's current adapter deliberately does not enable non-CPU binding.
 
 use ramforge_runtime::{CapabilityState, DeviceKind, DeviceRegistry};
 

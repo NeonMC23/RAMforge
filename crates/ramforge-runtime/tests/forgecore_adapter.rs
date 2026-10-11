@@ -1,4 +1,4 @@
-//! Focused Phase-2 adapter coverage.
+//! Focused ForgeCore adapter coverage.
 //!
 //! The native-backed tests use ForgeCore's deterministic tiny GGUF fixture
 //! through FORGE_TEST_MODEL. The binary is deliberately not stored in this
@@ -7,7 +7,8 @@
 use std::path::PathBuf;
 
 use ramforge_runtime::{
-    ForgeCoreAdapterError, ForgeCoreContextOptions, ForgeCoreModel, ForgeCoreModelMetadata,
+    DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreAdapterError,
+    ForgeCoreContextOptions, ForgeCoreModel, ForgeCoreModelMetadata,
 };
 
 fn fixture() -> Option<PathBuf> {
@@ -28,6 +29,34 @@ fn load_fixture() -> Option<(ForgeCoreModel, ForgeCoreModelMetadata)> {
 }
 
 #[test]
+fn forgecore_selection_errors_are_propagated_without_fallback() {
+    let missing_id = ExecutionConfig::new(
+        DeviceSelection::by_id("missing-device"),
+        1,
+        None,
+        false,
+    )
+    .expect("selection syntax is valid");
+    let error = ForgeCoreModel::load_for_execution(
+        "/definitely/not/a/model.gguf",
+        missing_id,
+        &DeviceRegistry::cpu_only(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ForgeCoreAdapterError::DeviceSelection(_)));
+
+    let no_cpu = ExecutionConfig::new(DeviceSelection::Cpu, 1, None, false)
+        .expect("CPU selection is valid");
+    let error = ForgeCoreModel::load_for_execution(
+        "/definitely/not/a/model.gguf",
+        no_cpu,
+        &DeviceRegistry::from_devices(Vec::new()),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ForgeCoreAdapterError::DeviceSelection(_)));
+}
+
+#[test]
 fn forgecore_model_and_context_use_native_metadata() {
     let Some((model, metadata)) = load_fixture() else {
         return;
@@ -45,7 +74,9 @@ fn forgecore_model_and_context_use_native_metadata() {
     let session = model
         .open_context(ForgeCoreContextOptions::default())
         .expect("default CPU context must open");
-    assert_eq!(session.context_length(), 64);
+    // ForgeCore exposes the effective native length, including its 256-token
+    // padding; model metadata above retains the training length (64).
+    assert_eq!(session.context_length(), 256);
     assert_eq!(session.vocab_size(), 32);
 }
 

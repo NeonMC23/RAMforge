@@ -1,5 +1,12 @@
 # RAMforge Phase 4 Engineering Report
 
+> **Historical record.** This report documents RAMforge Phase 4 against the
+> former ForgeCore `v2.0` pin. Current ForgeCore `v3.1.2` exposes public static
+> model-load/offload options, but the current RAMforge adapter deliberately
+> leaves non-CPU execution disabled; the old blocker statements below describe
+> the historical revision and are not current upstream findings. See the
+> repository README and PROJECT_STATE for the current boundary.
+
 **Date:** 2026-10-02  
 **Status:** Implemented in source; compilation and native execution validation unavailable in this environment  
 **Boundary:** Static CPU/device discovery and explicit execution selection only

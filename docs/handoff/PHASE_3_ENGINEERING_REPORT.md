@@ -1,5 +1,12 @@
 # RAMforge Phase 3 Engineering Report
 
+> **Historical record.** This report predates the current RAMforge ForgeCore
+> refresh and records the v2-era boundary it audited. Current RAMforge uses
+> verified ForgeCore `v3.1.2` at
+> `d3203099a315db134193404e79ba2581d9fc53ab`; current upstream capability and
+> scope are summarized in the repository README. No historical result below is
+> being rewritten as a current API claim.
+
 **Date:** 2026-10-02  
 **Status:** Implemented and validated  
 **Boundary:** Representation and accounting only

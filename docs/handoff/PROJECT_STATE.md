@@ -4,17 +4,19 @@
 **Repository:** RAMforge workspace at the handoff source checkout.  
 **Status labels:** see [README.md](README.md).
 
-**Phase-4 note:** static ForgeCore device discovery, explicit selection, and
-execution metadata are implemented. The pinned safe ForgeCore Model/Context
-API still cannot bind non-CPU devices, so GPU facts may be discoverable but GPU
-model execution is explicitly unsupported; no CPU fallback is performed. See
-[PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md).
+**Current ForgeCore note:** static ForgeCore device discovery, explicit
+selection, and execution metadata are implemented. The verified ForgeCore
+`v3.1.2` Model/Context surface now includes public static model-load/offload
+options, but the RAMforge adapter remains deliberately CPU-only in this
+refresh; GPU facts may be discoverable but non-CPU model execution is
+explicitly unsupported, with no CPU fallback. See [README.md](../../README.md)
+and the historical [PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md).
 
 ## What RAMforge is
 
 RAMforge is a local, CPU-oriented GGUF inspection, planning, and inference runtime with an explicit static ForgeCore device-discovery boundary. Its original purpose is **usable out-of-core inference**: run a model whose complete tensor payload does not fit in the selected RAM budget by treating the model file as backing storage, retaining only selected persistent weights and the active/cacheable transformer layers in memory.
 
-The repository describes RAM, VRAM, and storage as a hierarchical memory system. Phase 4 can snapshot native CPU/GPU/accelerator facts through ForgeCore and associate them with separate accounting domains, but the pinned safe ForgeCore Model/Context API has no non-CPU binding, so the implemented model execution strategy remains CPU layer streaming. RAMforge explicitly tracks the memory it owns through `MemoryBudget`; this is not a claim to control process RSS, the operating-system page cache, VRAM, or native backend allocations.
+The repository describes RAM, VRAM, and storage as a hierarchical memory system. Phase 4 can snapshot native CPU/GPU/accelerator facts through ForgeCore and associate them with separate accounting domains. Although verified ForgeCore `v3.1.2` exposes static model-load/offload options, the implemented RAMforge ForgeCore adapter remains CPU-only in this refresh and the legacy planner/runtime remains a separate CPU-only path. RAMforge explicitly tracks the memory it owns through `MemoryBudget`; this is not a claim to control process RSS, the operating-system page cache, VRAM, or native backend allocations.
 
 ## Workspace and version assumptions
 
@@ -41,7 +43,7 @@ The following is the repository's milestone history, cross-checked against the c
 - **Accounting hardening:** direct F32 reads, F16/BF16 decoded residency accounting, transactional persistent-weight loading, grouped reads, grouped-buffer reuse, chunked output projection, and chunk-growing KV-cache accounting are implemented and tested.
 - **Compute-layer remodel:** `ramforge_core::compute` now contains storage-independent scalar/reference operations and explicit matrix/attention contracts. Runtime scalar operations delegate to those references and optimized paths have focused equivalence tests. This was a structural boundary improvement, not proof of Qwen2.5 numerical parity; see [CURRENT_INFERENCE_ENGINE.md](CURRENT_INFERENCE_ENGINE.md) and [QWEN25_CORRECTNESS_INVESTIGATION.md](QWEN25_CORRECTNESS_INVESTIGATION.md).
 - **Planning/orchestration:** inspection, machine/storage discovery, model profiles, capability derivation, calibration, deterministic planner output, plan compilation, plan persistence, and runtime activation are implemented.
-- **Static ForgeCore execution boundary:** `DeviceId`, `BackendId`, `DeviceKind`, `DeviceInfo`, capabilities, `DeviceRegistry`, explicit selection, and `ExecutionConfig` are implemented. CPU is selectable; native non-CPU facts are preserved but rejected for model execution by the pinned ForgeCore adapter because safe Model/Context device binding is absent. Selection is not residency proof.
+- **Static ForgeCore execution boundary:** `DeviceId`, `BackendId`, `DeviceKind`, `DeviceInfo`, capabilities, `DeviceRegistry`, explicit selection, and `ExecutionConfig` are implemented. CPU is selectable; native non-CPU facts are preserved but rejected by the RAMforge adapter's deliberate CPU-only contract. ForgeCore `v3.1.2` has the public static offload surface, but this task does not enable it. Selection is not residency proof.
 - **CLI/TUI diagnostics:** CLI `inspect`, `plan`, `support`, and `run` commands exist. The CLI can emit profile and memory reports, and `run --device` now carries an explicit static ForgeCore selection. The TUI has planning, calibration, persisted-plan compatibility, generation, diagnostics, run history, and export flows; no TUI redesign was made for Phase 4.
 
 ## GGUF and model support
@@ -113,7 +115,7 @@ The following infrastructure is implemented with extensive unit/integration cove
 
 ### Incomplete or unsupported
 
-The repository does not implement GPU model execution or GPU offload (Phase 4 only discovers native facts and rejects unsupported non-CPU binding), asynchronous I/O, prefetch/double buffering, HTTP serving, model downloading, MoE execution, speculative decoding, or the additional quantization formats listed as unsupported. `qwen35` is intentionally inspect/plan-only because its hybrid attention/SSM architecture is not the Qwen2 path.
+The repository does not implement GPU model execution or GPU offload through RAMforge (the current adapter intentionally leaves ForgeCore's static offload surface unused), asynchronous I/O, prefetch/double buffering, HTTP serving, model downloading, MoE execution, speculative decoding, or the additional quantization formats listed as unsupported. `qwen35` is intentionally inspect/plan-only because its hybrid attention/SSM architecture is not the Qwen2 path.
 
 ## Important commands
 

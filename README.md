@@ -38,16 +38,17 @@ ramforge run MODEL.gguf --ram 8G --prompt "Hello" --backend forgecore
 Use `ramforge run ... --backend forgecore` to select it. The default
 `--backend legacy` path remains available as the comparison/reference
 `InferenceEngine`; ForgeCore failures never fall back to it implicitly. The
-adapter is pinned to ForgeCore commit
-`944bc3ca1ed7e48e2ad897107d9dcda5dd5eedc9` and keeps direct `forge-sys` and
-llama.cpp/ggml FFI out of RAMforge.
+adapter is pinned to verified ForgeCore commit
+`d3203099a315db134193404e79ba2581d9fc53ab` (`v3.1.2`) and keeps direct
+`forge-sys` and llama.cpp/ggml FFI out of RAMforge.
 
 Phase 2 does not claim GPU, out-of-core execution, controlled residency,
 ForgeCore-native memory accounting, or migration of the legacy numerical
 modules. RAMforge GGUF inspection, planning, diagnostics, cache, residency,
-and accounting infrastructure remains retained; ForgeCore native allocations
-are reported as unmeasured until a later API supports them. Runtime linking
-follows ForgeCore's native runbook; arrange
+and accounting infrastructure remains retained; ForgeCore native model,
+context, KV, and backend allocations remain outside RAMforge accounting, while
+safe device facts are reported only where the adapter can observe them.
+Runtime linking follows ForgeCore's native runbook; arrange
 `LD_LIBRARY_PATH=$FORGE_LLAMA_DIR/build/bin` (or an equivalent final-binary
 rpath) for the CPU shared libraries.
 
@@ -66,11 +67,12 @@ accepts:
 ```
 
 CPU is selectable and remains first-class. Native GPU/accelerator facts and
-safe free/total memory values are preserved when ForgeCore reports them, but
-the pinned ForgeCore `Model`/`Context` API does not accept a backend/device or
-offload option. Non-CPU selections therefore fail explicitly with no CPU
-fallback. Zero/unavailable VRAM and native allocation values remain unknown;
-device selection is not residency proof. See
+safe free/total memory values are preserved when ForgeCore reports them.
+Verified ForgeCore `v3.1.2` exposes public static model-load/offload options,
+but this RAMforge refresh intentionally does not enable non-CPU model
+execution, scheduling, or placement policy. Non-CPU selections therefore fail
+explicitly with no CPU fallback. Zero/unavailable VRAM and native allocation
+values remain unknown; device selection is not residency proof. See
 [`docs/handoff/PHASE_4_ENGINEERING_REPORT.md`](docs/handoff/PHASE_4_ENGINEERING_REPORT.md)
 for the boundary and validation record.
 

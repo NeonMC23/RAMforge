@@ -20,7 +20,7 @@ struct Cli {
 enum InferenceBackend {
     /// Existing RAMforge custom CPU engine; retained as the default reference path.
     Legacy,
-    /// ForgeCore/libllama model/context/batch/decode/logits path (CPU in the pinned API).
+    /// ForgeCore/libllama model/context/batch/decode/logits path (CPU in the current RAMforge adapter).
     #[value(name = "forgecore", alias = "forge-core")]
     ForgeCore,
 }
@@ -422,7 +422,8 @@ fn run_forgecore_inference(
     // The explicit ForgeCore backend is the only owner of model execution in
     // this branch. RAMforge still owns device selection, prompt tokenization,
     // and sampling; ForgeCore owns native model execution. Resolve the exact
-    // device before parsing/loading so an unavailable request fails directly.
+    // device before parsing/loading so an unavailable request fails directly;
+    // RAMforge does not implicitly switch devices or backends.
     let registry = DeviceRegistry::discover();
     let execution = ExecutionConfig::new(device, 1, None, false)
         .map_err(|error| anyhow::anyhow!(error))?;

@@ -1,16 +1,17 @@
-//! RAMforge's safe adapter for the pinned ForgeCore API.
+//! RAMforge's safe adapter for the verified ForgeCore API.
 //!
 //! RAMforge supplies model selection, token IDs, positions, and sampling
 //! policy; ForgeCore owns model loading, context state, batch construction,
 //! decode, device discovery, and native logits extraction. No llama.cpp/ggml
-//! symbols or numerical model operations belong here. Static non-CPU device
-//! selection is represented and rejected explicitly until ForgeCore exposes a
-//! safe model/context device binding.
+//! symbols or numerical model operations belong here. Current ForgeCore also
+//! exposes static model offload options, but this adapter deliberately binds
+//! only CPU execution in this refresh; non-CPU selection remains an explicit
+//! error rather than an implicit fallback.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use forge_core::{BatchBuilder, Context, Model, ModelOptions};
+use forge_core::{BatchBuilder, Context, GpuLayers, Model, ModelOptions};
 
 use crate::execution::{
     CapabilityState, DeviceInfo, DeviceRegistry, DeviceSelection, DeviceSelectionError,
@@ -80,10 +81,11 @@ pub struct ForgeCoreModelMetadata {
 
 /// RAMforge-owned handle for one ForgeCore/libllama model.
 ///
-/// The pinned ForgeCore model/context API currently executes models on CPU.
-/// The selected device is still retained explicitly so diagnostics and future
-/// safe ForgeCore extensions cannot confuse selection with residency. Cloning
-/// this wrapper only shares ForgeCore's native model; it does not copy weights.
+/// RAMforge intentionally binds the current ForgeCore model/context path to
+/// CPU for this refresh. The selected device is still retained explicitly so
+/// diagnostics and future safe extensions cannot confuse selection with
+/// residency. Cloning this wrapper only shares ForgeCore's native model; it
+/// does not copy weights.
 #[derive(Debug, Clone)]
 pub struct ForgeCoreModel {
     model: Model,
@@ -94,7 +96,7 @@ pub struct ForgeCoreModel {
 }
 
 impl ForgeCoreModel {
-    /// Load a model through ForgeCore/libllama using CPU defaults.
+    /// Load a model through ForgeCore/libllama using an explicit CPU load.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ForgeCoreAdapterError> {
         Self::load_with_options(path, ForgeCoreModelOptions::default())
     }
@@ -113,9 +115,10 @@ impl ForgeCoreModel {
         Self::load_native(path, options, execution, selected.info().clone())
     }
 
-    /// Load using an explicit static device selection. The current pinned
-    /// ForgeCore model API can execute only CPU models; non-CPU selections
-    /// fail explicitly rather than being initialized and silently run on CPU.
+    /// Load using an explicit static device selection. RAMforge's current
+    /// adapter intentionally enables only CPU model execution; non-CPU
+    /// selections fail explicitly rather than being initialized and silently
+    /// run on CPU.
     pub fn load_for_execution(
         path: impl AsRef<Path>,
         execution: ExecutionConfig,
@@ -127,7 +130,7 @@ impl ForgeCoreModel {
                 DeviceSelectionError::DeviceNotSelectable { id, reason },
             )) if !matches!(&execution.device, &DeviceSelection::Cpu) => {
                 return Err(ForgeCoreAdapterError::UnsupportedDevice(format!(
-                    "selected device {id} is not supported for pinned ForgeCore model execution: {reason}; no CPU fallback"
+                    "selected device {id} is not supported by RAMforge's current ForgeCore adapter: {reason}; no CPU fallback"
                 )));
             }
             Err(ExecutionConfigError::DeviceSelection(error)) => {
@@ -139,7 +142,7 @@ impl ForgeCoreModel {
             || selected.info().capabilities.model_execution != CapabilityState::Supported
         {
             return Err(ForgeCoreAdapterError::UnsupportedDevice(format!(
-                "selected {} ({}) cannot be bound to Model/Context by pinned ForgeCore; no CPU fallback",
+                "selected {} ({}) is not enabled by RAMforge's current ForgeCore adapter; no CPU fallback",
                 selected.info().kind,
                 selected.info().id
             )));
@@ -158,6 +161,10 @@ impl ForgeCoreModel {
     ) -> Result<Self, ForgeCoreAdapterError> {
         let path = path.as_ref().to_path_buf();
         let mut model_options = ModelOptions::default();
+        // Current ForgeCore exposes static offload options. Keep this adapter's
+        // CPU-only contract explicit rather than relying on a default that
+        // could change as the public API grows.
+        model_options.gpu_layers = GpuLayers::Cpu;
         model_options.check_tensors = options.check_tensors;
         let model = Model::load_with_options(&path, &model_options)
             .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))?;
@@ -228,6 +235,8 @@ impl ForgeCoreModel {
         options: ForgeCoreContextOptions,
     ) -> Result<ForgeCoreSession, ForgeCoreAdapterError> {
         options.validate()?;
+        // ContextOptions is non-exhaustive in current ForgeCore: start from
+        // its verified defaults and override only RAMforge-owned CPU fields.
         let mut context_options = forge_core::ContextOptions::default();
         context_options.n_ctx = options.n_ctx.unwrap_or(0);
         context_options.n_threads = u32::try_from(options.n_threads).map_err(|_| {
@@ -247,7 +256,7 @@ impl ForgeCoreModel {
     }
 }
 
-/// Context options accepted by the Phase-2 CPU adapter.
+/// Context options accepted by the current CPU adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForgeCoreContextOptions {
     /// `None` selects the model's training context length. `Some(value)`

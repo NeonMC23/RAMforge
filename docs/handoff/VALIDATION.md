@@ -139,9 +139,10 @@ The later recorded workspace results above are the authoritative historical vali
 **UNKNOWN / NOT RUN:** each attempted `cargo` command returned status 127
 (`cargo: not found`); `rustc`, the historical `/var/tmp/forge-toolchain`
 location, and the historical `/var/tmp/forge-native` location are also absent
-from the current environment. No compatible local pinned ForgeCore/native build
-was found. Consequently, these commands could not run against the Phase-4
-source:
+from the current environment. No compatible local native build for verified
+ForgeCore `v3.1.2` was found. Consequently, these commands could not run
+against the Phase-4 source
+or this dependency refresh:
 
 ```text
 cargo fmt --all -- --check
@@ -160,10 +161,43 @@ Also not run:
 Source-level Phase-4 facts are documented in
 [PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md):
 `DeviceRegistry::discover` uses ForgeCore's safe `enumerate_devices`; CPU is
-selectable; non-CPU model selection is rejected because the pinned safe
-Model/Context API has no backend/device binding; unknown memory is preserved;
-and selection is not residency proof. These are implementation claims awaiting
-compiler/test confirmation, not substituted validation results.
+selectable; non-CPU model selection is rejected by RAMforge's deliberate
+CPU-only adapter contract; current ForgeCore `v3.1.2` does expose public static
+offload options, but this task does not enable them; unknown memory is
+preserved; and selection is not residency proof. These are implementation
+claims awaiting compiler/test confirmation, not substituted validation
+results.
+
+## ForgeCore revision-refresh validation status — 2026-10-11
+
+The dependency/API refresh was applied to the final source tree, but the
+requested validation could not execute on this host. Every `cargo` command
+listed below returned status **127** with `/bin/bash: cargo: command not found`.
+No result is marked passed. The only available Rustup binary reports no
+installed toolchains and no active toolchain; `FORGE_LLAMA_DIR` is unset, and
+no local native build or model fixture is present.
+
+Commands attempted against the final tree:
+
+```text
+cargo fmt --all -- --check
+cargo check --workspace
+cargo test --workspace
+cargo test --workspace --release
+cargo build --workspace --release
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo test --workspace --doc
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo test -p ramforge-runtime --test forgecore_adapter -- --nocapture
+cargo test -p ramforge-runtime --test execution_devices -- --nocapture
+RAMFORGE_RUN_NATIVE_DEVICE_TESTS=1 cargo test -p ramforge-runtime --test execution_devices -- --nocapture
+```
+
+The ForgeCore fixture-gated tests and optional native-device test therefore
+remain **UNKNOWN / NOT RUN** in terms of Rust execution. Source inspection
+verified that the adapter uses current non-exhaustive defaults, explicitly
+selects `GpuLayers::Cpu`, observes ForgeCore's effective padded context length,
+and preserves selection/error propagation without fallback.
 
 ## Validation commands for a future checkout
 

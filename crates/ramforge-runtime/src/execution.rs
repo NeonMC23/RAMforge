@@ -5,11 +5,11 @@
 //! validates an explicit selection, and describes the execution options that
 //! the current ForgeCore adapter can actually consume.
 //!
-//! The pinned ForgeCore revision exposes safe device enumeration, but its
-//! model/context API still binds model loading to CPU and does not expose a
-//! model-offload parameter. Non-CPU devices are therefore discoverable when
-//! the native build exposes them, but are not selectable for model execution
-//! until ForgeCore adds that safe binding. No CPU fallback is performed.
+//! The verified ForgeCore revision exposes safe device enumeration and static
+//! model-load/offload options. RAMforge intentionally does not enable those
+//! non-CPU options in this refresh: non-CPU devices are discoverable when the
+//! native build exposes them, but remain non-selectable by this adapter. No
+//! CPU fallback is performed.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -84,8 +84,10 @@ impl fmt::Display for CapabilityState {
     }
 }
 
-/// Capabilities relevant to static execution selection. These are capability
-/// facts, not proof that a resource has been allocated or is resident.
+/// Capabilities relevant to static execution selection. These describe the
+/// active RAMforge adapter contract, not proof that upstream can satisfy every
+/// possible operation, and are not proof that a resource has been allocated or
+/// is resident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceCapabilities {
     pub backend_initialization: CapabilityState,
@@ -105,15 +107,15 @@ pub struct DeviceInfo {
     pub registry_index: Option<usize>,
     pub name: String,
     pub description: String,
-    /// ForgeCore's pinned safe device API does not expose a vendor field.
+    /// The verified ForgeCore device API does not expose a vendor field.
     pub vendor: Option<String>,
     pub memory_total: ByteMeasurement,
     pub memory_free: ByteMeasurement,
     pub capabilities: DeviceCapabilities,
     /// Present in the native registry, independent of model-execution support.
     pub available: bool,
-    /// A device is selectable only when the current ForgeCore model path can
-    /// actually execute the model on it.
+    /// A device is selectable only when RAMforge's current ForgeCore adapter
+    /// can actually execute the model on it.
     pub selectable: bool,
     pub selection_unavailable_reason: Option<String>,
 }
@@ -271,7 +273,7 @@ pub struct DeviceRegistry {
 }
 
 impl DeviceRegistry {
-    /// Discover exactly what the pinned ForgeCore native registry exposes.
+    /// Discover exactly what the verified ForgeCore native registry exposes.
     /// This performs no model load and no network access.
     pub fn discover() -> Self {
         let devices = enumerate_devices()
@@ -487,7 +489,7 @@ fn device_info_from_forgecore(info: ForgeDeviceInfo) -> DeviceInfo {
         (
             false,
             Some(
-                "pinned ForgeCore exposes device discovery but not model/context device binding"
+                "RAMforge does not enable non-CPU model binding in this refresh"
                     .to_string(),
             ),
         )

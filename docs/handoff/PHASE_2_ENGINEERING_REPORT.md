@@ -1,5 +1,13 @@
 # RAMforge Phase 2 ForgeCore engineering report
 
+> **Historical record.** This report documents the original ForgeCore `v2.0`
+> integration at the revision shown below. The current RAMforge source has
+> since been refreshed to verified ForgeCore `v3.1.2` at
+> `d3203099a315db134193404e79ba2581d9fc53ab`; the historical pin and API
+> statements below are retained as evidence, not as the current dependency
+> state. See the current [README](../../README.md) and
+> [PROJECT_STATE](PROJECT_STATE.md).
+
 **Date:** 2026-10-02  
 **Scope:** CPU-only RAMforge → ForgeCore → llama.cpp/ggml integration  
 **ForgeCore revision:** `944bc3ca1ed7e48e2ad897107d9dcda5dd5eedc9`  
