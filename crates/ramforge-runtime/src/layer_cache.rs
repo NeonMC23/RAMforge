@@ -216,11 +216,28 @@ impl<T> LayerCache<T> {
                 ));
             }
         }
-        let bytes = self
+        let entry = self
             .entries
             .get(&layer_index)
-            .map(|entry| entry.bytes)
             .expect("cached layer validated above");
+        let bytes = entry.bytes;
+        let charge_bytes = entry.charge_names.iter().try_fold(0u64, |total, name| {
+            let charge = budget.get(name).ok_or_else(|| {
+                format!(
+                    "cached layer {} charge '{}' disappeared during eviction",
+                    layer_index, name
+                )
+            })?;
+            total.checked_add(charge).ok_or_else(|| {
+                format!("cached layer {} charge total overflow", layer_index)
+            })
+        })?;
+        if charge_bytes != bytes {
+            return Err(format!(
+                "cached layer {} charge total {} does not match entry size {}",
+                layer_index, charge_bytes, bytes
+            ));
+        }
         let new_used_bytes = self
             .used_bytes
             .checked_sub(bytes)

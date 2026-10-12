@@ -26,10 +26,20 @@ impl Sampler {
         }
     }
 
-    /// Sample token ID from logits
+    /// Compatibility sampler API. Managed execution should use
+    /// [`Self::sample_checked`] so scratch-buffer reservation failures become
+    /// ordinary runtime errors instead of an unaccounted infallible allocation.
     pub fn sample(&self, logits: &[f32]) -> u32 {
+        self.sample_checked(logits)
+            .expect("sampler scratch allocation failed")
+    }
+
+    /// Sample a token while making the scratch allocations fallible. The
+    /// caller is responsible for keeping its `tmp:sampling` charge live for the
+    /// duration of this operation.
+    pub fn sample_checked(&self, logits: &[f32]) -> Result<u32, String> {
         if logits.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         if self.temperature <= 0.0 {
@@ -42,11 +52,16 @@ impl Sampler {
                     max_id = i;
                 }
             }
-            return max_id as u32;
+            return u32::try_from(max_id)
+                .map_err(|_| "sampled token index exceeds u32".to_string());
         }
 
-        // Temperature scaling
-        let mut scaled = logits.to_vec();
+        // Temperature scaling. Reserve before creating the owned scratch copy.
+        let mut scaled = Vec::new();
+        scaled
+            .try_reserve_exact(logits.len())
+            .map_err(|error| format!("failed to reserve scaled logits: {error}"))?;
+        scaled.extend_from_slice(logits);
         for v in scaled.iter_mut() {
             *v /= self.temperature;
         }
@@ -59,8 +74,14 @@ impl Sampler {
         // Apply top-k filtering if set: keep exactly k entries.
         if let Some(k) = self.top_k {
             if k > 0 && k < scaled.len() {
+                indexed
+                    .try_reserve_exact(scaled.len())
+                    .map_err(|error| format!("failed to reserve sampler index table: {error}"))?;
                 indexed.extend(scaled.iter().enumerate().map(|(i, &v)| (i, v)));
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                indexed.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 indexed.truncate(k);
                 for v in scaled.iter_mut() {
                     *v = f32::NEG_INFINITY;
@@ -92,9 +113,15 @@ impl Sampler {
         // table, zero everything, then restore the kept prefix.
         if let Some(p) = self.top_p {
             if p < 1.0 && p > 0.0 {
+                indexed
+                    .try_reserve_exact(scaled.len())
+                    .map_err(|error| format!("failed to reserve sampler index table: {error}"))?;
                 indexed.clear();
                 indexed.extend(scaled.iter().enumerate().map(|(i, &v)| (i, v)));
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                indexed.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 let mut cumsum = 0.0;
                 let mut cutoff = scaled.len();
                 for (i, (_, prob)) in indexed.iter().enumerate() {
@@ -128,11 +155,13 @@ impl Sampler {
         for (i, &prob) in scaled.iter().enumerate() {
             cumsum += prob;
             if r <= cumsum {
-                return i as u32;
+                return u32::try_from(i)
+                    .map_err(|_| "sampled token index exceeds u32".to_string());
             }
         }
         // Fallback to last
-        (scaled.len() - 1) as u32
+        u32::try_from(scaled.len() - 1)
+            .map_err(|_| "sampled token index exceeds u32".to_string())
     }
 }
 

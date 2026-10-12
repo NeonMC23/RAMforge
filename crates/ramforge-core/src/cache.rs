@@ -5,6 +5,7 @@
 //! reusable for tensor data, blocks, layers, MoE experts, etc.
 
 use std::collections::{HashMap, VecDeque};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use crate::error::CacheError;
 use crate::memory::MemoryBudget;
@@ -158,9 +159,20 @@ impl BoundedCache {
                     self.stats.evictions += 1;
                 }
             } else {
-                // Should not happen if size <= capacity, but break to avoid infinite loop.
-                break;
+                return Err(CacheError::General(
+                    "cache LRU is empty while usage exceeds capacity".to_string(),
+                ));
             }
+        }
+
+        if self
+            .used
+            .checked_add(size)
+            .map_or(true, |used| used > self.capacity)
+        {
+            return Err(CacheError::General(
+                "cache accounting cannot fit entry after eviction".to_string(),
+            ));
         }
 
         // Insert.
@@ -254,8 +266,19 @@ impl BoundedCache {
             > self.capacity
         {
             if !self.evict_lru_budgeted(budget) {
-                break;
+                return Err(CacheError::General(
+                    "cache LRU is empty while usage exceeds capacity".to_string(),
+                ));
             }
+        }
+        if self
+            .used
+            .checked_add(size)
+            .map_or(true, |used| used > self.capacity)
+        {
+            return Err(CacheError::General(
+                "cache accounting cannot fit entry after eviction".to_string(),
+            ));
         }
 
         // Evict further until the budget has room.
@@ -270,15 +293,25 @@ impl BoundedCache {
         budget
             .allocate(Self::budget_key(&key), size)
             .map_err(|e| CacheError::General(format!("budget charge failed: {}", e)))?;
-        let data = match build() {
-            Ok(data) => data,
-            Err(error) => {
+        let data = match catch_unwind(AssertUnwindSafe(build)) {
+            Ok(Ok(data)) => data,
+            Ok(Err(error)) => {
                 budget
                     .release(&Self::budget_key(&key))
                     .unwrap_or_else(|release_error| {
                         panic!("failed to roll back cache build charge: {release_error}")
                     });
                 return Err(error);
+            }
+            Err(payload) => {
+                budget
+                    .release(&Self::budget_key(&key))
+                    .unwrap_or_else(|release_error| {
+                        panic!(
+                            "failed to roll back cache build charge during unwind: {release_error}"
+                        )
+                    });
+                resume_unwind(payload);
             }
         };
         let actual_size = match u64::try_from(data.len()) {
@@ -588,6 +621,35 @@ mod tests {
         assert_eq!(budget.used_bytes(), 25);
         assert!(budget.get("cache:failed").is_none());
         assert!(!cache.contains("failed"));
+    }
+
+    #[test]
+    fn test_budgeted_builder_panic_rolls_back_reservation() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        let mut cache = BoundedCache::new(100).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = cache.insert_budgeted_with(&mut budget, "panic".into(), 50, || {
+                panic!("synthetic cache-builder panic");
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(budget.get("cache:panic").is_none());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_budgeted_builder_size_mismatch_rolls_back_reservation() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        budget.allocate("other", 25).unwrap();
+        let mut cache = BoundedCache::new(100).unwrap();
+        let result = cache.insert_budgeted_with(&mut budget, "mismatch".into(), 50, || {
+            Ok(vec![0u8; 49])
+        });
+        assert!(result.is_err());
+        assert_eq!(budget.used_bytes(), 25);
+        assert!(budget.get("cache:mismatch").is_none());
+        assert!(cache.is_empty());
     }
 
     #[test]

@@ -161,6 +161,21 @@ pub struct GenerationOutcome {
 /// Maximum number of generated token IDs included in `token_ids_sample`.
 pub const TOKEN_ID_SAMPLE_LIMIT: usize = 64;
 
+impl Drop for InferenceEngine {
+    fn drop(&mut self) {
+        // The engine owns both the model and its budget, so it can enforce the
+        // physical-drop-before-release ordering at its destruction boundary.
+        // Standalone models use `StreamingLlamaModel::release_persistent`
+        // explicitly because their budget is borrowed from the caller.
+        self.clear_kv_cache();
+        self.model
+            .release_persistent(&mut self.budget)
+            .unwrap_or_else(|error| {
+                panic!("failed to release model allocations during engine drop: {error}")
+            });
+    }
+}
+
 impl InferenceEngine {
     /// Construct the legacy/manual execution path. Its behavior is unchanged:
     /// all available CPU threads are exposed to the existing backend, the
@@ -231,7 +246,7 @@ impl InferenceEngine {
         // forward call. Resident persistents are charged to the budget
         // (weight:*), anything that does not fit is streamed on demand with
         // charged, bounded temps.
-        let model = match requested_config.as_ref() {
+        let mut model = match requested_config.as_ref() {
             Some(config) => {
                 StreamingLlamaModel::load_with_runtime_config(&data_source, &mut budget, config)
             }
@@ -240,17 +255,42 @@ impl InferenceEngine {
         .map_err(|e| format!("failed to load model weights: {}", e))?;
 
         let backend = match requested_config.as_ref() {
-            Some(config) => CpuBackend::try_with_threads(config.cpu_thread_count)?,
+            Some(config) => match CpuBackend::try_with_threads(config.cpu_thread_count) {
+                Ok(backend) => backend,
+                Err(error) => {
+                    model
+                        .release_persistent(&mut budget)
+                        .unwrap_or_else(|cleanup_error| {
+                            panic!(
+                                "failed to roll back model allocations after backend construction failure: {}",
+                                cleanup_error
+                            )
+                        });
+                    return Err(error);
+                }
+            },
             None => CpuBackend::new(),
         };
         let runtime_config = match requested_config {
             Some(config) => config,
-            None => RuntimeConfig::current_defaults_with_thread_count(
+            None => match RuntimeConfig::current_defaults_with_thread_count(
                 backend.num_threads(),
                 ram_budget_bytes,
                 model.layer_cache_capacity_bytes(),
-            )
-            .map_err(|error| format!("failed to materialize runtime defaults: {error}"))?,
+            ) {
+                Ok(config) => config,
+                Err(error) => {
+                    model
+                        .release_persistent(&mut budget)
+                        .unwrap_or_else(|cleanup_error| {
+                            panic!(
+                                "failed to roll back model allocations after runtime-default construction failure: {}",
+                                cleanup_error
+                            )
+                        });
+                    return Err(format!("failed to materialize runtime defaults: {error}"));
+                }
+            },
         };
         let residency_stats = ResidencyStats::new(model.total_weight_bytes);
 
@@ -487,13 +527,29 @@ impl InferenceEngine {
                 .ok_or_else(|| "hidden buffer byte size overflow".to_string())?,
         )
         .map_err(|_| "hidden buffer byte size exceeds u64".to_string())?;
-        // Sampler scratch: scaled logits + kept-index table (non-greedy only).
+        // Sampler scratch: the scaled logits table plus the optional index
+        // table used by top-k/top-p. `(usize, f32)` is not five bytes on the
+        // target platforms; use its actual layout size rather than a stale
+        // multiplier that would under-account the filtering table.
         let sampler_scratch = if sampler.temperature > 0.0 {
-            vocab
+            let scaled_bytes = vocab
                 .checked_mul(std::mem::size_of::<f32>())
-                .and_then(|value| value.checked_mul(5))
-                .and_then(|value| u64::try_from(value).ok())
-                .ok_or_else(|| "sampler scratch byte size overflow".to_string())?
+                .ok_or_else(|| "sampler scaled-logit size overflow".to_string())?;
+            let indexed_needed = sampler.top_k.is_some_and(|k| k > 0 && k < vocab)
+                || sampler.top_p.is_some_and(|p| p > 0.0 && p < 1.0);
+            let indexed_bytes = if indexed_needed {
+                vocab
+                    .checked_mul(std::mem::size_of::<(usize, f32)>())
+                    .ok_or_else(|| "sampler index-table size overflow".to_string())?
+            } else {
+                0
+            };
+            u64::try_from(
+                scaled_bytes
+                    .checked_add(indexed_bytes)
+                    .ok_or_else(|| "sampler scratch byte size overflow".to_string())?,
+            )
+            .map_err(|_| "sampler scratch byte size exceeds u64".to_string())?
         } else {
             0
         };
@@ -552,10 +608,11 @@ impl InferenceEngine {
 
                         let sampling_started = profiler.start();
                         model.ensure_layer_cache_headroom(budget, sampler_scratch)?;
-                        let next_token =
-                            budget.with_temp("tmp:sampling", sampler_scratch, |_b| {
-                                Ok::<u32, String>(sampler.sample(&logits))
-                            })?;
+                        let next_token = budget.with_temp(
+                            "tmp:sampling",
+                            sampler_scratch,
+                            |_budget| sampler.sample_checked(&logits),
+                        )?;
                         profiler.record_since(ProfileEvent::Sampling, sampling_started);
 
                         if let Some(eos) = eos_id {

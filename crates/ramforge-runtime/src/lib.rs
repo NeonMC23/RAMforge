@@ -85,6 +85,18 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    fn copy_returned_bytes(data: &[u8], name: &str) -> Result<Vec<u8>, DataSourceError> {
+        let mut returned = Vec::new();
+        returned.try_reserve_exact(data.len()).map_err(|error| {
+            DataSourceError::General(format!(
+                "failed to reserve compatibility tensor copy '{}': {}",
+                name, error
+            ))
+        })?;
+        returned.extend_from_slice(data);
+        Ok(returned)
+    }
+
     pub fn new<P: AsRef<std::path::Path>>(
         model_path: P,
         ram_budget_bytes: u64,
@@ -130,15 +142,7 @@ impl Runtime {
     /// enclosing charge instead.
     pub fn get_tensor(&mut self, name: &str) -> Result<Vec<u8>, DataSourceError> {
         if let Some(data) = self.cache.get(name) {
-            let mut returned = Vec::new();
-            returned.try_reserve_exact(data.len()).map_err(|error| {
-                DataSourceError::General(format!(
-                    "failed to reserve compatibility tensor copy '{}': {}",
-                    name, error
-                ))
-            })?;
-            returned.extend_from_slice(data);
-            return Ok(returned);
+            return Self::copy_returned_bytes(data, name);
         }
         let file_bytes = self
             .data_source
@@ -167,12 +171,15 @@ impl Runtime {
             },
         );
         match insertion {
-            Ok(true) => cache.get(name).cloned().ok_or_else(|| {
-                DataSourceError::General(format!(
-                    "cache reported insertion for '{}' but the entry was missing",
-                    name
-                ))
-            }),
+            Ok(true) => {
+                let data = cache.get(name).ok_or_else(|| {
+                    DataSourceError::General(format!(
+                        "cache reported insertion for '{}' but the entry was missing",
+                        name
+                    ))
+                })?;
+                Self::copy_returned_bytes(data, name)
+            },
             Ok(false) | Err(ramforge_core::CacheError::TooLarge { .. }) => data_source.read_tensor(name),
             Err(error) => Err(DataSourceError::General(format!(
                 "cache insert failed: {}",

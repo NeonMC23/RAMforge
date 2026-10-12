@@ -19,6 +19,7 @@
 //! logical ledger unless a caller explicitly measures them separately.
 
 use std::collections::BTreeMap;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use crate::error::{MemoryError, ParseSizeError};
 
@@ -366,14 +367,19 @@ impl MemoryBudget {
             return f(self);
         }
         self.allocate(name, bytes).map_err(E::from)?;
-        let result = f(self);
-        // A release failure is an accounting failure, not something that may
-        // be discarded while returning the callback's result. The scope name
-        // remains charged when release itself fails, so the caller receives
-        // an explicit error and can decide how to recover.
-        match self.release(name) {
-            Ok(_) => result,
-            Err(error) => Err(E::from(error)),
+        // Catch the closure's unwind long enough to release the charge, then
+        // resume the original panic. Without this guard, a panic in a caller
+        // or test hook would leave the logical reservation live until the
+        // entire budget is dropped.
+        let result = catch_unwind(AssertUnwindSafe(|| f(self)));
+        let release_result = self.release(name);
+        match (result, release_result) {
+            (Ok(result), Ok(_)) => result,
+            (Ok(_), Err(error)) => Err(E::from(error)),
+            (Err(payload), Ok(_)) => resume_unwind(payload),
+            (Err(_), Err(error)) => {
+                panic!("temporary allocation '{}' failed to release during unwind: {}", name, error)
+            }
         }
     }
 
@@ -706,6 +712,21 @@ mod tests {
             .unwrap();
         assert_eq!(v, 7);
         assert!(budget.get("noop").is_none());
+    }
+
+    #[test]
+    fn test_with_temp_releases_on_panic_before_resuming_unwind() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result: Result<(), MemoryError> = budget.with_temp("scratch", 400, |b| {
+                assert_eq!(b.get("scratch"), Some(400));
+                panic!("synthetic temporary-scope panic");
+            });
+            let _ = result;
+        }));
+        assert!(panic.is_err());
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(budget.get("scratch").is_none());
     }
 
     #[test]

@@ -141,6 +141,11 @@ pub struct StreamingLlamaModel {
     layer_cache: Mutex<LayerCache<StreamingLayerWeights>>,
     read_coalescing_enabled: bool,
     grouped_read_buffer_reuse_enabled: bool,
+    /// Names of persistent `weight:*` charges owned by this model. The model
+    /// cannot implement `Drop` for an externally borrowed `MemoryBudget`, so a
+    /// in-place release method uses this ownership record to make standalone
+    /// destruction explicit and exact.
+    persistent_charge_names: Vec<String>,
     pub(crate) profiler: Profiler,
     #[cfg(test)]
     test_layer_hidden_hook: Mutex<Option<TestLayerHiddenHook>>,
@@ -302,14 +307,12 @@ impl StreamingLlamaModel {
         // Match the planner's necessary lower bound: retain neither startup
         // peak nor largest-layer headroom as cache capacity. Additional
         // mandatory workspaces dynamically evict cache entries.
-        let layer_lower_bound = budget
-            .used_bytes()
-            .checked_add(max_layer_load_peak)
-            .ok_or_else(|| "layer cache lower-bound overflow".to_string())?;
-        let managed_lower_bound = budget.peak_used_bytes().max(layer_lower_bound);
-        let maximum_layer_cache_capacity = match budget.total_bytes().checked_sub(managed_lower_bound) {
-            Some(available) => available,
+        let layer_lower_bound = match budget.used_bytes().checked_add(max_layer_load_peak) {
+            Some(lower_bound) => lower_bound,
             None => {
+                // Persistent weights are live on this success path; an
+                // arithmetic failure must not return while their charges are
+                // still attached to the caller's budget.
                 drop(output);
                 drop(output_norm);
                 drop(token_embd);
@@ -320,13 +323,34 @@ impl StreamingLlamaModel {
                             panic!("failed to roll back persistent charge '{}': {}", name, release_error)
                         });
                 }
-                return Err(format!(
-                    "managed lower bound {} exceeds RAMforge budget {}",
-                    managed_lower_bound,
-                    budget.total_bytes()
-                ));
+                return Err("layer cache lower-bound overflow".to_string());
             }
         };
+        let managed_lower_bound = budget.peak_used_bytes().max(layer_lower_bound);
+        let maximum_layer_cache_capacity =
+            match budget.total_bytes().checked_sub(managed_lower_bound) {
+                Some(available) => available,
+                None => {
+                    drop(output);
+                    drop(output_norm);
+                    drop(token_embd);
+                    for name in persistent_allocations.iter().rev() {
+                        budget
+                            .release(name)
+                            .unwrap_or_else(|release_error| {
+                                panic!(
+                                    "failed to roll back persistent charge '{}': {}",
+                                    name, release_error
+                                )
+                            });
+                    }
+                    return Err(format!(
+                        "managed lower bound {} exceeds RAMforge budget {}",
+                        managed_lower_bound,
+                        budget.total_bytes()
+                    ));
+                }
+            };
         let layer_cache_capacity = runtime_config
             .map(|config| {
                 if config.layer_cache_enabled {
@@ -379,6 +403,7 @@ impl StreamingLlamaModel {
             layer_cache: Mutex::new(LayerCache::new(layer_cache_capacity)),
             read_coalescing_enabled,
             grouped_read_buffer_reuse_enabled,
+            persistent_charge_names: persistent_allocations,
             profiler,
             #[cfg(test)]
             test_layer_hidden_hook: Mutex::new(None),
@@ -462,6 +487,68 @@ impl StreamingLlamaModel {
         cache.clear(budget)?;
         self.profiler
             .record_cache_state(cache.entry_count(), cache.used_bytes());
+        Ok(())
+    }
+
+    /// Release all allocations owned by this model before it is destroyed.
+    ///
+    /// `StreamingLlamaModel::load` deliberately accepts a mutable borrow of an
+    /// external `MemoryBudget`, so Rust cannot safely make the model's `Drop`
+    /// implementation mutate that budget after the borrow has ended. This
+    /// terminal method is the ownership-preserving boundary for standalone
+    /// callers: it clears cached layers, requires separately returned layers to
+    /// have been released, drops the resident persistent tensors, and only then
+    /// releases this model's recorded `weight:*` charges. This is a terminal
+    /// operation by contract; callers must not use the model for inference after
+    /// it succeeds. The mutable receiver preserves the model if a recoverable
+    /// invariant error is reported before physical teardown.
+    pub fn release_persistent(&mut self, budget: &mut MemoryBudget) -> Result<(), String> {
+        self.clear_layer_cache(budget)?;
+        let active_layer_charges: Vec<String> = budget
+            .allocations()
+            .keys()
+            .filter(|name| name.starts_with("layer:"))
+            .cloned()
+            .collect();
+        if !active_layer_charges.is_empty() {
+            return Err(format!(
+                "cannot release persistent model while external layer charges remain: {:?}",
+                active_layer_charges
+            ));
+        }
+        let charge_names = self.persistent_charge_names.clone();
+        for name in &charge_names {
+            if budget.get(name).is_none() {
+                return Err(format!(
+                    "persistent model charge '{}' is missing before model release",
+                    name
+                ));
+            }
+        }
+        if charge_names.is_empty() {
+            return Ok(());
+        }
+
+        // The public fields cannot be changed to `Option` without breaking
+        // callers. Replace them with a zero-sized sentinel, so the resident
+        // tensors are physically dropped before their logical charges leave the
+        // external budget. The method is terminal for this model instance.
+        let token_embd = std::mem::replace(&mut self.token_embd, empty_persistent_weight());
+        let output_norm = std::mem::replace(&mut self.output_norm, empty_persistent_weight());
+        let output = self.output.take();
+        drop(output);
+        drop(output_norm);
+        drop(token_embd);
+
+        self.persistent_charge_names.clear();
+        for name in charge_names {
+            budget.release(&name).unwrap_or_else(|error| {
+                panic!(
+                    "failed to release persistent model charge '{}' after dropping weight: {}",
+                    name, error
+                )
+            });
+        }
         Ok(())
     }
 
@@ -1094,22 +1181,37 @@ impl StreamingLlamaModel {
                 // layer residual/FFN output before the next layer starts.
                 #[cfg(test)]
                 self.emit_test_layer_hidden(layer_idx, &hidden);
-                staged_k.push(cloned_f32_buffer(&k_tmp, "staged K storage")?);
-                settle_staged_kv_charge(
-                    budget,
-                    non_staged_forward_bytes,
-                    staged_requested_bytes,
-                    &staged_k,
-                    &staged_v,
-                )?;
-                staged_v.push(cloned_f32_buffer(&v_tmp, "staged V storage")?);
-                settle_staged_kv_charge(
-                    budget,
-                    non_staged_forward_bytes,
-                    staged_requested_bytes,
-                    &staged_k,
-                    &staged_v,
-                )?;
+                let staging_result = (|| -> Result<(), String> {
+                    staged_k.push(cloned_f32_buffer(&k_tmp, "staged K storage")?);
+                    settle_staged_kv_charge(
+                        budget,
+                        non_staged_forward_bytes,
+                        staged_requested_bytes,
+                        &staged_k,
+                        &staged_v,
+                    )?;
+                    staged_v.push(cloned_f32_buffer(&v_tmp, "staged V storage")?);
+                    settle_staged_kv_charge(
+                        budget,
+                        non_staged_forward_bytes,
+                        staged_requested_bytes,
+                        &staged_k,
+                        &staged_v,
+                    )?;
+                    Ok(())
+                })();
+                if let Err(error) = staging_result {
+                    // Staging can fail after the layer has been loaded and
+                    // computed (for example, a fallible K/V clone or charge
+                    // settlement). The layer still owns the active charges.
+                    drop(layer);
+                    let release_started = self.profiler.start();
+                    self.release_layer(layer_idx, budget, stats);
+                    self.profiler
+                        .record_since(ProfileEvent::LayerRelease, release_started);
+                    self.profiler.record_layer_release();
+                    return Err(error);
+                }
 
                 let layer_bytes = match layer.try_total_resident_bytes() {
                     Ok(bytes) => bytes,
@@ -1256,6 +1358,13 @@ impl StreamingLlamaModel {
             }
         }
     }
+}
+
+fn empty_persistent_weight() -> PersistentWeight {
+    PersistentWeight::Resident(
+        TensorData::from_f32_vec(vec![0], 0, Vec::new())
+            .expect("zero-sized persistent sentinel must be constructible"),
+    )
 }
 
 fn persistent_f32_view<'a>(
@@ -2474,6 +2583,26 @@ mod tests {
         settle_staged_kv_charge(&mut budget, 0, 0, &staged_k, &staged_v).unwrap();
         assert_eq!(budget.get("tmp:forward"), Some(actual));
         assert_eq!(budget.used_bytes(), actual);
+    }
+
+    #[test]
+    fn test_explicit_model_release_drops_persistent_charges() {
+        let tmp = create_model_with_n_layers(1, 8, 16);
+        let data_source = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
+        let mut budget = MemoryBudget::new(4096).unwrap();
+        let mut model = StreamingLlamaModel::load(&data_source, &mut budget).unwrap();
+
+        assert!(budget.get("weight:token_embd.weight").is_some());
+        assert!(budget.get("weight:output_norm.weight").is_some());
+        model.release_persistent(&mut budget).unwrap();
+
+        assert_eq!(budget.used_bytes(), 0);
+        assert!(budget
+            .allocations()
+            .keys()
+            .all(|name| !name.starts_with("weight:")));
+        // A second call is intentionally harmless for destruction paths.
+        model.release_persistent(&mut budget).unwrap();
     }
 
     #[test]
