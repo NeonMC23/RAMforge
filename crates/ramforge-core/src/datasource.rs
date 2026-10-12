@@ -260,7 +260,7 @@ impl GgufDataSource {
         self.validate_bounds(desc, byte_length)?;
 
         let result = self.read_range(desc.file_offset, byte_length);
-        let bytes = result.as_ref().map(|data| data.len() as u64).unwrap_or(0);
+        let bytes = result.as_ref().map(|_| byte_length).unwrap_or(0);
         self.record_tensor_read(&desc.name, bytes, result.is_err());
         result
     }
@@ -362,10 +362,7 @@ impl GgufDataSource {
             })?;
         self.validate_bounds_at(file_offset, range_byte_length, desc)?;
         let result = self.read_f32_range(file_offset, element_count);
-        let bytes = result
-            .as_ref()
-            .map(|values| std::mem::size_of_val(values.as_slice()) as u64)
-            .unwrap_or(0);
+        let bytes = result.as_ref().map(|_| range_byte_length).unwrap_or(0);
         self.record_tensor_read(&desc.name, bytes, result.is_err());
         result
     }
@@ -507,7 +504,7 @@ impl GgufDataSource {
         self.validate_bounds_at(file_offset, length, desc)?;
 
         let result = self.read_range(file_offset, length);
-        let bytes = result.as_ref().map(|data| data.len() as u64).unwrap_or(0);
+        let bytes = result.as_ref().map(|_| length).unwrap_or(0);
         self.record_tensor_read(&desc.name, bytes, result.is_err());
         result
     }
@@ -597,14 +594,16 @@ impl GgufDataSource {
                     "failed to fill whole buffer",
                 )));
             }
-            state.position = file_offset.checked_add(length);
+            let next_position = file_offset.checked_add(length).ok_or_else(|| {
+                DataSourceError::InvalidRange(format!(
+                    "file position overflow after reading offset {} length {}",
+                    file_offset, length
+                ))
+            })?;
+            state.position = Some(next_position);
             Ok(())
         })();
-        let bytes = if result.is_ok() {
-            buffer.len() as u64
-        } else {
-            0
-        };
+        let bytes = if result.is_ok() { length } else { 0 };
         if result.is_ok() && self.profiling_enabled.load(Ordering::Relaxed) {
             if usize::try_from(length)
                 .ok()
@@ -632,7 +631,7 @@ impl GgufDataSource {
         let result = self.read_f32_range_unprofiled(file_offset, element_count);
         let bytes = result
             .as_ref()
-            .map(|values| std::mem::size_of_val(values.as_slice()) as u64)
+            .and_then(|_| element_count.checked_mul(std::mem::size_of::<f32>() as u64))
             .unwrap_or(0);
         self.record_read(started, bytes, result.is_err());
         result
@@ -657,6 +656,15 @@ impl GgufDataSource {
                     element_count
                 ))
             })?;
+        let byte_length_u64 = u64::try_from(byte_length).map_err(|_| {
+            DataSourceError::InvalidRange("F32 read byte length exceeds u64".to_string())
+        })?;
+        let next_position = file_offset.checked_add(byte_length_u64).ok_or_else(|| {
+            DataSourceError::InvalidRange(format!(
+                "F32 file position overflow after offset {} and length {}",
+                file_offset, byte_length_u64
+            ))
+        })?;
         if element_count == 0 {
             return Ok(Vec::new());
         }
@@ -692,7 +700,7 @@ impl GgufDataSource {
             state.position = None;
             return Err(DataSourceError::Io(error));
         }
-        state.position = file_offset.checked_add(byte_length as u64);
+        state.position = Some(next_position);
 
         // SAFETY: `read_exact` above initialized every byte of every reserved
         // f32 slot, and all f32 bit patterns are valid.

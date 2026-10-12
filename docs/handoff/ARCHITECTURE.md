@@ -142,7 +142,7 @@ Planner policy is separate from execution.
 
 `crates/ramforge-runtime/src/layer.rs` groups `blk.{i}.*` descriptors into `LayerDescriptor`s and identifies `PersistentDescriptors` for `token_embd.weight`, `output_norm.weight`, and `output.weight`.
 
-`crates/ramforge-runtime/src/persistent.rs` contains `PersistentWeight`, either `Resident(TensorData)` or `Streamed(TensorDescriptor)`. Resident policy uses actual post-decode/compact representation size. Streamed embedding and output projection paths use bounded, budget-charged temporary workspaces.
+`crates/ramforge-runtime/src/persistent.rs` contains `PersistentWeight`, either `Resident(TensorData)` or `Streamed(TensorDescriptor)`. Resident policy uses actual post-decode/compact representation size. Managed execution fills caller-owned embedding/logits buffers while bounded streamed read/decode workspaces are charged for their full scope. The compatibility helper that returns an owned embedding `Vec` is explicitly outside the ledger after return.
 
 `crates/ramforge-runtime/src/streaming_model.rs` contains `StreamingLlamaModel`. Loading validates the dense Llama/Qwen2 tensor contract, estimates layer memory and read plans, loads resident persistent weights transactionally, and retains runtime configuration decisions. `load_layer`, `release_layer`, `forward_single_streaming`, and `compute_logits` are the key runtime operations.
 
@@ -154,7 +154,7 @@ Planner policy is separate from execution.
 
 ### MemoryBudget
 
-`crates/ramforge-core/src/memory.rs` contains `MemoryBudget`. Named allocations are used for persistent weights (`weight:*`), active layers (`layer:*`), KV (`kv_cache`), and temporary workspaces (`tmp:*`). `with_temp` releases scoped charges on both success and error. Runtime code treats budget accounting as the authoritative managed-memory limit.
+`crates/ramforge-core/src/memory.rs` contains `MemoryBudget`. Named allocations are used for persistent weights (`weight:*`), active layers (`layer:*`), KV (`kv_cache`), and temporary workspaces (`tmp:*`). `with_temp` releases scoped charges on both success and error, and checked release/resize operations report accounting corruption rather than saturating. Runtime code treats this as the authoritative limit for explicitly managed logical allocations only; it is not an RSS cap or an OS-memory limit, and native/dependency allocations, allocator overhead, page cache, and legacy returned buffers remain outside complete coverage.
 
 ### ModelExecutor and compute dispatch
 

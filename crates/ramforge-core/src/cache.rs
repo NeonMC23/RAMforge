@@ -31,7 +31,7 @@ struct CacheEntry {
 /// Strict bounded LRU cache
 ///
 /// - `capacity` is max bytes
-/// - Every entry has exact byte cost (data.len() as u64)
+/// - Every entry has an exact checked byte cost derived from `data.len()`
 /// - Insertion respects capacity, evicting LRU entries when needed
 /// - Oversized entry (larger than capacity) fails with `CacheError::TooLarge`
 /// - Never exceeds capacity
@@ -74,7 +74,9 @@ impl BoundedCache {
     }
 
     pub fn available_bytes(&self) -> u64 {
-        self.capacity.saturating_sub(self.used)
+        self.capacity
+            .checked_sub(self.used)
+            .expect("BoundedCache invariant violated: used bytes exceed capacity")
     }
 
     pub fn len(&self) -> usize {
@@ -117,7 +119,8 @@ impl BoundedCache {
     /// - Evicts LRU entries until enough space
     /// - Never exceeds capacity
     pub fn insert(&mut self, key: String, data: Vec<u8>) -> Result<(), CacheError> {
-        let size = data.len() as u64;
+        let size = u64::try_from(data.len())
+            .map_err(|_| CacheError::General("cache entry length exceeds u64".to_string()))?;
 
         if size > self.capacity {
             return Err(CacheError::TooLarge {
@@ -128,27 +131,45 @@ impl BoundedCache {
 
         // If key exists, remove old entry first
         if let Some(old) = self.entries.remove(&key) {
-            self.used = self.used.saturating_sub(old.size);
+            let old_size = old.size;
+            drop(old.data);
+            self.used = self
+                .used
+                .checked_sub(old_size)
+                .expect("BoundedCache accounting underflow while replacing entry");
             self.lru.retain(|k| k != &key);
         }
 
-        // Evict until enough space
-        while self.used + size > self.capacity {
+        // Evict until enough space.
+        while self
+            .used
+            .checked_add(size)
+            .expect("BoundedCache accounting overflow while inserting")
+            > self.capacity
+        {
             if let Some(lru_key) = self.lru.pop_back() {
                 if let Some(entry) = self.entries.remove(&lru_key) {
-                    self.used = self.used.saturating_sub(entry.size);
+                    let entry_size = entry.size;
+                    drop(entry.data);
+                    self.used = self
+                        .used
+                        .checked_sub(entry_size)
+                        .expect("BoundedCache accounting underflow while evicting");
                     self.stats.evictions += 1;
                 }
             } else {
-                // Should not happen if size <= capacity, but break to avoid infinite loop
+                // Should not happen if size <= capacity, but break to avoid infinite loop.
                 break;
             }
         }
 
-        // Insert
+        // Insert.
         self.lru.push_front(key.clone());
         self.entries.insert(key, CacheEntry { data, size });
-        self.used += size;
+        self.used = self
+            .used
+            .checked_add(size)
+            .expect("BoundedCache accounting overflow while inserting");
 
         self.update_stats();
         debug_assert!(self.used <= self.capacity);
@@ -159,10 +180,15 @@ impl BoundedCache {
     /// Remove an entry
     pub fn remove(&mut self, key: &str) -> Option<Vec<u8>> {
         if let Some(entry) = self.entries.remove(key) {
-            self.used = self.used.saturating_sub(entry.size);
+            let entry_size = entry.size;
+            let data = entry.data;
+            self.used = self
+                .used
+                .checked_sub(entry_size)
+                .expect("BoundedCache accounting underflow while removing entry");
             self.lru.retain(|k| k != key);
             self.update_stats();
-            Some(entry.data)
+            Some(data)
         } else {
             None
         }
@@ -175,24 +201,28 @@ impl BoundedCache {
     // can never grow into an unaccounted second memory pool. The budget is
     // the authoritative limit; `capacity` remains a secondary hard cap.
 
-    /// Budget-charged insert.
+    /// Budget-charged insert whose builder runs only after the cache charge is
+    /// reserved. This is the managed entry point for reads or decodes that
+    /// would otherwise allocate a `Vec<u8>` before accounting it.
     ///
-    /// Evicts LRU entries until both the cache capacity and the memory
-    /// budget have room (each eviction releases its budget charge).
-    ///
-    /// Returns:
-    /// - `Ok(true)` if the entry was cached (and charged to the budget)
-    /// - `Ok(false)` if the budget cannot fit the entry even after evicting
-    ///   everything (the entry is simply not cached; callers can fall back
-    ///   to reading from disk)
-    /// - `Err(CacheError::TooLarge)` if the entry exceeds the cache capacity
-    pub fn insert_budgeted(
+    /// Evicts LRU entries until both the cache capacity and the memory budget
+    /// have room (each eviction drops its data before releasing its charge).
+    /// The builder's returned buffer must have exactly `size` bytes.
+    pub fn insert_budgeted_with<F>(
         &mut self,
         budget: &mut MemoryBudget,
         key: String,
-        data: Vec<u8>,
-    ) -> Result<bool, CacheError> {
-        let size = data.len() as u64;
+        size: u64,
+        build: F,
+    ) -> Result<bool, CacheError>
+    where
+        F: FnOnce() -> Result<Vec<u8>, CacheError>,
+    {
+        if size == 0 {
+            return Err(CacheError::General(
+                "budgeted cache entries must have positive size".to_string(),
+            ));
+        }
         if size > self.capacity {
             return Err(CacheError::TooLarge {
                 size,
@@ -200,15 +230,29 @@ impl BoundedCache {
             });
         }
 
-        // Replacing an existing key: release its old budget charge first.
+        // Replacing an existing key: drop its old data before releasing the
+        // corresponding budget charge.
         if let Some(old) = self.entries.remove(&key) {
-            self.used = self.used.saturating_sub(old.size);
+            let old_size = old.size;
+            drop(old.data);
+            self.used = self
+                .used
+                .checked_sub(old_size)
+                .expect("BoundedCache accounting underflow while replacing budgeted entry");
             self.lru.retain(|k| k != &key);
-            let _ = budget.release(&Self::budget_key(&key));
+            budget
+                .release(&Self::budget_key(&key))
+                .unwrap_or_else(|error| panic!("failed to release replaced cache charge: {error}"));
         }
 
-        // Evict until capacity has room (releasing budget charges).
-        while self.used + size > self.capacity {
+        // Evict until capacity has room (releasing budget charges only after
+        // each evicted buffer has been dropped).
+        while self
+            .used
+            .checked_add(size)
+            .expect("BoundedCache accounting overflow while inserting budgeted entry")
+            > self.capacity
+        {
             if !self.evict_lru_budgeted(budget) {
                 break;
             }
@@ -217,8 +261,8 @@ impl BoundedCache {
         // Evict further until the budget has room.
         while !budget.can_allocate(size) {
             if !self.evict_lru_budgeted(budget) {
-                // Nothing left to evict and budget still full: skip caching
-                // instead of failing – streaming must keep working.
+                // Nothing left to evict and budget still full: skip building
+                // the entry so no unaccounted cache allocation is created.
                 return Ok(false);
             }
         }
@@ -226,31 +270,113 @@ impl BoundedCache {
         budget
             .allocate(Self::budget_key(&key), size)
             .map_err(|e| CacheError::General(format!("budget charge failed: {}", e)))?;
+        let data = match build() {
+            Ok(data) => data,
+            Err(error) => {
+                budget
+                    .release(&Self::budget_key(&key))
+                    .unwrap_or_else(|release_error| {
+                        panic!("failed to roll back cache build charge: {release_error}")
+                    });
+                return Err(error);
+            }
+        };
+        let actual_size = match u64::try_from(data.len()) {
+            Ok(actual_size) => actual_size,
+            Err(_) => {
+                drop(data);
+                budget
+                    .release(&Self::budget_key(&key))
+                    .unwrap_or_else(|error| {
+                        panic!("failed to release oversized cache build charge: {error}")
+                    });
+                return Err(CacheError::General(
+                    "cache entry length exceeds u64".to_string(),
+                ));
+            }
+        };
+        if actual_size != size {
+            drop(data);
+            budget
+                .release(&Self::budget_key(&key))
+                .unwrap_or_else(|error| {
+                    panic!("failed to release mismatched cache charge: {error}")
+                });
+            return Err(CacheError::General(format!(
+                "cache builder returned {} bytes, expected {}",
+                actual_size, size
+            )));
+        }
 
         self.lru.push_front(key.clone());
         self.entries.insert(key, CacheEntry { data, size });
-        self.used += size;
+        self.used = self
+            .used
+            .checked_add(size)
+            .expect("BoundedCache accounting overflow after budgeted insert");
         self.update_stats();
         debug_assert!(self.used <= self.capacity);
         Ok(true)
     }
 
-    /// Remove an entry and release its budget charge.
-    pub fn remove_budgeted(&mut self, budget: &mut MemoryBudget, key: &str) -> Option<Vec<u8>> {
-        let removed = self.remove(key);
-        if removed.is_some() {
-            let _ = budget.release(&Self::budget_key(key));
-        }
-        removed
+    /// Budget-charged insert of an already-created buffer. Prefer
+    /// [`Self::insert_budgeted_with`] when the buffer can be built after the
+    /// reservation; this compatibility form cannot retroactively protect the
+    /// allocation performed by its caller.
+    pub fn insert_budgeted(
+        &mut self,
+        budget: &mut MemoryBudget,
+        key: String,
+        data: Vec<u8>,
+    ) -> Result<bool, CacheError> {
+        let size = u64::try_from(data.len())
+            .map_err(|_| CacheError::General("cache entry length exceeds u64".to_string()))?;
+        self.insert_budgeted_with(budget, key, size, || Ok(data))
     }
 
-    /// Clear the cache and release all budget charges.
-    pub fn clear_budgeted(&mut self, budget: &mut MemoryBudget) {
-        let keys: Vec<String> = self.entries.keys().cloned().collect();
-        for k in keys {
-            let _ = budget.release(&Self::budget_key(&k));
+    /// Remove an entry and release its budget charge.
+    ///
+    /// This legacy API returns an owned `Vec` after the cache charge is
+    /// released, so the returned copy is outside `MemoryBudget` accounting.
+    /// Managed callers that need lifetime coverage should retain a caller-owned
+    /// output charge and use the cache only as the source of its bytes.
+    pub fn remove_budgeted(&mut self, budget: &mut MemoryBudget, key: &str) -> Option<Vec<u8>> {
+        let removed = self.remove(key);
+        let data = removed?;
+        // Preserve the legacy return type while ensuring the cache-owned
+        // allocation is dropped before its charge is released. The returned
+        // clone is caller-owned and intentionally outside this budget ledger.
+        let mut returned = Vec::new();
+        if returned.try_reserve_exact(data.len()).is_err() {
+            drop(data);
+            budget
+                .release(&Self::budget_key(key))
+                .unwrap_or_else(|error| {
+                    panic!("failed to release removed cache charge: {error}")
+                });
+            return None;
         }
-        self.clear();
+        returned.extend_from_slice(&data);
+        drop(data);
+        budget
+            .release(&Self::budget_key(key))
+            .unwrap_or_else(|error| panic!("failed to release removed cache charge: {error}"));
+        Some(returned)
+    }
+
+    /// Clear the cache and release all budget charges after dropping the
+    /// corresponding cached buffers.
+    pub fn clear_budgeted(&mut self, budget: &mut MemoryBudget) {
+        let entries = std::mem::take(&mut self.entries);
+        self.lru.clear();
+        self.used = 0;
+        for (key, entry) in entries {
+            drop(entry.data);
+            budget
+                .release(&Self::budget_key(&key))
+                .unwrap_or_else(|error| panic!("failed to release cleared cache charge: {error}"));
+        }
+        self.update_stats();
     }
 
     fn budget_key(key: &str) -> String {
@@ -262,9 +388,18 @@ impl BoundedCache {
     fn evict_lru_budgeted(&mut self, budget: &mut MemoryBudget) -> bool {
         if let Some(lru_key) = self.lru.pop_back() {
             if let Some(entry) = self.entries.remove(&lru_key) {
-                self.used = self.used.saturating_sub(entry.size);
+                let entry_size = entry.size;
+                drop(entry.data);
+                self.used = self
+                    .used
+                    .checked_sub(entry_size)
+                    .expect("BoundedCache accounting underflow while budgeted eviction");
                 self.stats.evictions += 1;
-                let _ = budget.release(&Self::budget_key(&lru_key));
+                budget
+                    .release(&Self::budget_key(&lru_key))
+                    .unwrap_or_else(|error| {
+                        panic!("failed to release evicted cache charge: {error}")
+                    });
                 self.update_stats();
                 return true;
             }
@@ -296,6 +431,7 @@ impl BoundedCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn test_insert_and_hit() {
@@ -427,15 +563,31 @@ mod tests {
         let mut budget = MemoryBudget::new(50).unwrap();
         budget.allocate("other", 45).unwrap();
         let mut cache = BoundedCache::new(100).unwrap();
+        let built = Cell::new(false);
         let cached = cache
-            .insert_budgeted(&mut budget, "x".to_string(), vec![0u8; 10])
+            .insert_budgeted_with(&mut budget, "x".to_string(), 10, || {
+                built.set(true);
+                Ok(vec![0u8; 10])
+            })
             .unwrap();
-        assert!(
-            !cached,
-            "must skip caching when budget cannot fit the entry"
-        );
+        assert!(!cached, "must skip caching when budget cannot fit the entry");
+        assert!(!built.get(), "builder must run only after reservation");
         assert!(!cache.contains("x"));
         assert_eq!(budget.used_bytes(), 45);
+    }
+
+    #[test]
+    fn test_budgeted_builder_failure_rolls_back_reservation() {
+        let mut budget = MemoryBudget::new(100).unwrap();
+        budget.allocate("other", 25).unwrap();
+        let mut cache = BoundedCache::new(100).unwrap();
+        let result = cache.insert_budgeted_with(&mut budget, "failed".into(), 50, || {
+            Err(CacheError::General("synthetic read failure".to_string()))
+        });
+        assert!(result.is_err());
+        assert_eq!(budget.used_bytes(), 25);
+        assert!(budget.get("cache:failed").is_none());
+        assert!(!cache.contains("failed"));
     }
 
     #[test]

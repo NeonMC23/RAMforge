@@ -71,6 +71,15 @@ impl GenerationProfile {
     }
 }
 
+fn zeroed_f32_buffer(len: usize, label: &str) -> Result<Vec<f32>, String> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(len)
+        .map_err(|error| format!("failed to reserve {label}: {error}"))?;
+    buffer.resize(len, 0.0);
+    Ok(buffer)
+}
+
 fn validate_runtime_config_for_host(runtime_config: &RuntimeConfig) -> Result<(), String> {
     runtime_config
         .validate()
@@ -302,9 +311,24 @@ impl InferenceEngine {
     /// "a `kv_cache` charge exists in the budget". After this call the
     /// engine can start (or retry) a generation from a clean state.
     pub fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-        if self.budget.get("kv_cache").is_some() {
-            let _ = self.budget.release("kv_cache");
+        // Drop the owned buffers before releasing their logical charge. The
+        // method cannot return a Result without changing its public API, so a
+        // broken accounting invariant is made loud rather than silently
+        // discarding an owned cache or charge.
+        let had_cache = self.kv_cache.take().is_some();
+        let had_charge = self.budget.get("kv_cache").is_some();
+        if had_cache && !had_charge {
+            panic!(
+                "KV cache ownership/accounting invariant violated: cache present without charge"
+            );
+        }
+        // A failed generation can leave the local cache already dropped while
+        // its charge still needs this cleanup path; that is the intentional
+        // `had_cache == false, had_charge == true` case.
+        if had_charge {
+            self.budget
+                .release("kv_cache")
+                .unwrap_or_else(|error| panic!("failed to release KV cache charge: {error}"));
         }
     }
 
@@ -396,8 +420,13 @@ impl InferenceEngine {
             return Err("prompt tokenization produced no tokens".to_string());
         }
 
-        // Check context length
-        if prompt_tokens.len() + max_tokens > self.model.config.context_length {
+        // Check context length with checked arithmetic before sizing the KV
+        // cache or any generation buffers.
+        let needed_len = prompt_tokens
+            .len()
+            .checked_add(max_tokens)
+            .ok_or_else(|| "prompt + max_tokens length overflow".to_string())?;
+        if needed_len > self.model.config.context_length {
             return Err(format!(
                 "prompt + max_tokens exceeds context length: {} + {} > {}",
                 prompt_tokens.len(),
@@ -405,32 +434,27 @@ impl InferenceEngine {
                 self.model.config.context_length
             ));
         }
-        let needed_len = prompt_tokens.len() + max_tokens;
 
         // KV cache: start at the prompt length; grow chunk-wise as tokens
         // are generated (capped at needed_len rather than context_length).
-        let mut kv_cache = KvCache::new(
+        let mut kv_cache = KvCache::new_with_budget(
             self.model.config.block_count,
             self.model.config.head_count_kv,
             self.model.config.head_dim,
             prompt_tokens.len(),
+            &mut self.budget,
+            "kv_cache",
         )
-        .map_err(|e| format!("failed to create KV cache: {}", e))?;
-
-        let kv_bytes = kv_cache.total_bytes() as u64;
-        self.budget
-            .allocate("kv_cache", kv_bytes)
-            .map_err(|e| {
-                format!(
-                    "RAM budget too small for initial KV cache: need {} bytes ({} layers, {} kv_heads, head_dim {}, {} prompt tokens): {}",
-                    kv_bytes,
-                    self.model.config.block_count,
-                    self.model.config.head_count_kv,
-                    self.model.config.head_dim,
-                    prompt_tokens.len(),
-                    e
-                )
-            })?;
+        .map_err(|e| {
+            format!(
+                "RAM budget too small for initial KV cache ({} layers, {} kv_heads, head_dim {}, {} prompt tokens): {}",
+                self.model.config.block_count,
+                self.model.config.head_count_kv,
+                self.model.config.head_dim,
+                prompt_tokens.len(),
+                e
+            )
+        })?;
 
         // Initialize residency stats with total model weight bytes
         let mut residency_stats = ResidencyStats::new(self.model.total_weight_bytes);
@@ -451,15 +475,32 @@ impl InferenceEngine {
         // exactly match their lifetimes. In particular, `tmp:hidden` remains
         // live while every per-token forward writes and later consumers read
         // the hidden vector returned through the caller-owned slice.
-        let logits_bytes = (vocab * 4) as u64;
-        let hidden_bytes = (n_embd * 4) as u64;
+        let logits_bytes = u64::try_from(
+            vocab
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| "logits buffer byte size overflow".to_string())?,
+        )
+        .map_err(|_| "logits buffer byte size exceeds u64".to_string())?;
+        let hidden_bytes = u64::try_from(
+            n_embd
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| "hidden buffer byte size overflow".to_string())?,
+        )
+        .map_err(|_| "hidden buffer byte size exceeds u64".to_string())?;
         // Sampler scratch: scaled logits + kept-index table (non-greedy only).
         let sampler_scratch = if sampler.temperature > 0.0 {
-            (vocab * 4 * 5) as u64
+            vocab
+                .checked_mul(std::mem::size_of::<f32>())
+                .and_then(|value| value.checked_mul(5))
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or_else(|| "sampler scratch byte size overflow".to_string())?
         } else {
             0
         };
 
+        // Returned token/text history and tokenizer internals are caller-facing
+        // output state; their growth is intentionally outside the named
+        // MemoryBudget ledger in this legacy API.
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut generated_text = String::new();
         let mut decoder = tokenizer.decoder();
@@ -471,11 +512,11 @@ impl InferenceEngine {
         let run_result: Result<(), String> =
             budget.with_temp("tmp:hidden", hidden_bytes, |budget| {
                 let allocation_started = profiler.start();
-                let mut hidden = vec![0.0f32; n_embd];
+                let mut hidden = zeroed_f32_buffer(n_embd, "hidden activation")?;
                 profiler.record_since(ProfileEvent::Allocation, allocation_started);
                 budget.with_temp("tmp:logits", logits_bytes, |budget| {
                     let allocation_started = profiler.start();
-                    let mut logits = vec![0.0f32; vocab];
+                    let mut logits = zeroed_f32_buffer(vocab, "logits buffer")?;
                     profiler.record_since(ProfileEvent::Allocation, allocation_started);
 
                     // Prompt pass – fills the KV cache one token at a time.
@@ -534,8 +575,13 @@ impl InferenceEngine {
                             generated_text.push_str(&decoded);
                         }
 
-                        let more_tokens_requested = generation_index + 1 < max_tokens;
-                        let room_in_context = current_pos + 1 < context_length;
+                        let next_pos = current_pos
+                            .checked_add(1)
+                            .ok_or_else(|| "generation position overflow".to_string())?;
+                        let more_tokens_requested = generation_index
+                            .checked_add(1)
+                            .is_some_and(|next_generation| next_generation < max_tokens);
+                        let room_in_context = next_pos < context_length;
                         if !more_tokens_requested {
                             stop_reason = StopReason::MaxTokens;
                             profiler.record_since(ProfileEvent::TokenLatency, token_started);
@@ -551,36 +597,26 @@ impl InferenceEngine {
                             break;
                         }
 
-                        // Chunk-wise KV growth with deterministic rollback:
-                        // release the old charge, try the new one; if it fails,
-                        // restore the old charge so the budget stays consistent.
-                        if current_pos + 1 > kv_cache.capacity_tokens() {
+                        // Reserve the replacement while the old cache remains
+                        // live. The resulting charge is the real old+new peak,
+                        // and both the budget and cache stay unchanged on any
+                        // failure.
+                        if next_pos > kv_cache.capacity_tokens() {
                             let target = kv_cache
-                                .chunk_aligned_capacity(current_pos + 1)
+                                .try_chunk_aligned_capacity(next_pos)?
                                 .min(needed_len);
-                            let old_bytes = kv_cache.total_bytes() as u64;
-                            let new_bytes = kv_cache.bytes_for_tokens(target) as u64;
-                            let _ = budget.release("kv_cache");
-                            if let Err(error) =
-                                model.ensure_layer_cache_headroom(budget, new_bytes)
-                            {
-                                let _ = budget.allocate("kv_cache", old_bytes);
-                                return Err(error);
-                            }
-                            if let Err(e) = budget.allocate("kv_cache", new_bytes) {
-                                let _ = budget.allocate("kv_cache", old_bytes);
-                                return Err(format!(
-                                    "RAM budget too small to grow KV cache from {} to {} tokens ({} -> {} bytes): {}",
-                                    kv_cache.capacity_tokens(),
-                                    target,
-                                    old_bytes,
-                                    new_bytes,
-                                    e
-                                ));
-                            }
+                            let new_bytes = u64::try_from(kv_cache.try_bytes_for_tokens(target)?)
+                                .map_err(|_| "grown KV cache byte size exceeds u64".to_string())?;
+                            model.ensure_layer_cache_headroom(budget, new_bytes)?;
+                            let old_capacity = kv_cache.capacity_tokens();
                             kv_cache
-                                .grow_to(target)
-                                .map_err(|e| format!("failed to grow KV cache: {}", e))?;
+                                .grow_to_with_budget(target, budget, "kv_cache")
+                                .map_err(|e| {
+                                    format!(
+                                        "failed to grow KV cache from {} to {} tokens (new charge {} bytes): {}",
+                                        old_capacity, target, new_bytes, e
+                                    )
+                                })?;
                         }
 
                         model.forward_single_streaming(
@@ -593,7 +629,7 @@ impl InferenceEngine {
                             &mut residency_stats,
                             &mut hidden,
                         )?;
-                        current_pos += 1;
+                        current_pos = next_pos;
                         profiler.record_decode_forward();
                         profiler.record_since(ProfileEvent::TokenLatency, token_started);
                         profiler.record_token();
@@ -3416,13 +3452,9 @@ mod qwen25_bounded_diagnostic {
             return Ok(());
         }
         let target = kv_cache
-            .chunk_aligned_capacity(required_tokens)
+            .try_chunk_aligned_capacity(required_tokens)?
             .min(maximum_tokens);
-        let new_bytes = kv_cache.bytes_for_tokens(target) as u64;
-        budget
-            .resize("kv_cache", new_bytes)
-            .map_err(|error| format!("failed to resize diagnostic KV charge: {error}"))?;
-        kv_cache.grow_to(target)?;
+        kv_cache.grow_to_with_budget(target, budget, "kv_cache")?;
         Ok(())
     }
 
@@ -3460,10 +3492,15 @@ mod qwen25_bounded_diagnostic {
 
         // Match the normal generation lifetime: initial KV capacity equals the
         // prompt length, then grows only when the first/second decode needs it.
-        let mut kv_cache = KvCache::new(n_layers, n_kv_heads, head_dim, prompt_len)?;
-        kv_cache
-            .allocate_from_budget(budget)
-            .map_err(|error| format!("failed to allocate diagnostic KV cache: {error}"))?;
+        let mut kv_cache = KvCache::new_with_budget(
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            prompt_len,
+            budget,
+            "kv_cache",
+        )
+        .map_err(|error| format!("failed to allocate diagnostic KV cache: {error}"))?;
 
         let mut hidden = vec![0.0f32; n_embd];
         for (position_id, &token_id) in prompt_tokens.iter().enumerate() {

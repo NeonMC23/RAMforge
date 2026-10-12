@@ -1,7 +1,7 @@
 //! RAMforge runtime for budgeted, profiled out-of-core inference.
 //!
 //! This crate builds on `ramforge-core` to provide:
-//! - Memory budget enforcement (RAII-style scoped temp reservations)
+//! - RAMforge-managed allocation accounting (scoped temporary reservations)
 //! - File-backed tensor data source
 //! - Bounded LRU cache whose contents are charged to the budget
 //! - Planning logic for `ramforge plan`
@@ -94,11 +94,25 @@ impl Runtime {
 
         // The cache capacity is a hard bound; its contents are charged to the
         // budget per entry via `insert_budgeted` – no double-counted capacity
-        // pre-reservation.
-        let cache_capacity = (ram_budget_bytes as f64 * 0.8) as u64;
-        let cache_capacity = cache_capacity
+        // pre-reservation. Keep the 80% policy in integer arithmetic so a
+        // byte-size conversion cannot silently round or overflow.
+        let cache_capacity_80 = (ram_budget_bytes / 5)
+            .checked_mul(4)
+            .and_then(|base| base.checked_add((ram_budget_bytes % 5) * 4 / 5))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cache capacity arithmetic overflow",
+                )
+            })?;
+        let cache_headroom = if ram_budget_bytes >= 1024 * 1024 {
+            ram_budget_bytes - 1024 * 1024
+        } else {
+            0
+        };
+        let cache_capacity = cache_capacity_80
             .max(1024 * 1024)
-            .min(ram_budget_bytes.saturating_sub(1024 * 1024));
+            .min(cache_headroom);
         let cache = BoundedCache::new(cache_capacity)?;
 
         Ok(Self {
@@ -108,28 +122,63 @@ impl Runtime {
         })
     }
 
+    /// Read a tensor, using the raw cache when possible.
+    ///
+    /// This compatibility API returns a caller-owned `Vec` clone. The cache
+    /// charge covers only the cached copy and is not retained for the returned
+    /// buffer; managed inference paths use caller-owned buffers with an
+    /// enclosing charge instead.
     pub fn get_tensor(&mut self, name: &str) -> Result<Vec<u8>, DataSourceError> {
         if let Some(data) = self.cache.get(name) {
-            return Ok(data.clone());
+            let mut returned = Vec::new();
+            returned.try_reserve_exact(data.len()).map_err(|error| {
+                DataSourceError::General(format!(
+                    "failed to reserve compatibility tensor copy '{}': {}",
+                    name, error
+                ))
+            })?;
+            returned.extend_from_slice(data);
+            return Ok(returned);
         }
-        let data = self.data_source.read_tensor(name)?;
-        // Budget-charged insert: if the budget has no room even after LRU
-        // eviction, the entry is simply not cached (Ok(false)) and the
-        // caller still gets the data it asked for.
-        match self
-            .cache
-            .insert_budgeted(&mut self.budget, name.to_string(), data.clone())
-        {
-            Ok(_) => {}
-            Err(ramforge_core::CacheError::TooLarge { .. }) => {}
-            Err(e) => {
-                return Err(DataSourceError::General(format!(
-                    "cache insert failed: {}",
-                    e
-                )));
-            }
+        let file_bytes = self
+            .data_source
+            .get_descriptor(name)?
+            .byte_length
+            .ok_or_else(|| {
+                DataSourceError::General(format!(
+                    "cannot cache tensor '{}': byte length is unknown",
+                    name
+                ))
+            })?;
+        // The builder runs only after the cache charge is live. If the entry is
+        // too large or the budget cannot fit it, read once as an explicitly
+        // unmanaged compatibility fallback.
+        let data_source = &self.data_source;
+        let cache = &mut self.cache;
+        let budget = &mut self.budget;
+        let insertion = cache.insert_budgeted_with(
+            budget,
+            name.to_string(),
+            file_bytes,
+            || {
+                data_source
+                    .read_tensor(name)
+                    .map_err(|error| ramforge_core::CacheError::General(error.to_string()))
+            },
+        );
+        match insertion {
+            Ok(true) => cache.get(name).cloned().ok_or_else(|| {
+                DataSourceError::General(format!(
+                    "cache reported insertion for '{}' but the entry was missing",
+                    name
+                ))
+            }),
+            Ok(false) | Err(ramforge_core::CacheError::TooLarge { .. }) => data_source.read_tensor(name),
+            Err(error) => Err(DataSourceError::General(format!(
+                "cache insert failed: {}",
+                error
+            ))),
         }
-        Ok(data)
     }
 
     pub fn model(&self) -> &GgufModel {

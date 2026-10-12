@@ -38,6 +38,90 @@ use crate::runtime_config::RuntimeConfig;
 #[cfg(test)]
 type TestLayerHiddenHook = fn(usize, &[f32]);
 
+fn zeroed_f32_buffer(len: usize, label: &str) -> Result<Vec<f32>, String> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(len)
+        .map_err(|error| format!("failed to reserve {label}: {error}"))?;
+    buffer.resize(len, 0.0);
+    Ok(buffer)
+}
+
+fn cloned_f32_buffer(source: &[f32], label: &str) -> Result<Vec<f32>, String> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(source.len())
+        .map_err(|error| format!("failed to reserve {label}: {error}"))?;
+    buffer.extend_from_slice(source);
+    Ok(buffer)
+}
+
+fn cloned_byte_buffer(source: &[u8], label: &str) -> Result<Vec<u8>, String> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(source.len())
+        .map_err(|error| format!("failed to reserve {label}: {error}"))?;
+    buffer.extend_from_slice(source);
+    Ok(buffer)
+}
+
+/// Return the logical bytes owned by the actual capacities of the staged K/V
+/// tables and their child buffers. Vec allocator metadata and allocator
+/// over-allocation remain outside the logical payload ledger, just as they do
+/// for other RAMforge-managed Vec storage.
+fn staged_kv_capacity_bytes(
+    staged_k: &Vec<Vec<f32>>,
+    staged_v: &Vec<Vec<f32>>,
+) -> Result<u64, String> {
+    let table_slots = staged_k
+        .capacity()
+        .checked_add(staged_v.capacity())
+        .ok_or_else(|| "staged K/V table capacity overflow".to_string())?;
+    let table_bytes = table_slots
+        .checked_mul(std::mem::size_of::<Vec<f32>>())
+        .ok_or_else(|| "staged K/V table byte size overflow".to_string())?;
+    let mut payload_elements = 0usize;
+    for buffer in staged_k.iter().chain(staged_v.iter()) {
+        payload_elements = payload_elements
+            .checked_add(buffer.capacity())
+            .ok_or_else(|| "staged K/V payload capacity overflow".to_string())?;
+    }
+    let payload_bytes = payload_elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "staged K/V payload byte size overflow".to_string())?;
+    let total = table_bytes
+        .checked_add(payload_bytes)
+        .ok_or_else(|| "staged K/V capacity byte size overflow".to_string())?;
+    u64::try_from(total).map_err(|_| "staged K/V capacity exceeds u64".to_string())
+}
+
+/// Keep the forward charge at least large enough for the planned staged
+/// allocation while staging is in progress, then settle it to actual Vec
+/// capacities after staging completes. This avoids both under-accounting
+/// allocator-visible payload capacity and double-counting K/V scratch buffers.
+fn settle_staged_kv_charge(
+    budget: &mut MemoryBudget,
+    non_staged_bytes: u64,
+    minimum_staged_bytes: u64,
+    staged_k: &Vec<Vec<f32>>,
+    staged_v: &Vec<Vec<f32>>,
+) -> Result<(), String> {
+    let actual_staged_bytes = staged_kv_capacity_bytes(staged_k, staged_v)?;
+    let staged_charge = actual_staged_bytes.max(minimum_staged_bytes);
+    let target = non_staged_bytes
+        .checked_add(staged_charge)
+        .ok_or_else(|| "forward staged K/V charge overflow".to_string())?;
+    let current = budget
+        .get("tmp:forward")
+        .ok_or_else(|| "forward charge missing while staging K/V".to_string())?;
+    if current != target {
+        budget
+            .resize("tmp:forward", target)
+            .map_err(|error| format!("failed to settle staged K/V charge: {error}"))?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct StreamingLlamaModel {
     pub config: LlamaConfig,
@@ -105,7 +189,8 @@ impl StreamingLlamaModel {
             .tensors
             .iter()
             .filter_map(|t| t.byte_length)
-            .sum();
+            .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+            .ok_or_else(|| "total model weight byte size overflow".to_string())?;
 
         let quantized_weight_bytes = gguf_model
             .tensors
@@ -124,7 +209,8 @@ impl StreamingLlamaModel {
                 )
             })
             .filter_map(|t| t.byte_length)
-            .sum();
+            .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+            .ok_or_else(|| "quantized model weight byte size overflow".to_string())?;
         let layer_descriptors = group_layers(gguf_model, config.block_count);
         let layer_read_plans = layer_descriptors
             .iter()
@@ -203,7 +289,11 @@ impl StreamingLlamaModel {
             Ok(weights) => weights,
             Err(error) => {
                 for name in persistent_allocations.iter().rev() {
-                    let _ = budget.release(name);
+                    budget
+                        .release(name)
+                        .unwrap_or_else(|release_error| {
+                            panic!("failed to roll back persistent charge '{}': {}", name, release_error)
+                        });
                 }
                 return Err(error);
             }
@@ -217,7 +307,26 @@ impl StreamingLlamaModel {
             .checked_add(max_layer_load_peak)
             .ok_or_else(|| "layer cache lower-bound overflow".to_string())?;
         let managed_lower_bound = budget.peak_used_bytes().max(layer_lower_bound);
-        let maximum_layer_cache_capacity = budget.total_bytes().saturating_sub(managed_lower_bound);
+        let maximum_layer_cache_capacity = match budget.total_bytes().checked_sub(managed_lower_bound) {
+            Some(available) => available,
+            None => {
+                drop(output);
+                drop(output_norm);
+                drop(token_embd);
+                for name in persistent_allocations.iter().rev() {
+                    budget
+                        .release(name)
+                        .unwrap_or_else(|release_error| {
+                            panic!("failed to roll back persistent charge '{}': {}", name, release_error)
+                        });
+                }
+                return Err(format!(
+                    "managed lower bound {} exceeds RAMforge budget {}",
+                    managed_lower_bound,
+                    budget.total_bytes()
+                ));
+            }
+        };
         let layer_cache_capacity = runtime_config
             .map(|config| {
                 if config.layer_cache_enabled {
@@ -232,7 +341,11 @@ impl StreamingLlamaModel {
             drop(output_norm);
             drop(token_embd);
             for name in persistent_allocations.iter().rev() {
-                let _ = budget.release(name);
+                budget
+                    .release(name)
+                    .unwrap_or_else(|release_error| {
+                        panic!("failed to roll back persistent charge '{}': {}", name, release_error)
+                    });
             }
             return Err(format!(
                 "configured layer cache capacity {} exceeds runtime maximum {}",
@@ -405,7 +518,9 @@ impl StreamingLlamaModel {
             if !use_grouped_reads {
                 for tensor_desc in &layer_desc.tensors {
                     let name = &tensor_desc.name;
-                    let file_bytes = tensor_desc.byte_length.unwrap_or(0);
+                    let file_bytes = tensor_desc
+                        .byte_length
+                        .ok_or_else(|| format!("tensor '{}' byte length is unknown", name))?;
                     let charge =
                         tensor_load_charge_bytes(tensor_desc.ggml_type, file_bytes)?.max(1);
                     let alloc_name = format!("layer:{}:{}", layer_idx, name);
@@ -418,7 +533,8 @@ impl StreamingLlamaModel {
                             )
                         })?;
                     let tensor_data = load_tensor_data(data_source, tensor_desc, &self.profiler)?;
-                    let resident = tensor_data.resident_bytes() as u64;
+                    let resident = u64::try_from(tensor_data.resident_bytes())
+                        .map_err(|_| format!("tensor '{}' resident size exceeds u64", name))?;
                     total_layer_bytes = total_layer_bytes
                         .checked_add(resident)
                         .ok_or_else(|| "layer resident byte total overflow".to_string())?;
@@ -472,7 +588,12 @@ impl StreamingLlamaModel {
                     .map_err(|_| "reusable grouped read buffer is too large".to_string())?;
                 let temp_name = format!("tmp:layer_read:{}:reused", layer_idx);
                 budget.with_temp(&temp_name, scratch_bytes, |budget| {
-                    let mut buffer = Vec::with_capacity(scratch_capacity);
+                    let mut buffer = Vec::new();
+                    buffer
+                        .try_reserve_exact(scratch_capacity)
+                        .map_err(|error| {
+                            format!("failed to reserve reusable grouped read buffer: {error}")
+                        })?;
                     for (range_index, range) in read_plan.ranges.iter().enumerate() {
                         read_and_decode_grouped_range(
                             data_source,
@@ -519,8 +640,16 @@ impl StreamingLlamaModel {
                     }
 
                     let temp_name = format!("tmp:layer_read:{}:{}", layer_idx, range_index);
+                    let range_capacity = usize::try_from(range.byte_length).map_err(|_| {
+                        format!("grouped read range {} is too large for this platform", range_index)
+                    })?;
                     budget.with_temp(&temp_name, range.byte_length, |budget| {
+                        // The temporary charge covers the physical Vec capacity,
+                        // not merely the bytes eventually decoded into tensors.
                         let mut buffer = Vec::new();
+                        buffer.try_reserve_exact(range_capacity).map_err(|error| {
+                            format!("failed to reserve grouped read buffer: {error}")
+                        })?;
                         read_and_decode_grouped_range(
                             data_source,
                             layer_desc,
@@ -540,7 +669,9 @@ impl StreamingLlamaModel {
                 for tensor in &range.tensors {
                     let tensor_desc = &layer_desc.tensors[tensor.descriptor_index];
                     let name = &tensor_desc.name;
-                    let file_bytes = tensor_desc.byte_length.unwrap_or(0);
+                    let file_bytes = tensor_desc
+                        .byte_length
+                        .ok_or_else(|| format!("tensor '{}' byte length is unknown", name))?;
                     // Peak owned representation during an individual load.
                     let charge =
                         tensor_load_charge_bytes(tensor_desc.ggml_type, file_bytes)?.max(1);
@@ -553,7 +684,8 @@ impl StreamingLlamaModel {
                     })?;
 
                     let tensor_data = load_tensor_data(data_source, tensor_desc, &self.profiler)?;
-                    let resident = tensor_data.resident_bytes() as u64;
+                    let resident = u64::try_from(tensor_data.resident_bytes())
+                        .map_err(|_| format!("tensor '{}' resident size exceeds u64", name))?;
                     total_layer_bytes = total_layer_bytes
                         .checked_add(resident)
                         .ok_or_else(|| "layer resident byte total overflow".to_string())?;
@@ -574,8 +706,9 @@ impl StreamingLlamaModel {
         })(budget);
 
         if let Err(e) = result {
-            // Budget-integrity: never leave charges behind for a layer that
-            // failed to load.
+            // Budget-integrity: drop every loaded tensor before releasing its
+            // active charges on a failed layer load.
+            drop(loaded);
             self.release_layer(layer_idx, budget, stats);
             return Err(e);
         }
@@ -618,6 +751,9 @@ impl StreamingLlamaModel {
         match extract_result {
             Ok(w) => Ok(w),
             Err(e) => {
+                // Remaining map values are owned by the active layer charges.
+                // Drop them before releasing those charges.
+                drop(map);
                 self.release_layer(layer_idx, budget, stats);
                 Err(e)
             }
@@ -637,14 +773,22 @@ impl StreamingLlamaModel {
             .filter(|k| k.starts_with(&prefix))
             .cloned()
             .collect();
+        for name in &names {
+            if budget.get(name).is_none() {
+                panic!("layer charge '{}' disappeared before release", name);
+            }
+        }
         for name in names {
-            let _ = budget.release(&name);
+            budget.release(&name).unwrap_or_else(|error| {
+                panic!("failed to release layer charge '{}': {}", name, error)
+            });
         }
         stats.on_layer_release(budget.used_bytes());
     }
 
     fn embedding_workspace_bytes(&self, n_embd: usize) -> Result<u64, String> {
-        let decoded_bytes = (n_embd as u64)
+        let decoded_bytes = u64::try_from(n_embd)
+            .map_err(|_| "embedding workspace dimension exceeds u64".to_string())?
             .checked_mul(std::mem::size_of::<f32>() as u64)
             .ok_or_else(|| "embedding workspace size overflow".to_string())?;
         match &self.token_embd {
@@ -652,12 +796,10 @@ impl StreamingLlamaModel {
             PersistentWeight::Streamed(descriptor) if descriptor.ggml_type == GgmlType::F32 => {
                 Ok(decoded_bytes)
             }
-            PersistentWeight::Streamed(descriptor) => {
-                let raw_bytes = row_bytes_for(descriptor, n_embd)? as u64;
-                raw_bytes
-                    .checked_add(decoded_bytes)
-                    .ok_or_else(|| "embedding workspace size overflow".to_string())
-            }
+            PersistentWeight::Streamed(descriptor) => u64::try_from(row_bytes_for(
+                descriptor, n_embd,
+            )?)
+            .map_err(|_| "embedding workspace row size exceeds u64".to_string()),
         }
     }
 
@@ -724,9 +866,15 @@ impl StreamingLlamaModel {
         let n_kv_heads = cfg.head_count_kv;
         let head_dim = cfg.head_dim;
         let ffn_dim = cfg.feed_forward_length;
-        let kv_dim = n_kv_heads * head_dim;
-        let q_dim = n_heads * head_dim;
-        let seq = pos + 1; // history + current token (attention work)
+        let kv_dim = n_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| "KV activation dimension overflow".to_string())?;
+        let q_dim = n_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| "query activation dimension overflow".to_string())?;
+        let seq = pos
+            .checked_add(1)
+            .ok_or_else(|| "attention sequence length overflow".to_string())?;
 
         // Worst-case transient floats for this forward pass:
         //   hidden + tmp + 2 norm decode/copy fallbacks: 4 * n_embd
@@ -737,38 +885,77 @@ impl StreamingLlamaModel {
         //   attention scores (per head):                n_heads * seq
         //   decoded qwen2 Q/K/V bias fallbacks (per layer, if present)
         let bias_floats = if self.attn_bias_present {
-            q_dim + 2 * kv_dim
+            q_dim
+                .checked_add(
+                    kv_dim
+                        .checked_mul(2)
+                        .ok_or_else(|| "attention bias dimension overflow".to_string())?,
+                )
+                .ok_or_else(|| "attention bias dimension overflow".to_string())?
         } else {
             0
         };
-        let act_floats =
-            7 * n_embd + 2 * q_dim + 2 * kv_dim + 4 * ffn_dim + n_heads * seq + bias_floats;
-        let act_bytes = (act_floats * 4) as u64;
+        let act_floats = n_embd
+            .checked_mul(7)
+            .and_then(|value| value.checked_add(q_dim.checked_mul(2)?))
+            .and_then(|value| value.checked_add(kv_dim.checked_mul(2)?))
+            .and_then(|value| value.checked_add(ffn_dim.checked_mul(4)?))
+            .and_then(|value| value.checked_add(n_heads.checked_mul(seq)?))
+            .and_then(|value| value.checked_add(bias_floats))
+            .ok_or_else(|| "forward activation size overflow".to_string())?;
+        // Staged K/V is retained until every layer has consumed the previous
+        // history. Charge both payload capacities and the two outer Vec tables
+        // before their first allocation/clone.
+        let staged_kv_floats = cfg
+            .block_count
+            .checked_mul(kv_dim)
+            .and_then(|value| value.checked_mul(2))
+            .ok_or_else(|| "staged K/V capacity overflow".to_string())?;
+        let staged_payload_bytes = staged_kv_floats
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "staged K/V byte size overflow".to_string())?;
+        let staged_table_bytes = cfg
+            .block_count
+            .checked_mul(2)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<Vec<f32>>()))
+            .ok_or_else(|| "staged K/V table byte size overflow".to_string())?;
+        let staged_requested_bytes = staged_payload_bytes
+            .checked_add(staged_table_bytes)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| "forward staged K/V byte size exceeds u64".to_string())?;
+        let non_staged_forward_bytes = act_floats
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| "forward activation byte size exceeds u64".to_string())?;
+        let act_bytes = non_staged_forward_bytes
+            .checked_add(staged_requested_bytes)
+            .ok_or_else(|| "forward temporary byte size overflow".to_string())?;
 
         self.ensure_layer_cache_headroom(budget, act_bytes)?;
         budget.with_temp("tmp:forward", act_bytes, |budget| {
             // Embedding lookup (streams one row if non-resident; charges its
             // own `tmp:embd_row` inside this scope).
             self.ensure_layer_cache_headroom(budget, self.embedding_workspace_bytes(n_embd)?)?;
-            let mut hidden = self.token_embd.get_embedding(
-                token_id as usize,
+            let allocation_started = self.profiler.start();
+            let mut hidden = zeroed_f32_buffer(n_embd, "hidden activation")?;
+            self.token_embd.get_embedding_into(
+                usize::try_from(token_id)
+                    .map_err(|_| "token id does not fit this platform".to_string())?,
                 n_embd,
                 data_source,
                 budget,
-                stats,
+                &mut hidden,
             )?;
-
-            let allocation_started = self.profiler.start();
-            let mut tmp = vec![0.0f32; n_embd];
-            let mut q_tmp = vec![0.0f32; q_dim];
-            let mut k_tmp = vec![0.0f32; kv_dim];
-            let mut v_tmp = vec![0.0f32; kv_dim];
-            let mut attn_proj = vec![0.0f32; n_embd];
-            let mut gate = vec![0.0f32; ffn_dim];
-            let mut up = vec![0.0f32; ffn_dim];
-            let mut gate_silu = vec![0.0f32; ffn_dim];
-            let mut gate_up = vec![0.0f32; ffn_dim];
-            let mut ffn_out = vec![0.0f32; n_embd];
+            let mut tmp = zeroed_f32_buffer(n_embd, "forward scratch")?;
+            let mut q_tmp = zeroed_f32_buffer(q_dim, "query scratch")?;
+            let mut k_tmp = zeroed_f32_buffer(kv_dim, "key scratch")?;
+            let mut v_tmp = zeroed_f32_buffer(kv_dim, "value scratch")?;
+            let mut attn_proj = zeroed_f32_buffer(n_embd, "attention projection scratch")?;
+            let mut gate = zeroed_f32_buffer(ffn_dim, "FFN gate scratch")?;
+            let mut up = zeroed_f32_buffer(ffn_dim, "FFN up scratch")?;
+            let mut gate_silu = zeroed_f32_buffer(ffn_dim, "FFN activation scratch")?;
+            let mut gate_up = zeroed_f32_buffer(ffn_dim, "FFN product scratch")?;
+            let mut ffn_out = zeroed_f32_buffer(n_embd, "FFN output scratch")?;
             // Stage K/V for every layer so they can be appended to the KV
             // cache only AFTER every layer has consumed the prior seq_len
             // history. Writing a layer's own K/V into the cache while later
@@ -776,8 +963,21 @@ impl StreamingLlamaModel {
             // layers: later layers' attention would "see" an earlier layer's
             // freshly-written K/V as history even though it belongs to the
             // SAME token position.
-            let mut staged_k: Vec<Vec<f32>> = Vec::with_capacity(cfg.block_count);
-            let mut staged_v: Vec<Vec<f32>> = Vec::with_capacity(cfg.block_count);
+            let mut staged_k: Vec<Vec<f32>> = Vec::new();
+            staged_k
+                .try_reserve_exact(cfg.block_count)
+                .map_err(|error| format!("failed to reserve staged K table: {error}"))?;
+            let mut staged_v: Vec<Vec<f32>> = Vec::new();
+            staged_v
+                .try_reserve_exact(cfg.block_count)
+                .map_err(|error| format!("failed to reserve staged V table: {error}"))?;
+            settle_staged_kv_charge(
+                budget,
+                non_staged_forward_bytes,
+                staged_requested_bytes,
+                &staged_k,
+                &staged_v,
+            )?;
             self.profiler
                 .record_since(ProfileEvent::Allocation, allocation_started);
 
@@ -826,8 +1026,22 @@ impl StreamingLlamaModel {
                     // not yet consumed `hidden`.
                     #[cfg(test)]
                     self.emit_test_layer_hidden(layer_idx, &hidden);
-                    staged_k.push(k_tmp.clone());
-                    staged_v.push(v_tmp.clone());
+                    staged_k.push(cloned_f32_buffer(&k_tmp, "staged K storage")?);
+                    settle_staged_kv_charge(
+                        budget,
+                        non_staged_forward_bytes,
+                        staged_requested_bytes,
+                        &staged_k,
+                        &staged_v,
+                    )?;
+                    staged_v.push(cloned_f32_buffer(&v_tmp, "staged V storage")?);
+                    settle_staged_kv_charge(
+                        budget,
+                        non_staged_forward_bytes,
+                        staged_requested_bytes,
+                        &staged_k,
+                        &staged_v,
+                    )?;
                     continue;
                 }
 
@@ -865,6 +1079,10 @@ impl StreamingLlamaModel {
                 self.profiler
                     .record_since(ProfileEvent::LayerCompute, compute_started);
                 if let Err(error) = layer_result {
+                    // `layer` owns the loaded allocations represented by the
+                    // active charges. End that ownership before releasing the
+                    // charges on the failure path.
+                    drop(layer);
                     let release_started = self.profiler.start();
                     self.release_layer(layer_idx, budget, stats);
                     self.profiler
@@ -876,14 +1094,36 @@ impl StreamingLlamaModel {
                 // layer residual/FFN output before the next layer starts.
                 #[cfg(test)]
                 self.emit_test_layer_hidden(layer_idx, &hidden);
-                staged_k.push(k_tmp.clone());
-                staged_v.push(v_tmp.clone());
+                staged_k.push(cloned_f32_buffer(&k_tmp, "staged K storage")?);
+                settle_staged_kv_charge(
+                    budget,
+                    non_staged_forward_bytes,
+                    staged_requested_bytes,
+                    &staged_k,
+                    &staged_v,
+                )?;
+                staged_v.push(cloned_f32_buffer(&v_tmp, "staged V storage")?);
+                settle_staged_kv_charge(
+                    budget,
+                    non_staged_forward_bytes,
+                    staged_requested_bytes,
+                    &staged_k,
+                    &staged_v,
+                )?;
 
-                let layer_bytes = layer.total_resident_bytes();
+                let layer_bytes = match layer.try_total_resident_bytes() {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        drop(layer);
+                        self.release_layer(layer_idx, budget, stats);
+                        return Err(error);
+                    }
+                };
                 let insert_result = {
                     let mut cache = match self.layer_cache.lock() {
                         Ok(cache) => cache,
                         Err(_) => {
+                            drop(layer);
                             self.release_layer(layer_idx, budget, stats);
                             return Err("layer cache lock poisoned".to_string());
                         }
@@ -907,9 +1147,12 @@ impl StreamingLlamaModel {
                         stats.on_layer_cached(budget.used_bytes());
                     }
                     Ok(InsertOutcome::Skipped { value: layer, .. }) => {
+                        // The loaded layer owns the bytes represented by its
+                        // active charges. Drop it before releasing those
+                        // charges when the cache declines to retain it.
+                        drop(layer);
                         let release_started = self.profiler.start();
                         self.release_layer(layer_idx, budget, stats);
-                        drop(layer);
                         self.profiler
                             .record_since(ProfileEvent::LayerRelease, release_started);
                         self.profiler.record_layer_release();
@@ -920,6 +1163,16 @@ impl StreamingLlamaModel {
                     }
                 }
             }
+
+            // All staged buffers now exist; settle the coarse reservation to
+            // their actual payload/table capacities before committing the K/V.
+            settle_staged_kv_charge(
+                budget,
+                non_staged_forward_bytes,
+                0,
+                &staged_k,
+                &staged_v,
+            )?;
 
             // Commit all per-layer K/V for the current token atomically:
             // this avoids leaking a shallow layer's K/V into a deeper
@@ -945,12 +1198,17 @@ impl StreamingLlamaModel {
         let PersistentWeight::Streamed(descriptor) = weight else {
             return Ok(0);
         };
-        let row_bytes = row_bytes_for(descriptor, self.config.embedding_length)? as u64;
+        let row_bytes = u64::try_from(row_bytes_for(descriptor, self.config.embedding_length)?)
+            .map_err(|_| "logits workspace row size exceeds u64".to_string())?;
         if descriptor.ggml_type == GgmlType::F32 {
             Ok(row_bytes)
         } else {
+            let decoded_bytes = u64::try_from(self.config.embedding_length)
+                .map_err(|_| "logits workspace dimension exceeds u64".to_string())?
+                .checked_mul(std::mem::size_of::<f32>() as u64)
+                .ok_or_else(|| "logits workspace decoded size overflow".to_string())?;
             row_bytes
-                .checked_add((self.config.embedding_length * 4) as u64)
+                .checked_add(decoded_bytes)
                 .ok_or_else(|| "logits workspace size overflow".to_string())
         }
     }
@@ -1049,7 +1307,9 @@ fn read_and_decode_grouped_range(
 
     for tensor in &range.tensors {
         let descriptor = &layer.tensors[tensor.descriptor_index];
-        let tensor_bytes = descriptor.byte_length.unwrap_or(0);
+        let tensor_bytes = descriptor
+            .byte_length
+            .ok_or_else(|| format!("tensor '{}' byte length is unknown", descriptor.name))?;
         let start = usize::try_from(tensor.offset_in_range)
             .map_err(|_| format!("tensor '{}' grouped offset is too large", descriptor.name))?;
         let length = usize::try_from(tensor_bytes)
@@ -1064,7 +1324,8 @@ fn read_and_decode_grouped_range(
             )
         })?;
         let tensor_data = load_tensor_data_from_borrowed_bytes(descriptor, slice, profiler)?;
-        let resident = tensor_data.resident_bytes() as u64;
+        let resident = u64::try_from(tensor_data.resident_bytes())
+            .map_err(|_| format!("tensor '{}' resident size exceeds u64", descriptor.name))?;
         let charge_name = format!("layer:{}:{}", layer_index, descriptor.name);
         if budget.get(&charge_name) != Some(resident.max(1)) {
             return Err(format!(
@@ -1145,12 +1406,16 @@ fn load_tensor_data_from_borrowed_bytes(
         let owned_bytes = if started.is_some() {
             // Keep the timed interval limited to the authoritative payload copy.
             let copy_started = std::time::Instant::now();
-            let owned_bytes = bytes.to_vec();
+            let owned_bytes = cloned_byte_buffer(bytes, "grouped quantized tensor")?;
             let copy_elapsed = copy_started.elapsed();
-            profiler.record_grouped_quantized_copy(bytes.len() as u64, copy_elapsed);
+            profiler.record_grouped_quantized_copy(
+                u64::try_from(bytes.len())
+                    .map_err(|_| "grouped quantized tensor size exceeds u64".to_string())?,
+                copy_elapsed,
+            );
             owned_bytes
         } else {
-            bytes.to_vec()
+            cloned_byte_buffer(bytes, "grouped quantized tensor")?
         };
         TensorData::from_bytes(
             desc.ggml_type,
@@ -1226,7 +1491,8 @@ fn load_persistent_weight(
         // by their larger transient charges.
         let tensor_data = load_tensor_data(data_source, &desc, profiler)?;
 
-        let actual_resident = tensor_data.resident_bytes() as u64;
+        let actual_resident = u64::try_from(tensor_data.resident_bytes())
+            .map_err(|_| format!("persistent tensor '{}' resident size exceeds u64", name))?;
         if actual_resident != expected_resident {
             return Err(format!(
                 "persistent tensor '{}' resident-size mismatch: descriptor predicted {} bytes, decoded representation owns {} bytes",
@@ -1249,7 +1515,11 @@ fn load_persistent_weight(
             // Covers read, decode, residency-consistency, and settlement
             // failures. `resize` is atomic, so this always removes whichever
             // transient/settled charge is currently present.
-            let _ = budget.release(&alloc_name);
+            budget
+                .release(&alloc_name)
+                .unwrap_or_else(|release_error| {
+                    panic!("failed to roll back persistent charge '{}': {}", alloc_name, release_error)
+                });
             Err(error)
         }
     }
@@ -1282,8 +1552,14 @@ fn validate_qkv_bias(
             layer_idx, present[0], present[1], present[2]
         ));
     }
-    let q_dim = cfg.head_count * cfg.head_dim;
-    let kv_dim = cfg.head_count_kv * cfg.head_dim;
+    let q_dim = cfg
+        .head_count
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| "Q bias dimension overflow".to_string())?;
+    let kv_dim = cfg
+        .head_count_kv
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| "K/V bias dimension overflow".to_string())?;
     for (name, bias, expected) in [
         ("attn_q.bias", &weights.attn_q_bias, q_dim),
         ("attn_k.bias", &weights.attn_k_bias, kv_dim),
@@ -2187,6 +2463,20 @@ mod tests {
     }
 
     #[test]
+    fn test_staged_kv_charge_uses_actual_vec_capacities() {
+        let mut budget = MemoryBudget::new(4096).unwrap();
+        budget.allocate("tmp:forward", 128).unwrap();
+        let mut staged_k = Vec::with_capacity(4);
+        staged_k.push(Vec::<f32>::with_capacity(8));
+        let mut staged_v = Vec::with_capacity(2);
+        staged_v.push(Vec::<f32>::with_capacity(3));
+        let actual = staged_kv_capacity_bytes(&staged_k, &staged_v).unwrap();
+        settle_staged_kv_charge(&mut budget, 0, 0, &staged_k, &staged_v).unwrap();
+        assert_eq!(budget.get("tmp:forward"), Some(actual));
+        assert_eq!(budget.used_bytes(), actual);
+    }
+
+    #[test]
     fn test_persistent_load_failure_rolls_back_all_startup_charges() {
         // token_embd loads successfully, then output_norm reads past a
         // deliberately truncated file. Both the current transient and the
@@ -2225,11 +2515,13 @@ mod tests {
         let mut budget = MemoryBudget::new(1024 * 1024).unwrap();
         let model = StreamingLlamaModel::load(&ds, &mut budget).unwrap();
         let persistent_used = budget.used_bytes();
-        let mut kv_cache = KvCache::new(
+        let mut kv_cache = KvCache::new_with_budget(
             model.config.block_count,
             model.config.head_count_kv,
             model.config.head_dim,
             1,
+            &mut budget,
+            "test:kv_cache",
         )
         .unwrap();
         let backend = crate::backend::CpuBackend::scalar();
@@ -2260,6 +2552,8 @@ mod tests {
             .unwrap();
 
         model.clear_layer_cache(&mut budget).unwrap();
+        drop(kv_cache);
+        budget.release("test:kv_cache").unwrap();
         assert_eq!(budget.used_bytes(), persistent_used);
         assert!(budget.get("tmp:hidden").is_none());
         assert!(!budget

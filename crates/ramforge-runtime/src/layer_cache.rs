@@ -102,7 +102,12 @@ impl<T> LayerCache<T> {
             self.evict_layer(layer_index, budget)?;
             evictions += 1;
         }
-        while self.used_bytes.saturating_add(bytes) > self.capacity_bytes {
+        while self
+            .used_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| "layer cache byte accounting overflow".to_string())?
+            > self.capacity_bytes
+        {
             if !self.evict_lru(budget)? {
                 return Ok(InsertOutcome::Skipped { value, evictions });
             }
@@ -117,13 +122,21 @@ impl<T> LayerCache<T> {
         let charge_names = match budget.rename_prefix(&active_prefix, &cache_prefix) {
             Ok(names) => names,
             Err(error) => {
-                // The value is about to be dropped. Release any still-active
-                // layer charges so an internal rename error cannot leak budget.
-                release_budget_prefix(budget, &active_prefix);
-                return Err(format!(
-                    "failed to convert layer {} charges to cache residency: {}",
-                    layer_index, error
-                ));
+                // The loaded value owns the allocation represented by these
+                // charges. Drop it before releasing the charges so the logical
+                // lifetime cannot end before the physical lifetime.
+                drop(value);
+                let release_error = release_budget_prefix(budget, &active_prefix).err();
+                return Err(match release_error {
+                    Some(release_error) => format!(
+                        "failed to convert layer {} charges to cache residency: {}; charge cleanup failed: {}",
+                        layer_index, error, release_error
+                    ),
+                    None => format!(
+                        "failed to convert layer {} charges to cache residency: {}",
+                        layer_index, error
+                    ),
+                });
             }
         };
 
@@ -203,41 +216,76 @@ impl<T> LayerCache<T> {
                 ));
             }
         }
+        let bytes = self
+            .entries
+            .get(&layer_index)
+            .map(|entry| entry.bytes)
+            .expect("cached layer validated above");
+        let new_used_bytes = self
+            .used_bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| "layer cache byte accounting underflow".to_string())?;
         let entry = self
             .entries
             .remove(&layer_index)
             .expect("cached layer validated above");
-        for charge_name in &entry.charge_names {
-            budget.release(charge_name).map_err(|error| {
-                format!(
-                    "failed to release cached layer {} charge '{}': {}",
+        let CacheEntry {
+            value,
+            charge_names,
+            ..
+        } = entry;
+
+        // Eviction ends the physical ownership lifetime first. Only then are
+        // the renamed logical charges released.
+        drop(value);
+        for charge_name in &charge_names {
+            budget.release(charge_name).unwrap_or_else(|error| {
+                panic!(
+                    "failed to release cached layer {} charge '{}' after dropping value: {}",
                     layer_index, charge_name, error
                 )
-            })?;
+            });
         }
-        self.used_bytes = self
-            .used_bytes
-            .checked_sub(entry.bytes)
-            .ok_or_else(|| "layer cache byte accounting underflow".to_string())?;
+        self.used_bytes = new_used_bytes;
         Ok(())
     }
 }
 
-fn release_budget_prefix(budget: &mut MemoryBudget, prefix: &str) {
+fn release_budget_prefix(budget: &mut MemoryBudget, prefix: &str) -> Result<(), String> {
     let names: Vec<String> = budget
         .allocations()
         .keys()
         .filter(|name| name.starts_with(prefix))
         .cloned()
         .collect();
-    for name in names {
-        let _ = budget.release(&name);
+    for name in &names {
+        if budget.get(name).is_none() {
+            return Err(format!("charge '{}' disappeared during prefix cleanup", name));
+        }
     }
+    // The names were validated while holding the only mutable budget borrow.
+    // Any release failure now indicates an accounting invariant violation;
+    // do not return a partially cleaned prefix as if it were recoverable.
+    for name in names {
+        budget.release(&name).unwrap_or_else(|error| {
+            panic!("failed to release charge '{}' during prefix cleanup: {}", name, error)
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     fn charge_layer(budget: &mut MemoryBudget, index: usize, bytes: u64) {
         budget
@@ -267,6 +315,23 @@ mod tests {
         assert!(budget.get("cache:layer:1:weight").is_none());
         assert_eq!(cache.used_bytes(), 200);
         assert!(cache.used_bytes() <= cache.capacity_bytes());
+    }
+
+    #[test]
+    fn test_eviction_drops_cached_value_and_releases_charge() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        let mut cache = LayerCache::new(100);
+        let dropped = Arc::new(AtomicBool::new(false));
+        charge_layer(&mut budget, 0, 40);
+        cache
+            .insert_loaded(0, DropProbe(dropped.clone()), 40, &mut budget)
+            .unwrap();
+        budget.allocate("other", 960).unwrap();
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert_eq!(cache.evict_until_available(&mut budget, 100).unwrap(), 1);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(budget.used_bytes(), 960);
+        assert_eq!(cache.used_bytes(), 0);
     }
 
     #[test]

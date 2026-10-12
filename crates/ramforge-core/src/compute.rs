@@ -209,9 +209,15 @@ pub fn quantized_matvec_reference(
         )));
     }
 
+    let mut decoded = Vec::new();
+    decoded.try_reserve_exact(shape.input).map_err(|error| {
+        ComputeError(format!(
+            "failed to reserve decoded quantized row: {error}"
+        ))
+    })?;
+    decoded.resize(shape.input, 0.0);
     for output_index in 0..shape.output {
         let row_bytes_slice = &raw[output_index * row_bytes..(output_index + 1) * row_bytes];
-        let mut decoded = vec![0.0f32; shape.input];
         decode_quantized_row(ggml_type, row_bytes_slice, shape.input, &mut decoded)?;
         let mut sum = 0.0f32;
         for input_index in 0..shape.input {
@@ -492,14 +498,22 @@ pub fn attention_reference(
     {
         return Err(ComputeError("attention tensor shape mismatch".to_string()));
     }
-    let mut output = vec![0.0f32; q_width];
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(q_width)
+        .map_err(|error| ComputeError(format!("failed to reserve attention output: {error}")))?;
+    output.resize(q_width, 0.0);
     let total_positions = history_len
         .checked_add(1)
         .ok_or_else(|| ComputeError("attention position count overflow".to_string()))?;
+    let mut scores = Vec::new();
+    scores
+        .try_reserve_exact(total_positions)
+        .map_err(|error| ComputeError(format!("failed to reserve attention scores: {error}")))?;
+    scores.resize(total_positions, 0.0);
     for query_head in 0..query_heads {
         let kv_head = query_head * kv_heads / query_heads;
         let q_head = &q[query_head * head_dim..(query_head + 1) * head_dim];
-        let mut scores = vec![0.0f32; total_positions];
         for position in 0..total_positions {
             let k_all = if position < history_len {
                 &k_history[position * kv_width..(position + 1) * kv_width]

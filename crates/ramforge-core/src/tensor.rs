@@ -40,88 +40,15 @@ impl QuantizedTensor {
         num_elements: usize,
         raw_data: Vec<u8>,
     ) -> Result<Self, DataSourceError> {
-        // Validate size
-        let expected_bytes = match ggml_type {
-            GgmlType::Q4_0 => {
-                if num_elements % quant::QK4_0 != 0 {
-                    return Err(DataSourceError::General(format!(
-                        "Q4_0 elements {} not divisible by {}",
-                        num_elements,
-                        quant::QK4_0
-                    )));
-                }
-                (num_elements / quant::QK4_0) * quant::BLOCK_SIZE_Q4_0
-            }
-            GgmlType::Q8_0 => {
-                if num_elements % quant::QK8_0 != 0 {
-                    return Err(DataSourceError::General(format!(
-                        "Q8_0 elements {} not divisible by {}",
-                        num_elements,
-                        quant::QK8_0
-                    )));
-                }
-                (num_elements / quant::QK8_0) * quant::BLOCK_SIZE_Q8_0
-            }
-            GgmlType::Q4_K => {
-                if num_elements % quant::QK_K != 0 {
-                    return Err(DataSourceError::General(format!(
-                        "Q4_K elements {} not divisible by {}",
-                        num_elements,
-                        quant::QK_K
-                    )));
-                }
-                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q4_K
-            }
-            GgmlType::Q5_K => {
-                if num_elements % quant::QK_K != 0 {
-                    return Err(DataSourceError::General(format!(
-                        "Q5_K elements {} not divisible by {}",
-                        num_elements,
-                        quant::QK_K
-                    )));
-                }
-                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q5_K
-            }
-            GgmlType::Q6_K => {
-                if num_elements % quant::QK_K != 0 {
-                    return Err(DataSourceError::General(format!(
-                        "Q6_K elements {} not divisible by {}",
-                        num_elements,
-                        quant::QK_K
-                    )));
-                }
-                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q6_K
-            }
-            GgmlType::Q2_K => {
-                if num_elements % quant::QK_K != 0 {
-                    return Err(DataSourceError::General(format!(
-                        "Q2_K elements {} not divisible by {}",
-                        num_elements,
-                        quant::QK_K
-                    )));
-                }
-                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q2_K
-            }
-            GgmlType::Q3_K => {
-                if num_elements % quant::QK_K != 0 {
-                    return Err(DataSourceError::General(format!(
-                        "Q3_K elements {} not divisible by {}",
-                        num_elements,
-                        quant::QK_K
-                    )));
-                }
-                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q3_K
-            }
-            GgmlType::Q8_K => {
-                if num_elements % quant::QK_K != 0 {
-                    return Err(DataSourceError::General(format!(
-                        "Q8_K elements {} not divisible by {}",
-                        num_elements,
-                        quant::QK_K
-                    )));
-                }
-                (num_elements / quant::QK_K) * quant::BLOCK_SIZE_Q8_K
-            }
+        let (block_elements, block_bytes) = match ggml_type {
+            GgmlType::Q4_0 => (quant::QK4_0, quant::BLOCK_SIZE_Q4_0),
+            GgmlType::Q8_0 => (quant::QK8_0, quant::BLOCK_SIZE_Q8_0),
+            GgmlType::Q4_K => (quant::QK_K, quant::BLOCK_SIZE_Q4_K),
+            GgmlType::Q5_K => (quant::QK_K, quant::BLOCK_SIZE_Q5_K),
+            GgmlType::Q6_K => (quant::QK_K, quant::BLOCK_SIZE_Q6_K),
+            GgmlType::Q2_K => (quant::QK_K, quant::BLOCK_SIZE_Q2_K),
+            GgmlType::Q3_K => (quant::QK_K, quant::BLOCK_SIZE_Q3_K),
+            GgmlType::Q8_K => (quant::QK_K, quant::BLOCK_SIZE_Q8_K),
             _ => {
                 return Err(DataSourceError::General(format!(
                     "not a quantized type: {}",
@@ -129,6 +56,38 @@ impl QuantizedTensor {
                 )))
             }
         };
+        if num_elements % block_elements != 0 {
+            return Err(DataSourceError::General(format!(
+                "{} elements {} not divisible by {}",
+                ggml_type.name(),
+                num_elements,
+                block_elements
+            )));
+        }
+        let shape_elements = shape.iter().try_fold(1usize, |count, &dimension| {
+            count.checked_mul(dimension).ok_or_else(|| {
+                DataSourceError::General(format!(
+                    "{} shape element count overflow",
+                    ggml_type.name()
+                ))
+            })
+        })?;
+        if shape_elements != num_elements {
+            return Err(DataSourceError::General(format!(
+                "{} shape describes {} elements, metadata reports {}",
+                ggml_type.name(),
+                shape_elements,
+                num_elements
+            )));
+        }
+        let expected_bytes = (num_elements / block_elements)
+            .checked_mul(block_bytes)
+            .ok_or_else(|| {
+                DataSourceError::General(format!(
+                    "{} quantized byte size overflow for {} elements",
+                    ggml_type.name(), num_elements
+                ))
+            })?;
 
         if raw_data.len() < expected_bytes {
             return Err(DataSourceError::General(format!(
@@ -153,7 +112,11 @@ impl QuantizedTensor {
 
     /// Dequantize entire tensor to F32 (reference, not for permanent residency)
     pub fn dequantize_to_f32(&self) -> Result<Vec<f32>, DataSourceError> {
-        let mut out = vec![0.0f32; self.num_elements];
+        let mut out = Vec::new();
+        out.try_reserve_exact(self.num_elements).map_err(|error| {
+            DataSourceError::General(format!("failed to reserve dequantized tensor: {error}"))
+        })?;
+        out.resize(self.num_elements, 0.0);
         match self.ggml_type {
             GgmlType::Q4_0 => {
                 quant::dequantize_row_q4_0(&self.raw_data, self.num_elements, &mut out)?
@@ -257,10 +220,17 @@ impl QuantizedTensor {
             )));
         }
 
-        let row_bytes = (row_elements / qk) * block_size;
-        let row_start = row_idx * row_bytes;
+        let row_bytes = (row_elements / qk)
+            .checked_mul(block_size)
+            .ok_or_else(|| DataSourceError::General("quantized row byte size overflow".to_string()))?;
+        let row_start = row_idx
+            .checked_mul(row_bytes)
+            .ok_or_else(|| DataSourceError::General("quantized row offset overflow".to_string()))?;
+        let row_end = row_start
+            .checked_add(row_bytes)
+            .ok_or_else(|| DataSourceError::General("quantized row end overflow".to_string()))?;
 
-        if row_start + row_bytes > self.raw_data.len() {
+        if row_end > self.raw_data.len() {
             return Err(DataSourceError::General(format!(
                 "row {} out of bounds for quantized tensor: row_start {} + row_bytes {} > raw_len {}",
                 row_idx,
@@ -270,8 +240,12 @@ impl QuantizedTensor {
             )));
         }
 
-        let row_slice = &self.raw_data[row_start..row_start + row_bytes];
-        let mut out = vec![0.0f32; row_elements];
+        let row_slice = &self.raw_data[row_start..row_end];
+        let mut out = Vec::new();
+        out.try_reserve_exact(row_elements).map_err(|error| {
+            DataSourceError::General(format!("failed to reserve quantized row: {error}"))
+        })?;
+        out.resize(row_elements, 0.0);
 
         match self.ggml_type {
             GgmlType::Q4_0 => quant::dequantize_row_q4_0(row_slice, row_elements, &mut out)?,
@@ -325,6 +299,24 @@ impl QuantizedTensor {
         )
         .map_err(|error| DataSourceError::General(error.to_string()))
     }
+}
+
+fn zeroed_f32_buffer(len: usize, label: &str) -> Result<Vec<f32>, DataSourceError> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(len).map_err(|error| {
+        DataSourceError::General(format!("failed to reserve {label}: {error}"))
+    })?;
+    output.resize(len, 0.0);
+    Ok(output)
+}
+
+fn clone_f32_buffer(data: &[f32], label: &str) -> Result<Vec<f32>, DataSourceError> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(data.len()).map_err(|error| {
+        DataSourceError::General(format!("failed to reserve {label}: {error}"))
+    })?;
+    output.extend_from_slice(data);
+    Ok(output)
 }
 
 #[derive(Debug, Clone)]
@@ -433,6 +425,22 @@ impl TensorData {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let shape_elements = shape.iter().try_fold(1usize, |count, &dimension| {
+            count.checked_mul(dimension).ok_or_else(|| {
+                DataSourceError::General(format!(
+                    "{} shape element count overflow",
+                    ggml_type.name()
+                ))
+            })
+        })?;
+        if shape_elements != expected_len {
+            return Err(DataSourceError::General(format!(
+                "{} shape describes {} elements, metadata reports {}",
+                ggml_type.name(),
+                shape_elements,
+                expected_len
+            )));
+        }
         match ggml_type {
             GgmlType::F32 => Ok(Self::F32 { data, shape }),
             GgmlType::F16 => Ok(Self::F16 { data, shape }),
@@ -447,7 +455,39 @@ impl TensorData {
         num_elements: u64,
         raw_bytes: Vec<u8>,
     ) -> Result<Self, DataSourceError> {
-        let shape_usize: Vec<usize> = shape.iter().map(|&v| v as usize).collect();
+        let shape_usize: Vec<usize> = shape
+            .iter()
+            .map(|&dimension| {
+                usize::try_from(dimension).map_err(|_| {
+                    DataSourceError::General(format!(
+                        "{} tensor dimension {} does not fit this platform",
+                        ggml_type.name(), dimension
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let element_count = usize::try_from(num_elements).map_err(|_| {
+            DataSourceError::General(format!(
+                "{} element count {} does not fit this platform",
+                ggml_type.name(), num_elements
+            ))
+        })?;
+        let shape_elements = shape_usize.iter().try_fold(1usize, |count, &dimension| {
+            count.checked_mul(dimension).ok_or_else(|| {
+                DataSourceError::General(format!(
+                    "{} shape element count overflow",
+                    ggml_type.name()
+                ))
+            })
+        })?;
+        if shape_elements != element_count {
+            return Err(DataSourceError::General(format!(
+                "{} shape describes {} elements, metadata reports {}",
+                ggml_type.name(),
+                shape_elements,
+                element_count
+            )));
+        }
 
         match ggml_type {
             GgmlType::F32 => {
@@ -472,35 +512,35 @@ impl TensorData {
                 })
             }
             GgmlType::Q4_0 => {
-                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
                 Ok(Self::Q4_0(qt))
             }
             GgmlType::Q8_0 => {
-                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
                 Ok(Self::Q8_0(qt))
             }
             GgmlType::Q4_K => {
-                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
                 Ok(Self::Q4_K(qt))
             }
             GgmlType::Q5_K => {
-                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
                 Ok(Self::Q5_K(qt))
             }
             GgmlType::Q6_K => {
-                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
                 Ok(Self::Q6_K(qt))
             }
             GgmlType::Q2_K => {
-                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
                 Ok(Self::Q2_K(qt))
             }
             GgmlType::Q3_K => {
-                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
                 Ok(Self::Q3_K(qt))
             }
             GgmlType::Q8_K => {
-                let qt = QuantizedTensor::new(ggml_type, shape_usize, num_elements as usize, raw_bytes)?;
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
                 Ok(Self::Q8_K(qt))
             }
             _ => Err(DataSourceError::General(format!(
@@ -656,9 +696,14 @@ impl TensorData {
         }
         match self {
             Self::F32 { data, .. } => {
-                let offset = token_id * n_embd;
-                if offset + n_embd <= data.len() {
-                    Ok(data[offset..offset + n_embd].to_vec())
+                let offset = token_id.checked_mul(n_embd).ok_or_else(|| {
+                    DataSourceError::General("F32 embedding row offset overflow".to_string())
+                })?;
+                let end = offset.checked_add(n_embd).ok_or_else(|| {
+                    DataSourceError::General("F32 embedding row end overflow".to_string())
+                })?;
+                if end <= data.len() {
+                    clone_f32_buffer(&data[offset..end], "F32 embedding row")
                 } else {
                     Err(DataSourceError::General(format!(
                         "token_id {} out of bounds for F32 embedding len {} n_embd {}",
@@ -669,9 +714,14 @@ impl TensorData {
                 }
             }
             Self::F16 { data, .. } | Self::BF16 { data, .. } => {
-                let offset = token_id * n_embd;
-                if offset + n_embd <= data.len() {
-                    Ok(data[offset..offset + n_embd].to_vec())
+                let offset = token_id.checked_mul(n_embd).ok_or_else(|| {
+                    DataSourceError::General("F16/BF16 embedding row offset overflow".to_string())
+                })?;
+                let end = offset.checked_add(n_embd).ok_or_else(|| {
+                    DataSourceError::General("F16/BF16 embedding row end overflow".to_string())
+                })?;
+                if end <= data.len() {
+                    clone_f32_buffer(&data[offset..end], "F16/BF16 embedding row")
                 } else {
                     Err(DataSourceError::General(format!(
                         "token_id {} out of bounds for F16 embedding",
@@ -692,9 +742,9 @@ impl TensorData {
 
     pub fn to_f32_vec(&self) -> Result<Vec<f32>, DataSourceError> {
         match self {
-            Self::F32 { data, .. } => Ok(data.clone()),
-            Self::F16 { data, .. } => Ok(data.clone()),
-            Self::BF16 { data, .. } => Ok(data.clone()),
+            Self::F32 { data, .. } => clone_f32_buffer(data, "F32 tensor copy"),
+            Self::F16 { data, .. } => clone_f32_buffer(data, "F16 tensor copy"),
+            Self::BF16 { data, .. } => clone_f32_buffer(data, "BF16 tensor copy"),
             Self::Q4_0(qt)
             | Self::Q8_0(qt)
             | Self::Q4_K(qt)
@@ -742,7 +792,9 @@ pub fn decode_row_to_f32(
     }
     match ggml_type {
         GgmlType::F32 => {
-            let need = num_elements * 4;
+            let need = num_elements.checked_mul(4).ok_or_else(|| {
+                DataSourceError::General("F32 row byte size overflow".to_string())
+            })?;
             if bytes.len() < need {
                 return Err(DataSourceError::General(format!(
                     "F32 row truncated: expected {} bytes, got {}",
@@ -756,7 +808,9 @@ pub fn decode_row_to_f32(
             Ok(())
         }
         GgmlType::F16 | GgmlType::BF16 => {
-            let need = num_elements * 2;
+            let need = num_elements.checked_mul(2).ok_or_else(|| {
+                DataSourceError::General("F16/BF16 row byte size overflow".to_string())
+            })?;
             if bytes.len() < need {
                 return Err(DataSourceError::General(format!(
                     "F16/BF16 row truncated: expected {} bytes, got {}",
@@ -795,52 +849,58 @@ pub fn decode_tensor_to_f32(
     ggml_type: GgmlType,
     num_elements: u64,
 ) -> Result<Vec<f32>, DataSourceError> {
-    // For F32/F16/BF16, decode directly
+    // For F32/F16/BF16, decode directly.
     // Quantized formats are supported here for callers that explicitly request
     // a complete F32 representation. Inference matvec paths retain compact
     // quantized storage and do not force weights through this expansion.
+    let element_count = usize::try_from(num_elements).map_err(|_| {
+        DataSourceError::General(format!(
+            "{} element count {} does not fit this platform",
+            ggml_type.name(), num_elements
+        ))
+    })?;
     match ggml_type {
         GgmlType::F32 => decode_f32(bytes, num_elements),
         GgmlType::F16 => decode_f16(bytes, num_elements),
         GgmlType::BF16 => decode_bf16(bytes, num_elements),
         GgmlType::Q4_0 => {
-            let mut out = vec![0.0f32; num_elements as usize];
-            quant::dequantize_row_q4_0(bytes, num_elements as usize, &mut out)?;
+            let mut out = zeroed_f32_buffer(element_count, "dequantized tensor")?;
+            quant::dequantize_row_q4_0(bytes, element_count, &mut out)?;
             Ok(out)
         }
         GgmlType::Q8_0 => {
-            let mut out = vec![0.0f32; num_elements as usize];
-            quant::dequantize_row_q8_0(bytes, num_elements as usize, &mut out)?;
+            let mut out = zeroed_f32_buffer(element_count, "dequantized tensor")?;
+            quant::dequantize_row_q8_0(bytes, element_count, &mut out)?;
             Ok(out)
         }
         GgmlType::Q4_K => {
-            let mut out = vec![0.0f32; num_elements as usize];
-            quant::dequantize_row_q4_k(bytes, num_elements as usize, &mut out)?;
+            let mut out = zeroed_f32_buffer(element_count, "dequantized tensor")?;
+            quant::dequantize_row_q4_k(bytes, element_count, &mut out)?;
             Ok(out)
         }
         GgmlType::Q5_K => {
-            let mut out = vec![0.0f32; num_elements as usize];
-            quant::dequantize_row_q5_k(bytes, num_elements as usize, &mut out)?;
+            let mut out = zeroed_f32_buffer(element_count, "dequantized tensor")?;
+            quant::dequantize_row_q5_k(bytes, element_count, &mut out)?;
             Ok(out)
         }
         GgmlType::Q6_K => {
-            let mut out = vec![0.0f32; num_elements as usize];
-            quant::dequantize_row_q6_k(bytes, num_elements as usize, &mut out)?;
+            let mut out = zeroed_f32_buffer(element_count, "dequantized tensor")?;
+            quant::dequantize_row_q6_k(bytes, element_count, &mut out)?;
             Ok(out)
         }
         GgmlType::Q2_K => {
-            let mut out = vec![0.0f32; num_elements as usize];
-            quant::dequantize_row_q2_k(bytes, num_elements as usize, &mut out)?;
+            let mut out = zeroed_f32_buffer(element_count, "dequantized tensor")?;
+            quant::dequantize_row_q2_k(bytes, element_count, &mut out)?;
             Ok(out)
         }
         GgmlType::Q3_K => {
-            let mut out = vec![0.0f32; num_elements as usize];
-            quant::dequantize_row_q3_k(bytes, num_elements as usize, &mut out)?;
+            let mut out = zeroed_f32_buffer(element_count, "dequantized tensor")?;
+            quant::dequantize_row_q3_k(bytes, element_count, &mut out)?;
             Ok(out)
         }
         GgmlType::Q8_K => {
-            let mut out = vec![0.0f32; num_elements as usize];
-            quant::dequantize_row_q8_k(bytes, num_elements as usize, &mut out)?;
+            let mut out = zeroed_f32_buffer(element_count, "dequantized tensor")?;
+            quant::dequantize_row_q8_k(bytes, element_count, &mut out)?;
             Ok(out)
         }
         _ => Err(DataSourceError::General(format!(
@@ -854,7 +914,12 @@ pub fn decode_tensor_to_f32(
 /// Inference tensor loading bypasses this loop via the datasource direct-F32
 /// path; keeping it provides backward compatibility and a parity oracle.
 fn decode_f32(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceError> {
-    let expected = num_elements as usize * 4;
+    let count = usize::try_from(num_elements).map_err(|_| {
+        DataSourceError::General("F32 element count exceeds platform usize".to_string())
+    })?;
+    let expected = count.checked_mul(4).ok_or_else(|| {
+        DataSourceError::General("F32 tensor byte size overflow".to_string())
+    })?;
     if bytes.len() < expected {
         return Err(DataSourceError::General(format!(
             "F32 tensor truncated: expected {} bytes, got {}",
@@ -862,7 +927,10 @@ fn decode_f32(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceErr
             bytes.len()
         )));
     }
-    let mut out = Vec::with_capacity(num_elements as usize);
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).map_err(|error| {
+        DataSourceError::General(format!("failed to reserve F32 tensor: {error}"))
+    })?;
     for chunk in bytes[..expected].as_chunks::<4>().0 {
         out.push(f32::from_le_bytes(*chunk));
     }
@@ -870,7 +938,12 @@ fn decode_f32(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceErr
 }
 
 fn decode_f16(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceError> {
-    let expected = num_elements as usize * 2;
+    let count = usize::try_from(num_elements).map_err(|_| {
+        DataSourceError::General("F16 element count exceeds platform usize".to_string())
+    })?;
+    let expected = count.checked_mul(2).ok_or_else(|| {
+        DataSourceError::General("F16 tensor byte size overflow".to_string())
+    })?;
     if bytes.len() < expected {
         return Err(DataSourceError::General(format!(
             "F16 tensor truncated: expected {} bytes, got {}",
@@ -878,7 +951,10 @@ fn decode_f16(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceErr
             bytes.len()
         )));
     }
-    let mut out = Vec::with_capacity(num_elements as usize);
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).map_err(|error| {
+        DataSourceError::General(format!("failed to reserve F16 tensor: {error}"))
+    })?;
     for chunk in bytes[..expected].as_chunks::<2>().0 {
         let bits = u16::from_le_bytes(*chunk);
         out.push(f16_to_f32(bits));
@@ -887,7 +963,12 @@ fn decode_f16(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceErr
 }
 
 fn decode_bf16(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceError> {
-    let expected = num_elements as usize * 2;
+    let count = usize::try_from(num_elements).map_err(|_| {
+        DataSourceError::General("BF16 element count exceeds platform usize".to_string())
+    })?;
+    let expected = count.checked_mul(2).ok_or_else(|| {
+        DataSourceError::General("BF16 tensor byte size overflow".to_string())
+    })?;
     if bytes.len() < expected {
         return Err(DataSourceError::General(format!(
             "BF16 tensor truncated: expected {} bytes, got {}",
@@ -895,7 +976,10 @@ fn decode_bf16(bytes: &[u8], num_elements: u64) -> Result<Vec<f32>, DataSourceEr
             bytes.len()
         )));
     }
-    let mut out = Vec::with_capacity(num_elements as usize);
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).map_err(|error| {
+        DataSourceError::General(format!("failed to reserve BF16 tensor: {error}"))
+    })?;
     for chunk in bytes[..expected].as_chunks::<2>().0 {
         let bits = u16::from_le_bytes(*chunk);
         out.push(bf16_to_f32(bits));
@@ -1237,6 +1321,21 @@ mod tests {
             18
         );
         assert!(TensorData::resident_bytes_for(GgmlType::Q4_1, 32, 20).is_err());
+    }
+
+    #[test]
+    fn test_tensor_shape_and_byte_arithmetic_fail_explicitly() {
+        let shape_error = TensorData::from_bytes(GgmlType::F32, vec![2, 3], 5, Vec::new())
+            .unwrap_err();
+        assert!(shape_error.to_string().contains("shape describes"));
+        assert!(TensorData::resident_bytes_for(GgmlType::F32, u64::MAX, 0).is_err());
+        let decode_error =
+            TensorData::from_bytes(GgmlType::F32, vec![u64::MAX], u64::MAX, Vec::new())
+                .unwrap_err();
+        assert!(
+            decode_error.to_string().contains("byte size")
+                || decode_error.to_string().contains("dimension")
+        );
     }
 
     #[test]

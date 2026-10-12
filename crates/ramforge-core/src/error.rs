@@ -78,6 +78,24 @@ pub enum MemoryError {
 
     #[error("invalid allocation size: {0} (must be > 0)")]
     InvalidSize(u64),
+
+    #[error(
+        "memory accounting underflow while releasing {released} bytes for '{name}' (used {used})"
+    )]
+    AccountingUnderflow {
+        name: String,
+        released: u64,
+        used: u64,
+    },
+
+    #[error(
+        "memory accounting overflow while adding {requested} bytes for '{name}' (used {used})"
+    )]
+    AccountingOverflow {
+        name: String,
+        requested: u64,
+        used: u64,
+    },
 }
 
 /// Allow using `?` with `MemoryError` in the runtime crate, whose functions

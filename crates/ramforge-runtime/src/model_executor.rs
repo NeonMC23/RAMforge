@@ -48,22 +48,45 @@ pub struct StreamingLayerWeights {
 }
 
 impl StreamingLayerWeights {
+    /// Checked resident byte total for all owned layer tensor payloads.
+    pub fn try_total_resident_bytes(&self) -> Result<u64, String> {
+        let tensors = [
+            &self.attn_norm,
+            &self.attn_q,
+            &self.attn_k,
+            &self.attn_v,
+            &self.attn_output,
+            &self.ffn_norm,
+            &self.ffn_gate,
+            &self.ffn_up,
+            &self.ffn_down,
+        ];
+        let mut total = 0u64;
+        for tensor in tensors {
+            total = total
+                .checked_add(u64::try_from(tensor.resident_bytes()).map_err(|_| {
+                    "layer tensor resident size exceeds u64".to_string()
+                })?)
+                .ok_or_else(|| "layer resident byte total overflow".to_string())?;
+        }
+        for bias in [&self.attn_q_bias, &self.attn_k_bias, &self.attn_v_bias]
+            .into_iter()
+            .flatten()
+        {
+            total = total
+                .checked_add(u64::try_from(bias.resident_bytes()).map_err(|_| {
+                    "layer bias resident size exceeds u64".to_string()
+                })?)
+                .ok_or_else(|| "layer resident byte total overflow".to_string())?;
+        }
+        Ok(total)
+    }
+
+    /// Compatibility accessor for callers that cannot propagate a sizing
+    /// error. New accounting paths should use `try_total_resident_bytes`.
     pub fn total_resident_bytes(&self) -> u64 {
-        let bias_bytes = [&self.attn_q_bias, &self.attn_k_bias, &self.attn_v_bias]
-            .iter()
-            .filter_map(|bias| bias.as_ref())
-            .map(|bias| bias.resident_bytes() as u64)
-            .sum::<u64>();
-        self.attn_norm.resident_bytes() as u64
-            + self.attn_q.resident_bytes() as u64
-            + self.attn_k.resident_bytes() as u64
-            + self.attn_v.resident_bytes() as u64
-            + self.attn_output.resident_bytes() as u64
-            + self.ffn_norm.resident_bytes() as u64
-            + self.ffn_gate.resident_bytes() as u64
-            + self.ffn_up.resident_bytes() as u64
-            + self.ffn_down.resident_bytes() as u64
-            + bias_bytes
+        self.try_total_resident_bytes()
+            .expect("layer resident byte total must be representable")
     }
 }
 
@@ -100,14 +123,20 @@ impl ModelExecutor {
         let n_heads = cfg.head_count;
         let n_kv_heads = cfg.head_count_kv;
         let head_dim = cfg.head_dim;
+        let q_dim = n_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| "query activation dimension overflow".to_string())?;
+        let kv_dim = n_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| "KV activation dimension overflow".to_string())?;
 
         if hidden.len() != n_embd
             || tmp.len() != n_embd
             || attn_proj.len() != n_embd
             || ffn_out.len() != n_embd
-            || q_tmp.len() != n_heads * head_dim
-            || k_tmp.len() != n_kv_heads * head_dim
-            || v_tmp.len() != n_kv_heads * head_dim
+            || q_tmp.len() != q_dim
+            || k_tmp.len() != kv_dim
+            || v_tmp.len() != kv_dim
         {
             return Err(format!(
                 "layer {} activation shape mismatch for embedding {}, heads {}, kv heads {}, head_dim {}",
@@ -177,9 +206,9 @@ impl ModelExecutor {
         let hist_len = kv_cache.seq_len();
         let k_history = kv_cache.get_k_range(layer_idx, 0, hist_len)?;
         let v_history = kv_cache.get_v_range(layer_idx, 0, hist_len)?;
-        let attn_out = crate::ops::attention(
+        let attn_out = crate::ops::attention_checked(
             q_tmp, k_history, v_history, k_tmp, v_tmp, hist_len, n_heads, n_kv_heads, head_dim,
-        );
+        )?;
 
         matvec_backend(backend, profiler, &layer.attn_output, &attn_out, attn_proj)?;
         backend.add(hidden, attn_proj, tmp);

@@ -98,13 +98,19 @@ pub fn plan_model(model: &GgufModel, ram_budget_bytes: u64) -> Result<PlanResult
 
     // Informational cache bound: 80% of budget (50% for tiny budgets).
     // Contents are charged per entry at runtime via insert_budgeted.
-    let cache_capacity = (ram_budget_bytes as f64 * 0.8) as u64;
+    let cache_capacity_80 = (ram_budget_bytes / 5)
+        .checked_mul(4)
+        .and_then(|base| base.checked_add((ram_budget_bytes % 5) * 4 / 5))
+        .ok_or_else(|| "cache capacity arithmetic overflow".to_string())?;
     let cache_capacity = if ram_budget_bytes < 2 * 1024 * 1024 {
         ram_budget_bytes / 2
     } else {
-        cache_capacity
-            .max(1024 * 1024)
-            .min(ram_budget_bytes.saturating_sub(1024 * 1024))
+        let cache_headroom = if ram_budget_bytes >= 1024 * 1024 {
+            ram_budget_bytes - 1024 * 1024
+        } else {
+            0
+        };
+        cache_capacity_80.max(1024 * 1024).min(cache_headroom)
     };
 
     // No static overhead pre-reservation: scoped `tmp:*` guards charge exact
@@ -256,7 +262,11 @@ fn plan_execution_memory(
         "persistent plus largest layer lower bound",
     )?;
     let managed_lower_bound_bytes = persistent_startup_peak_bytes.max(layer_with_persistents);
-    let layer_cache_capacity_bytes = ram_budget_bytes.saturating_sub(managed_lower_bound_bytes);
+    let layer_cache_capacity_bytes = if ram_budget_bytes >= managed_lower_bound_bytes {
+        ram_budget_bytes - managed_lower_bound_bytes
+    } else {
+        0
+    };
     layer_resident_sizes.sort_unstable();
     let min_layer_resident_bytes = layer_resident_sizes.first().copied().unwrap_or(0);
     let max_complete_cached_layers =

@@ -36,6 +36,26 @@ pub fn attention(
     n_kv_heads: usize,
     head_dim: usize,
 ) -> Vec<f32> {
+    attention_checked(
+        q, k_hist, v_hist, k_new, v_new, hist_len, n_heads, n_kv_heads, head_dim,
+    )
+    .expect("model attention tensors must satisfy their declared dimensions")
+}
+
+/// Fallible adapter for managed execution. The compatibility `attention`
+/// function above keeps its historical infallible return type, while the
+/// runtime path can report allocation or shape failures through its `Result`.
+pub(crate) fn attention_checked(
+    q: &[f32],
+    k_hist: &[f32],
+    v_hist: &[f32],
+    k_new: &[f32],
+    v_new: &[f32],
+    hist_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Result<Vec<f32>, String> {
     ramforge_core::compute::attention_reference(
         q,
         k_hist,
@@ -44,7 +64,7 @@ pub fn attention(
         v_new,
         ramforge_core::compute::AttentionConfig::new(hist_len, n_heads, n_kv_heads, head_dim),
     )
-    .expect("model attention tensors must satisfy their declared dimensions")
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

@@ -7,7 +7,8 @@
 //! Memory contract (M7.2):
 //! - streamed embedding lookup reads exactly one row and is budget-charged;
 //!   F32 goes directly into final storage, while converted/quantized formats
-//!   retain their raw-plus-decoded workspace accounting;
+//!   charge their raw row workspace separately from the caller-owned decoded
+//!   output buffer;
 //! - streamed matvec/logits run in row chunks sized by the *available*
 //!   budget (bounded temp, no full-tensor reads, no full F32 expansions);
 //! - logits are written into a caller-provided buffer (single allocation,
@@ -49,11 +50,13 @@ impl PersistentWeight {
         matches!(self, Self::Streamed(_))
     }
 
-    /// Embedding lookup for `token_id`; returns `n_embd` f32 values.
+    /// Compatibility helper returning an owned embedding vector.
     ///
-    /// Resident tensors answer from memory. Streamed tensors read exactly one
-    /// row: F32 is loaded directly into the returned vector; converted or
-    /// quantized rows retain their raw-plus-decoded temporary accounting.
+    /// The returned vector belongs to the caller and outlives the temporary
+    /// `MemoryBudget` scope used to construct it. Consequently this helper does
+    /// not claim that the returned vector is budget-covered. Managed execution
+    /// must use [`Self::get_embedding_into`], whose caller-owned output buffer
+    /// remains inside its surrounding charge.
     pub fn get_embedding(
         &self,
         token_id: usize,
@@ -62,51 +65,104 @@ impl PersistentWeight {
         budget: &mut MemoryBudget,
         _stats: &mut ResidencyStats,
     ) -> Result<Vec<f32>, String> {
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(n_embd)
+            .map_err(|error| format!("failed to reserve embedding output: {error}"))?;
+        output.resize(n_embd, 0.0);
+        self.get_embedding_into(token_id, n_embd, data_source, budget, &mut output)?;
+        Ok(output)
+    }
+
+    /// Fill a caller-owned embedding buffer without returning an allocation
+    /// whose charge could expire before the buffer is dropped. The caller must
+    /// keep its charge alive for `output`'s lifetime.
+    pub fn get_embedding_into(
+        &self,
+        token_id: usize,
+        n_embd: usize,
+        data_source: &GgufDataSource,
+        budget: &mut MemoryBudget,
+        output: &mut [f32],
+    ) -> Result<(), String> {
+        if n_embd == 0 || output.len() != n_embd {
+            return Err(format!(
+                "embedding output length mismatch: expected {}, got {}",
+                n_embd,
+                output.len()
+            ));
+        }
+        let n_embd_u64 = u64::try_from(n_embd)
+            .map_err(|_| "embedding dimension exceeds u64".to_string())?;
+        let decoded_bytes = n_embd_u64
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .ok_or_else(|| "embedding output byte size overflow".to_string())?;
+
         match self {
-            Self::Resident(td) => budget.with_temp("tmp:embd_row", (n_embd * 4) as u64, |_b| {
-                td.get_embedding(token_id, n_embd)
-                    .map_err(|e| format!("embedding lookup failed: {}", e))
+            Self::Resident(td) => budget.with_temp("tmp:embd_row", decoded_bytes, |_budget| {
+                let row = td
+                    .get_embedding(token_id, n_embd)
+                    .map_err(|e| format!("embedding lookup failed: {}", e))?;
+                output.copy_from_slice(&row);
+                Ok::<(), String>(())
             }),
             Self::Streamed(desc) => {
-                let element_offset = (token_id as u64)
-                    .checked_mul(n_embd as u64)
+                if desc.dimensions.len() != 2 {
+                    return Err(format!(
+                        "streamed embedding tensor '{}' must be 2D, got {:?}",
+                        desc.name, desc.dimensions
+                    ));
+                }
+                let row_width = usize::try_from(desc.dimensions[0])
+                    .map_err(|_| "streamed embedding row width exceeds platform usize".to_string())?;
+                let row_count = usize::try_from(desc.dimensions[1])
+                    .map_err(|_| "streamed embedding row count exceeds platform usize".to_string())?;
+                if row_width != n_embd || token_id >= row_count {
+                    return Err(format!(
+                        "streamed embedding shape mismatch: tensor '{}' is [{}, {}], requested row {} with width {}",
+                        desc.name, row_width, row_count, token_id, n_embd
+                    ));
+                }
+                let token_id_u64 = u64::try_from(token_id)
+                    .map_err(|_| "embedding token index exceeds u64".to_string())?;
+                let element_offset = token_id_u64
+                    .checked_mul(n_embd_u64)
                     .ok_or_else(|| "embedding row element offset overflow".to_string())?;
                 if desc.ggml_type == GgmlType::F32 {
-                    // One direct final representation: no raw row plus decode
-                    // copy. The charge is exactly the returned Vec<f32> bytes.
-                    let temp_bytes = (n_embd as u64)
-                        .checked_mul(std::mem::size_of::<f32>() as u64)
-                        .ok_or_else(|| "embedding row byte size overflow".to_string())?;
-                    budget.with_temp("tmp:embd_row", temp_bytes, |_b| {
-                        data_source
+                    budget.with_temp("tmp:embd_row", decoded_bytes, |_budget| {
+                        let row = data_source
                             .read_f32_tensor_range_by_descriptor(
                                 desc,
                                 element_offset,
-                                n_embd as u64,
+                                n_embd_u64,
                             )
-                            .map_err(|e| format!("failed to read embedding row: {}", e))
+                            .map_err(|e| format!("failed to read embedding row: {}", e))?;
+                        output.copy_from_slice(&row);
+                        Ok::<(), String>(())
                     })
                 } else {
-                    let row_bytes = row_bytes_for(desc, n_embd)? as u64;
-                    let byte_offset = (token_id as u64)
+                    let row_bytes = u64::try_from(row_bytes_for(desc, n_embd)?)
+                        .map_err(|_| "embedding row byte size exceeds u64".to_string())?;
+                    let byte_offset = token_id_u64
                         .checked_mul(row_bytes)
                         .ok_or_else(|| "embedding row byte offset overflow".to_string())?;
-                    let temp_bytes = row_bytes + (n_embd * 4) as u64;
-                    budget.with_temp("tmp:embd_row", temp_bytes, |_b| {
+                    // `output` is caller-owned and must be covered by its
+                    // surrounding lifetime charge. This path decodes directly
+                    // into it, so the temporary charge covers only the raw
+                    // streamed row; adding `decoded_bytes` here would count
+                    // the same output buffer twice.
+                    let temp_bytes = row_bytes;
+                    budget.with_temp("tmp:embd_row", temp_bytes, |_budget| {
                         let raw = data_source
                             .read_tensor_range_by_descriptor(desc, byte_offset, row_bytes)
                             .map_err(|e| format!("failed to read embedding row: {}", e))?;
-                        let td = TensorData::from_bytes(
+                        ramforge_core::tensor::decode_row_to_f32(
                             desc.ggml_type,
-                            vec![n_embd as u64],
-                            n_embd as u64,
-                            raw,
+                            &raw,
+                            n_embd,
+                            output,
                         )
-                        .map_err(|e| {
-                            format!("failed to create TensorData for embedding row: {}", e)
-                        })?;
-                        td.into_f32_vec()
-                            .map_err(|e| format!("failed to dequantize embedding row: {}", e))
+                        .map_err(|e| format!("failed to dequantize embedding row: {}", e))
                     })
                 }
             }
@@ -149,7 +205,9 @@ impl PersistentWeight {
     }
 
     /// Whole-tensor F32 materialization. Intended for small 1D tensors such
-    /// as `output_norm.weight` (n_embd elements); charged by the caller.
+    /// as `output_norm.weight` (n_embd elements); the caller must keep a
+    /// matching charge live for the returned `Vec`'s full lifetime. Managed
+    /// forward execution uses this only inside its coarse forward charge.
     pub fn to_f32_vec(&self, data_source: &GgufDataSource) -> Result<Vec<f32>, String> {
         match self {
             Self::Resident(td) => td.to_f32_vec().map_err(|e| e.to_string()),
@@ -180,18 +238,25 @@ impl PersistentWeight {
 
 /// Row bytes for a contiguous ggml row of `in_dim` elements of `desc`'s type.
 pub fn row_bytes_for(desc: &TensorDescriptor, in_dim: usize) -> Result<usize, String> {
-    let elems = in_dim;
-    let bytes = match desc.ggml_type {
-        GgmlType::F32 => elems * 4,
-        GgmlType::F16 | GgmlType::BF16 => elems * 2,
-        GgmlType::Q4_0 => (elems / 32) * 18,
-        GgmlType::Q8_0 => (elems / 32) * 34,
-        GgmlType::Q4_K => (elems / 256) * 144,
-        GgmlType::Q5_K => (elems / 256) * 176,
-        GgmlType::Q6_K => (elems / 256) * 210,
-        GgmlType::Q2_K => (elems / 256) * 84,
-        GgmlType::Q3_K => (elems / 256) * 110,
-        GgmlType::Q8_K => (elems / 256) * 292,
+    let (block_elements, block_bytes) = match desc.ggml_type {
+        GgmlType::F32 => {
+            return in_dim
+                .checked_mul(4)
+                .ok_or_else(|| "F32 row byte size overflow".to_string())
+        },
+        GgmlType::F16 | GgmlType::BF16 => {
+            return in_dim
+                .checked_mul(2)
+                .ok_or_else(|| "16-bit row byte size overflow".to_string())
+        },
+        GgmlType::Q4_0 => (32, 18),
+        GgmlType::Q8_0 => (32, 34),
+        GgmlType::Q4_K => (256, 144),
+        GgmlType::Q5_K => (256, 176),
+        GgmlType::Q6_K => (256, 210),
+        GgmlType::Q2_K => (256, 84),
+        GgmlType::Q3_K => (256, 110),
+        GgmlType::Q8_K => (256, 292),
         _ => {
             return Err(format!(
                 "unsupported persistent weight type for streaming: {}",
@@ -199,7 +264,17 @@ pub fn row_bytes_for(desc: &TensorDescriptor, in_dim: usize) -> Result<usize, St
             ))
         }
     };
-    Ok(bytes)
+    if in_dim % block_elements != 0 {
+        return Err(format!(
+            "row dimension {} is not divisible by block size {} for {}",
+            in_dim,
+            block_elements,
+            desc.ggml_type.name()
+        ));
+    }
+    (in_dim / block_elements)
+        .checked_mul(block_bytes)
+        .ok_or_else(|| format!("{} row byte size overflow", desc.ggml_type.name()))
 }
 
 /// Chunked, budget-aware streamed matvec for a non-resident 2D tensor.
@@ -221,8 +296,16 @@ fn streamed_matvec_into(
             desc.name, desc.dimensions
         ));
     }
-    let in_dim = desc.dimensions[0] as usize;
-    let out_dim = desc.dimensions[1] as usize;
+    let in_dim = usize::try_from(desc.dimensions[0])
+        .map_err(|_| format!("tensor '{}' input dimension exceeds platform usize", desc.name))?;
+    let out_dim = usize::try_from(desc.dimensions[1])
+        .map_err(|_| format!("tensor '{}' output dimension exceeds platform usize", desc.name))?;
+    if in_dim == 0 || out_dim == 0 {
+        return Err(format!(
+            "streamed matvec requires non-zero dimensions, '{}' has [{}, {}]",
+            desc.name, in_dim, out_dim
+        ));
+    }
     if x.len() != in_dim || y.len() != out_dim {
         return Err(format!(
             "streamed matvec arity mismatch (ggml layout [in, out]): '{}' {:?} implies in={}, out={}, but got x.len()={}, y.len()={}",
@@ -235,20 +318,29 @@ fn streamed_matvec_into(
         ));
     }
 
-    let row_bytes = row_bytes_for(desc, in_dim)? as u64;
-    let row_f32_bytes = (in_dim * 4) as u64;
+    let in_dim_u64 = u64::try_from(in_dim)
+        .map_err(|_| "streamed matvec input dimension exceeds u64".to_string())?;
+    let row_bytes = u64::try_from(row_bytes_for(desc, in_dim)?)
+        .map_err(|_| "streamed matvec row byte size exceeds u64".to_string())?;
+    let row_f32_bytes = in_dim_u64
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .ok_or_else(|| "streamed matvec F32 row byte size overflow".to_string())?;
 
     // Chunk size: bounded by budget share and an absolute cap, at least one
     // row, rounded down to whole rows. If one row does not fit, fail clearly.
     let avail_share = budget.available_bytes() / STREAM_CHUNK_BUDGET_SHARE;
     let chunk_target = avail_share.min(MAX_STREAM_CHUNK_BYTES).max(row_bytes);
     let rows_per_chunk = (chunk_target / row_bytes).max(1);
-    let chunk_bytes = rows_per_chunk * row_bytes;
+    let chunk_bytes = rows_per_chunk
+        .checked_mul(row_bytes)
+        .ok_or_else(|| "streamed matvec chunk byte size overflow".to_string())?;
     let direct_f32 = desc.ggml_type == GgmlType::F32;
     let temp_bytes = if direct_f32 {
         chunk_bytes
     } else {
-        chunk_bytes + row_f32_bytes
+        chunk_bytes
+            .checked_add(row_f32_bytes)
+            .ok_or_else(|| "streamed matvec temporary byte size overflow".to_string())?
     };
     if !budget.can_allocate(temp_bytes) {
         let detail = if direct_f32 {
@@ -269,12 +361,19 @@ fn streamed_matvec_into(
         budget.with_temp("tmp:streamed_matvec", temp_bytes, |_b| {
             let mut row_start = 0usize;
             while row_start < out_dim {
-                let rows_this = rows_per_chunk.min((out_dim - row_start) as u64) as usize;
-                let element_offset = (row_start as u64)
-                    .checked_mul(in_dim as u64)
+                let remaining_rows = u64::try_from(out_dim - row_start)
+                    .map_err(|_| "streamed F32 remaining row count exceeds u64".to_string())?;
+                let rows_this = usize::try_from(rows_per_chunk.min(remaining_rows))
+                    .map_err(|_| "streamed F32 chunk row count exceeds usize".to_string())?;
+                let row_start_u64 = u64::try_from(row_start)
+                    .map_err(|_| "streamed F32 row index exceeds u64".to_string())?;
+                let rows_this_u64 = u64::try_from(rows_this)
+                    .map_err(|_| "streamed F32 chunk row count exceeds u64".to_string())?;
+                let element_offset = row_start_u64
+                    .checked_mul(in_dim_u64)
                     .ok_or_else(|| "streamed F32 element offset overflow".to_string())?;
-                let element_count = (rows_this as u64)
-                    .checked_mul(in_dim as u64)
+                let element_count = rows_this_u64
+                    .checked_mul(in_dim_u64)
                     .ok_or_else(|| "streamed F32 element count overflow".to_string())?;
                 let chunk = data_source
                     .read_f32_tensor_range_by_descriptor(desc, element_offset, element_count)
@@ -282,7 +381,15 @@ fn streamed_matvec_into(
                         format!("failed to read direct F32 chunk of '{}': {}", desc.name, e)
                     })?;
                 for r in 0..rows_this {
-                    let row = &chunk[r * in_dim..(r + 1) * in_dim];
+                    let chunk_row_start = r
+                        .checked_mul(in_dim)
+                        .ok_or_else(|| "streamed F32 row offset overflow".to_string())?;
+                    let row_end = (r + 1)
+                        .checked_mul(in_dim)
+                        .ok_or_else(|| "streamed F32 row end overflow".to_string())?;
+                    let row = chunk.get(chunk_row_start..row_end).ok_or_else(|| {
+                        "streamed F32 row is outside chunk".to_string()
+                    })?;
                     let mut sum = 0.0f32;
                     for i in 0..in_dim {
                         sum += row[i] * x[i];
@@ -295,18 +402,46 @@ fn streamed_matvec_into(
         })
     } else {
         budget.with_temp("tmp:streamed_matvec", temp_bytes, |_b| {
-            let mut row_buf = vec![0.0f32; in_dim];
+            let mut row_buf = Vec::new();
+            row_buf
+                .try_reserve_exact(in_dim)
+                .map_err(|error| format!("failed to reserve streamed decoded row: {error}"))?;
+            row_buf.resize(in_dim, 0.0);
             let mut row_start = 0usize;
             while row_start < out_dim {
-                let rows_this = rows_per_chunk.min((out_dim - row_start) as u64) as usize;
-                let offset = (row_start as u64) * row_bytes;
-                let len = (rows_this as u64) * row_bytes;
+                let remaining_rows = u64::try_from(out_dim - row_start)
+                    .map_err(|_| "streamed matvec remaining row count exceeds u64".to_string())?;
+                let rows_this = usize::try_from(rows_per_chunk.min(remaining_rows))
+                    .map_err(|_| "streamed matvec chunk row count exceeds usize".to_string())?;
+                let row_start_u64 = u64::try_from(row_start)
+                    .map_err(|_| "streamed matvec row index exceeds u64".to_string())?;
+                let rows_this_u64 = u64::try_from(rows_this)
+                    .map_err(|_| "streamed matvec chunk row count exceeds u64".to_string())?;
+                let offset = row_start_u64
+                    .checked_mul(row_bytes)
+                    .ok_or_else(|| "streamed matvec byte offset overflow".to_string())?;
+                let len = rows_this_u64
+                    .checked_mul(row_bytes)
+                    .ok_or_else(|| "streamed matvec chunk length overflow".to_string())?;
                 let chunk = data_source
                     .read_tensor_range_by_descriptor(desc, offset, len)
                     .map_err(|e| format!("failed to read chunk of '{}': {}", desc.name, e))?;
                 for r in 0..rows_this {
-                    let row_slice = &chunk
-                        [(r as u64 * row_bytes) as usize..((r as u64 + 1) * row_bytes) as usize];
+                    let row_u64 = u64::try_from(r)
+                        .map_err(|_| "streamed matvec row index exceeds u64".to_string())?;
+                    let row_offset = row_u64
+                        .checked_mul(row_bytes)
+                        .ok_or_else(|| "streamed matvec row offset overflow".to_string())?;
+                    let row_end = row_offset
+                        .checked_add(row_bytes)
+                        .ok_or_else(|| "streamed matvec row end overflow".to_string())?;
+                    let chunk_row_start = usize::try_from(row_offset)
+                        .map_err(|_| "streamed matvec row offset exceeds usize".to_string())?;
+                    let chunk_row_end = usize::try_from(row_end)
+                        .map_err(|_| "streamed matvec row end exceeds usize".to_string())?;
+                    let row_slice = chunk.get(chunk_row_start..chunk_row_end).ok_or_else(|| {
+                        "streamed matvec decoded row is outside chunk".to_string()
+                    })?;
                     ramforge_core::tensor::decode_row_to_f32(
                         desc.ggml_type,
                         row_slice,
@@ -397,6 +532,17 @@ mod tests {
         assert_eq!(embd.len(), 8);
         assert!((embd[0] - 2.0).abs() < 1e-5);
         assert_eq!(budget.used_bytes(), 0, "temp must be released after lookup");
+
+        let mut output = [0.0f32; 8];
+        budget
+            .with_temp("tmp:embedding_output", 8 * 4, |budget| {
+                streamed.get_embedding_into(1, 8, &ds, budget, &mut output)?;
+                assert_eq!(budget.get("tmp:embedding_output"), Some(32));
+                assert_eq!(output[0], 1.0);
+                Ok::<(), String>(())
+            })
+            .unwrap();
+        assert_eq!(budget.used_bytes(), 0);
     }
 
     /// Streamed output projection over a non-square [in, out] F32 tensor,
@@ -461,7 +607,7 @@ mod tests {
             );
         }
         assert_eq!(budget.used_bytes(), 800, "no temp charge may leak");
-        let _ = budget.release("pinned");
+        budget.release("pinned").unwrap();
 
         // Resident path must agree with streamed path.
         let raw = ds.read_tensor("output.weight").unwrap();

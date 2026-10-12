@@ -10,16 +10,22 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 >
 > **Milestone 6.1 Baseline (Correctness & Accounting Fixes):** `generate()` is cleanly repeatable on one engine (explicit KV reset + failure-proof budget); RoPE uses the correct llama/qwen2 **half-split** pair convention; F16/BF16 resident RAM is booked at its true decoded size (4 B/elem, with a 3×-file-byte load transient); qwen2 Q/K/V biases are loaded, budgeted, validated (all-or-none + exact shape), and applied after the projections. The historical M6.1 baseline was verified by 132 synthetic tests; current validation is summarized below.
 >
-> **Milestone 6 Status (True Out-of-Core Integrity):** Every RAMforge allocation is charged to the RAM budget via RAII-style scoped guards; the cache is budget-charged per entry; matrix layout is the explicit GGML/GGUF convention (no orientation guessing, no full-F32 fallbacks); logits use a single budget-charged buffer with a budget-aware chunked streamed projection; the KV cache grows chunk-wise without prefix copies; the F32 matvec hot path uses AVX2/rayon. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented.
+> **Milestone 6 Status (Managed Out-of-Core Path):** The legacy inference path charges its named, RAMforge-managed allocations via scoped accounting helpers; the cache is budget-charged per entry; matrix layout is the explicit GGML/GGUF convention (no orientation guessing, no full-F32 fallbacks); logits use a single budget-charged buffer with a budget-aware chunked streamed projection; the KV cache grows chunk-wise without prefix copies; the F32 matvec hot path uses AVX2/rayon. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented. This ledger is not a process-RSS or OS-memory cap; allocator overhead, native/dependency allocations, page cache, and some legacy returned buffers remain outside it.
 
 ## Purpose
 
 - GGUF parsing without loading payloads
 - File-backed tensor access via `GgufDataSource`
-- Real RAM budget enforcement via `MemoryBudget`
+- Checked RAMforge-managed allocation accounting via `MemoryBudget` (not an RSS or OS-memory cap)
 - Bounded LRU cache via `BoundedCache`
 - Real CPU inference with the retained legacy layer-streaming path
 - Native quantized inference without full F32 expansion
+
+### Memory-contract boundary
+
+`MemoryBudget` is a RAMforge-managed logical ledger, not a process RSS cap or a hard operating-system memory limit. The first safe accounting tranche covers named persistent weights, decoded layer ownership, the generation KV cache (including old/new growth overlap), caller-owned generation buffers, staged K/V workspace, and bounded streamed read/decode buffers. Reservations are checked before the managed buffers are allocated, and charges remain live until those owned buffers are dropped.
+
+The ledger does not claim complete process-memory coverage. Allocator metadata and fragmentation, Rust runtime/container overhead not included in a named charge, native/dependency allocations, file-system page cache, tokenizer/output growth, and legacy APIs that return newly owned `Vec` values (including the raw-cache `get_tensor`/`remove_budgeted` and persistent-weight `get_embedding`/`to_f32_vec` compatibility paths) remain outside or only coarsely represented. Standalone core compute/reference helpers and calibration/profiling containers are likewise not automatically tied to the inference ledger. RSS and OS limits are reported separately where available; they are not enforced by `MemoryBudget`.
 
 ## Phase 2 ForgeCore backend
 
@@ -108,7 +114,7 @@ for the boundary and validation record.
 - `TensorData` enum: `F32`, `F16`, `BF16`, `Q4_0(QuantizedTensor)`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K`
 - `QuantizedTensor { ggml_type, shape, num_elements, raw_data: Vec<u8> }` keeps quantized compact while resident
 - `resident_bytes()` = raw_data.len() (e.g. 144B for 256 values Q4_K vs 1024B F32) – shows memory saving
-- `matvec()` for quantized does block-wise dequant: for each output row, for each quantized block, decode block to temp `[32]` or `[256]` f32, dot with x slice, discard temp. Working set bounded to one block.
+- Runtime quantized `matvec()` uses compact block-wise kernels and bounds dequantization to block workspaces; the storage-independent reference helper uses one reusable decoded row buffer and remains outside the runtime budget ledger.
 - `get_embedding()` for quantized token_embd dequantizes only the requested row.
 
 **Memory accounting:**
@@ -171,7 +177,7 @@ A Mistral 7B Q4_K_M GGUF (about 4.37 GB of weights, represented as llama-compati
 
 ### Milestone 6 – True Out-of-Core Integrity
 
-- **Memory accounting:** `MemoryBudget::with_temp(name, bytes, f)` is the RAII-style scoped guard for transient working sets (`tmp:hidden`, `tmp:forward`, `tmp:embd_row`, `tmp:streamed_matvec`, `tmp:logits`, `tmp:sampling`) – released on success and on error. Layer tensors charge *before* reading (peak = settled prefix + per-tensor transient) and settle to exact resident bytes after construction; a failed layer load releases all its charges.
+- **Memory accounting:** `MemoryBudget::with_temp(name, bytes, f)` is the scoped accounting helper for transient working sets (`tmp:hidden`, `tmp:forward`, `tmp:embd_row`, `tmp:streamed_matvec`, `tmp:logits`, `tmp:sampling`) – released on success and on error. Layer tensors charge *before* reading (peak = settled prefix + per-tensor transient) and settle to exact resident bytes after construction; a failed layer load releases all its charges.
 - **Cache:** `BoundedCache::insert_budgeted` charges each cached entry to the budget (`cache:{key}`), evicting LRU entries to make budget room; if nothing can be evicted, the entry is simply not cached (streaming keeps working) instead of failing or double-counting.
 - **Matrix layout:** one explicit GGML/GGUF convention everywhere: `shape = [in, out]`, buffer row-major `[out][in]`, `y[o] = Σ_i W[o·in+i]·x[i]`. No orientation heuristics, no transpose fallbacks, no full-F32 dequantization of 2D weights – arity mismatches are hard errors.
 - **Output projection:** single caller-owned logits buffer per `generate()` call; streamed (non-resident) output/embedding matrices are projected in budget-bounded row chunks (`min(16 MiB, available/4)`, ≥ 1 row) with per-row block decode.
@@ -291,7 +297,7 @@ crates/
 - Existing F32/F16/BF16 inference still works
 - Direct F32 loading: ordinary-value parity, exact edge bit patterns (signed zero, finite, subnormal, infinities, NaN payloads), non-square GGML layout, exact 1× accounting, and short-read rollback
 - Existing Milestone 4 streaming tests still pass
-- M6 integrity proofs: RAII temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
+- M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
 The last executed baseline passed 158 tests with 0 failures and 0 ignored. The current source inventory is 179 tests after adding shared-accounting, execution-preflight, bounded layer-cache, bounded coalesced-read, cursor-reuse, and grouped-buffer-reuse regressions; rerun the full suite before commit.
 

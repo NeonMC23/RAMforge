@@ -1,13 +1,22 @@
 //! Memory budget abstraction for RAMforge
 //!
-//! RAMforge-managed memory is defined as memory that is explicitly tracked
-//! via `MemoryBudget`. It does NOT represent total process RSS or OS page
-//! cache. It only tracks allocations that RAMforge itself accounts for, such
-//! as tensor caches, KV caches, and bounded read or decode buffers.
+//! `MemoryBudget` is RAMforge-managed logical allocation accounting. It is not
+//! a hard process-RSS cap, an operating-system memory limit, or a page-cache
+//! limit. It only covers allocations that RAMforge explicitly reserves and
+//! keeps charged for their owned lifetime, such as tensor caches, KV caches,
+//! and bounded read or decode buffers.
 //!
-//! This design makes it difficult for future code to bypass the budget
-//! accidentally: all RAMforge-managed allocations should go through
-//! `MemoryBudget::allocate` / `reserve`.
+//! The managed-allocation invariant is:
+//! - calculate sizes with checked arithmetic;
+//! - reserve before allocating;
+//! - keep the charge while the owned allocation is live;
+//! - release only after the allocation has been dropped; and
+//! - roll back a reservation when allocation or a later construction step
+//!   fails.
+//!
+//! Allocator metadata, fragmentation, thread stacks, dependency/native
+//! allocations, process RSS, and filesystem page cache remain outside this
+//! logical ledger unless a caller explicitly measures them separately.
 
 use std::collections::BTreeMap;
 
@@ -59,12 +68,17 @@ impl MemoryBudget {
         self.used
     }
 
-    /// Available bytes = total - used
+    /// Available bytes = total - used.
+    ///
+    /// `MemoryBudget` maintains the invariant `used <= total`; a violation is
+    /// a programming/accounting error and must not be hidden by saturation.
     pub fn available_bytes(&self) -> u64 {
-        self.total.saturating_sub(self.used)
+        self.total
+            .checked_sub(self.used)
+            .expect("MemoryBudget invariant violated: used bytes exceed total")
     }
 
-    /// Check if a given size can be allocated
+    /// Check if a given size can be allocated.
     pub fn can_allocate(&self, bytes: u64) -> bool {
         bytes <= self.available_bytes()
     }
@@ -92,11 +106,16 @@ impl MemoryBudget {
                 used: self.used,
             });
         }
-        self.allocations.insert(name, bytes);
-        self.used = self
+        let new_used = self
             .used
             .checked_add(bytes)
-            .expect("used overflow checked by can_allocate");
+            .ok_or_else(|| MemoryError::AccountingOverflow {
+                name: name.clone(),
+                requested: bytes,
+                used: self.used,
+            })?;
+        self.allocations.insert(name, bytes);
+        self.used = new_used;
         self.peak_used = self.peak_used.max(self.used);
         Ok(())
     }
@@ -106,16 +125,29 @@ impl MemoryBudget {
         self.allocate(name, bytes)
     }
 
-    /// Release an allocation by name, returning its size if it existed
+    /// Release an allocation by name, returning its size if it existed.
+    ///
+    /// The allocation is removed only after the accounting subtraction is
+    /// checked. An underflow is reported instead of being silently saturated.
     pub fn release(&mut self, name: &str) -> Result<u64, MemoryError> {
-        if let Some(bytes) = self.allocations.remove(name) {
-            self.used = self.used.saturating_sub(bytes);
-            Ok(bytes)
-        } else {
-            Err(MemoryError::NotFound {
+        let bytes = self
+            .allocations
+            .get(name)
+            .copied()
+            .ok_or_else(|| MemoryError::NotFound {
                 name: name.to_string(),
-            })
-        }
+            })?;
+        let new_used = self
+            .used
+            .checked_sub(bytes)
+            .ok_or_else(|| MemoryError::AccountingUnderflow {
+                name: name.to_string(),
+                released: bytes,
+                used: self.used,
+            })?;
+        self.allocations.remove(name);
+        self.used = new_used;
+        Ok(bytes)
     }
 
     /// Atomically resize an existing named allocation and return its old size.
@@ -150,9 +182,19 @@ impl MemoryBudget {
             }
             self.used
                 .checked_add(additional)
-                .expect("resize overflow checked by can_allocate")
+                .ok_or_else(|| MemoryError::AccountingOverflow {
+                    name: name.to_string(),
+                    requested: additional,
+                    used: self.used,
+                })?
         } else {
-            self.used - (old_bytes - new_bytes)
+            self.used
+                .checked_sub(old_bytes - new_bytes)
+                .ok_or_else(|| MemoryError::AccountingUnderflow {
+                    name: name.to_string(),
+                    released: old_bytes - new_bytes,
+                    used: self.used,
+                })?
         };
 
         *self
@@ -162,6 +204,79 @@ impl MemoryBudget {
         self.used = new_used;
         self.peak_used = self.peak_used.max(self.used);
         Ok(old_bytes)
+    }
+
+    /// Commit a physically completed resize that was protected by a separate
+    /// reservation.
+    ///
+    /// `target` is the existing charge for the old allocation and
+    /// `reservation` is a charge for the new allocation. While the physical
+    /// resize is in progress both charges must exist, because old and new
+    /// storage may overlap. On success they are atomically replaced by one
+    /// `target` charge of `final_bytes`.
+    pub fn commit_resize(
+        &mut self,
+        target: &str,
+        reservation: &str,
+        final_bytes: u64,
+    ) -> Result<(), MemoryError> {
+        if final_bytes == 0 {
+            return Err(MemoryError::InvalidSize(final_bytes));
+        }
+        if target == reservation {
+            return Err(MemoryError::AlreadyExists {
+                name: reservation.to_string(),
+            });
+        }
+        let old_bytes = self
+            .allocations
+            .get(target)
+            .copied()
+            .ok_or_else(|| MemoryError::NotFound {
+                name: target.to_string(),
+            })?;
+        let reserved_bytes = self
+            .allocations
+            .get(reservation)
+            .copied()
+            .ok_or_else(|| MemoryError::NotFound {
+                name: reservation.to_string(),
+            })?;
+        let base_used = self
+            .used
+            .checked_sub(old_bytes)
+            .and_then(|used| used.checked_sub(reserved_bytes))
+            .ok_or_else(|| MemoryError::AccountingUnderflow {
+                name: target.to_string(),
+                released: old_bytes,
+                used: self.used,
+            })?;
+        let new_used = base_used
+            .checked_add(final_bytes)
+            .ok_or_else(|| MemoryError::AccountingOverflow {
+                name: target.to_string(),
+                requested: final_bytes,
+                used: base_used,
+            })?;
+        if new_used > self.total {
+            return Err(MemoryError::Insufficient {
+                name: target.to_string(),
+                requested: final_bytes,
+                available: self
+                    .total
+                    .checked_sub(base_used)
+                    .expect("MemoryBudget invariant violated during resize commit"),
+                total: self.total,
+                used: base_used,
+            });
+        }
+
+        self.allocations.remove(target);
+        self.allocations.remove(reservation);
+        self.allocations.insert(target.to_string(), final_bytes);
+        self.used = new_used;
+        self.peak_used = self.peak_used.max(new_used);
+        Ok(())
     }
 
     /// Atomically rename every allocation whose name starts with `old_prefix`.
@@ -231,10 +346,10 @@ impl MemoryBudget {
     /// Execute `f` while a temporary allocation of `bytes` is charged under
     /// `name`, releasing it afterwards no matter how `f` returns.
     ///
-    /// This is the RAII-style guard for short-lived working buffers
-    /// (activations, logits, sampler temporaries, attention scores, streamed
-    /// chunks, ...): the reservation is always released exactly once, on both
-    /// success and error paths. The closure receives `&mut MemoryBudget` so
+    /// This is the scoped helper for short-lived working buffers (activations,
+    /// logits, sampler temporaries, attention scores, streamed chunks, ...):
+    /// the reservation is released exactly once on both ordinary success and
+    /// error returns. The closure receives `&mut MemoryBudget` so
     /// nested accounting (e.g. per-layer allocations) keeps working.
     ///
     /// A `bytes == 0` reservation is a no-op (runs `f` without accounting).
@@ -252,8 +367,14 @@ impl MemoryBudget {
         }
         self.allocate(name, bytes).map_err(E::from)?;
         let result = f(self);
-        let _ = self.release(name);
-        result
+        // A release failure is an accounting failure, not something that may
+        // be discarded while returning the callback's result. The scope name
+        // remains charged when release itself fails, so the caller receives
+        // an explicit error and can decide how to recover.
+        match self.release(name) {
+            Ok(_) => result,
+            Err(error) => Err(E::from(error)),
+        }
     }
 
     /// Adapt the existing single host-memory budget to the Phase-3 budget
@@ -361,7 +482,9 @@ pub fn parse_memory_size(s: &str) -> Result<u64, ParseSizeError> {
 
     // Compute bytes: num * multiplier, check overflow
     let bytes_f = num * (multiplier as f64);
-    if bytes_f > (u64::MAX as f64) {
+    // `u64::MAX` is rounded to 2^64 in f64, so reject that boundary as
+    // well as non-finite products before the float-to-integer conversion.
+    if !bytes_f.is_finite() || bytes_f >= (u64::MAX as f64) {
         return Err(ParseSizeError::Overflow(s.to_string()));
     }
     let bytes = bytes_f as u64;
@@ -407,6 +530,7 @@ mod tests {
         assert!(parse_memory_size("-8G").is_err());
         assert!(parse_memory_size("0G").is_err());
         assert!(parse_memory_size("0").is_err());
+        assert!(parse_memory_size("18446744073709551615B").is_err());
     }
 
     #[test]
@@ -474,6 +598,46 @@ mod tests {
         assert!(matches!(err, MemoryError::Insufficient { .. }));
         assert_eq!(budget.get("load"), Some(200));
         assert_eq!(budget.used_bytes(), before);
+    }
+
+    #[test]
+    fn test_commit_resize_transfers_overlap_reservation_atomically() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        budget.allocate("kv_cache", 200).unwrap();
+        budget.allocate("kv_cache:growth", 400).unwrap();
+        budget.commit_resize("kv_cache", "kv_cache:growth", 400).unwrap();
+        assert_eq!(budget.get("kv_cache"), Some(400));
+        assert!(budget.get("kv_cache:growth").is_none());
+        assert_eq!(budget.used_bytes(), 400);
+    }
+
+    #[test]
+    fn test_commit_resize_failure_preserves_both_charges() {
+        let mut budget = MemoryBudget::new(1000).unwrap();
+        budget.allocate("kv_cache", 200).unwrap();
+        budget.allocate("kv_cache:growth", 400).unwrap();
+        budget.allocate("other", 400).unwrap();
+        let before = budget.used_bytes();
+        let error = budget
+            .commit_resize("kv_cache", "kv_cache:growth", 700)
+            .unwrap_err();
+        assert!(matches!(error, MemoryError::Insufficient { .. }));
+        assert_eq!(budget.used_bytes(), before);
+        assert_eq!(budget.get("kv_cache"), Some(200));
+        assert_eq!(budget.get("kv_cache:growth"), Some(400));
+        assert_eq!(budget.get("other"), Some(400));
+    }
+
+    #[test]
+    fn test_release_reports_missing_or_underflow_without_saturation() {
+        let mut budget = MemoryBudget::new(100).unwrap();
+        assert!(matches!(
+            budget.release("missing"),
+            Err(MemoryError::NotFound { .. })
+        ));
+        budget.allocate("value", 40).unwrap();
+        assert_eq!(budget.release("value").unwrap(), 40);
+        assert_eq!(budget.used_bytes(), 0);
     }
 
     #[test]
