@@ -727,16 +727,12 @@ impl StreamingLlamaModel {
                     }
 
                     let temp_name = format!("tmp:layer_read:{}:{}", layer_idx, range_index);
-                    let range_capacity = usize::try_from(range.byte_length).map_err(|_| {
-                        format!("grouped read range {} is too large for this platform", range_index)
-                    })?;
                     budget.with_temp(&temp_name, range.byte_length, |budget| {
-                        // The temporary charge covers the physical Vec capacity,
-                        // not merely the bytes eventually decoded into tensors.
+                        // `read_coalesced_tensor_range_into` performs the checked
+                        // reservation while this temporary charge is live. A
+                        // fresh per-range buffer must remain distinguishable from
+                        // the one buffer intentionally reused across ranges.
                         let mut buffer = Vec::new();
-                        buffer.try_reserve_exact(range_capacity).map_err(|error| {
-                            format!("failed to reserve grouped read buffer: {error}")
-                        })?;
                         read_and_decode_grouped_range(
                             data_source,
                             layer_desc,
@@ -3201,17 +3197,19 @@ mod tests {
     fn test_layer_load_failure_cleans_budget() {
         let tmp = create_f16_bf16_model();
         let ds = ramforge_core::datasource::GgufDataSource::open(tmp.path()).unwrap();
-        // Under the corrected resident-size policy, the decoded 512-byte F16
-        // embedding exceeds this budget's 25% threshold and stays streamed;
-        // only the 32-byte output norm is resident. Layer loading progresses
-        // through the F16/BF16 projections, then fails when the next F32 load
-        // transient cannot fit. The partial layer must still roll back fully.
-        let mut budget = ramforge_core::memory::MemoryBudget::new(1024).unwrap();
+        // 3,200 B is above this fixture's 3,168 B persistent-plus-layer
+        // lower bound, so construction succeeds and the 512-byte decoded F16
+        // embedding is resident. Add a live 64-byte caller charge to leave
+        // insufficient headroom for the complete layer load; the partial layer
+        // must still roll back fully without disturbing that existing charge.
+        let mut budget = ramforge_core::memory::MemoryBudget::new(3_200).unwrap();
 
-        let model = StreamingLlamaModel::load(&ds, &mut budget).unwrap();
-        assert!(model.token_embd.is_streamed());
+        let mut model = StreamingLlamaModel::load(&ds, &mut budget).unwrap();
+        assert!(model.token_embd.is_resident());
+        assert_eq!(budget.used_bytes(), 544);
+        budget.allocate("test:headroom", 64).unwrap();
         let before = budget.used_bytes();
-        assert_eq!(before, 32);
+        assert_eq!(before, 608);
 
         let mut stats = crate::residency::ResidencyStats::new(model.total_weight_bytes);
         let err = model
@@ -3223,8 +3221,10 @@ mod tests {
             "expected budget error, got: {}",
             err
         );
-        // The failed load must leave no partial layer or cache charges behind.
+        // The failed load must leave no partial layer or cache charges behind
+        // and must preserve the unrelated live charge.
         assert_eq!(budget.used_bytes(), before);
+        assert_eq!(budget.get("test:headroom"), Some(64));
         assert!(!budget
             .allocations()
             .keys()
@@ -3232,6 +3232,10 @@ mod tests {
         let cache = model.layer_cache.lock().unwrap();
         assert_eq!(cache.entry_count(), 0);
         assert_eq!(cache.used_bytes(), 0);
+        drop(cache);
+        budget.release("test:headroom").unwrap();
+        model.release_persistent(&mut budget).unwrap();
+        assert_eq!(budget.used_bytes(), 0);
     }
 
     #[test]

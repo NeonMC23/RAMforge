@@ -168,7 +168,7 @@ impl BoundedCache {
         if self
             .used
             .checked_add(size)
-            .map_or(true, |used| used > self.capacity)
+            .is_none_or(|used| used > self.capacity)
         {
             return Err(CacheError::General(
                 "cache accounting cannot fit entry after eviction".to_string(),
@@ -274,7 +274,7 @@ impl BoundedCache {
         if self
             .used
             .checked_add(size)
-            .map_or(true, |used| used > self.capacity)
+            .is_none_or(|used| used > self.capacity)
         {
             return Err(CacheError::General(
                 "cache accounting cannot fit entry after eviction".to_string(),

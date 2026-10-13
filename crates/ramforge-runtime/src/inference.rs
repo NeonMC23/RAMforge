@@ -1432,10 +1432,19 @@ pub(crate) mod tests {
         let result = InferenceEngine::new(tmp.path().to_str().unwrap(), 0);
         assert!(result.is_err());
 
-        // A near-zero budget may construct the engine (persistents become
-        // streamed), but generate() must fail clearly at the first
-        // budget-checked allocation (KV cache).
-        let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), 64).unwrap();
+        // A budget below the fixture's largest-layer managed lower bound is
+        // rejected during construction rather than deferred to generate().
+        let lower_bound_error = InferenceEngine::new(tmp.path().to_str().unwrap(), 64)
+            .unwrap_err();
+        assert!(
+            lower_bound_error.contains("managed lower bound"),
+            "expected lower-bound rejection, got: {}",
+            lower_bound_error
+        );
+
+        // 3,200 B is just above this fixture's 3,168 B persistent-plus-layer
+        // lower bound, but still too small for a complete generation forward.
+        let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), 3_200).unwrap();
         let sampler = crate::sampling::Sampler::greedy();
         let err = engine.generate("hello", 2, &sampler).unwrap_err();
         assert!(
@@ -1511,14 +1520,11 @@ pub(crate) mod tests {
 
     #[test]
     fn test_failed_generate_releases_kv_charge() {
-        // Budget tuned to fail *inside* the first forward pass (after the
-        // KV charge exists): the failure must clean up the KV charge.
+        // The budget is above the fixture's 3,168 B managed lower bound, so
+        // construction succeeds, but the first generation forward still cannot
+        // fit after its KV/output/activation charges are live.
         let tmp = create_tiny_llama_gguf();
-
-        // n_embd=8: output_norm resident 32 B; KV initial 2 tokens*64 B=128;
-        // caller-owned logits + hidden charges total 96 B. Those startup
-        // charges fit, but the subsequent forward/layer working set does not.
-        let budget_bytes = 900;
+        let budget_bytes = 3_200;
         let mut engine = InferenceEngine::new(tmp.path().to_str().unwrap(), budget_bytes).unwrap();
         let used_before = engine.budget.used_bytes();
 
@@ -1545,10 +1551,11 @@ pub(crate) mod tests {
     fn test_engine_reusable_after_failed_generate() {
         let tmp = create_tiny_llama_gguf();
 
-        // Case A: failure inside generate (same tight budget as above) ->
-        // a second attempt must fail identically, NOT with a stale-charge
-        // "already exists" error, and the engine remains reusable.
-        let mut tight = InferenceEngine::new(tmp.path().to_str().unwrap(), 900).unwrap();
+        // Case A: the budget is above the model lower bound but too tight for
+        // generate after its live KV/output/activation charges. A second
+        // attempt must fail identically, NOT with a stale-charge "already
+        // exists" error, and the engine remains reusable.
+        let mut tight = InferenceEngine::new(tmp.path().to_str().unwrap(), 3_200).unwrap();
         let sampler = crate::sampling::Sampler::greedy();
         let err1 = tight.generate("hello", 5, &sampler).unwrap_err();
         let err2 = tight.generate("hello", 5, &sampler).unwrap_err();

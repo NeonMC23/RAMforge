@@ -31,7 +31,9 @@ pub struct IoProfile {
     pub logical_tensor_bytes: u64,
     pub coalesced_ranges: u64,
     pub coalesced_gap_bytes: u64,
+    /// Successful reads whose caller-provided capacity already covered the span.
     pub read_buffer_reuses: u64,
+    /// Successful reads whose destination capacity grew during reservation.
     pub read_buffer_growths: u64,
     pub elapsed: Duration,
 }
