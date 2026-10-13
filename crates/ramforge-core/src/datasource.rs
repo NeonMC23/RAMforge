@@ -628,11 +628,23 @@ impl GgufDataSource {
         element_count: u64,
     ) -> Result<Vec<f32>, DataSourceError> {
         let started = self.profile_start();
-        let result = self.read_f32_range_unprofiled(file_offset, element_count);
-        let bytes = result
-            .as_ref()
-            .and_then(|_| element_count.checked_mul(std::mem::size_of::<f32>() as u64))
-            .unwrap_or(0);
+        let profiled_result = self
+            .read_f32_range_unprofiled(file_offset, element_count)
+            .and_then(|values| {
+                element_count
+                    .checked_mul(std::mem::size_of::<f32>() as u64)
+                    .ok_or_else(|| {
+                        DataSourceError::InvalidRange(format!(
+                            "F32 read size overflows for {} elements",
+                            element_count
+                        ))
+                    })
+                    .map(|bytes| (values, bytes))
+            });
+        let (result, bytes) = match profiled_result {
+            Ok((values, bytes)) => (Ok(values), bytes),
+            Err(error) => (Err(error), 0),
+        };
         self.record_read(started, bytes, result.is_err());
         result
     }
