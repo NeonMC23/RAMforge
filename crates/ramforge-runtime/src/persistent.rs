@@ -264,7 +264,7 @@ pub fn row_bytes_for(desc: &TensorDescriptor, in_dim: usize) -> Result<usize, St
             ))
         }
     };
-    if in_dim % block_elements != 0 {
+    if !in_dim.is_multiple_of(block_elements) {
         return Err(format!(
             "row dimension {} is not divisible by block size {} for {}",
             in_dim,

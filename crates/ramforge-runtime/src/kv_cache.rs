@@ -40,6 +40,8 @@ struct KvLayout {
     total_bytes: usize,
 }
 
+type KvBuffers = (Vec<Vec<f32>>, Vec<Vec<f32>>, KvLayout);
+
 impl KvCache {
     /// Growth granularity: capacity grows in chunks of this many tokens to
     /// avoid paying a realloc per generated token, without allocating the
@@ -205,9 +207,9 @@ impl KvCache {
         let rounded = required
             .checked_add(chunk - 1)
             .ok_or_else(|| "KV cache chunk capacity overflow".to_string())?;
-        Ok((rounded / chunk)
+        (rounded / chunk)
             .checked_mul(chunk)
-            .ok_or_else(|| "KV cache chunk capacity overflow".to_string())?)
+            .ok_or_else(|| "KV cache chunk capacity overflow".to_string())
     }
 
     /// Smallest chunk-aligned capacity that can hold `required` tokens.
@@ -220,7 +222,7 @@ impl KvCache {
     fn allocate_grown_buffers(
         &self,
         new_capacity: usize,
-    ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, KvLayout), String> {
+    ) -> Result<KvBuffers, String> {
         if new_capacity <= self.max_seq_len {
             let elems_per_layer = self
                 .max_seq_len

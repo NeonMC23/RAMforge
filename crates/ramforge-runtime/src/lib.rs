@@ -117,11 +117,7 @@ impl Runtime {
                     "cache capacity arithmetic overflow",
                 )
             })?;
-        let cache_headroom = if ram_budget_bytes >= 1024 * 1024 {
-            ram_budget_bytes - 1024 * 1024
-        } else {
-            0
-        };
+        let cache_headroom = ram_budget_bytes.saturating_sub(1024 * 1024);
         let cache_capacity = cache_capacity_80
             .max(1024 * 1024)
             .min(cache_headroom);

@@ -45,6 +45,7 @@ pub fn attention(
 /// Fallible adapter for managed execution. The compatibility `attention`
 /// function above keeps its historical infallible return type, while the
 /// runtime path can report allocation or shape failures through its `Result`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_checked(
     q: &[f32],
     k_hist: &[f32],

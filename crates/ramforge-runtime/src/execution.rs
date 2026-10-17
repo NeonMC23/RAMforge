@@ -403,9 +403,9 @@ impl ExecutionConfig {
         Ok(())
     }
 
-    pub fn resolve<'a>(
+    pub fn resolve(
         &self,
-        registry: &'a DeviceRegistry,
+        registry: &DeviceRegistry,
     ) -> Result<SelectedDevice, ExecutionConfigError> {
         self.validate()?;
         registry

@@ -105,11 +105,7 @@ pub fn plan_model(model: &GgufModel, ram_budget_bytes: u64) -> Result<PlanResult
     let cache_capacity = if ram_budget_bytes < 2 * 1024 * 1024 {
         ram_budget_bytes / 2
     } else {
-        let cache_headroom = if ram_budget_bytes >= 1024 * 1024 {
-            ram_budget_bytes - 1024 * 1024
-        } else {
-            0
-        };
+        let cache_headroom = ram_budget_bytes.saturating_sub(1024 * 1024);
         cache_capacity_80.max(1024 * 1024).min(cache_headroom)
     };
 
@@ -262,11 +258,7 @@ fn plan_execution_memory(
         "persistent plus largest layer lower bound",
     )?;
     let managed_lower_bound_bytes = persistent_startup_peak_bytes.max(layer_with_persistents);
-    let layer_cache_capacity_bytes = if ram_budget_bytes >= managed_lower_bound_bytes {
-        ram_budget_bytes - managed_lower_bound_bytes
-    } else {
-        0
-    };
+    let layer_cache_capacity_bytes = ram_budget_bytes.saturating_sub(managed_lower_bound_bytes);
     layer_resident_sizes.sort_unstable();
     let min_layer_resident_bytes = layer_resident_sizes.first().copied().unwrap_or(0);
     let max_complete_cached_layers =
