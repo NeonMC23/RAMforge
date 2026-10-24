@@ -12,7 +12,7 @@
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
-  `cargo test`: **423 passed, 0 failed, 2 ignored** (the real-model Qwen2.5
+  `cargo test`: **424 passed, 0 failed, 2 ignored** (the real-model Qwen2.5
   diagnostic and the quantized microbenchmark).
 - The ForgeCore adapter integration suite checks independent native context
   state across drops, owned logits surviving session drop, and model reuse
