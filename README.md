@@ -160,6 +160,13 @@ from 3.86 s to 3.07 s while cutting anonymous residency by about 5.5x. The
 pay for refaults; they are correctness and fit demonstrations, not throughput
 targets. All successful Qwen rows produced the same text.
 
+`/usr/bin/time -v` file-system input counts show the refault amplification:
+5,211,776 512-byte blocks at 1G (about 2.7 GB), 17,160,536 at 512M (about
+8.8 GB), and 18,262,968 at 256M (about 9.4 GB), against a 1.07 GB model file.
+The 20B run reported 50,728,408 blocks (about 26 GB) for a 13.1 GB file. These
+are kernel block counters, not model bytes, and confirm that the bounded runs
+trade I/O for resident memory.
+
 ### GPT-NeoX-20B under 8 GiB
 
 The 20B GGUF is 13,135,032,320 B on disk and 13,133,230,080 tensor bytes,

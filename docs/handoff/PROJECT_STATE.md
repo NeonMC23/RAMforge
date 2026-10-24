@@ -150,7 +150,11 @@ enforced 1G `--no-repack` 345.1 ms, 3.63 tok/s, 3.07 s, 1.006 GiB RSS;
 enforced 512M `--no-repack` 656 ms, 1.59 tok/s, 5.87 s; enforced 256M
 `--no-repack` 790 ms, 1.53 tok/s, 6.17 s. The enforced runs are cold-cache
 primed; warm and cold no-enforce runs were nearly identical on this SSD, so
-the slowdown is dominated by cgroup reclaim.
+the slowdown is dominated by cgroup reclaim. `/usr/bin/time -v` file-system
+inputs were 5,211,776 512-byte blocks at 1G, 17,160,536 at 512M, and
+18,262,968 at 256M against a 1.07 GB model file; the 20B run reported
+50,728,408 blocks for a 13.1 GB file. These counters show the refault I/O cost
+of bounded residency.
 
 GPT-NeoX-20B: 13,135,032,320 B file, 13,133,230,080 tensor bytes, SHA-256
 `1a35c13535c26bb925a2379d9f021de67a0390124ffe2051aa94412002652d6d`, run with
