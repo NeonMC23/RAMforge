@@ -12,7 +12,7 @@
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
-  `cargo test`: **408 passed, 0 failed, 2 ignored** (the real-model Qwen2.5
+  `cargo test`: **423 passed, 0 failed, 2 ignored** (the real-model Qwen2.5
   diagnostic and the quantized microbenchmark).
 - The ForgeCore adapter integration suite checks independent native context
   state across drops, owned logits surviving session drop, and model reuse
@@ -36,46 +36,72 @@
 
 ### Real-model smoke evidence (2026-10-24)
 
-`scripts/smoke-real-models.sh --no-build` ran each real model/backend pair in a
-separate process, sequentially, with a 4 GiB `MemAvailable` start threshold.
-Evidence was written to `/tmp/ramforge-real-model-smoke/20261024-184439`.
+`scripts/smoke-real-models.sh --no-build --matrix --include-7b --max-tokens 4
+--prompt Hello --timeout 900` ran each case in a separate process, sequentially,
+with a 4 GiB `MemAvailable` start threshold. Evidence was written to
+`/tmp/ramforge-real-model-smoke/20261024-193321`; TSV, JSON, per-case commands,
+stdout/stderr, hashes, and system-memory samples are retained there. The model
+paths were directories from the new layout, so the split-GGUF discovery and
+merged virtual data source were exercised by the ordinary CLI path.
 
-| Model | Backend | Exit | Wall | Max RSS | Managed peak | Native compute buffer |
-|---|---|---:|---:|---:|---:|---:|
-| SmolLM2-135M Q4_K_M | legacy | 0 | 15.54 s | 138,300 KiB | 104,007,876 B | n/a |
-| SmolLM2-135M Q4_K_M | ForgeCore CPU | 0 | 0.30 s | 367,176 KiB | not exposed | 98.25 MiB |
-| Qwen2.5-1.5B Q4_0 | legacy | 0 | 17.94 s | 1,150,900 KiB | 1,061,215,600 B | n/a |
-| Qwen2.5-1.5B Q4_0 | ForgeCore CPU | 0 | 1.87 s | 2,815,624 KiB | not exposed | 302.75 MiB |
+Exact budgets: `8G` = 8,589,934,592 B, `4G` = 4,294,967,296 B, `1G` =
+1,073,741,824 B, `100M` = 104,857,600 B.
 
-All runs generated 8 tokens and reported `Swaps: 0`. The legacy backend
-retained 30/30 SmolLM2 layers and 28/28 Qwen2.5 layers because the 4 GiB budget
-exceeded the managed footprint. ForgeCore's budget is diagnostic only and is
-not enforced. Its RSS includes loader, page-cache effects, Rust heap, and
-native allocations; it is not model residency.
+| Model / case | Budget | Exit | Wall | Max RSS | Managed peak | Evictions |
+|---|---:|---:|---:|---:|---:|---:|
+| SmolLM2-135M Q4_K_M legacy | 8G | 0 | 7.36 s | 138,732 KiB | 104,007,876 B | 0 |
+| SmolLM2-135M Q4_K_M legacy | 4G | 0 | 7.33 s | 138,596 KiB | 104,007,876 B | 0 |
+| SmolLM2-135M Q4_K_M legacy | 1G | 0 | 7.42 s | 138,496 KiB | 104,007,876 B | 0 |
+| SmolLM2-135M Q4_K_M legacy | 100M | 0 | 7.66 s | 116,752 KiB | 73,926,852 B | 0 |
+| Qwen2.5-1.5B Q4_0 legacy | 8G | 0 | 8.69 s | 1,151,564 KiB | 1,061,215,600 B | 0 |
+| Qwen2.5-1.5B Q4_0 legacy | 4G | 0 | 8.70 s | 1,151,644 KiB | 1,061,215,600 B | 0 |
+| Qwen2.5-1.5B Q4_0 legacy | 1G | 0 | 8.98 s | 1,127,204 KiB | 1,061,445,120 B | 85 |
+| Qwen2.5-1.5B Q4_0 legacy | 100M | 0 | 23.71 s | 169,240 KiB | 80,198,656 B | 110 |
+| Qwen2.5-7B Q4_K_M, two shards, legacy | 4G | 0 | 5:18.67 | 4,279,892 KiB | 4,285,007,616 B | 88 |
+| SmolLM2-135M Q4_K_M ForgeCore CPU | 4G | 0 | 0.25 s | 374,700 KiB | not exposed | n/a |
+| Qwen2.5-1.5B Q4_0 ForgeCore CPU | 4G | 0 | 1.23 s | 2,839,396 KiB | not exposed | n/a |
 
-The GPU stayed at 40 MiB used / 3731 MiB free before and after each run. The
-pinned native build is CPU-only and RAMforge has no GPU execution backend, so
-this is not GPU validation.
+All cases generated 4 tokens with greedy sampling. Legacy `/usr/bin/time`
+reported `Swaps: 0`; system-wide swap usage is sampled separately and is not
+attributed to the process. The 7B case used 112 layer loads, retained 24 layers
+at peak, and stayed 9,959,680 B below its 4 GiB budget. The GPU remained
+unused: the pinned native build is CPU-only, and RAMforge has no GPU execution
+backend.
 
-SmolLM2 output was coherent on both backends. The raw `Hello` prompt was not
-chat-templated, so the Qwen2.5 outputs are not quality evidence. Model inputs
-were hashed read-only before the runs; the recorded SHA-256 values were
-`2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d`
-(SmolLM2) and
-`dcd819ff094852c38faba6873d8ff0c9d51eadb2844539e52042ae5d647bbfdb`
-(Qwen2.5).
+A controlled failure at `--ram 100M` on Qwen2.5-7B exited 1 in 0.41 s with
+`managed lower bound 149127168 exceeds RAMforge budget 104857600` and
+94,464 KiB max RSS. It did not OOM, hang, or fall back. The 100M Qwen2.5-1.5B
+success above is not a claim that every model fits in 100M.
+
+Chat-template support was validated on the real Qwen2.5-1.5B GGUF. The model's
+own `tokenizer.chat_template` rendered a 177-byte ChatML prompt, tokenized the
+control markers as their model IDs, generated 2 tokens (then EOS), and output
+`4` for `What is 2+2? Answer briefly.` The run used 1G, took 1:07.21, peaked
+at 1,064,027,136 B managed memory, loaded 1008 layers, and evicted 981. The
+same model with a raw prompt did not produce answer-quality output. SmolLM2's
+ChatML template also parsed and rendered, though its small-model answer was not
+coherent. A chat-templated Qwen2.5-7B run at 4G was stopped by the 900 s harness
+timeout before its first token; that is a performance limit, not a quality
+result.
 
 Q5_0 block decoding is additionally checked against a vector produced by the
 pinned native `ggml` `dequantize_row_q5_0` implementation, not just by
 end-to-end text coherence.
 
-A budget-pressure run used `--ram 768M` on Qwen2.5 legacy, below its managed
-footprint. It exited 0, generated 8 tokens in 18.36 s, and reported peak
-managed 798,260,928 B (761.28 MiB) under the 805,306,368 B (768 MiB) budget,
-peak resident layer 26,341,376 B (25.12 MiB), 224 layer loads, 207 layer-cache
-evictions, max RSS 869,312 KiB, and `Swaps: 0`. This demonstrates
+The earlier budget-pressure run used `--ram 768M` on Qwen2.5 legacy, below its
+managed footprint. It exited 0, generated 8 tokens in 18.36 s, and reported
+peak managed 798,260,928 B (761.28 MiB) under the 805,306,368 B (768 MiB)
+budget, peak resident layer 26,341,376 B (25.12 MiB), 224 layer loads, 207
+layer-cache evictions, max RSS 869,312 KiB, and `Swaps: 0`. This demonstrates
 budget-constrained eviction. It does not demonstrate control of total RSS,
 which includes unmanaged loader, allocator, page-cache, and workspace memory.
+
+Read-only model hashes from the matrix inventory:
+
+- SmolLM2: `2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d`
+- Qwen2.5-1.5B: `dcd819ff094852c38faba6873d8ff0c9d51eadb2844539e52042ae5d647bbfdb`
+- Qwen2.5-7B shard 1: `dfce12e3862a5283ccfb88221b48480e58745165de856439950d0f22590580db`
+- Qwen2.5-7B shard 2: `539cf93f78e887edea1c04e2d7d8cdaca9d01dae9c9025bcb8accbe29df3d72a`
 
 **Current ForgeCore note:** static ForgeCore device discovery, explicit
 selection, and execution metadata are implemented. The verified ForgeCore
@@ -108,6 +134,8 @@ No model file, external llama.cpp checkout, or external reference output is pres
 The following is the repository's milestone history, cross-checked against the current source. These are implementation milestones, not a claim that every numerical path is production-correct for every architecture.
 
 - **GGUF inspection:** `parse_gguf_file` reads GGUF header, metadata, tensor descriptors, offsets, dimensions, and type information without loading tensor payloads. GGUF versions 1–3 are accepted by the parser.
+- **Split/model-directory support:** `discover_model_set` resolves a file, a standard `*-00001-of-0000N.gguf` shard set, or a single-model directory; validates split counts/indices/tensor counts, architecture and duplicate tensor names, then exposes a merged model view with virtual data offsets. `GgufDataSource` reads across shard handles without concatenating files on disk.
+- **Chat templates:** `ChatTemplate` parses GGUF `tokenizer.chat_template` with a conservative Jinja subset and renders one user message plus an optional system message. `--chat` is opt-in; unsupported constructs fail explicitly. Tokenizer encoding recognizes model control tokens such as role markers.
 - **Budgeted file-backed access:** `GgufDataSource` retains a synchronized file handle, performs bounded range reads, tracks logical versus physical I/O, can reuse the file cursor, and supports bounded coalesced reads.
 - **Memory and cache accounting:** `MemoryBudget` provides named allocation/resize/release accounting and scoped temporary reservations. `BoundedCache` and the runtime `LayerCache` enforce byte limits and release charges on eviction.
 - **CPU dense inference:** the runtime has a Llama/Qwen2-shaped transformer path with tokenizer, RMSNorm, RoPE, attention, GQA, SwiGLU, residuals, KV cache, output projection, sampling, and generation.

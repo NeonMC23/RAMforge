@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use ramforge_core::{
-    discover_model_set, parse_memory_size, GgufModel, GgufModelSet, Tokenizer,
+    discover_model_set, parse_memory_size, ChatMessage, ChatTemplate, GgufModel, GgufModelSet,
+    Tokenizer,
 };
 use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::{DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreModel};
@@ -71,6 +72,14 @@ enum Commands {
         #[arg(long)]
         prompt: String,
 
+        /// Apply the model's tokenizer.chat_template to a single user message
+        #[arg(long)]
+        chat: bool,
+
+        /// Optional system message used with --chat
+        #[arg(long, requires = "chat")]
+        system: Option<String>,
+
         /// Explicit inference backend; legacy remains the default comparison path
         #[arg(long, value_enum, default_value_t = InferenceBackend::Legacy)]
         backend: InferenceBackend,
@@ -134,6 +143,8 @@ fn main() {
             model,
             ram,
             prompt,
+            chat,
+            system,
             backend,
             device,
             max_tokens,
@@ -148,6 +159,8 @@ fn main() {
                 model,
                 ram,
                 prompt,
+                chat,
+                system,
                 backend,
                 device,
                 max_tokens,
@@ -197,11 +210,44 @@ fn run_plan(model_path: PathBuf, ram_str: String, json_output: bool) -> anyhow::
     Ok(())
 }
 
+fn prepare_prompt(
+    model: &GgufModel,
+    prompt: String,
+    chat: bool,
+    system: Option<String>,
+) -> anyhow::Result<String> {
+    if !chat {
+        if system.is_some() {
+            return Err(anyhow::anyhow!("--system requires --chat"));
+        }
+        return Ok(prompt);
+    }
+
+    let template = ChatTemplate::from_gguf(model)
+        .map_err(|error| anyhow::anyhow!("--chat requested but {error}"))?;
+    let mut messages = Vec::new();
+    if let Some(system) = system {
+        messages.push(ChatMessage::system(system));
+    }
+    messages.push(ChatMessage::user(prompt));
+    let rendered = template
+        .render(&messages, true)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if rendered.is_empty() {
+        return Err(anyhow::anyhow!(
+            "tokenizer.chat_template rendered an empty prompt"
+        ));
+    }
+    Ok(rendered)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_inference(
     model_path: PathBuf,
     ram_str: String,
     prompt: String,
+    chat: bool,
+    system: Option<String>,
     backend: InferenceBackend,
     device: String,
     max_tokens: usize,
@@ -224,6 +270,8 @@ fn run_inference(
             ram_str,
             ram_bytes,
             prompt,
+            chat,
+            system,
             device_selection.clone(),
             max_tokens,
             temperature,
@@ -246,7 +294,6 @@ fn run_inference(
     eprintln!("========================================================");
     eprintln!("Model: {}", model_path.display());
     eprintln!("RAM budget: {} ({} bytes)", ram_str, ram_bytes);
-    eprintln!("Prompt: {:?}", prompt);
     eprintln!("Max tokens: {}", max_tokens);
     eprintln!("Temperature: {}", temperature);
     if let Some(k) = top_k {
@@ -271,6 +318,13 @@ fn run_inference(
     .map_err(|e| anyhow::anyhow!(e))?;
     let model_load_elapsed = model_load_started.elapsed();
     engine.set_profiling(profile);
+    let raw_prompt = prompt;
+    let prompt = prepare_prompt(engine.data_source.model(), raw_prompt.clone(), chat, system)?;
+    eprintln!("Prompt: {:?}", raw_prompt);
+    if chat {
+        eprintln!("Chat template: applied (rendered {} bytes)", prompt.len());
+        eprintln!("Chat prompt: {:?}", prompt);
+    }
 
     let detected_architecture = engine
         .data_source
@@ -430,6 +484,8 @@ fn run_forgecore_inference(
     ram_str: String,
     ram_bytes: u64,
     prompt: String,
+    chat: bool,
+    system: Option<String>,
     device: DeviceSelection,
     max_tokens: usize,
     temperature: f32,
@@ -458,6 +514,8 @@ fn run_forgecore_inference(
     let metadata = model.metadata().clone();
 
     let gguf = model_set.merged_model();
+    let raw_prompt = prompt;
+    let prompt = prepare_prompt(&gguf, raw_prompt.clone(), chat, system)?;
     let tokenizer = Tokenizer::from_gguf(&gguf).map_err(|error| anyhow::anyhow!(error))?;
     let mut prompt_tokens = tokenizer.encode(&prompt, true);
     if prompt_tokens.is_empty() {
@@ -518,7 +576,11 @@ fn run_forgecore_inference(
         "RAM budget: {} ({} bytes; planning/diagnostics only for ForgeCore)",
         ram_str, ram_bytes
     );
-    eprintln!("Prompt: {:?}", prompt);
+    eprintln!("Prompt: {:?}", raw_prompt);
+    if chat {
+        eprintln!("Chat template: applied (rendered {} bytes)", prompt.len());
+        eprintln!("Chat prompt: {:?}", prompt);
+    }
     eprintln!("Prompt tokens: {}", prompt_tokens.len());
     eprintln!("Max tokens: {}", max_tokens);
     eprintln!("Temperature: {}", temperature);

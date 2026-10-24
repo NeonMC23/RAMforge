@@ -230,6 +230,19 @@ cargo run -p ramforge-cli -- support
 
 Accepted `--ram` syntax: `8G`, `8GiB`, `8192M`, `512MiB`, `1.5G`, `KB`/`KiB`/`MB`/`MiB`/`GB`/`GiB`.
 
+`MODEL` may be a single GGUF file, any shard of a standard split GGUF set, or a directory containing exactly one model. Standard `*-00001-of-0000N.gguf` shards are grouped and validated; multiple independent models in one directory are rejected instead of guessing. `inspect` reports shard count, per-shard sizes/tensor counts, total file bytes, and merged tensor types.
+
+Chat templates declared by the GGUF are opt-in:
+
+```bash
+cargo run -p ramforge-cli -- run models/qwen2.5-1.5b-instruct-q4_0 \
+  --ram 1G --prompt "What is 2+2? Answer briefly." --chat --max-tokens 16
+cargo run -p ramforge-cli -- run models/qwen2.5-1.5b-instruct-q4_0 \
+  --ram 1G --prompt "Explain streaming." --chat --system "Answer in one sentence."
+```
+
+Without `--chat`, the prompt is encoded as raw text, preserving the previous behavior.
+
 Diagnostics/profile data go to stderr; `Assistant:` text streams to stdout as tokens become decodable.
 
 **Out-of-core quantized example:**
@@ -253,8 +266,10 @@ crates/
     gguf.rs, model.rs, types.rs
     memory.rs – MemoryBudget, parse_memory_size
     cache.rs – BoundedCache LRU
-    datasource.rs – GgufDataSource, exact range reads, direct little-endian F32 reads into final storage
-    tokenizer.rs – Tokenizer from GGUF
+    datasource.rs – GgufDataSource, exact range reads, split-shard virtual offsets, direct little-endian F32 reads into final storage
+    model_set.rs – split-GGUF discovery, validation, merged model view
+    chat_template.rs – conservative GGUF chat-template parser/renderer
+    tokenizer.rs – Tokenizer from GGUF, control-token-aware encoding
     quant.rs – Q4_0, Q8_0, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K block layouts, dequant, quantized matvec (scalar, block-wise)
     tensor.rs – TensorData (F32/F16/BF16/Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K), direct F32 ownership, QuantizedTensor, resident_bytes, matvec, get_embedding
   ramforge-runtime/
@@ -307,33 +322,55 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current full workspace run passes **408 tests, 0 failed, 2 ignored** (the real-model Qwen2.5 diagnostic and the quantized microbenchmark) using the shared native fixture. Run `scripts/test.sh --workspace --locked` to reproduce it.
+The current full workspace run passes **423 tests, 0 failed, 2 ignored** (the real-model Qwen2.5 diagnostic and the quantized microbenchmark) using the shared native fixture. Run `scripts/test.sh --workspace --locked` to reproduce it.
 
 ## Real-model smoke validation
 
-`scripts/smoke-real-models.sh` runs the two real GGUF files sequentially, each in a separate process, and records the exact command, exit status, `/usr/bin/time -v` facts, model hashes, memory state, GPU state, and captured output. It refuses to start a run when `MemAvailable` is below 4 GiB by default. It never writes, converts, renames, or deletes a model file.
+`scripts/smoke-real-models.sh` accepts a single GGUF file, a split GGUF shard, or a model directory containing one model's shard set. Model files remain read-only. Each case runs in a separate process, waits for exit, checks that `MemAvailable` is above a configurable threshold (4 GiB by default), and records the exact command, exit status, `/usr/bin/time -v` facts, per-file model sizes/sha256 hashes, system memory and swap samples, GPU state, and captured output. Results are written as TSV and JSON outside the repository.
 
 ```sh
 cd RAMforge
-scripts/smoke-real-models.sh              # builds the CLI, then runs four cases
+scripts/smoke-real-models.sh              # four 4 GiB smoke cases
 scripts/smoke-real-models.sh --no-build   # reuse target/debug/ramforge
+scripts/smoke-real-models.sh --matrix --include-7b --timeout 900
 ```
 
-Evidence from the 2026-10-24 run (`/tmp/ramforge-real-model-smoke/20261024-184439`):
+The opt-in matrix uses exact byte budgets `8G` = 8,589,934,592 B, `4G` = 4,294,967,296 B, `1G` = 1,073,741,824 B, and `100M` = 104,857,600 B. It keeps prompt, generation length, sampling, and backend fixed within each comparison. A controlled budget rejection is recorded without failing the suite; timeouts and signals still fail. The latest evidence directory is `/tmp/ramforge-real-model-smoke/20261024-193321`.
 
-| Model | Backend | Exit | Wall | Max RSS | Managed peak | Native compute buffer |
-|---|---|---:|---:|---:|---:|---:|
-| SmolLM2-135M Q4_K_M | legacy | 0 | 15.54 s | 135.1 MiB | 99.19 MiB | n/a |
-| SmolLM2-135M Q4_K_M | ForgeCore CPU | 0 | 0.30 s | 358.6 MiB | not exposed | 98.25 MiB |
-| Qwen2.5-1.5B Q4_0 | legacy | 0 | 17.94 s | 1.10 GiB | 1012.05 MiB | n/a |
-| Qwen2.5-1.5B Q4_0 | ForgeCore CPU | 0 | 1.87 s | 2.68 GiB | not exposed | 302.75 MiB |
+| Model / case | Budget | Exit | Wall | Max RSS | Managed peak | Cache evictions |
+|---|---:|---:|---:|---:|---:|---:|
+| SmolLM2-135M Q4_K_M legacy | 8G | 0 | 7.36 s | 135.5 MiB | 99.19 MiB | 0 |
+| SmolLM2-135M Q4_K_M legacy | 4G | 0 | 7.33 s | 135.3 MiB | 99.19 MiB | 0 |
+| SmolLM2-135M Q4_K_M legacy | 1G | 0 | 7.42 s | 135.3 MiB | 99.19 MiB | 0 |
+| SmolLM2-135M Q4_K_M legacy | 100M | 0 | 7.66 s | 114.0 MiB | 70.50 MiB | 0 |
+| Qwen2.5-1.5B Q4_0 legacy | 8G | 0 | 8.69 s | 1124.6 MiB | 1012.05 MiB | 0 |
+| Qwen2.5-1.5B Q4_0 legacy | 4G | 0 | 8.70 s | 1124.7 MiB | 1012.05 MiB | 0 |
+| Qwen2.5-1.5B Q4_0 legacy | 1G | 0 | 8.98 s | 1100.8 MiB | 1012.30 MiB | 85 |
+| Qwen2.5-1.5B Q4_0 legacy | 100M | 0 | 23.71 s | 165.3 MiB | 76.48 MiB | 110 |
+| Qwen2.5-7B Q4_K_M, two shards, legacy | 4G | 0 | 5:18.67 | 4179.6 MiB | 4086.50 MiB | 88 |
+| SmolLM2-135M Q4_K_M ForgeCore CPU | 4G | 0 | 0.25 s | 365.9 MiB | not exposed | n/a |
+| Qwen2.5-1.5B Q4_0 ForgeCore CPU | 4G | 0 | 1.23 s | 2772.9 MiB | not exposed | n/a |
 
-- All four runs generated 8 tokens, exited 0, and reported `Swaps: 0`.
-- The legacy backend retained 30/30 SmolLM2 layers and 28/28 Qwen2.5 layers because the 4 GiB budget exceeded each model's managed footprint.
-- ForgeCore's requested 4 GiB budget is diagnostic only and is **not enforced**; its RSS includes the loader, page cache, Rust heap, and native allocations.
-- The GPU stayed at 40 MiB used / 3731 MiB free before and after every run. The pinned native build is CPU-only and RAMforge has no GPU execution backend, so this is not GPU validation.
-- SmolLM2 output was coherent on both backends. The raw `Hello` prompt was not chat-templated, so the Qwen2.5 snippets (`1. 2.` legacy, `, I'm trying...` ForgeCore) are not treated as quality evidence.
-- Model inputs were unchanged; recorded hashes were `2e8040ce…c68c2d` for SmolLM2 and `dcd819ff…7bbfdb` for Qwen2.5.
+- All cases generated 4 tokens with a fixed `Hello` prompt and greedy sampling. Legacy `Swaps` was `0` in every case; the suite also records system-wide swap samples, which can move for unrelated reasons and are not process swap attribution.
+- The 100M Qwen2.5 run demonstrates that a budget below the total model footprint can still stream successfully when one layer and the mandatory workspaces fit. It is not a claim that 100M fits every model.
+- A Qwen2.5-7B run at 100M fails before inference with `managed lower bound 149127168 exceeds RAMforge budget 104857600`, exit 1, in 0.41 s and 92.3 MiB max RSS. This is the intended controlled failure, not an OOM.
+- The 7B split model is discovered from its directory and all 339 tensors are read through the merged virtual data source. Its 4G run retains 24 layers at peak with 112 loads and 88 evictions. `Peak managed bytes` stays 9,959,680 B below the 4 GiB budget.
+- ForgeCore's requested budget remains diagnostic only and is **not enforced**; its RSS includes loader, page cache, Rust heap, and native allocations. The native build is CPU-only, so these runs are not GPU validation.
+- Model inputs are unchanged; per-shard SHA-256 values are recorded in `model-inventory.tsv` and each case's `model-files.tsv`.
+
+### Chat-template evidence
+
+`ramforge run --chat` reads `tokenizer.chat_template` from the GGUF and renders a single user message with an optional `--system` message. The interpreter is deliberately conservative: it supports the `if`/`elif`/`else`, `for`, `set`, member/index access, concatenation, comparisons, `and`/`or`/`not`, `is defined`, `tojson`, and whitespace-trimming constructs needed by the real templates tested here. Unsupported constructs fail explicitly; there is no silent model-specific fallback.
+
+```sh
+ramforge run models/qwen2.5-1.5b-instruct-q4_0 --ram 1G \
+  --prompt "What is 2+2? Answer briefly." --chat --max-tokens 16 \
+  --temperature 0 --verbose --memory-report
+```
+
+Result: exit 0, rendered 177-byte Qwen ChatML prompt, generated 2 tokens then EOS, output ` 4` (correct), 1:07.21 wall, max RSS 1,129,396 KiB, peak managed 1,064,027,136 B under 1 GiB, 1008 layer loads, 981 evictions. The same model with the raw non-chat prompt previously produced non-answer text; chat formatting is therefore quality evidence for this prompt. SmolLM2 also rendered its own ChatML template successfully, but its small-model output was not coherent.
+
+A Qwen2.5-7B `--chat` run at 4G/900 s was stopped by the harness before emitting a token; prompt processing of the 177-byte ChatML prompt is too slow in the current scalar quantized path. That timeout is a performance limitation, not quality evidence, and it is not counted as a successful 7B chat validation.
 
 ### Budget-pressure eviction evidence
 
@@ -357,7 +394,9 @@ unmanaged loader, allocator, page-cache, and workspace memory.
 - Current Q4_K_M CPU inference is functional but extremely slow in the measured NAS-backed Mistral run; profiling identifies both GGUF reads and scalar quantized matvec/dequantization as major costs. Performance optimization remains measurement-driven.
 - The layer cache is generation-local and strict LRU. If its complete-layer capacity is smaller than a sequential full-model working set, scan-pattern thrashing can produce few or no hits; planner capacity never guarantees hit rate.
 - Read coalescing is opportunistic and bounded. Large tensors/gaps, layouts exceeding the 64 MiB span cap, or insufficient grouped-buffer headroom retain one physical read per tensor; fewer reads do not guarantee lower NAS wall time until benchmarked.
-- Real-model execution and streaming are validated, but generated-text quality is not yet validated.
+- Real-model execution and streaming are validated. Qwen2.5-1.5B produced a correct chat-templated answer (`4`) for a simple arithmetic prompt; broad numerical-quality validation across prompts and models is still incomplete.
+- Chat templates are interpreted by a conservative Jinja subset, not a full Jinja2 engine. Unsupported filters/tests/constructs fail explicitly. `--chat` is opt-in and applies to one user message per invocation.
+- Qwen2.5-7B processed real split-shard inference at 4G, but its prompt processing is very slow; a chat-templated 7B run exceeded a 900 s harness timeout before emitting a token.
 - Quantized inference limited to Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K; Q4_1/Q5_1/Q8_1 and IQ* quants not supported
 - CPU-only: quantized matvec is scalar (block-wise dequant); F32 dot/matvec have runtime-detected AVX2 kernels and rayon row-parallelism; no GPU
 - Tokenizer: SentencePiece unigram (score-based Viterbi) and BPE (gpt2/qwen2 merges); other pre-tokenizers/model families untested

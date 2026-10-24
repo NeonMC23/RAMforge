@@ -25,6 +25,7 @@
 //! `MemoryBudget`. It does NOT include total process RSS or OS page cache.
 
 pub mod cache;
+pub mod chat_template;
 pub mod compute;
 pub mod datasource;
 pub mod error;
@@ -39,6 +40,7 @@ pub mod tokenizer;
 pub mod types;
 
 pub use cache::{BoundedCache, CacheStats};
+pub use chat_template::{ChatMessage, ChatTemplate, ChatTemplateError};
 pub use compute::{AttentionConfig, ComputeError, MatrixShape};
 pub use datasource::GgufDataSource;
 pub use error::{CacheError, DataSourceError, GgufError, MemoryError, ParseSizeError, Result};

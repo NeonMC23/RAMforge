@@ -78,6 +78,8 @@ pub struct Tokenizer {
     merges_rank: HashMap<(String, String), usize>,
     // For quick byte fallback
     byte_tokens: HashMap<u8, u32>,
+    // Added/control tokens such as <|im_start|>, sorted longest first.
+    special_tokens: Vec<(String, u32)>,
 }
 
 /// Stateful token decoder for incremental generation output.
@@ -365,6 +367,29 @@ impl Tokenizer {
                 }
             }
         }
+        // Added/control tokens are matched literally before normal BPE. This
+        // is required for chat templates whose role markers are model tokens,
+        // not text that the merge table can reconstruct.
+        let mut special_tokens: Vec<(String, u32)> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(index, token)| {
+                token.starts_with('<')
+                    && token.len() > 1
+                    && matches!(
+                        token_types.get(*index),
+                        Some(TokenType::Control | TokenType::UserDefined)
+                    )
+            })
+            .map(|(index, token)| (token.clone(), index as u32))
+            .collect();
+        special_tokens.sort_by(|left, right| {
+            right
+                .0
+                .len()
+                .cmp(&left.0.len())
+                .then_with(|| left.1.cmp(&right.1))
+        });
         // Also for gpt2, byte tokens are often represented as "Ġ" etc., but we also need to handle raw bytes
         // For gpt2, the first 256 tokens are often byte encodings
         // We'll also populate byte_tokens for any token that is a single byte and type Byte, or for <0x..> we already did
@@ -385,6 +410,7 @@ impl Tokenizer {
             token_to_id,
             merges_rank,
             byte_tokens,
+            special_tokens,
         })
     }
 
@@ -406,16 +432,7 @@ impl Tokenizer {
             }
         }
 
-        let mut encoded = if self.model == "gpt2"
-            || self.pre.as_deref() == Some("qwen2")
-            || self.merges.is_some()
-        {
-            self.encode_bpe(text)
-        } else {
-            // Default to SentencePiece unigram (llama)
-            self.encode_sentencepiece(text)
-        };
-
+        let mut encoded = self.encode_with_special_tokens(text);
         ids.append(&mut encoded);
 
         if self.add_eos {
@@ -425,6 +442,47 @@ impl Tokenizer {
         }
 
         ids
+    }
+
+    /// Encode text while preserving model-defined control/added tokens.
+    fn encode_with_special_tokens(&self, text: &str) -> Vec<u32> {
+        if self.special_tokens.is_empty() {
+            return self.encode_plain(text);
+        }
+
+        let mut ids = Vec::new();
+        let mut normal_start = 0;
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let remaining = &text[cursor..];
+            let matched = self
+                .special_tokens
+                .iter()
+                .find(|(token, _)| remaining.starts_with(token.as_str()));
+            if let Some((token, id)) = matched {
+                if normal_start < cursor {
+                    ids.extend(self.encode_plain(&text[normal_start..cursor]));
+                }
+                ids.push(*id);
+                cursor += token.len();
+                normal_start = cursor;
+            } else {
+                cursor += remaining.chars().next().map(char::len_utf8).unwrap_or(1);
+            }
+        }
+        if normal_start < text.len() {
+            ids.extend(self.encode_plain(&text[normal_start..]));
+        }
+        ids
+    }
+
+    fn encode_plain(&self, text: &str) -> Vec<u32> {
+        if self.model == "gpt2" || self.pre.as_deref() == Some("qwen2") || self.merges.is_some() {
+            self.encode_bpe(text)
+        } else {
+            // Default to SentencePiece unigram (llama)
+            self.encode_sentencepiece(text)
+        }
     }
 
     /// SentencePiece unigram encoding using Viterbi best path based on scores
@@ -845,6 +903,7 @@ mod tests {
             token_to_id,
             merges_rank: HashMap::new(),
             byte_tokens: HashMap::new(),
+            special_tokens: Vec::new(),
         }
     }
 
@@ -887,6 +946,7 @@ mod tests {
             token_to_id,
             merges_rank: HashMap::new(),
             byte_tokens: HashMap::new(),
+            special_tokens: Vec::new(),
         }
     }
 
@@ -917,6 +977,26 @@ mod tests {
         assert_eq!(decoder.push(4), "\n");
         assert_eq!(decoder.push(5), " world");
         assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn test_encode_preserves_control_tokens() {
+        let mut tokenizer = make_gpt2_byte_tokenizer();
+        tokenizer.tokens.push("<|im_start|>".to_string());
+        tokenizer.token_types.push(TokenType::Control);
+        tokenizer.token_to_id.insert("<|im_start|>".to_string(), 7);
+        tokenizer
+            .special_tokens
+            .push(("<|im_start|>".to_string(), 7));
+
+        assert_eq!(
+            tokenizer.encode("<|im_start|><|im_start|>", false),
+            vec![7, 7]
+        );
+        assert_eq!(
+            tokenizer.decode(&tokenizer.encode("<|im_start|>", false)),
+            "<|im_start|>"
+        );
     }
 
     #[test]
