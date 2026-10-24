@@ -69,6 +69,14 @@ Q5_0 block decoding is additionally checked against a vector produced by the
 pinned native `ggml` `dequantize_row_q5_0` implementation, not just by
 end-to-end text coherence.
 
+A budget-pressure run used `--ram 768M` on Qwen2.5 legacy, below its managed
+footprint. It exited 0, generated 8 tokens in 18.36 s, and reported peak
+managed 798,260,928 B (761.28 MiB) under the 805,306,368 B (768 MiB) budget,
+peak resident layer 26,341,376 B (25.12 MiB), 224 layer loads, 207 layer-cache
+evictions, max RSS 869,312 KiB, and `Swaps: 0`. This demonstrates
+budget-constrained eviction. It does not demonstrate control of total RSS,
+which includes unmanaged loader, allocator, page-cache, and workspace memory.
+
 **Current ForgeCore note:** static ForgeCore device discovery, explicit
 selection, and execution metadata are implemented. The verified ForgeCore
 `v3.1.2` Model/Context surface now includes public static model-load/offload

@@ -335,6 +335,23 @@ Evidence from the 2026-10-24 run (`/tmp/ramforge-real-model-smoke/20261024-18443
 - SmolLM2 output was coherent on both backends. The raw `Hello` prompt was not chat-templated, so the Qwen2.5 snippets (`1. 2.` legacy, `, I'm trying...` ForgeCore) are not treated as quality evidence.
 - Model inputs were unchanged; recorded hashes were `2e8040ce…c68c2d` for SmolLM2 and `dcd819ff…7bbfdb` for Qwen2.5.
 
+### Budget-pressure eviction evidence
+
+A separate Qwen2.5 legacy run used a budget below the model's managed footprint:
+
+```sh
+ramforge run models/qwen2.5-1.5b-instruct-q4_0.gguf \
+  --ram 768M --prompt Hello --backend legacy --max-tokens 8 \
+  --temperature 0 --memory-report --profile --verbose
+```
+
+Result: exit 0, 8 tokens, 18.36 s, max RSS 869,312 KiB, peak managed
+798,260,928 B (761.28 MiB) under a 805,306,368 B (768 MiB) budget, peak
+resident layer 26,341,376 B (25.12 MiB), 224 layer loads, 207 layer-cache
+evictions, and `Swaps: 0`. This demonstrates budget-constrained eviction, not
+control of total process RSS: RSS exceeded the budget because it includes
+unmanaged loader, allocator, page-cache, and workspace memory.
+
 ## Known Limitations
 
 - Current Q4_K_M CPU inference is functional but extremely slow in the measured NAS-backed Mistral run; profiling identifies both GGUF reads and scalar quantized matvec/dequantization as major costs. Performance optimization remains measurement-driven.
