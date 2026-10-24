@@ -664,13 +664,17 @@ fn run_forgecore_inference(
     }
 
     let load_elapsed = model_load_started.elapsed();
+    let prompt_started = Instant::now();
     let mut logits = session
         .decode_tokens(&prompt_tokens, 0)
         .map_err(|error| anyhow::anyhow!(error))?;
+    let prompt_elapsed = prompt_started.elapsed();
     let sampler = ramforge_runtime::sampling::Sampler::new(temperature, top_k, top_p);
     let eos_id = tokenizer.eos_id;
     let mut decoder = tokenizer.decoder();
     let mut generated_token_ids = Vec::new();
+    let mut first_token_elapsed = None;
+    let mut decode_started = None;
     let mut stop_reason = if max_tokens == 0 {
         "max_tokens"
     } else {
@@ -810,6 +814,10 @@ fn run_forgecore_inference(
             break;
         }
         generated_token_ids.push(next_token);
+        if first_token_elapsed.is_none() {
+            first_token_elapsed = Some(prompt_started.elapsed());
+            decode_started = Some(Instant::now());
+        }
         let piece = decoder.push(next_token);
         if !piece.is_empty() {
             write!(stdout, "{piece}")?;
@@ -860,9 +868,41 @@ fn run_forgecore_inference(
             "RAMforge retained: GGUF inspection, tokenizer, sampler, diagnostics, and planning/accounting infrastructure"
         );
     }
+    let decode_elapsed = decode_started.map(|started| started.elapsed());
+    let decode_tokens = generated_token_ids.len().saturating_sub(1);
+    let total_generation_elapsed = prompt_started.elapsed();
     if profile {
         eprintln!(
-            "Profile unavailable for ForgeCore backend: Phase 2 exposes no native I/O, kernel, residency, or RAMforge MemoryBudget counters"
+            "Profile (RAMforge-observed wall clock; native kernel/I/O counters unavailable):"
+        );
+        eprintln!(
+            "  Prompt processing: {} tokens in {} ({})",
+            prompt_tokens.len(),
+            format_duration(prompt_elapsed),
+            format_rate(prompt_tokens.len(), prompt_elapsed)
+        );
+        eprintln!(
+            "  Time to first token: {}",
+            first_token_elapsed
+                .map(format_duration)
+                .unwrap_or_else(|| "unavailable".to_string())
+        );
+        match (decode_elapsed, decode_tokens) {
+            (Some(elapsed), tokens) => eprintln!(
+                "  Decode: {} tokens in {} ({})",
+                tokens,
+                format_duration(elapsed),
+                format_rate(tokens, elapsed)
+            ),
+            (None, _) => eprintln!("  Decode: unavailable"),
+        }
+        eprintln!(
+            "  Total after context open: {}",
+            format_duration(total_generation_elapsed)
+        );
+        eprintln!(
+            "  Model load plus tokenization: {}",
+            format_duration(load_elapsed)
         );
     }
     if memory_report {
@@ -1287,6 +1327,13 @@ fn format_duration(duration: Duration) -> String {
     } else {
         format!("{:.3} ms", duration.as_secs_f64() * 1000.0)
     }
+}
+
+fn format_rate(tokens: usize, duration: Duration) -> String {
+    if tokens == 0 || duration.is_zero() {
+        return "n/a".to_string();
+    }
+    format!("{:.2} tok/s", tokens as f64 / duration.as_secs_f64())
 }
 
 fn format_bytes(bytes: u64) -> String {

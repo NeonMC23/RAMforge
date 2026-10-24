@@ -2,7 +2,7 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **GPT-NeoX/Pythia execution (2026-10-25):** `gptneox` GGUFs are now executable through the explicit `--backend forgecore` path, which delegates to the pinned llama.cpp/ggml implementation. The legacy RAMforge executor still rejects the architecture before reading weights, with an actionable error naming the required backend; it never falls back or approximates GPT-NeoX math. Real Pythia-70M Q8_0 runs match the native tokenization and greedy continuation, and an independent NumPy forward pass confirms the final-token logits (top-1 exact, cosine similarity 1.000000046). The 20B GPT-NeoX GGUF remains inspect/plan-only: it was not run because the machine has ~15.4 GiB RAM and the ForgeCore backend does not enforce the requested RAM budget.
+> **GPT-NeoX/Pythia execution and enforced budgets (2026-10-25):** `gptneox` GGUFs are executable through the explicit `--backend forgecore` path, which delegates to the pinned llama.cpp/ggml implementation. The legacy RAMforge executor still rejects the architecture before reading weights, with an actionable error naming the required backend; it never falls back or approximates GPT-NeoX math. Real Pythia-70M Q8_0 runs match the native tokenization and greedy continuation, and an independent NumPy forward pass confirms the final-token logits (top-1 exact, cosine similarity 1.000000046). The 20B GPT-NeoX GGUF (13.13 GB tensor bytes) now executes under an 8 GiB hard cgroup v2 cap with `--enforce-ram --no-repack`: 7.65 GiB of the model mapping resident at the end-of-run sample, 54,721 limit events, no OOM kill, and one greedy token ` Paris` in 16.94 s. This is out-of-core execution under a kernel-enforced cap, not a throughput or quality guarantee. See [Enforced host-memory budgets](#enforced-host-memory-budgets-cgroup-v2).
 >
 > **Usable Out-of-Core Inference:** `ramforge run` now streams decoded assistant text to stdout with UTF-8 byte-token accumulation. Optional `--profile` reports measured GGUF I/O, layer load/compute/release, quantized/F32 matvec, allocation, sampling, token latency, bytes read, and peak managed memory. `--memory-report` separates RAMforge-managed memory, process RSS, and system memory. `ramforge support` exposes the architecture/quantization registry; qwen35 remains inspectable/plannable but intentionally not executable.
 >
@@ -47,18 +47,157 @@ Use `ramforge run ... --backend forgecore` to select it. The default
 `--backend legacy` path remains available as the comparison/reference
 `InferenceEngine`; ForgeCore failures never fall back to it implicitly. The
 adapter is pinned to verified ForgeCore commit
-`d3203099a315db134193404e79ba2581d9fc53ab` (`v3.1.2`) and keeps direct
-`forge-sys` and llama.cpp/ggml FFI out of RAMforge.
+`8d67cb466dba1ee013efc13ee152391602752473` and keeps direct
+`forge-sys` and llama.cpp/ggml FFI out of RAMforge. That ForgeCore revision
+exposes `ModelOptions::use_extra_bufts`, which RAMforge uses to disable CPU
+weight repacking when requested.
 
-Phase 2 does not claim GPU, out-of-core execution, controlled residency,
-ForgeCore-native memory accounting, or migration of the legacy numerical
-modules. RAMforge GGUF inspection, planning, diagnostics, cache, residency,
-and accounting infrastructure remains retained; ForgeCore native model,
-context, KV, and backend allocations remain outside RAMforge accounting, while
-safe device facts are reported only where the adapter can observe them.
-Runtime linking follows ForgeCore's native runbook; arrange
-`LD_LIBRARY_PATH=$FORGE_LLAMA_DIR/build/bin` (or an equivalent final-binary
-rpath) for the CPU shared libraries.
+Phase 2 does not claim GPU, ForgeCore-native per-allocation accounting, or
+migration of the legacy numerical modules. RAMforge GGUF inspection, planning,
+diagnostics, cache, residency, and accounting infrastructure remains retained;
+ForgeCore native model, context, KV, and backend allocations remain outside
+RAMforge's `MemoryBudget`, while safe device facts are reported only where the
+adapter can observe them. The separate `--enforce-ram` supervisor described
+below provides an operating-system hard cap; it is not a claim that
+`MemoryBudget` controls native allocations. Runtime linking follows ForgeCore's
+native runbook; arrange `LD_LIBRARY_PATH=$FORGE_LLAMA_DIR/build/bin` (or an
+equivalent final-binary rpath) for the CPU shared libraries.
+
+## Enforced host-memory budgets (cgroup v2)
+
+`--ram` by itself remains a RAMforge-managed/planning value. Add
+`--enforce-ram` to turn the same byte value into a hard kernel cap for the
+supervised process group:
+
+```sh
+ramforge run MODEL.gguf --ram 512M --enforce-ram --ctx 256 --no-repack \
+  --prompt "The capital of France is" --max-tokens 8 --temperature 0 \
+  --backend forgecore --memory-report --profile
+```
+
+The supervisor creates an unprivileged child cgroup v2 below the caller's
+delegated user subtree, writes `memory.max=<bytes>` and `memory.swap.max=0`,
+sets `memory.oom.group=1`, re-execs the same command, and reports
+`memory.peak`, `memory.events`, selected `memory.stat` counters, wall time, and
+the child exit status. The cap applies to **charged memory of that process
+group**: anonymous allocations, file-backed mapped pages charged to the group,
+and kernel memory. It does not cap memory outside the group, and it does not
+make RSS equal to the limit.
+
+Weight residency: llama.cpp maps the GGUF file (`load_mode=mmap`) and currently
+prefaults it with `MAP_POPULATE`. RAMforge does not copy the weights into its
+own buffers, and it does not implement per-layer eviction on the forgeCORE
+path. Under the cgroup cap, the kernel evicts clean file-backed weight pages and
+refaults them on demand. `--no-repack` disables upstream CPU weight-repacking
+buffers, which otherwise create a large anonymous copy of quantized weights.
+For Qwen2.5-1.5B Q4_0 this reduced anonymous residency from 858.60 MiB to
+155.74 MiB.
+
+Cold-cache priming: when enforcement is active, RAMforge calls
+`posix_fadvise(POSIX_FADV_DONTNEED)` for the model shards before load. This
+makes the measured run pay for the pages it faults and makes the cgroup
+accounting meaningful. It is a hint, not a guarantee; it cannot drop pages
+that are still mapped or files on tmpfs. Keep large test models on disk-backed
+storage.
+
+Flags:
+
+- `--enforce-ram`: hard cgroup v2 limit for the run.
+- `--enforce-timeout SECONDS`: wall-clock cap (default 900). On timeout the
+  supervisor writes `cgroup.kill`, reaps the child, and exits 124.
+- `--ctx TOKENS`: ForgeCore context override. The legacy executor rejects it.
+  Context size controls the KV cache and is essential for small budgets.
+- `--no-repack`: disable llama.cpp CPU weight repacking.
+
+### Enforced budget matrix
+
+Prompt `The capital of France is`, 1 greedy token, `--ctx 256`,
+`--no-repack`, `--backend forgecore`, `--enforce-ram`, cold-cache primed.
+Exact bytes: `8G` = 8,589,934,592; `4G` = 4,294,967,296; `1G` =
+1,073,741,824; `100M` = 104,857,600.
+
+| Model | Budget | Exact bytes | Exit | Peak charged | `max` events | OOM kills | Model mapping resident | Output |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| Qwen2.5-1.5B Q4_0 | 8G | 8,589,934,592 | 0 | 1,243,525,120 | 0 | 0 | 1,011.16 MiB (100%) | ` Paris` |
+| Qwen2.5-1.5B Q4_0 | 4G | 4,294,967,296 | 0 | 1,244,364,800 | 0 | 0 | 1,011.16 MiB (100%) | ` Paris` |
+| Qwen2.5-1.5B Q4_0 | 1G | 1,073,741,824 | 0 | 1,073,741,824 | 1,457 | 0 | 857.93 MiB (84.8%) | ` Paris` |
+| Qwen2.5-1.5B Q4_0 | 100M | 104,857,600 | 137 | 104,857,600 | 7,814 | 2 | n/a (OOM) | none |
+| Pythia-70M Q8_0 | 8G | 8,589,934,592 | 0 | 137,224,192 | 0 | 0 | 71.48 MiB (100%) | ` the` |
+| Pythia-70M Q8_0 | 4G | 4,294,967,296 | 0 | 137,224,192 | 0 | 0 | 71.48 MiB (100%) | ` the` |
+| Pythia-70M Q8_0 | 1G | 1,073,741,824 | 0 | 137,224,192 | 0 | 0 | 71.48 MiB (100%) | ` the` |
+| Pythia-70M Q8_0 | 100M | 104,857,600 | 0 | 104,857,600 | 373 | 0 | 33.24 MiB (46.5%) | ` the` |
+| GPT-NeoX-20B Q4_K_M | 8G | 8,589,934,592 | 0 | 8,589,934,592 | 54,721 | 0 | 7.65 GiB (62.5%) | ` Paris` |
+
+"Model mapping resident" is a point-in-time `/proc/self/smaps` sample taken
+after decode, not a peak. "Peak charged" is the cgroup's `memory.peak`.
+
+The Qwen 100M case is a controlled failure: its minimum anonymous working set
+(155.74 MiB plus kernel overhead) is larger than 100 MiB, so the kernel OOM-kills
+the process group. The supervisor reports exit 137, `oom_kill=2`, and
+`Result: cgroup OOM kill`; it does not report success. Pythia-70M at 100M is
+different: its smaller anonymous working set fits, and the kernel reclaims
+about half of its 71.48 MiB weight mapping while the run still completes.
+
+### Measured cost of bounded residency
+
+Qwen2.5-1.5B Q4_0, same prompt, 8 greedy tokens, `--ctx 256`, cold-cache primed.
+The unbounded row is a separate warm/no-cgroup reference run; the enforced rows
+are the meaningful comparison. Warm and cold no-enforce runs were nearly
+identical on this SSD (TTFT 230 ms, 11.8 tok/s), so the slowdown below is
+dominated by cgroup reclaim, not cache temperature.
+
+| Configuration | Budget | Peak charged | Model resident | TTFT | Decode | Wall | Max RSS |
+|---|---:|---:|---|---:|---:|---:|---:|
+| Unbounded, `--no-repack` | 1G requested (diagnostic) | n/a | 1,011.16 MiB (100%) | 230 ms | 11.84 tok/s | 1.50 s | 1.16 GiB |
+| Enforced, repack enabled | 1G | 1 GiB | 147.67 MiB (14.6%) | 430.9 ms | 3.43 tok/s | 3.86 s | 1.005 GiB |
+| Enforced, `--no-repack` | 1G | 1 GiB | 845.59 MiB (83.6%) | 345.1 ms | 3.63 tok/s | 3.07 s | 1.006 GiB |
+| Enforced, `--no-repack` | 512M | 512 MiB | 334.74 MiB (33.1%) | 656 ms | 1.59 tok/s | 5.87 s | 530 MB |
+| Enforced, `--no-repack` | 256M | 256 MiB | 84.36 MiB (8.3%) | 790 ms | 1.53 tok/s | 6.17 s | 270 MB |
+
+Disabling repacking at 1G reduced TTFT from 430.9 ms to 345.1 ms and wall time
+from 3.86 s to 3.07 s while cutting anonymous residency by about 5.5x. The
+512M and 256M runs keep only 33.1% and 8.3% of the weight mapping resident and
+pay for refaults; they are correctness and fit demonstrations, not throughput
+targets. All successful Qwen rows produced the same text.
+
+### GPT-NeoX-20B under 8 GiB
+
+The 20B GGUF is 13,135,032,320 B on disk and 13,133,230,080 tensor bytes. It
+was executed with:
+
+```sh
+ramforge run models/gpt-neox-20b.i1-Q4_K_M/gpt-neox-20b.i1-Q4_K_M.gguf \
+  --ram 8G --enforce-ram --enforce-timeout 300 --ctx 128 --no-repack \
+  --prompt "The capital of France is" --max-tokens 1 --temperature 0 \
+  --backend forgecore --memory-report --profile
+```
+
+Result: exit 0; actual context 256; 5 prompt tokens; output ` Paris`; wall
+16.94 s; model load plus tokenization 6.64 s; TTFT 10.03 s; model mapping
+12.23 GiB with 7.65 GiB resident (62.5%); cgroup peak exactly 8 GiB; anonymous
+319.08 MiB; file-backed 7.65 GiB; kernel 36.45 MiB; 54,721 `max` events; 190
+major page faults; cgroup swap peak 0; process max RSS 7.97 GiB. This is one
+greedy token from one run. It is evidence that a model larger than the cap can
+execute with bounded charged memory; it is not throughput, quality, or
+bit-exact numerical parity evidence. During the test the host's overall swap
+usage rose from about 3.5 GiB to 5.4 GiB (other processes under page-cache
+pressure); the supervised cgroup itself reported zero swap and no swap
+configuration was changed.
+
+### Enforcement limits
+
+- The cgroup caps charged memory, not all host page cache. Shared file pages
+  charged to another cgroup are outside this cap; mapping RSS/PSS is reported
+  separately.
+- The pinned loader prefaults the whole mapping at load. Large models therefore
+  pay a long load and reclaim/refault cost even when peak residency is bounded.
+- There is no RAMforge-managed per-layer eviction or staging queue on the
+  forgeCORE path. The kernel's demand paging is the residency mechanism.
+- `--enforce-ram` requires cgroup v2 memory delegation. If unavailable, the
+  command fails with an actionable error and does not silently fall back to
+  diagnostic-only mode. cgroup v1 is unsupported.
+- The 20B model was measured only at 8G. It was not run at 4G, 1G, or 100M.
+- GPU/VRAM execution remains out of scope.
 
 ## Architecture and quantization matrix
 
@@ -130,10 +269,11 @@ ramforge run /path/to/pythia-70m.Q8_0.gguf --ram 1G \
 
 Result: exit 0, **5 prompt tokens** `[510, 5347, 273, 6181, 310]`, output
 ` the capital of the French Empire.`, 8 tokens, 0.14 s wall, max RSS
-167,668 KiB, 1 GiB requested but **not enforced** by the forgeCORE backend,
-logical GGUF tensor bytes 74,948,608 B, `Swaps: 0`. The native llama.cpp probe
-encodes the same prompt as the same five ids and produces the same greedy
-prefix. A second greedy run produces identical ids.
+167,668 KiB, 1 GiB requested (this particular run did not use
+`--enforce-ram`; see the enforced matrix above), logical GGUF tensor bytes
+74,948,608 B, `Swaps: 0`. The native llama.cpp probe encodes the same prompt as
+the same five ids and produces the same greedy prefix. A second greedy run
+produces identical ids.
 
 The tokenizer fix that made this possible: when
 `tokenizer.ggml.add_bos_token` is absent, BPE/GPT-2 vocabularies now default to
@@ -156,11 +296,13 @@ parity. It covers one 70M fixture; it is not broad model-quality validation.
 
 The real 20B GPT-NeoX GGUF
 (`models/gpt-neox-20b.i1-Q4_K_M/...`, 13,135,032,320 B, 13,133,230,080 tensor
-bytes) is inspectable and plannable at 8G, 4G, 1G, and 100M. It was **not
-executed**: the pinned forgeCORE backend loads weights eagerly, does not enforce
-the requested RAM budget, and the host has 15.39 GiB total RAM with no safe
-out-of-core path for a 12.23 GiB payload. Running it would be an uncontrolled
-memory risk, not evidence.
+bytes) is inspectable and plannable at 8G, 4G, 1G, and 100M. It was executed
+under the 8 GiB cgroup cap described above: exit 0, 7.65 GiB of the 12.23 GiB
+mapping resident at the end-of-run sample, 54,721 limit events, no OOM kill,
+and one greedy token ` Paris` in 16.94 s. This supersedes the earlier inspect/plan-only status.
+It is one controlled run, not a claim of acceptable throughput or quality; the
+pinned loader still prefaults the whole file, and there is no per-layer staging
+on the forgeCORE path. The 4G, 1G, and 100M 20B cases were not run.
 
 ## Phase 4 static device selection
 
@@ -178,7 +320,7 @@ accepts:
 
 CPU is selectable and remains first-class. Native GPU/accelerator facts and
 safe free/total memory values are preserved when ForgeCore reports them.
-Verified ForgeCore `v3.1.2` exposes public static model-load/offload options,
+The pinned ForgeCore revision exposes public static model-load/offload options,
 but this RAMforge refresh intentionally does not enable non-CPU model
 execution, scheduling, or placement policy. Non-CPU selections therefore fail
 explicitly with no CPU fallback. Zero/unavailable VRAM and native allocation
@@ -431,7 +573,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **428 tests, 0 failed, 3 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, and the opt-in GPT-NeoX integration test; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **442 tests, 0 failed, 7 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and two CLI enforcement tests. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 
@@ -467,9 +609,9 @@ The latest opt-in matrix uses exact byte budgets `8G` = 8,589,934,592 B, `4G` = 
 | Pythia-70M-deduped Q8_0 (GPT-NeoX) | legacy | 1G | 1 | 0.01 s | 23.1 MiB | not exposed | n/a |
 
 - Every legacy comparison generated byte-identical stdout at all four budgets: SmolLM2 `da6b6d7d…`, Qwen2.5 `209447e5…`. The 100M Qwen run shows the budget pressure mechanism: 222 layer-cache evictions and a 76.70 MiB managed peak under 100.00 MiB. The 1G run used 197 evictions; the 4G/8G runs used none.
-- The GPT-NeoX forgecore runs generated byte-identical stdout (`c69c103d…`) at 8G, 4G, 1G, and 100M. That is expected because the forgeCORE backend accepts the value as a diagnostic and does **not** enforce it. It is budget-invariance, not out-of-core execution.
+- The earlier GPT-NeoX forgecore runs generated byte-identical stdout (`c69c103d…`) at 8G, 4G, 1G, and 100M **without** `--enforce-ram`. That was budget-invariance, not out-of-core execution. The new enforced matrix above uses `--enforce-ram` and shows real reclaim at 1G/512M/256M.
 - The GPT-NeoX legacy case is a controlled architecture rejection, classified as `unsupported-architecture` with exit 1 in 0.01 s. No weights were loaded, no OOM occurred, and no fallback happened.
-- The 20B `gptneox` GGUF (13,135,032,320 B file, 13,133,230,080 tensor bytes) was only inspected and planned at 8G/4G/1G/100M. It was not run; see the GPT-NeoX section for the memory-safety reasoning.
+- The 20B `gptneox` GGUF (13,135,032,320 B file, 13,133,230,080 tensor bytes) was executed at 8G under `--enforce-ram --no-repack`: exit 0, 7.65 GiB resident of a 12.23 GiB mapping, 54,721 limit events, no OOM kill, one token ` Paris` in 16.94 s. The 4G/1G/100M 20B cases were not run.
 - Previous evidence (not re-run in this matrix): Qwen2.5-7B Q4_K_M as a two-shard set through the legacy backend at 4G, exit 0, 5:18.67 wall, 4179.6 MiB max RSS, 4086.50 MiB managed peak, 24 cached layers, 88 evictions. That result exercises split discovery and cross-shard reads, not GPT-NeoX or forgeCORE streaming.
 - ForgeCore `Swaps` was 0 in every case. Its RSS includes the loader, page cache, Rust heap, and native allocations; it is not model residency. The native build is CPU-only, so none of these runs is GPU validation.
 - Model inputs are unchanged; per-file sizes and SHA-256 values are recorded in `model-inventory.tsv` and each case's `model-files.tsv`.
@@ -511,9 +653,9 @@ unmanaged loader, allocator, page-cache, and workspace memory.
 - The layer cache is generation-local and strict LRU. If its complete-layer capacity is smaller than a sequential full-model working set, scan-pattern thrashing can produce few or no hits; planner capacity never guarantees hit rate.
 - Read coalescing is opportunistic and bounded. Large tensors/gaps, layouts exceeding the 64 MiB span cap, or insufficient grouped-buffer headroom retain one physical read per tensor; fewer reads do not guarantee lower NAS wall time until benchmarked.
 - Real-model execution and streaming are validated. Qwen2.5-1.5B produced a correct chat-templated answer (`4`) for a simple arithmetic prompt; broad numerical-quality validation across prompts and models is still incomplete.
-- GPT-NeoX/Pythia is validated through forgeCORE on one 70M Q8_0 fixture (`mradermacher/pythia-70m-deduped`), including native/tokenizer parity and an independent NumPy logits check. It is not a broad GPT-NeoX quality claim, and the 20B GPT-NeoX GGUF was not executed.
-- The 20B GPT-NeoX model remains inspect/plan-only on this host: the pinned forgeCORE/libllama backend loads weights eagerly, does not enforce RAM budgets, and the 12.23 GiB tensor payload is unsafe to load in 15.39 GiB total RAM without an out-of-core design.
-- forgeCORE's `--ram` value is a diagnostic, not an enforced limit. Identical GPT-NeoX output at 100M and 8G is evidence of that non-enforcement, not of out-of-core execution.
+- GPT-NeoX/Pythia is validated through forgeCORE on one 70M Q8_0 fixture (`mradermacher/pythia-70m-deduped`), including native/tokenizer parity and an independent NumPy logits check. It is not a broad GPT-NeoX quality claim. The 20B GPT-NeoX GGUF executed once at 8G under the enforced cgroup cap (one greedy token); that is a fit/mechanism result, not broad quality evidence.
+- The 20B GPT-NeoX result still relies on OS demand paging, not RAMforge layer staging. The pinned loader prefaults the whole file, so load time and refault cost remain high, and the 20B model was not tested at 4G, 1G, or 100M.
+- `--ram` alone is a diagnostic/planning value. `--enforce-ram` adds a cgroup v2 `memory.max` hard cap; without it, identical GPT-NeoX output at 100M and 8G is evidence of non-enforcement, not out-of-core execution. The enforced matrix above shows the difference.
 - Chat templates are interpreted by a conservative Jinja subset, not a full Jinja2 engine. Unsupported filters/tests/constructs fail explicitly. `--chat` is opt-in and applies to one user message per invocation.
 - Qwen2.5-7B processed real split-shard inference at 4G, but its prompt processing is very slow; a chat-templated 7B run exceeded a 900 s harness timeout before emitting a token.
 - Legacy quantized inference is limited to Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K; Q4_1/Q5_1/Q8_1 and IQ* quants are not supported by the legacy executor. The forgeCORE backend delegates tensor decoding to llama.cpp.
