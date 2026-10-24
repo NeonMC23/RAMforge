@@ -186,10 +186,14 @@ A Mistral 7B Q4_K_M GGUF (about 4.37 GB of weights, represented as llama-compati
 
 ## Build & Test
 
+`scripts/test.sh` resolves `FORGE_LLAMA_DIR` (defaulting to the sibling
+`native/` tree) and supplies the process-local `LD_LIBRARY_PATH` needed by the
+shared llama.cpp/ggml libraries. It does not modify system configuration.
+
 ```bash
-cargo fmt --all -- --check
+cargo fmt --all -- --check          # known pre-existing diffs; see PROJECT_STATE.md
 cargo check --workspace
-cargo test --workspace
+scripts/test.sh --workspace --locked
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 

@@ -1,5 +1,11 @@
 # Validation and evidence
 
+> **Historical snapshot.** The results below predate the 2026-10-24 local
+> verification recorded in [PROJECT_STATE.md](PROJECT_STATE.md). They remain
+> useful evidence for the cited source state, but they are not the current test
+> count or command recipe. Use [`../../scripts/test.sh`](../../scripts/test.sh)
+> for the current repeatable invocation.
+
 **As-of date:** 2026-09-22 for the historical repository results below; Phase-4
 status is recorded in the final section dated 2026-10-02.  
 **Purpose:** distinguish commands that actually ran from source-only claims and unavailable real-model evidence.

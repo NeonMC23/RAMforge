@@ -850,15 +850,11 @@ mod tests {
         let tokenizer = Tokenizer::from_gguf(&model).unwrap();
         assert_eq!(tokenizer.model, "gpt2");
         assert!(tokenizer.merges.is_some());
-        // With merges h e -> he, he l -> hel, l o -> lo, hel lo -> hello, "hello" should encode to single token "hello" id 10
-        let ids = tokenizer.encode("hello", false);
-        // BPE should merge h+e->he, he+l->hel, l+o->lo, hel+lo->hello
-        // So should be [10]
-        assert!(
-            ids.contains(&10),
-            "BPE should produce hello token, got {:?}",
-            ids
-        );
+        // With merges h e -> he, he l -> hel, l o -> lo, hel lo -> hello,
+        // "hello" must encode to the single merged token id 10.
+        assert_eq!(tokenizer.encode("hello", false), vec![10]);
+        assert_eq!(tokenizer.encode("hel", false), vec![9]);
+        assert_eq!(tokenizer.decode(&[10]), "hello");
     }
 
     #[test]
@@ -899,9 +895,10 @@ mod tests {
         let tmp = make_gguf_with_bpe_tokenizer();
         let model = crate::gguf::parse_gguf_file(tmp.path()).unwrap();
         let tokenizer = Tokenizer::from_gguf(&model).unwrap();
-        // Encode unknown char that is not in vocab, should fallback to unk
-        let ids = tokenizer.encode("xyz", false);
-        assert!(!ids.is_empty());
+        // The fixture has no byte tokens for x/y/z, so each unknown byte
+        // falls back to the configured unknown token (id 0). This is
+        // intentionally a deterministic fallback, not a silent truncation.
+        assert_eq!(tokenizer.encode("xyz", false), vec![0, 0, 0]);
     }
 
     #[test]
