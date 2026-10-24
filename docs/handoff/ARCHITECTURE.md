@@ -202,15 +202,17 @@ The tokenizer has no chat-template application. It encodes the prompt text suppl
 - `inspect MODEL [--json]`;
 - `plan MODEL --ram SIZE [--json]`;
 - `support`;
-- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
+- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--ctx N] [--enforce-ram] [--enforce-timeout S] [--no-repack] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
 
 The static Phase-4 device boundary is in `crates/ramforge-runtime/src/execution.rs`.
 `DeviceRegistry::discover()` is a safe ForgeCore snapshot; CPU is selectable,
 while non-CPU entries are explicit discovery facts but currently rejected by
-the RAMforge adapter's deliberate CPU-only execution contract. Verified
-ForgeCore `v3.1.2` exposes public static model-load/offload options, but this
-refresh does not enable them. Selection is not residency proof and native
-allocation/VRAM values remain unknown unless ForgeCore reports them safely. See
+the RAMforge adapter's deliberate CPU-only execution contract. The pinned
+ForgeCore revision exposes public static model-load/offload options and CPU
+weight-repacking control, but this refresh does not enable non-CPU execution.
+The separate `--enforce-ram` supervisor adds a cgroup v2 hard cap. Selection is
+not residency proof and native allocation/VRAM values remain unknown unless
+ForgeCore reports them safely. See
 [PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md).
 
 `crates/ramforge-cli/src/tui/mod.rs` sequences interactive actions through `RuntimeOrchestrator`, calibration, plan creation/validation, runtime activation, generation, plan save/load, and run export. `tui/app.rs` is the state machine; `tui/render.rs` renders screens; `tui/terminal.rs` parses terminal commands; `tui/diagnostics.rs` defines the diagnostic/run-history schema and JSON export.
