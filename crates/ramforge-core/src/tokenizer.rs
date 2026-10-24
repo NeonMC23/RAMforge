@@ -34,6 +34,31 @@ impl TokenType {
     }
 }
 
+/// Inverse of GPT-2's `bytes_to_unicode` alphabet.
+///
+/// Printable bytes map to themselves; bytes 0..=32 map to U+0100..=U+0120,
+/// bytes 127..=160 map to U+0121..=U+0142, and byte 173 maps to U+0143.
+/// Returning `None` means the character is not part of the byte alphabet, so
+/// the caller can fall back to emitting the token text unchanged.
+fn gpt2_char_to_byte(c: char) -> Option<u8> {
+    let cp = c as u32;
+    match cp {
+        0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF => Some(cp as u8),
+        0x100..=0x120 => Some((cp - 0x100) as u8),
+        0x121..=0x142 => Some((127 + (cp - 0x121)) as u8),
+        0x143 => Some(0xAD),
+        _ => None,
+    }
+}
+
+fn gpt2_token_bytes(token: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(token.len());
+    for character in token.chars() {
+        bytes.push(gpt2_char_to_byte(character)?);
+    }
+    Some(bytes)
+}
+
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
     pub model: String,
@@ -149,6 +174,18 @@ impl<'a> TokenDecoder<'a> {
         {
             self.pending_bytes.push(token.as_bytes()[0]);
             return self.drain_bytes(false);
+        }
+
+        // GPT-2/Qwen BPE vocabularies use the byte-to-Unicode alphabet:
+        // printable bytes map to themselves, space to 'Ġ', newline to 'Ċ',
+        // and the remaining bytes to U+0100..U+0143. Decode the whole token
+        // through that inverse mapping so multi-byte UTF-8 is reconstructed
+        // correctly instead of leaking marker characters into generated text.
+        if self.tokenizer.uses_gpt2_byte_encoding() {
+            if let Some(bytes) = gpt2_token_bytes(&token) {
+                self.pending_bytes.extend_from_slice(&bytes);
+                return self.drain_bytes(false);
+            }
         }
 
         let mut output = self.drain_bytes(true);
@@ -353,6 +390,10 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.tokens.len()
+    }
+
+    fn uses_gpt2_byte_encoding(&self) -> bool {
+        self.model == "gpt2" || self.model == "qwen2"
     }
 
     /// Encode text into token IDs – dispatches based on tokenizer model
@@ -807,6 +848,48 @@ mod tests {
         }
     }
 
+    fn make_gpt2_byte_tokenizer() -> Tokenizer {
+        let tokens = vec![
+            "<unk>".to_string(),
+            "<s>".to_string(),
+            "</s>".to_string(),
+            "Ġhello".to_string(),
+            "Ċ".to_string(),
+            "Ġworld".to_string(),
+            "âĤ¬".to_string(),
+        ];
+        let token_to_id = tokens
+            .iter()
+            .enumerate()
+            .map(|(index, token)| (token.clone(), index as u32))
+            .collect();
+        Tokenizer {
+            model: "gpt2".to_string(),
+            pre: None,
+            scores: vec![0.0; tokens.len()],
+            token_types: vec![
+                TokenType::Unknown,
+                TokenType::Control,
+                TokenType::Control,
+                TokenType::Normal,
+                TokenType::Normal,
+                TokenType::Normal,
+                TokenType::Normal,
+            ],
+            tokens,
+            merges: None,
+            bos_id: Some(1),
+            eos_id: Some(2),
+            unk_id: Some(0),
+            pad_id: None,
+            add_bos: true,
+            add_eos: false,
+            token_to_id,
+            merges_rank: HashMap::new(),
+            byte_tokens: HashMap::new(),
+        }
+    }
+
     #[test]
     fn test_incremental_decoder_accumulates_utf8_and_matches_batch() {
         let tokenizer = make_byte_decoder_tokenizer();
@@ -820,6 +903,20 @@ mod tests {
         assert_eq!(decoder.push(1), "");
         assert_eq!(decoder.finish(), "");
         assert_eq!(tokenizer.decode(&ids), "€ hello");
+    }
+
+    #[test]
+    fn test_gpt2_byte_level_decoder_maps_spaces_newlines_and_utf8() {
+        let tokenizer = make_gpt2_byte_tokenizer();
+        assert_eq!(tokenizer.decode(&[3, 4, 5]), " hello\n world");
+        assert_eq!(tokenizer.decode(&[4, 4]), "\n\n");
+        assert_eq!(tokenizer.decode(&[6]), "€");
+
+        let mut decoder = tokenizer.decoder();
+        assert_eq!(decoder.push(3), " hello");
+        assert_eq!(decoder.push(4), "\n");
+        assert_eq!(decoder.push(5), " world");
+        assert_eq!(decoder.finish(), "");
     }
 
     #[test]
