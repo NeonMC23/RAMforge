@@ -41,7 +41,9 @@ impl LlamaConfig {
 
         // Execution capability is centralized. In particular qwen35 is a
         // hybrid attention/SSM architecture and must never be treated as qwen2.
-        crate::support::ensure_execution_supported(&arch)?;
+        // Tensor-format support is model-specific and is checked here before
+        // any payload is read.
+        crate::support::ensure_model_execution_supported(model)?;
 
         // Helper to get u64 from metadata with fallback trying arch-specific keys
         let get_u64_arch = |suffix: &str| -> Option<u64> {

@@ -360,17 +360,8 @@ impl ModelProfile {
     pub fn from_gguf(model: &GgufModel) -> Self {
         let info = model.info();
         let architecture = info.architecture.clone();
-        let execution_compatibility = architecture
-            .as_deref()
-            .and_then(architecture_capability)
-            .map(|capability| {
-                if capability.run == RunSupport::Supported {
-                    ModelExecutionCompatibility::Executable
-                } else {
-                    ModelExecutionCompatibility::InspectPlanOnly
-                }
-            })
-            .unwrap_or(ModelExecutionCompatibility::UnknownArchitecture);
+        let unsupported_tensor_formats =
+            crate::support::unsupported_inference_tensor_formats(model);
 
         let mut formats: BTreeMap<String, FormatAccumulator> = BTreeMap::new();
         let mut total_tensor_elements = Some(0u64);
@@ -405,6 +396,20 @@ impl ModelProfile {
                 runtime_supported: accumulated.runtime_supported,
             })
             .collect();
+
+        // A supported architecture is necessary but not sufficient: every
+        // tensor format must also be executable by the legacy runtime.
+        let execution_compatibility =
+            match architecture.as_deref().and_then(architecture_capability) {
+                Some(capability)
+                    if capability.run == RunSupport::Supported
+                        && unsupported_tensor_formats.is_empty() =>
+                {
+                    ModelExecutionCompatibility::Executable
+                }
+                Some(_) => ModelExecutionCompatibility::InspectPlanOnly,
+                None => ModelExecutionCompatibility::UnknownArchitecture,
+            };
 
         let mut has_coalescible_layer_reads = false;
         let mut has_reusable_grouped_read_candidate = false;
@@ -654,7 +659,8 @@ impl CapabilitySet {
             gpu_backend_usable: gpu_hardware_usable && gpu_strategy_available,
             model_execution_compatible: model.execution_compatibility
                 == ModelExecutionCompatibility::Executable
-                && execution.is_some(),
+                && execution.is_some()
+                && unsupported_tensor_formats.is_empty(),
             layer_cache_possible,
             read_coalescing_possible: execution.is_some()
                 && storage_usable
@@ -1840,6 +1846,49 @@ mod tests {
             profile.execution_compatibility,
             ModelExecutionCompatibility::InspectPlanOnly
         );
+    }
+
+    #[test]
+    fn test_unsupported_tensor_format_is_inspect_plan_only() {
+        let mut model = tiny_model("llama");
+        let tensor = model
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.ffn_gate.weight")
+            .unwrap();
+        tensor.ggml_type = GgmlType::Q5_0;
+        tensor.byte_length = Some(88);
+
+        let profile = ModelProfile::from_gguf(&model);
+        assert_eq!(
+            profile.execution_compatibility,
+            ModelExecutionCompatibility::InspectPlanOnly
+        );
+        assert!(profile
+            .tensor_formats
+            .iter()
+            .any(|format| format.format == "Q5_0" && !format.runtime_supported));
+
+        let static_plan = crate::plan::plan_model(&tiny_model("llama"), 10_000).unwrap();
+        let capabilities = CapabilitySet::derive(
+            &machine_profile(),
+            &profile,
+            &storage_profile(),
+            &static_plan,
+        );
+        assert!(!capabilities.model_execution_compatible);
+        assert_eq!(
+            capabilities.unsupported_tensor_formats,
+            vec!["Q5_0".to_string()]
+        );
+
+        let unsupported_plan = crate::plan::plan_model(&model, 10_000).unwrap();
+        assert!(unsupported_plan.execution_memory.is_none());
+        assert!(unsupported_plan
+            .execution_preflight_error
+            .as_deref()
+            .unwrap()
+            .contains("Q5_0"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! GGUF parsing/inspection is architecture-neutral. Execution support is
 //! deliberately narrower and must never be inferred from a similar name.
 
-use ramforge_core::types::GgmlType;
+use ramforge_core::{model::GgufModel, types::GgmlType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunSupport {
@@ -222,9 +222,126 @@ pub fn ggml_type_supported_for_inference(ggml_type: GgmlType) -> bool {
     )
 }
 
+/// Names of the tensor formats the legacy runtime can execute. This is the
+/// single source of truth used by both the registry and model-aware checks.
+pub fn supported_inference_format_names() -> Vec<&'static str> {
+    QUANTIZATIONS
+        .iter()
+        .filter(|capability| capability.inference)
+        .map(|capability| capability.name)
+        .collect()
+}
+
+/// Unique tensor formats in `model` that the legacy runtime cannot execute.
+/// Ordering follows the tensor order in the GGUF file for stable diagnostics.
+pub fn unsupported_inference_tensor_formats(model: &GgufModel) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    for tensor in &model.tensors {
+        if !ggml_type_supported_for_inference(tensor.ggml_type) {
+            let name = tensor.ggml_type.name();
+            if !unsupported.contains(&name) {
+                unsupported.push(name);
+            }
+        }
+    }
+    unsupported
+}
+
+/// Model-specific execution support. Architecture-level registry answers are
+/// not enough: a supported architecture can still contain a tensor format the
+/// legacy runtime cannot decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelExecutionSupport {
+    pub architecture: Option<String>,
+    pub architecture_run: RunSupport,
+    pub unsupported_tensor_formats: Vec<String>,
+}
+
+impl ModelExecutionSupport {
+    pub fn is_supported(&self) -> bool {
+        self.architecture_run == RunSupport::Supported && self.unsupported_tensor_formats.is_empty()
+    }
+
+    pub fn label(&self) -> &'static str {
+        if self.is_supported() {
+            "yes"
+        } else {
+            "no"
+        }
+    }
+}
+
+pub fn model_execution_support(model: &GgufModel) -> ModelExecutionSupport {
+    let architecture = model.info().architecture;
+    let architecture_run = architecture
+        .as_deref()
+        .and_then(architecture_capability)
+        .map(|capability| capability.run)
+        .unwrap_or(RunSupport::NotYet);
+    ModelExecutionSupport {
+        architecture,
+        architecture_run,
+        unsupported_tensor_formats: unsupported_inference_tensor_formats(model),
+    }
+}
+
+/// Preflight used by the legacy execution path. It fails before any tensor
+/// payload is read when the architecture or a tensor format is unsupported.
+pub fn ensure_model_execution_supported(model: &GgufModel) -> Result<(), String> {
+    let architecture = model
+        .info()
+        .architecture
+        .unwrap_or_else(|| "unknown".to_string());
+    ensure_execution_supported(&architecture)?;
+
+    let unsupported = unsupported_inference_tensor_formats(model);
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "unsupported tensor type(s) for legacy execution: {} (supported: {})",
+            unsupported.join(", "),
+            supported_inference_format_names().join(", ")
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use ramforge_core::{MetadataValue, TensorDescriptor};
+
     use super::*;
+
+    fn model_with_tensor_type(architecture: &str, ggml_type: GgmlType) -> GgufModel {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "general.architecture".to_string(),
+            MetadataValue::String(architecture.to_string()),
+        );
+        let byte_length = match ggml_type {
+            GgmlType::Q5_0 => Some(88),
+            _ => Some(128),
+        };
+        GgufModel {
+            path: PathBuf::from("/models/tiny.gguf"),
+            file_size: byte_length.unwrap_or(0),
+            version: 3,
+            metadata,
+            tensors: vec![TensorDescriptor {
+                name: "blk.0.ffn_gate.weight".to_string(),
+                dimensions: vec![8, 16],
+                ggml_type,
+                offset: 0,
+                file_offset: 0,
+                byte_length,
+                num_elements: 128,
+            }],
+            alignment: 32,
+            data_start_offset: 0,
+        }
+    }
 
     #[test]
     fn test_supported_execution_architectures() {
@@ -257,5 +374,36 @@ mod tests {
         assert!(ggml_type_supported_for_inference(GgmlType::Q4_K));
         assert!(ggml_type_supported_for_inference(GgmlType::F32));
         assert!(!ggml_type_supported_for_inference(GgmlType::Q4_1));
+        assert!(!ggml_type_supported_for_inference(GgmlType::Q5_0));
+    }
+
+    #[test]
+    fn test_supported_format_names_match_registry() {
+        let names = supported_inference_format_names();
+        assert!(names.contains(&"Q4_0"));
+        assert!(names.contains(&"Q5_K"));
+        assert!(!names.contains(&"Q5_0"));
+        assert!(!names.contains(&"other GGUF types"));
+    }
+
+    #[test]
+    fn test_model_specific_execution_rejects_unsupported_tensor_format() {
+        let model = model_with_tensor_type("llama", GgmlType::Q5_0);
+        let support = model_execution_support(&model);
+        assert!(!support.is_supported());
+        assert_eq!(support.architecture_run, RunSupport::Supported);
+        assert_eq!(support.unsupported_tensor_formats, vec!["Q5_0"]);
+        let error = ensure_model_execution_supported(&model).unwrap_err();
+        assert!(error.contains("Q5_0"));
+        assert!(error.contains("supported: F32"));
+    }
+
+    #[test]
+    fn test_supported_architecture_and_tensor_format_is_executable() {
+        let model = model_with_tensor_type("qwen2", GgmlType::Q4_0);
+        let support = model_execution_support(&model);
+        assert!(support.is_supported());
+        assert_eq!(support.label(), "yes");
+        assert!(ensure_model_execution_supported(&model).is_ok());
     }
 }

@@ -427,8 +427,8 @@ fn run_forgecore_inference(
     // device before parsing/loading so an unavailable request fails directly;
     // RAMforge does not implicitly switch devices or backends.
     let registry = DeviceRegistry::discover();
-    let execution = ExecutionConfig::new(device, 1, None, false)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let execution =
+        ExecutionConfig::new(device, 1, None, false).map_err(|error| anyhow::anyhow!(error))?;
     let model = ForgeCoreModel::load_for_execution(&model_path, execution, &registry)
         .map_err(|error| anyhow::anyhow!(error))?;
     let rss_after_load = process_rss();
@@ -670,6 +670,7 @@ fn output_support() {
     }
     println!();
     println!("Inspection/planning are generic GGUF operations and do not imply execution support.");
+    println!("Run=yes is architecture-level; tensor-format support is model-specific. Use `inspect` or `plan` for the final legacy-execution verdict.");
 }
 
 fn output_generation_profile(
@@ -1016,6 +1017,14 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
     } else {
         println!("  Architecture support: inspect=yes plan=yes run=not-yet");
     }
+    let model_support = ramforge_runtime::support::model_execution_support(model);
+    println!("  Model execution support: {}", model_support.label());
+    if !model_support.unsupported_tensor_formats.is_empty() {
+        println!(
+            "  Unsupported tensor formats for legacy execution: {}",
+            model_support.unsupported_tensor_formats.join(", ")
+        );
+    }
     if let Some(name) = &info.name {
         println!("  Name: {}", name);
     }
@@ -1176,13 +1185,17 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     );
     let architecture = info.architecture.as_deref().unwrap_or("unknown");
     println!("  Architecture: {}", architecture);
-    let run_support = ramforge_runtime::support::architecture_capability(architecture)
-        .map(|capability| capability.run.label())
-        .unwrap_or("not-yet");
+    let model_support = ramforge_runtime::support::model_execution_support(model);
     println!(
         "  Execution support: {} (inspection/planning remain available)",
-        run_support
+        model_support.label()
     );
+    if !model_support.unsupported_tensor_formats.is_empty() {
+        println!(
+            "  Unsupported tensor formats: {}",
+            model_support.unsupported_tensor_formats.join(", ")
+        );
+    }
     println!("  Tensor count: {}", plan.tensor_count);
     if let Some(total) = plan.total_tensor_bytes {
         println!(
@@ -1340,6 +1353,8 @@ fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {
         .collect();
 
     let summary = model.type_summary();
+    let model_support = ramforge_runtime::support::model_execution_support(model);
+    let execution_supported = model_support.is_supported();
 
     let output = json!({
         "path": model.path,
@@ -1363,6 +1378,8 @@ fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {
         "tokenizer_model": info.tokenizer_model,
         "vocab_size": info.vocab_size,
         "type_summary": summary,
+        "execution_supported": execution_supported,
+        "unsupported_tensor_formats": model_support.unsupported_tensor_formats,
         "total_tensor_bytes": model.total_tensor_bytes(),
         "tensors": tensors_json,
         "tensors_truncated": model.tensors.len() > max_tensors,
@@ -1415,6 +1432,8 @@ fn output_plan_json(
         })
     };
 
+    let model_support = ramforge_runtime::support::model_execution_support(model);
+    let execution_supported = model_support.is_supported();
     let output = json!({
         "model": {
             "path": model.path,
@@ -1422,6 +1441,8 @@ fn output_plan_json(
             "architecture": plan.architecture,
             "tensor_count": plan.tensor_count,
             "total_tensor_bytes": plan.total_tensor_bytes,
+            "execution_supported": execution_supported,
+            "unsupported_tensor_formats": model_support.unsupported_tensor_formats,
         },
         "ram_budget": {
             "requested_str": format!("{} bytes", plan.ram_requested),
