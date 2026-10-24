@@ -188,7 +188,10 @@ A Mistral 7B Q4_K_M GGUF (about 4.37 GB of weights, represented as llama-compati
 
 `scripts/test.sh` resolves `FORGE_LLAMA_DIR` (defaulting to the sibling
 `native/` tree) and supplies the process-local `LD_LIBRARY_PATH` needed by the
-shared llama.cpp/ggml libraries. It does not modify system configuration.
+shared llama.cpp/ggml libraries. When
+`$FORGE_LLAMA_DIR/models/tiny-llama.gguf` exists, it also exports
+`FORGE_TEST_MODEL` so the real-adapter tests run instead of skipping. It does
+not modify system configuration.
 
 ```bash
 cargo fmt --all -- --check          # known pre-existing diffs; see PROJECT_STATE.md

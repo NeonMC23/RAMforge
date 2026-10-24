@@ -12,6 +12,10 @@
 #   2. ../native relative to this repository (the current workspace layout).
 #   3. /var/tmp/forge-native (the forgeCORE default).
 #
+# If the standard forgeCORE fixture path exists and FORGE_TEST_MODEL is not
+# already set, export it so the real ForgeCore adapter tests run instead of
+# reporting SKIP. An explicit caller value always wins.
+#
 # Usage:
 #   scripts/test.sh [cargo test arguments...]
 #   FORGE_LLAMA_DIR=/path/to/native scripts/test.sh --workspace
@@ -34,6 +38,12 @@ if [ ! -d "$lib_dir" ]; then
     echo "RAMforge test: native library directory not found: $lib_dir" >&2
     echo "Set FORGE_LLAMA_DIR to a llama.cpp/ggml v0.5.0 tree built with shared libraries." >&2
     exit 1
+fi
+
+fixture="$FORGE_LLAMA_DIR/models/tiny-llama.gguf"
+if [ -z "${FORGE_TEST_MODEL:-}" ] && [ -f "$fixture" ]; then
+    FORGE_TEST_MODEL="$fixture"
+    export FORGE_TEST_MODEL
 fi
 
 LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

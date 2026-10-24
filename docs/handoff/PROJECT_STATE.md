@@ -10,12 +10,16 @@
   `d320309` (v3.1.2) with Rust/Cargo 1.98.1 and the workspace native tree at
   `/home/neon/Documents/CODE LOCAL/forge/native` (llama.cpp/ggml v0.5.0).
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
-  process-local `LD_LIBRARY_PATH`, then runs `cargo test`: **396 passed,
-  0 failed, 2 ignored** (the real-model Qwen2.5 diagnostic and the quantized
-  microbenchmark).
+  process-local `LD_LIBRARY_PATH`, auto-detects
+  `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
+  `cargo test`: **397 passed, 0 failed, 2 ignored** (the real-model Qwen2.5
+  diagnostic and the quantized microbenchmark).
 - The ForgeCore adapter integration suite checks independent native context
   state across drops, owned logits surviving session drop, and model reuse
   after context drops.
+- A fixture-backed memory test exercises logical GGUF bytes, native
+  `size_bytes()`, measured RSS, and explicit budget non-enforcement against the
+  real native model.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: **not clean**; the repository has pre-existing
   formatting differences in several files. They are not mass-reformatted here.

@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 
+use ramforge_core::parse_gguf_file;
+use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::{
     DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreAdapterError,
     ForgeCoreContextOptions, ForgeCoreModel, ForgeCoreModelMetadata,
@@ -197,6 +199,43 @@ fn forgecore_contexts_keep_independent_native_state_across_drops() {
             .n_vocab(),
         vocab
     );
+}
+
+#[test]
+fn forgecore_memory_report_uses_real_native_facts() {
+    let Some(path) = fixture() else {
+        return;
+    };
+    let rss_before_load = process_rss();
+    let model = ForgeCoreModel::load(&path).expect("fixture load");
+    let rss_after_load = process_rss();
+    let metadata = model.metadata().clone();
+    let gguf = parse_gguf_file(&path).expect("RAMforge GGUF parse");
+    let logical = gguf
+        .total_tensor_bytes()
+        .expect("fixture tensor sizes are known");
+    let report = ForgeCoreMemoryReport::new(
+        logical.saturating_sub(1),
+        Some(logical),
+        metadata.size_bytes,
+        rss_before_load,
+        rss_after_load,
+        process_rss(),
+        model.device(),
+    );
+
+    assert!(!report.enforces_budget());
+    assert_eq!(report.logical_model_bytes, Some(logical));
+    assert_eq!(report.native_model_bytes, metadata.size_bytes);
+    assert_eq!(report.logical_model_exceeds_budget(), Some(true));
+    assert!(logical > 0);
+
+    #[cfg(target_os = "linux")]
+    {
+        assert!(report.rss_before_load_bytes.is_some());
+        assert!(report.rss_after_load_bytes.is_some());
+        assert!(report.rss_delta_after_load_bytes().is_some());
+    }
 }
 
 #[test]
