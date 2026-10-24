@@ -307,7 +307,33 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The last executed baseline passed 158 tests with 0 failures and 0 ignored. The current source inventory is 179 tests after adding shared-accounting, execution-preflight, bounded layer-cache, bounded coalesced-read, cursor-reuse, and grouped-buffer-reuse regressions; rerun the full suite before commit.
+The current full workspace run passes **408 tests, 0 failed, 2 ignored** (the real-model Qwen2.5 diagnostic and the quantized microbenchmark) using the shared native fixture. Run `scripts/test.sh --workspace --locked` to reproduce it.
+
+## Real-model smoke validation
+
+`scripts/smoke-real-models.sh` runs the two real GGUF files sequentially, each in a separate process, and records the exact command, exit status, `/usr/bin/time -v` facts, model hashes, memory state, GPU state, and captured output. It refuses to start a run when `MemAvailable` is below 4 GiB by default. It never writes, converts, renames, or deletes a model file.
+
+```sh
+cd RAMforge
+scripts/smoke-real-models.sh              # builds the CLI, then runs four cases
+scripts/smoke-real-models.sh --no-build   # reuse target/debug/ramforge
+```
+
+Evidence from the 2026-10-24 run (`/tmp/ramforge-real-model-smoke/20261024-184439`):
+
+| Model | Backend | Exit | Wall | Max RSS | Managed peak | Native compute buffer |
+|---|---|---:|---:|---:|---:|---:|
+| SmolLM2-135M Q4_K_M | legacy | 0 | 15.54 s | 135.1 MiB | 99.19 MiB | n/a |
+| SmolLM2-135M Q4_K_M | ForgeCore CPU | 0 | 0.30 s | 358.6 MiB | not exposed | 98.25 MiB |
+| Qwen2.5-1.5B Q4_0 | legacy | 0 | 17.94 s | 1.10 GiB | 1012.05 MiB | n/a |
+| Qwen2.5-1.5B Q4_0 | ForgeCore CPU | 0 | 1.87 s | 2.68 GiB | not exposed | 302.75 MiB |
+
+- All four runs generated 8 tokens, exited 0, and reported `Swaps: 0`.
+- The legacy backend retained 30/30 SmolLM2 layers and 28/28 Qwen2.5 layers because the 4 GiB budget exceeded each model's managed footprint.
+- ForgeCore's requested 4 GiB budget is diagnostic only and is **not enforced**; its RSS includes the loader, page cache, Rust heap, and native allocations.
+- The GPU stayed at 40 MiB used / 3731 MiB free before and after every run. The pinned native build is CPU-only and RAMforge has no GPU execution backend, so this is not GPU validation.
+- SmolLM2 output was coherent on both backends. The raw `Hello` prompt was not chat-templated, so the Qwen2.5 snippets (`1. 2.` legacy, `, I'm trying...` ForgeCore) are not treated as quality evidence.
+- Model inputs were unchanged; recorded hashes were `2e8040ce…c68c2d` for SmolLM2 and `dcd819ff…7bbfdb` for Qwen2.5.
 
 ## Known Limitations
 

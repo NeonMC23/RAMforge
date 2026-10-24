@@ -12,7 +12,7 @@
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
-  `cargo test`: **397 passed, 0 failed, 2 ignored** (the real-model Qwen2.5
+  `cargo test`: **408 passed, 0 failed, 2 ignored** (the real-model Qwen2.5
   diagnostic and the quantized microbenchmark).
 - The ForgeCore adapter integration suite checks independent native context
   state across drops, owned logits surviving session drop, and model reuse
@@ -33,6 +33,41 @@
   Revisit only when RAMforge needs a newer API.
 - See [../../scripts/test.sh](../../scripts/test.sh) for the reproducible test
   invocation.
+
+### Real-model smoke evidence (2026-10-24)
+
+`scripts/smoke-real-models.sh --no-build` ran each real model/backend pair in a
+separate process, sequentially, with a 4 GiB `MemAvailable` start threshold.
+Evidence was written to `/tmp/ramforge-real-model-smoke/20261024-184439`.
+
+| Model | Backend | Exit | Wall | Max RSS | Managed peak | Native compute buffer |
+|---|---|---:|---:|---:|---:|---:|
+| SmolLM2-135M Q4_K_M | legacy | 0 | 15.54 s | 138,300 KiB | 104,007,876 B | n/a |
+| SmolLM2-135M Q4_K_M | ForgeCore CPU | 0 | 0.30 s | 367,176 KiB | not exposed | 98.25 MiB |
+| Qwen2.5-1.5B Q4_0 | legacy | 0 | 17.94 s | 1,150,900 KiB | 1,061,215,600 B | n/a |
+| Qwen2.5-1.5B Q4_0 | ForgeCore CPU | 0 | 1.87 s | 2,815,624 KiB | not exposed | 302.75 MiB |
+
+All runs generated 8 tokens and reported `Swaps: 0`. The legacy backend
+retained 30/30 SmolLM2 layers and 28/28 Qwen2.5 layers because the 4 GiB budget
+exceeded the managed footprint. ForgeCore's budget is diagnostic only and is
+not enforced. Its RSS includes loader, page-cache effects, Rust heap, and
+native allocations; it is not model residency.
+
+The GPU stayed at 40 MiB used / 3731 MiB free before and after each run. The
+pinned native build is CPU-only and RAMforge has no GPU execution backend, so
+this is not GPU validation.
+
+SmolLM2 output was coherent on both backends. The raw `Hello` prompt was not
+chat-templated, so the Qwen2.5 outputs are not quality evidence. Model inputs
+were hashed read-only before the runs; the recorded SHA-256 values were
+`2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d`
+(SmolLM2) and
+`dcd819ff094852c38faba6873d8ff0c9d51eadb2844539e52042ae5d647bbfdb`
+(Qwen2.5).
+
+Q5_0 block decoding is additionally checked against a vector produced by the
+pinned native `ggml` `dequantize_row_q5_0` implementation, not just by
+end-to-end text coherence.
 
 **Current ForgeCore note:** static ForgeCore device discovery, explicit
 selection, and execution metadata are implemented. The verified ForgeCore
