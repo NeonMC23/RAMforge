@@ -152,7 +152,8 @@ enforced 512M `--no-repack` 656 ms, 1.59 tok/s, 5.87 s; enforced 256M
 primed; warm and cold no-enforce runs were nearly identical on this SSD, so
 the slowdown is dominated by cgroup reclaim.
 
-GPT-NeoX-20B: 13,135,032,320 B file, 13,133,230,080 tensor bytes, run with
+GPT-NeoX-20B: 13,135,032,320 B file, 13,133,230,080 tensor bytes, SHA-256
+`1a35c13535c26bb925a2379d9f021de67a0390124ffe2051aa94412002652d6d`, run with
 `--ram 8G --enforce-ram --enforce-timeout 300 --ctx 128 --no-repack`, 1 token.
 Actual context 256; 5 prompt tokens; output ` Paris`; wall 16.94 s; load plus
 tokenization 6.64 s; TTFT 10.03 s; mapping 12.23 GiB with 7.65 GiB resident at

@@ -162,7 +162,8 @@ targets. All successful Qwen rows produced the same text.
 
 ### GPT-NeoX-20B under 8 GiB
 
-The 20B GGUF is 13,135,032,320 B on disk and 13,133,230,080 tensor bytes. It
+The 20B GGUF is 13,135,032,320 B on disk and 13,133,230,080 tensor bytes,
+SHA-256 `1a35c13535c26bb925a2379d9f021de67a0390124ffe2051aa94412002652d6d`. It
 was executed with:
 
 ```sh
