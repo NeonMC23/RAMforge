@@ -1,5 +1,5 @@
 //! Tensor representation – supports F32/F16/BF16 and quantized
-//! Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K.
+//! Q4_0/Q5_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K.
 //!
 //! Quantized tensors remain quantized while resident; dequantization happens
 //! block-wise inside the matvec kernels (working set bounded to one block).
@@ -42,6 +42,7 @@ impl QuantizedTensor {
     ) -> Result<Self, DataSourceError> {
         let (block_elements, block_bytes) = match ggml_type {
             GgmlType::Q4_0 => (quant::QK4_0, quant::BLOCK_SIZE_Q4_0),
+            GgmlType::Q5_0 => (quant::QK5_0, quant::BLOCK_SIZE_Q5_0),
             GgmlType::Q8_0 => (quant::QK8_0, quant::BLOCK_SIZE_Q8_0),
             GgmlType::Q4_K => (quant::QK_K, quant::BLOCK_SIZE_Q4_K),
             GgmlType::Q5_K => (quant::QK_K, quant::BLOCK_SIZE_Q5_K),
@@ -121,6 +122,9 @@ impl QuantizedTensor {
             GgmlType::Q4_0 => {
                 quant::dequantize_row_q4_0(&self.raw_data, self.num_elements, &mut out)?
             }
+            GgmlType::Q5_0 => {
+                quant::dequantize_row_q5_0(&self.raw_data, self.num_elements, &mut out)?
+            }
             GgmlType::Q8_0 => {
                 quant::dequantize_row_q8_0(&self.raw_data, self.num_elements, &mut out)?
             }
@@ -196,6 +200,7 @@ impl QuantizedTensor {
 
         let (qk, block_size) = match self.ggml_type {
             GgmlType::Q4_0 => (quant::QK4_0, quant::BLOCK_SIZE_Q4_0),
+            GgmlType::Q5_0 => (quant::QK5_0, quant::BLOCK_SIZE_Q5_0),
             GgmlType::Q8_0 => (quant::QK8_0, quant::BLOCK_SIZE_Q8_0),
             GgmlType::Q4_K => (quant::QK_K, quant::BLOCK_SIZE_Q4_K),
             GgmlType::Q5_K => (quant::QK_K, quant::BLOCK_SIZE_Q5_K),
@@ -249,6 +254,7 @@ impl QuantizedTensor {
 
         match self.ggml_type {
             GgmlType::Q4_0 => quant::dequantize_row_q4_0(row_slice, row_elements, &mut out)?,
+            GgmlType::Q5_0 => quant::dequantize_row_q5_0(row_slice, row_elements, &mut out)?,
             GgmlType::Q8_0 => quant::dequantize_row_q8_0(row_slice, row_elements, &mut out)?,
             GgmlType::Q4_K => quant::dequantize_row_q4_k(row_slice, row_elements, &mut out)?,
             GgmlType::Q5_K => quant::dequantize_row_q5_k(row_slice, row_elements, &mut out)?,
@@ -326,6 +332,7 @@ pub enum TensorData {
     F16 { data: Vec<f32>, shape: Vec<usize> },
     BF16 { data: Vec<f32>, shape: Vec<usize> },
     Q4_0(QuantizedTensor),
+    Q5_0(QuantizedTensor),
     Q8_0(QuantizedTensor),
     Q4_K(QuantizedTensor),
     Q5_K(QuantizedTensor),
@@ -359,6 +366,7 @@ impl TensorData {
                     ))
                 }),
             GgmlType::Q4_0
+            | GgmlType::Q5_0
             | GgmlType::Q8_0
             | GgmlType::Q4_K
             | GgmlType::Q5_K
@@ -367,7 +375,7 @@ impl TensorData {
             | GgmlType::Q3_K
             | GgmlType::Q8_K => Ok(file_bytes),
             _ => Err(DataSourceError::General(format!(
-                "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K)",
+                "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K)",
                 ggml_type.name()
             ))),
         }
@@ -515,6 +523,10 @@ impl TensorData {
                 let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
                 Ok(Self::Q4_0(qt))
             }
+            GgmlType::Q5_0 => {
+                let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
+                Ok(Self::Q5_0(qt))
+            }
             GgmlType::Q8_0 => {
                 let qt = QuantizedTensor::new(ggml_type, shape_usize, element_count, raw_bytes)?;
                 Ok(Self::Q8_0(qt))
@@ -544,7 +556,7 @@ impl TensorData {
                 Ok(Self::Q8_K(qt))
             }
             _ => Err(DataSourceError::General(format!(
-                "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K)",
+                "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K)",
                 ggml_type.name()
             ))),
         }
@@ -559,6 +571,7 @@ impl TensorData {
             Self::F16 { data, .. } => std::mem::size_of_val(data.as_slice()),
             Self::BF16 { data, .. } => std::mem::size_of_val(data.as_slice()),
             Self::Q4_0(qt) => qt.resident_bytes(),
+            Self::Q5_0(qt) => qt.resident_bytes(),
             Self::Q8_0(qt) => qt.resident_bytes(),
             Self::Q4_K(qt) => qt.resident_bytes(),
             Self::Q5_K(qt) => qt.resident_bytes(),
@@ -575,6 +588,7 @@ impl TensorData {
             Self::F16 { data, .. } => data.len(),
             Self::BF16 { data, .. } => data.len(),
             Self::Q4_0(qt) => qt.num_elements,
+            Self::Q5_0(qt) => qt.num_elements,
             Self::Q8_0(qt) => qt.num_elements,
             Self::Q4_K(qt) => qt.num_elements,
             Self::Q5_K(qt) => qt.num_elements,
@@ -591,6 +605,7 @@ impl TensorData {
             Self::F16 { shape, .. } => shape,
             Self::BF16 { shape, .. } => shape,
             Self::Q4_0(qt) => &qt.shape,
+            Self::Q5_0(qt) => &qt.shape,
             Self::Q8_0(qt) => &qt.shape,
             Self::Q4_K(qt) => &qt.shape,
             Self::Q5_K(qt) => &qt.shape,
@@ -607,6 +622,7 @@ impl TensorData {
             Self::F16 { .. } => GgmlType::F16,
             Self::BF16 { .. } => GgmlType::BF16,
             Self::Q4_0(qt) => qt.ggml_type,
+            Self::Q5_0(qt) => qt.ggml_type,
             Self::Q8_0(qt) => qt.ggml_type,
             Self::Q4_K(qt) => qt.ggml_type,
             Self::Q5_K(qt) => qt.ggml_type,
@@ -634,6 +650,7 @@ impl TensorData {
         matches!(
             self,
             Self::Q4_0(_)
+                | Self::Q5_0(_)
                 | Self::Q8_0(_)
                 | Self::Q4_K(_)
                 | Self::Q5_K(_)
@@ -665,6 +682,7 @@ impl TensorData {
                     .map_err(|error| DataSourceError::General(error.to_string()))
             }
             Self::Q4_0(qt)
+            | Self::Q5_0(qt)
             | Self::Q8_0(qt)
             | Self::Q4_K(qt)
             | Self::Q5_K(qt)
@@ -730,6 +748,7 @@ impl TensorData {
                 }
             }
             Self::Q4_0(qt)
+            | Self::Q5_0(qt)
             | Self::Q8_0(qt)
             | Self::Q4_K(qt)
             | Self::Q5_K(qt)
@@ -746,6 +765,7 @@ impl TensorData {
             Self::F16 { data, .. } => clone_f32_buffer(data, "F16 tensor copy"),
             Self::BF16 { data, .. } => clone_f32_buffer(data, "BF16 tensor copy"),
             Self::Q4_0(qt)
+            | Self::Q5_0(qt)
             | Self::Q8_0(qt)
             | Self::Q4_K(qt)
             | Self::Q5_K(qt)
@@ -763,6 +783,7 @@ impl TensorData {
         match self {
             Self::F32 { data, .. } | Self::F16 { data, .. } | Self::BF16 { data, .. } => Ok(data),
             Self::Q4_0(qt)
+            | Self::Q5_0(qt)
             | Self::Q8_0(qt)
             | Self::Q4_K(qt)
             | Self::Q5_K(qt)
@@ -829,6 +850,7 @@ pub fn decode_row_to_f32(
             Ok(())
         }
         GgmlType::Q4_0 => quant::dequantize_row_q4_0(bytes, num_elements, out),
+        GgmlType::Q5_0 => quant::dequantize_row_q5_0(bytes, num_elements, out),
         GgmlType::Q8_0 => quant::dequantize_row_q8_0(bytes, num_elements, out),
         GgmlType::Q4_K => quant::dequantize_row_q4_k(bytes, num_elements, out),
         GgmlType::Q5_K => quant::dequantize_row_q5_k(bytes, num_elements, out),
@@ -868,6 +890,11 @@ pub fn decode_tensor_to_f32(
             quant::dequantize_row_q4_0(bytes, element_count, &mut out)?;
             Ok(out)
         }
+        GgmlType::Q5_0 => {
+            let mut out = zeroed_f32_buffer(element_count, "dequantized tensor")?;
+            quant::dequantize_row_q5_0(bytes, element_count, &mut out)?;
+            Ok(out)
+        }
         GgmlType::Q8_0 => {
             let mut out = zeroed_f32_buffer(element_count, "dequantized tensor")?;
             quant::dequantize_row_q8_0(bytes, element_count, &mut out)?;
@@ -904,7 +931,7 @@ pub fn decode_tensor_to_f32(
             Ok(out)
         }
         _ => Err(DataSourceError::General(format!(
-            "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K)",
+            "unsupported tensor type for inference: {} (supported: F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K)",
             ggml_type.name()
         ))),
     }
@@ -1065,6 +1092,21 @@ mod tests {
         assert!(td.is_quantized());
         assert_eq!(td.resident_bytes(), 18);
         // F32 equivalent would be 128 bytes, so quantized is smaller
+        assert!(td.resident_bytes() < 128);
+    }
+
+    #[test]
+    fn test_tensor_data_q5_0() {
+        // Q5_0: 32 elements, 22 bytes (2B scale + 4B high bits + 16B nibbles).
+        let d_fp16: u16 = 0x3C00;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&d_fp16.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&[0u8; 16]);
+        let td = TensorData::from_bytes(crate::types::GgmlType::Q5_0, vec![32], 32, raw).unwrap();
+        assert!(td.is_quantized());
+        assert_eq!(td.resident_bytes(), 22);
+        assert_eq!(td.to_f32_vec().unwrap()[0], -16.0);
         assert!(td.resident_bytes() < 128);
     }
 

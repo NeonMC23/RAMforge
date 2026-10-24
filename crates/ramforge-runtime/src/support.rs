@@ -127,6 +127,10 @@ pub const QUANTIZATIONS: &[QuantizationCapability] = &[
         inference: true,
     },
     QuantizationCapability {
+        name: "Q5_0",
+        inference: true,
+    },
+    QuantizationCapability {
         name: "Q8_0",
         inference: true,
     },
@@ -212,6 +216,7 @@ pub fn ggml_type_supported_for_inference(ggml_type: GgmlType) -> bool {
             | GgmlType::F16
             | GgmlType::BF16
             | GgmlType::Q4_0
+            | GgmlType::Q5_0
             | GgmlType::Q8_0
             | GgmlType::Q2_K
             | GgmlType::Q3_K
@@ -321,6 +326,7 @@ mod tests {
             MetadataValue::String(architecture.to_string()),
         );
         let byte_length = match ggml_type {
+            GgmlType::Q4_1 => Some(80),
             GgmlType::Q5_0 => Some(88),
             _ => Some(128),
         };
@@ -373,34 +379,35 @@ mod tests {
     fn test_quantization_registry_matches_runtime_types() {
         assert!(ggml_type_supported_for_inference(GgmlType::Q4_K));
         assert!(ggml_type_supported_for_inference(GgmlType::F32));
+        assert!(ggml_type_supported_for_inference(GgmlType::Q5_0));
         assert!(!ggml_type_supported_for_inference(GgmlType::Q4_1));
-        assert!(!ggml_type_supported_for_inference(GgmlType::Q5_0));
     }
 
     #[test]
     fn test_supported_format_names_match_registry() {
         let names = supported_inference_format_names();
         assert!(names.contains(&"Q4_0"));
+        assert!(names.contains(&"Q5_0"));
         assert!(names.contains(&"Q5_K"));
-        assert!(!names.contains(&"Q5_0"));
+        assert!(!names.contains(&"Q4_1"));
         assert!(!names.contains(&"other GGUF types"));
     }
 
     #[test]
     fn test_model_specific_execution_rejects_unsupported_tensor_format() {
-        let model = model_with_tensor_type("llama", GgmlType::Q5_0);
+        let model = model_with_tensor_type("llama", GgmlType::Q4_1);
         let support = model_execution_support(&model);
         assert!(!support.is_supported());
         assert_eq!(support.architecture_run, RunSupport::Supported);
-        assert_eq!(support.unsupported_tensor_formats, vec!["Q5_0"]);
+        assert_eq!(support.unsupported_tensor_formats, vec!["Q4_1"]);
         let error = ensure_model_execution_supported(&model).unwrap_err();
-        assert!(error.contains("Q5_0"));
+        assert!(error.contains("Q4_1"));
         assert!(error.contains("supported: F32"));
     }
 
     #[test]
     fn test_supported_architecture_and_tensor_format_is_executable() {
-        let model = model_with_tensor_type("qwen2", GgmlType::Q4_0);
+        let model = model_with_tensor_type("qwen2", GgmlType::Q5_0);
         let support = model_execution_support(&model);
         assert!(support.is_supported());
         assert_eq!(support.label(), "yes");

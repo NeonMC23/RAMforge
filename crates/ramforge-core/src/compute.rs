@@ -231,6 +231,7 @@ pub fn quantized_matvec_reference(
 pub fn quantized_row_bytes(ggml_type: GgmlType, input: usize) -> Result<usize, ComputeError> {
     let (qk, block_bytes) = match ggml_type {
         GgmlType::Q4_0 => (quant::QK4_0, quant::BLOCK_SIZE_Q4_0),
+        GgmlType::Q5_0 => (quant::QK5_0, quant::BLOCK_SIZE_Q5_0),
         GgmlType::Q8_0 => (quant::QK8_0, quant::BLOCK_SIZE_Q8_0),
         GgmlType::Q2_K => (quant::QK_K, quant::BLOCK_SIZE_Q2_K),
         GgmlType::Q3_K => (quant::QK_K, quant::BLOCK_SIZE_Q3_K),
@@ -266,6 +267,7 @@ fn decode_quantized_row(
 ) -> Result<(), ComputeError> {
     let result = match ggml_type {
         GgmlType::Q4_0 => quant::dequantize_row_q4_0(bytes, input, out),
+        GgmlType::Q5_0 => quant::dequantize_row_q5_0(bytes, input, out),
         GgmlType::Q8_0 => quant::dequantize_row_q8_0(bytes, input, out),
         GgmlType::Q2_K => quant::dequantize_row_q2_k(bytes, input, out),
         GgmlType::Q3_K => quant::dequantize_row_q3_k(bytes, input, out),

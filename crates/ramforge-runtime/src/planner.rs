@@ -1856,8 +1856,8 @@ mod tests {
             .iter_mut()
             .find(|tensor| tensor.name == "blk.0.ffn_gate.weight")
             .unwrap();
-        tensor.ggml_type = GgmlType::Q5_0;
-        tensor.byte_length = Some(88);
+        tensor.ggml_type = GgmlType::Q4_1;
+        tensor.byte_length = Some(80);
 
         let profile = ModelProfile::from_gguf(&model);
         assert_eq!(
@@ -1867,7 +1867,7 @@ mod tests {
         assert!(profile
             .tensor_formats
             .iter()
-            .any(|format| format.format == "Q5_0" && !format.runtime_supported));
+            .any(|format| format.format == "Q4_1" && !format.runtime_supported));
 
         let static_plan = crate::plan::plan_model(&tiny_model("llama"), 10_000).unwrap();
         let capabilities = CapabilitySet::derive(
@@ -1879,7 +1879,7 @@ mod tests {
         assert!(!capabilities.model_execution_compatible);
         assert_eq!(
             capabilities.unsupported_tensor_formats,
-            vec!["Q5_0".to_string()]
+            vec!["Q4_1".to_string()]
         );
 
         let unsupported_plan = crate::plan::plan_model(&model, 10_000).unwrap();
@@ -1888,7 +1888,7 @@ mod tests {
             .execution_preflight_error
             .as_deref()
             .unwrap()
-            .contains("Q5_0"));
+            .contains("Q4_1"));
     }
 
     #[test]

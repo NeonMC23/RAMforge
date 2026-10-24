@@ -11,7 +11,7 @@ use rayon::prelude::*;
 
 use ramforge_core::{
     quant::{
-        matvec_q2_k, matvec_q3_k, matvec_q4_0_row_range, matvec_q4_k, matvec_q5_k,
+        matvec_q2_k, matvec_q3_k, matvec_q4_0_row_range, matvec_q4_k, matvec_q5_0, matvec_q5_k,
         matvec_q6_k_row_range, matvec_q8_0, matvec_q8_k, BLOCK_SIZE_Q4_0, BLOCK_SIZE_Q6_K, QK4_0,
         QK_K,
     },
@@ -221,6 +221,7 @@ fn optimized_quantized_matvec(td: &TensorData, x: &[f32], y: &mut [f32]) -> Resu
         TensorData::Q2_K(tensor) => (GgmlType::Q2_K, &tensor.raw_data, &tensor.shape),
         TensorData::Q3_K(tensor) => (GgmlType::Q3_K, &tensor.raw_data, &tensor.shape),
         TensorData::Q4_K(tensor) => (GgmlType::Q4_K, &tensor.raw_data, &tensor.shape),
+        TensorData::Q5_0(tensor) => (GgmlType::Q5_0, &tensor.raw_data, &tensor.shape),
         TensorData::Q5_K(tensor) => (GgmlType::Q5_K, &tensor.raw_data, &tensor.shape),
         TensorData::Q8_0(tensor) => (GgmlType::Q8_0, &tensor.raw_data, &tensor.shape),
         TensorData::Q8_K(tensor) => (GgmlType::Q8_K, &tensor.raw_data, &tensor.shape),
@@ -243,6 +244,7 @@ fn optimized_quantized_matvec(td: &TensorData, x: &[f32], y: &mut [f32]) -> Resu
         GgmlType::Q2_K => matvec_q2_k(raw, &w_shape, x, y),
         GgmlType::Q3_K => matvec_q3_k(raw, &w_shape, x, y),
         GgmlType::Q4_K => matvec_q4_k(raw, &w_shape, x, y),
+        GgmlType::Q5_0 => matvec_q5_0(raw, &w_shape, x, y),
         GgmlType::Q5_K => matvec_q5_k(raw, &w_shape, x, y),
         GgmlType::Q8_0 => matvec_q8_0(raw, &w_shape, x, y),
         GgmlType::Q8_K => matvec_q8_k(raw, &w_shape, x, y),

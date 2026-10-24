@@ -1,8 +1,9 @@
-//! GGUF quantized tensor support – Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K
+//! GGUF quantized tensor support – Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, Q8_K
 //!
 //! Implements exact GGML/GGUF block layouts and dequantization semantics.
 //!
 //! Q4_0: 32 vals, 18B (2B half d + 16B nibbles, dequant d*(q-8))
+//! Q5_0: 32 vals, 22B (2B half d + 4B high bits + 16B nibbles, dequant d*(q-16))
 //! Q8_0: 32 vals, 34B (2B half d + 32B int8, dequant d*q)
 //! Q4_K: 256 vals, 144B (2B d, 2B dmin, 12B scales 6-bit, 128B 4-bit quants, dequant d*sc*q - dmin*m)
 //! Q5_K: 256 vals, 176B (2B d, 2B dmin, 12B scales, 32B qh high bit, 128B qs, dequant d*sc*(q+16*high) - dmin*m)
@@ -21,10 +22,12 @@
 use crate::error::DataSourceError;
 
 pub const QK4_0: usize = 32;
+pub const QK5_0: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK_K: usize = 256;
 
 pub const BLOCK_SIZE_Q4_0: usize = 18;
+pub const BLOCK_SIZE_Q5_0: usize = 22;
 pub const BLOCK_SIZE_Q8_0: usize = 34;
 pub const BLOCK_SIZE_Q4_K: usize = 144;
 pub const BLOCK_SIZE_Q2_K: usize = 84;
@@ -103,6 +106,44 @@ impl BlockQ4_0 {
             let byte = self.qs[j];
             let q0 = (byte & 0x0F) as i8 - 8;
             let q1 = (byte >> 4) as i8 - 8;
+            out[j] = q0 as f32 * self.d;
+            out[16 + j] = q1 as f32 * self.d;
+        }
+    }
+}
+
+// ---------- Q5_0 ----------
+#[derive(Debug, Clone)]
+pub struct BlockQ5_0 {
+    pub d: f32,
+    pub qh: [u8; 4],
+    pub qs: [u8; 16],
+}
+
+impl BlockQ5_0 {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DataSourceError> {
+        if bytes.len() < BLOCK_SIZE_Q5_0 {
+            return Err(DataSourceError::General(format!(
+                "Q5_0 block truncated: expected {} bytes, got {}",
+                BLOCK_SIZE_Q5_0,
+                bytes.len()
+            )));
+        }
+        let d = read_f16_le(&bytes[0..2])?;
+        let mut qh = [0u8; 4];
+        qh.copy_from_slice(&bytes[2..6]);
+        let mut qs = [0u8; 16];
+        qs.copy_from_slice(&bytes[6..22]);
+        Ok(Self { d, qh, qs })
+    }
+
+    pub fn dequantize(&self, out: &mut [f32; 32]) {
+        let qh = u32::from_le_bytes(self.qh);
+        for j in 0..16 {
+            let xh0 = (((qh >> j) << 4) & 0x10) as u8;
+            let xh1 = ((qh >> (j + 12)) & 0x10) as u8;
+            let q0 = ((self.qs[j] & 0x0F) | xh0) as i32 - 16;
+            let q1 = ((self.qs[j] >> 4) | xh1) as i32 - 16;
             out[j] = q0 as f32 * self.d;
             out[16 + j] = q1 as f32 * self.d;
         }
@@ -601,6 +642,34 @@ pub fn dequantize_row_q4_0(
     Ok(())
 }
 
+pub fn dequantize_row_q5_0(
+    bytes: &[u8],
+    n_elements: usize,
+    out: &mut [f32],
+) -> Result<(), DataSourceError> {
+    if n_elements % QK5_0 != 0 {
+        return Err(DataSourceError::General(format!(
+            "Q5_0 row size {} not divisible by block size {}",
+            n_elements, QK5_0
+        )));
+    }
+    let n_blocks = n_elements / QK5_0;
+    if bytes.len() < n_blocks * BLOCK_SIZE_Q5_0 {
+        return Err(DataSourceError::General(format!(
+            "Q5_0 row truncated: expected {} bytes, got {}",
+            n_blocks * BLOCK_SIZE_Q5_0,
+            bytes.len()
+        )));
+    }
+    for (i, chunk) in bytes.chunks(BLOCK_SIZE_Q5_0).enumerate().take(n_blocks) {
+        let block = BlockQ5_0::from_bytes(chunk)?;
+        let mut tmp = [0f32; QK5_0];
+        block.dequantize(&mut tmp);
+        out[i * QK5_0..(i + 1) * QK5_0].copy_from_slice(&tmp);
+    }
+    Ok(())
+}
+
 pub fn dequantize_row_q8_0(
     bytes: &[u8],
     n_elements: usize,
@@ -951,6 +1020,60 @@ pub fn matvec_q8_0(
             block.dequantize(&mut deq);
             let x_offset = block_idx * QK8_0;
             for j in 0..QK8_0 {
+                sum += deq[j] * x[x_offset + j];
+            }
+        }
+        y[i] = sum;
+    }
+    Ok(())
+}
+
+pub fn matvec_q5_0(
+    w_bytes: &[u8],
+    w_shape: &[usize],
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), DataSourceError> {
+    if w_shape.len() != 2 {
+        return Err(DataSourceError::General(
+            "Q5_0 matvec expects 2D weight".to_string(),
+        ));
+    }
+    let out_dim = w_shape[0];
+    let in_dim = w_shape[1];
+    if x.len() != in_dim || y.len() != out_dim {
+        return Err(DataSourceError::General(format!(
+            "matvec shape mismatch: W {:?}, x {}, y {}",
+            w_shape,
+            x.len(),
+            y.len()
+        )));
+    }
+    if in_dim % QK5_0 != 0 {
+        return Err(DataSourceError::General(format!(
+            "Q5_0 in_dim {} not divisible by {}",
+            in_dim, QK5_0
+        )));
+    }
+    let row_bytes = (in_dim / QK5_0) * BLOCK_SIZE_Q5_0;
+    if w_bytes.len() < out_dim * row_bytes {
+        return Err(DataSourceError::General(format!(
+            "Q5_0 weight truncated: expected {} bytes, got {}",
+            out_dim * row_bytes,
+            w_bytes.len()
+        )));
+    }
+
+    for i in 0..out_dim {
+        let row_start = i * row_bytes;
+        let row_slice = &w_bytes[row_start..row_start + row_bytes];
+        let mut sum = 0.0f32;
+        for (block_idx, block_bytes) in row_slice.chunks(BLOCK_SIZE_Q5_0).enumerate() {
+            let block = BlockQ5_0::from_bytes(block_bytes)?;
+            let mut deq = [0f32; QK5_0];
+            block.dequantize(&mut deq);
+            let x_offset = block_idx * QK5_0;
+            for j in 0..QK5_0 {
                 sum += deq[j] * x[x_offset + j];
             }
         }
@@ -1376,6 +1499,14 @@ mod tests {
         bytes
     }
 
+    fn q5_0_test_block(scale: u16, qh: u32, quants: [u8; 16]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(BLOCK_SIZE_Q5_0);
+        bytes.extend_from_slice(&scale.to_le_bytes());
+        bytes.extend_from_slice(&qh.to_le_bytes());
+        bytes.extend_from_slice(&quants);
+        bytes
+    }
+
     fn q8_0_test_block(scale: u16, quants: [i8; 32]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(BLOCK_SIZE_Q8_0);
         bytes.extend_from_slice(&scale.to_le_bytes());
@@ -1417,6 +1548,67 @@ mod tests {
     fn test_q4_0_block_size() {
         assert_eq!(QK4_0, 32);
         assert_eq!(BLOCK_SIZE_Q4_0, 18);
+    }
+
+    #[test]
+    fn test_q5_0_block_size() {
+        assert_eq!(QK5_0, 32);
+        assert_eq!(BLOCK_SIZE_Q5_0, 22);
+    }
+
+    #[test]
+    fn test_q5_0_decode_high_bits() {
+        let mut quants = [0u8; 16];
+        quants[1] = 0xFF;
+        let bytes = q5_0_test_block(0x3C00, 0x0003_0003, quants);
+        let block = BlockQ5_0::from_bytes(&bytes).unwrap();
+        let mut decoded = [0f32; QK5_0];
+        block.dequantize(&mut decoded);
+        assert_eq!(decoded[0], 0.0);
+        assert_eq!(decoded[1], 15.0);
+        assert_eq!(decoded[2], -16.0);
+        assert_eq!(decoded[16], 0.0);
+        assert_eq!(decoded[17], 15.0);
+        assert_eq!(decoded[18], -16.0);
+    }
+
+    #[test]
+    fn test_q5_0_decode_matches_native_reference_vector() {
+        // Vector generated with the pinned ggml `dequantize_row_q5_0`
+        // (libggml-base 0.25.1) for d=0.5, qh=0x9E3779B9, qs=i*7+3.
+        let quants = [
+            3, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 87, 94, 101, 108,
+        ];
+        let bytes = q5_0_test_block(0x3800, 0x9E37_79B9, quants);
+        let block = BlockQ5_0::from_bytes(&bytes).unwrap();
+        let mut decoded = [0f32; QK5_0];
+        block.dequantize(&mut decoded);
+        assert_eq!(
+            decoded,
+            [
+                1.5, -3.0, -7.5, 4.0, 7.5, 3.0, -1.5, 2.0, 5.5, -7.0, -3.5, 0.0, 3.5, 7.0, 2.5,
+                -2.0, 0.0, 0.0, 0.5, -7.5, 0.5, 1.0, -7.0, -6.5, -6.5, 2.0, 2.0, 2.5, 2.5, -5.5,
+                -5.0, 3.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_q5_0_row_decode_and_matvec() {
+        let row_one = q5_0_test_block(0x3C00, 0, [0u8; 16]);
+        let row_two = q5_0_test_block(0x3800, 0, [0u8; 16]);
+        let mut bytes = row_one.clone();
+        bytes.extend_from_slice(&row_two);
+
+        let mut decoded = [0f32; 64];
+        dequantize_row_q5_0(&bytes, 64, &mut decoded).unwrap();
+        assert_eq!(decoded[0], -16.0);
+        assert_eq!(decoded[32], -8.0);
+
+        let x = vec![1.0f32; 32];
+        let mut y = [0f32; 2];
+        matvec_q5_0(&bytes, &[2, 32], &x, &mut y).unwrap();
+        assert_eq!(y, [-512.0, -256.0]);
     }
 
     #[test]

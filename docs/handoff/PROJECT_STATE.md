@@ -108,6 +108,7 @@ The source-level inference registry marks these as supported:
 - `F16`
 - `BF16`
 - `Q4_0`
+- `Q5_0`
 - `Q8_0`
 - `Q2_K`
 - `Q3_K`
@@ -116,7 +117,9 @@ The source-level inference registry marks these as supported:
 - `Q6_K`
 - `Q8_K`
 
-`Q4_1`, `Q5_0`, `Q5_1`, `Q8_1`, IQ formats, and other unimplemented GGUF types remain unsupported for inference even though the generic type enum can preserve unknown/future tags for inspection.
+`Q4_1`, `Q5_1`, `Q8_1`, IQ formats, and other unimplemented GGUF types remain unsupported for inference even though the generic type enum can preserve unknown/future tags for inspection.
+
+`Q5_0` was added to the inference registry after validating the real `SmolLM2-135M-Instruct-Q4_K_M.gguf` model through the legacy backend. Its block decode is checked against a vector produced by the pinned native `ggml` `dequantize_row_q5_0` implementation.
 
 ## Current subsystem state
 
