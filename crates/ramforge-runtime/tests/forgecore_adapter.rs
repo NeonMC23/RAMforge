@@ -151,6 +151,55 @@ fn forgecore_adapter_translates_model_batch_and_decode_errors() {
 }
 
 #[test]
+fn forgecore_contexts_keep_independent_native_state_across_drops() {
+    let Some((model, metadata)) = load_fixture() else {
+        return;
+    };
+    let vocab = usize::try_from(metadata.vocab_size).expect("vocab size fits usize");
+    let mut first = model
+        .open_context(ForgeCoreContextOptions::default())
+        .expect("first context");
+    let mut second = model
+        .open_context(ForgeCoreContextOptions::default())
+        .expect("second context");
+
+    assert_eq!(
+        first
+            .decode_tokens(&[1, 5], 0)
+            .expect("first decode")
+            .n_vocab(),
+        vocab
+    );
+    let second_logits = second.decode_tokens(&[1, 6], 0).expect("second decode");
+    assert_eq!(second_logits.n_vocab(), vocab);
+    assert!(second_logits.values().iter().all(|value| value.is_finite()));
+
+    // A session owns a shared model handle and its own native context. Dropping
+    // the first context must not invalidate the second or the model wrapper.
+    drop(first);
+    let after_drop = second
+        .decode_tokens(&[7], 2)
+        .expect("second context survives first drop");
+    assert_eq!(after_drop.token_index(), 0);
+    assert_eq!(after_drop.n_vocab(), vocab);
+
+    // Owned logits stay valid after the session that produced them is dropped.
+    drop(second);
+    assert_eq!(second_logits.values().len(), vocab);
+
+    let mut third = model
+        .open_context(ForgeCoreContextOptions::default())
+        .expect("model remains usable after context drops");
+    assert_eq!(
+        third
+            .decode_tokens(&[1, 8], 0)
+            .expect("third decode")
+            .n_vocab(),
+        vocab
+    );
+}
+
+#[test]
 fn forgecore_boundary_keeps_native_ffi_out_of_ramforge() {
     let manifest = include_str!("../Cargo.toml");
     let adapter = include_str!("../src/forgecore.rs");
