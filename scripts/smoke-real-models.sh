@@ -16,6 +16,8 @@
 #   scripts/smoke-real-models.sh
 #   scripts/smoke-real-models.sh --no-build
 #   scripts/smoke-real-models.sh --matrix --include-7b --timeout 900
+#   RAMFORGE_GPTNEOX_MODEL=/path/to/pythia.gguf \
+#     scripts/smoke-real-models.sh --include-gptneox
 #   RAMFORGE_BIN=/path/to/ramforge scripts/smoke-real-models.sh --no-build
 #
 # The legacy budget matrix uses 8G, 4G, 1G, and 100M by default. ForgeCore
@@ -54,6 +56,7 @@ case_timeout=${RAMFORGE_SMOKE_TIMEOUT_SECS:-900}
 build=1
 matrix=0
 include_7b=0
+include_gptneox=0
 
 usage() {
     sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
@@ -71,6 +74,10 @@ while [ $# -gt 0 ]; do
             ;;
         --include-7b)
             include_7b=1
+            shift
+            ;;
+        --include-gptneox)
+            include_gptneox=1
             shift
             ;;
         --model-dir)
@@ -143,8 +150,19 @@ if [ "$include_7b" -eq 1 ]; then
         exit 2
     }
 fi
+gptneox_model=
+if [ "$include_gptneox" -eq 1 ]; then
+    if [ -n "${RAMFORGE_GPTNEOX_MODEL:-}" ]; then
+        gptneox_model=$RAMFORGE_GPTNEOX_MODEL
+    else
+        gptneox_model=$(resolve_model "pythia-70m-deduped") || {
+            echo "GPT-NeoX model not found: set RAMFORGE_GPTNEOX_MODEL or add pythia-70m-deduped under $model_dir" >&2
+            exit 2
+        }
+    fi
+fi
 
-for model in "$smol_model" "$qwen15_model" "$qwen7b_model"; do
+for model in "$smol_model" "$qwen15_model" "$qwen7b_model" "$gptneox_model"; do
     [ -n "$model" ] || continue
     if [ ! -r "$model" ]; then
         echo "model not readable: $model" >&2
@@ -202,6 +220,7 @@ mkdir -p "$run_dir"
     echo "min_available_kib=$min_available_kib"
     echo "matrix=$matrix"
     echo "include_7b=$include_7b"
+    echo "include_gptneox=$include_gptneox"
     echo "ld_library_path=$LD_LIBRARY_PATH"
     git -C "$repo_dir" rev-parse HEAD 2>/dev/null | sed 's/^/ramforge_rev=/'
     git -C "$workspace_dir/forgeCORE" rev-parse HEAD 2>/dev/null | sed 's/^/forgecore_rev=/'
@@ -238,6 +257,9 @@ inventory_model() {
     inventory_model "qwen2.5-1.5b" "$qwen15_model"
     if [ -n "$qwen7b_model" ]; then
         inventory_model "qwen2.5-7b" "$qwen7b_model"
+    fi
+    if [ -n "$gptneox_model" ]; then
+        inventory_model "gptneox" "$gptneox_model"
     fi
 } > "$run_dir/model-inventory.tsv"
 
@@ -298,6 +320,8 @@ classify_exit() {
         printf 'timeout\n'
     elif [ "$status" -ge 128 ] && [ "$status" -le 159 ]; then
         printf 'signal\n'
+    elif grep -qiE 'unsupported execution architecture|not supported by RAMforge.s legacy executor|not implemented by RAMforge.s legacy executor' "$stderr_file"; then
+        printf 'unsupported-architecture\n'
     elif grep -qiE 'insufficient memory|too small|does not fit|exceeds|out of memory|allocation .* failed|ram budget' "$stderr_file"; then
         printf 'controlled-budget-failure\n'
     else
@@ -310,6 +334,7 @@ run_case() {
     local model=$2
     local backend=$3
     local budget=$4
+    local expected=${5:-success}
     local case_dir="$run_dir/$name"
     local status
 
@@ -328,6 +353,7 @@ run_case() {
         printf 'max_tokens=%s\n' "$max_tokens"
         printf 'prompt=%s\n' "$prompt"
         printf 'timeout_secs=%s\n' "$case_timeout"
+        printf 'expected_outcome=%s\n' "$expected"
     } > "$case_dir/case.txt"
     {
         printf 'env LD_LIBRARY_PATH=%q timeout %q %q run %q --ram %q --prompt %q --backend %q --max-tokens %q --temperature 0 --memory-report --verbose\n' \
@@ -366,7 +392,7 @@ run_case() {
         > "$case_dir/gpu-after.txt" 2>/dev/null || true
 
     {
-        grep -E '^(Model config|Tokenizer|Execution backend|Prompt tokens|Generated [0-9]+ tokens|Stop reason|State reset|Budget after run):' \
+        grep -E '^(Model config|Tokenizer|Architecture:|Execution backend|Prompt tokens|Generated [0-9]+ tokens|Stop reason|State reset|Budget after run):' \
             "$case_dir/stderr.txt" || true
         grep -E '^  (Peak resident layer bytes|Peak managed bytes|Layer loads|Layer releases|Cache placements|Current cached layers|Peak cached layers|Cache hits):' \
             "$case_dir/stderr.txt" || true
@@ -376,17 +402,18 @@ run_case() {
         grep -E 'Maximum resident set size|Elapsed \(wall clock\) time|^[[:space:]]*Swaps:|^[[:space:]]*Exit status:' \
             "$case_dir/time.txt" || true
         echo "captured_exit_status=$status"
+        echo "expected_outcome=$expected"
         echo "outcome=$(cat "$case_dir/outcome.txt")"
     } > "$case_dir/summary.txt"
 
     local outcome
     outcome=$(cat "$case_dir/outcome.txt")
-    if [ "$outcome" = "success" ]; then
+    if [ "$outcome" = "$expected" ]; then
         echo "ok $name" >&2
-    elif [ "$matrix" -eq 1 ] && [ "$outcome" = "controlled-budget-failure" ]; then
+    elif [ "$matrix" -eq 1 ] && [ "$outcome" = "controlled-budget-failure" ] && [ "$expected" = "success" ]; then
         echo "controlled failure $name (budget $budget); see $case_dir/stderr.txt" >&2
     else
-        echo "FAILED $name (exit $status, $outcome); see $case_dir/stderr.txt" >&2
+        echo "FAILED $name (exit $status, outcome $outcome, expected $expected); see $case_dir/stderr.txt" >&2
         return 1
     fi
 }
@@ -394,36 +421,52 @@ run_case() {
 specs=()
 if [ "$matrix" -eq 1 ]; then
     for budget in $matrix_budgets; do
-        specs+=("smollm2-legacy-$budget|$smol_model|legacy|$budget")
-        specs+=("qwen2.5-1.5b-legacy-$budget|$qwen15_model|legacy|$budget")
+        specs+=("smollm2-legacy-$budget|$smol_model|legacy|$budget|success")
+        specs+=("qwen2.5-1.5b-legacy-$budget|$qwen15_model|legacy|$budget|success")
     done
-    specs+=("smollm2-forgecore-$default_ram|$smol_model|forgecore|$default_ram")
-    specs+=("qwen2.5-1.5b-forgecore-$default_ram|$qwen15_model|forgecore|$default_ram")
+    specs+=("smollm2-forgecore-$default_ram|$smol_model|forgecore|$default_ram|success")
+    specs+=("qwen2.5-1.5b-forgecore-$default_ram|$qwen15_model|forgecore|$default_ram|success")
     if [ -n "$qwen7b_model" ]; then
-        specs+=("qwen2.5-7b-legacy-4G|$qwen7b_model|legacy|4G")
+        specs+=("qwen2.5-7b-legacy-4G|$qwen7b_model|legacy|4G|success")
     fi
 else
-    specs+=("smollm2-legacy|$smol_model|legacy|$default_ram")
-    specs+=("smollm2-forgecore|$smol_model|forgecore|$default_ram")
-    specs+=("qwen2.5-1.5b-legacy|$qwen15_model|legacy|$default_ram")
-    specs+=("qwen2.5-1.5b-forgecore|$qwen15_model|forgecore|$default_ram")
+    specs+=("smollm2-legacy|$smol_model|legacy|$default_ram|success")
+    specs+=("smollm2-forgecore|$smol_model|forgecore|$default_ram|success")
+    specs+=("qwen2.5-1.5b-legacy|$qwen15_model|legacy|$default_ram|success")
+    specs+=("qwen2.5-1.5b-forgecore|$qwen15_model|forgecore|$default_ram|success")
     if [ -n "$qwen7b_model" ]; then
-        specs+=("qwen2.5-7b-legacy|$qwen7b_model|legacy|$default_ram")
+        specs+=("qwen2.5-7b-legacy|$qwen7b_model|legacy|$default_ram|success")
     fi
+fi
+if [ -n "$gptneox_model" ]; then
+    # GPT-NeoX is implemented by llama.cpp, not by RAMforge's legacy
+    # executor. Both behaviours are asserted: forgeCORE generation succeeds,
+    # and the legacy preflight rejects the architecture without loading
+    # weights or silently switching backends. On the forgeCORE backend the
+    # requested RAM budget is diagnostic-only, so every budget is exercised
+    # to make that distinction explicit rather than implied.
+    if [ "$matrix" -eq 1 ]; then
+        for budget in $matrix_budgets; do
+            specs+=("gptneox-forgecore-$budget|$gptneox_model|forgecore|$budget|success")
+        done
+    else
+        specs+=("gptneox-forgecore-1G|$gptneox_model|forgecore|1G|success")
+    fi
+    specs+=("gptneox-legacy-rejected|$gptneox_model|legacy|1G|unsupported-architecture")
 fi
 
 failures=0
 for spec in "${specs[@]}"; do
-    IFS='|' read -r name model backend budget <<EOF
+    IFS='|' read -r name model backend budget expected <<EOF
 $spec
 EOF
-    if ! run_case "$name" "$model" "$backend" "$budget"; then
+    if ! run_case "$name" "$model" "$backend" "$budget" "$expected"; then
         failures=$((failures + 1))
     fi
 done
 
 {
-    printf 'case\tbackend\tbudget\texit\toutcome\tmax_rss_kib\tmanaged_peak_bytes\tpeak_cached_layers\tcache_evictions\tgenerated\tstop_reason\n'
+    printf 'case\tbackend\tbudget\texit\toutcome\texpected\tmax_rss_kib\tmanaged_peak_bytes\tpeak_cached_layers\tcache_evictions\tgenerated\tstop_reason\n'
     for case_dir in "$run_dir"/*/; do
         [ -d "$case_dir" ] || continue
         name=$(basename "$case_dir")
@@ -431,14 +474,15 @@ done
         budget=$(sed -n 's/^budget=//p' "$case_dir/case.txt" 2>/dev/null | head -1)
         status=$(cat "$case_dir/status.txt" 2>/dev/null || echo missing)
         outcome=$(cat "$case_dir/outcome.txt" 2>/dev/null || echo missing)
+        expected=$(sed -n 's/^expected_outcome=//p' "$case_dir/case.txt" 2>/dev/null | head -1)
         rss=$(awk -F': ' '/Maximum resident set size/ {gsub(/,/, "", $2); print $2}' "$case_dir/time.txt" 2>/dev/null | tail -1 || true)
         managed=$(sed -n 's/^  Peak managed bytes: \([0-9][0-9]*\).*/\1/p' "$case_dir/stderr.txt" 2>/dev/null | tail -1)
         peak_cached=$(sed -n 's/^  Peak cached layers: \([0-9][0-9]*\).*/\1/p' "$case_dir/stderr.txt" 2>/dev/null | tail -1)
         evictions=$(sed -n 's/^  Cache hits: .* evictions: \([0-9][0-9]*\).*/\1/p' "$case_dir/stderr.txt" 2>/dev/null | tail -1)
         generated=$(sed -n 's/^Generated \([0-9][0-9]*\) tokens.*/\1/p' "$case_dir/stderr.txt" 2>/dev/null | tail -1)
         stop=$(sed -n 's/^Stop reason: //p' "$case_dir/stderr.txt" 2>/dev/null | tail -1)
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$name" "${backend:-n/a}" "${budget:-n/a}" "$status" "$outcome" \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$name" "${backend:-n/a}" "${budget:-n/a}" "$status" "$outcome" "${expected:-n/a}" \
             "${rss:-n/a}" "${managed:-n/a}" "${peak_cached:-n/a}" "${evictions:-n/a}" \
             "${generated:-n/a}" "${stop:-n/a}"
     done
@@ -510,6 +554,14 @@ for case_dir in sorted(path for path in run_dir.iterdir() if path.is_dir()):
         "name": case_dir.name,
         "status": int(read("status.txt")) if read("status.txt").isdigit() else None,
         "outcome": read("outcome.txt") or None,
+        "expected_outcome": next(
+            (
+                line.split("=", 1)[1]
+                for line in read("case.txt").splitlines()
+                if line.startswith("expected_outcome=")
+            ),
+            None,
+        ),
         "model": read("case.txt").splitlines()[0].removeprefix("model=") if read("case.txt") else None,
         "backend": read("case.txt").splitlines()[1].removeprefix("backend=") if read("case.txt") else None,
         "budget": read("case.txt").splitlines()[2].removeprefix("budget=") if read("case.txt") else None,

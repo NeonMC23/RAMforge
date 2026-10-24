@@ -1,10 +1,10 @@
 # Project state
 
-**As-of date:** 2026-10-02; local verification refreshed 2026-10-24.  
-**Repository:** RAMforge workspace at the handoff source checkout.  
+**As-of date:** 2026-10-02; local verification refreshed 2026-10-25.<br>
+**Repository:** RAMforge workspace at the handoff source checkout.<br>
 **Status labels:** see [README.md](README.md).
 
-## Local verification (2026-10-24)
+## Local verification (2026-10-25)
 
 - The workspace builds and tests against the pinned `forge-core` revision
   `d320309` (v3.1.2) with Rust/Cargo 1.98.1 and the workspace native tree at
@@ -12,8 +12,25 @@
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
-  `cargo test`: **424 passed, 0 failed, 2 ignored** (the real-model Qwen2.5
-  diagnostic and the quantized microbenchmark).
+  `cargo test`. A direct `cargo test --workspace --locked` without fixture
+  environment variables passes **428 tests, 0 failed, 3 ignored**; the ignored
+  tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark,
+  and the opt-in GPT-NeoX integration test. Fixture-gated tests report SKIP
+  when their environment variables are unset.
+- The registry now tracks `legacy_run` and `forgecore_run` separately.
+  `gptneox`/`gpt_neox` is `legacy_run=not-yet`, `forgecore_run=yes`; the legacy
+  preflight error names `--backend forgecore` and never switches implicitly.
+- `inspect`, `plan`, `support`, and JSON output distinguish legacy from
+  forgeCORE execution. `execution_supported` remains the legacy verdict for
+  JSON compatibility; `execution_supported_scope` states that explicitly, and
+  `forgecore_execution_supported` is reported separately.
+- The tokenizer now matches llama.cpp defaults when
+  `tokenizer.ggml.add_bos_token` is absent: BPE/GPT-2-style vocabularies add no
+  BOS; SentencePiece vocabularies add BOS.
+- The opt-in GPT-NeoX tests are gated by `FORGE_GPTNEOX_MODEL` in both
+  forgeCORE (`tests/gptneox_execution.rs`) and RAMforge
+  (`tests/forgecore_adapter.rs`). They load a real fixture, tokenize, decode,
+  generate greedily twice, and assert deterministic ids and finite logits.
 - The ForgeCore adapter integration suite checks independent native context
   state across drops, owned logits surviving session drop, and model reuse
   after context drops.
@@ -34,52 +51,97 @@
 - See [../../scripts/test.sh](../../scripts/test.sh) for the reproducible test
   invocation.
 
-### Real-model smoke evidence (2026-10-24)
+### Real-model smoke evidence (2026-10-25)
 
-`scripts/smoke-real-models.sh --no-build --matrix --include-7b --max-tokens 4
---prompt Hello --timeout 900` ran each case in a separate process, sequentially,
-with a 4 GiB `MemAvailable` start threshold. Evidence was written to
-`/tmp/ramforge-real-model-smoke/20261024-193321`; TSV, JSON, per-case commands,
-stdout/stderr, hashes, and system-memory samples are retained there. The model
-paths were directories from the new layout, so the split-GGUF discovery and
-merged virtual data source were exercised by the ordinary CLI path.
+`scripts/smoke-real-models.sh --no-build --matrix --include-gptneox
+--max-tokens 8` ran each case in a separate process, sequentially, with a 4 GiB
+`MemAvailable` start threshold. The GPT-NeoX fixture was supplied through
+`RAMFORGE_GPTNEOX_MODEL`. Evidence:
+`/tmp/ramforge-real-model-smoke/20261025-002055`; TSV, JSON, per-case commands,
+stdout/stderr, hashes, and system-memory samples are retained there.
 
 Exact budgets: `8G` = 8,589,934,592 B, `4G` = 4,294,967,296 B, `1G` =
-1,073,741,824 B, `100M` = 104,857,600 B.
+1,073,741,824 B, `100M` = 104,857,600 B. Prompt `Hello`, 8 greedy tokens,
+backend fixed within each comparison.
 
-| Model / case | Budget | Exit | Wall | Max RSS | Managed peak | Evictions |
-|---|---:|---:|---:|---:|---:|---:|
-| SmolLM2-135M Q4_K_M legacy | 8G | 0 | 7.36 s | 138,732 KiB | 104,007,876 B | 0 |
-| SmolLM2-135M Q4_K_M legacy | 4G | 0 | 7.33 s | 138,596 KiB | 104,007,876 B | 0 |
-| SmolLM2-135M Q4_K_M legacy | 1G | 0 | 7.42 s | 138,496 KiB | 104,007,876 B | 0 |
-| SmolLM2-135M Q4_K_M legacy | 100M | 0 | 7.66 s | 116,752 KiB | 73,926,852 B | 0 |
-| Qwen2.5-1.5B Q4_0 legacy | 8G | 0 | 8.69 s | 1,151,564 KiB | 1,061,215,600 B | 0 |
-| Qwen2.5-1.5B Q4_0 legacy | 4G | 0 | 8.70 s | 1,151,644 KiB | 1,061,215,600 B | 0 |
-| Qwen2.5-1.5B Q4_0 legacy | 1G | 0 | 8.98 s | 1,127,204 KiB | 1,061,445,120 B | 85 |
-| Qwen2.5-1.5B Q4_0 legacy | 100M | 0 | 23.71 s | 169,240 KiB | 80,198,656 B | 110 |
-| Qwen2.5-7B Q4_K_M, two shards, legacy | 4G | 0 | 5:18.67 | 4,279,892 KiB | 4,285,007,616 B | 88 |
-| SmolLM2-135M Q4_K_M ForgeCore CPU | 4G | 0 | 0.25 s | 374,700 KiB | not exposed | n/a |
-| Qwen2.5-1.5B Q4_0 ForgeCore CPU | 4G | 0 | 1.23 s | 2,839,396 KiB | not exposed | n/a |
+| Model / case | Backend | Budget | Exit | Wall | Max RSS | Managed peak | Evictions |
+|---|---|---:|---:|---:|---:|---:|---:|
+| SmolLM2-135M Q4_K_M | legacy | 8G | 0 | 1.22 s | 135,768 KiB | 104,007,876 B | 0 |
+| SmolLM2-135M Q4_K_M | legacy | 4G | 0 | 1.16 s | 135,572 KiB | 104,007,876 B | 0 |
+| SmolLM2-135M Q4_K_M | legacy | 1G | 0 | 1.26 s | 135,728 KiB | 104,007,876 B | 0 |
+| SmolLM2-135M Q4_K_M | legacy | 100M | 0 | 1.19 s | 113,924 KiB | 73,926,852 B | 0 |
+| Qwen2.5-1.5B Q4_0 | legacy | 8G | 0 | 3.24 s | 1,148,752 KiB | 1,061,215,600 B | 0 |
+| Qwen2.5-1.5B Q4_0 | legacy | 4G | 0 | 3.26 s | 1,148,748 KiB | 1,061,215,600 B | 0 |
+| Qwen2.5-1.5B Q4_0 | legacy | 1G | 0 | 3.82 s | 1,125,360 KiB | 1,061,674,688 B | 197 |
+| Qwen2.5-1.5B Q4_0 | legacy | 100M | 0 | 6.23 s | 166,444 KiB | 80,428,224 B | 222 |
+| SmolLM2-135M Q4_K_M | forgecore | 4G | 0 | 0.20 s | 370,388 KiB | not exposed | n/a |
+| Qwen2.5-1.5B Q4_0 | forgecore | 4G | 0 | 1.31 s | 2,839,744 KiB | not exposed | n/a |
+| Pythia-70M-deduped Q8_0 (GPT-NeoX) | forgecore | 8G | 0 | 0.14 s | 167,616 KiB | not exposed | n/a |
+| Pythia-70M-deduped Q8_0 (GPT-NeoX) | forgecore | 4G | 0 | 0.13 s | 167,576 KiB | not exposed | n/a |
+| Pythia-70M-deduped Q8_0 (GPT-NeoX) | forgecore | 1G | 0 | 0.13 s | 167,584 KiB | not exposed | n/a |
+| Pythia-70M-deduped Q8_0 (GPT-NeoX) | forgecore | 100M | 0 | 0.13 s | 167,512 KiB | not exposed | n/a |
+| Pythia-70M-deduped Q8_0 (GPT-NeoX) | legacy | 1G | 1 | 0.01 s | 23,664 KiB | not exposed | n/a |
 
-All cases generated 4 tokens with greedy sampling. Legacy `/usr/bin/time`
-reported `Swaps: 0`; system-wide swap usage is sampled separately and is not
-attributed to the process. The 7B case used 112 layer loads, retained 24 layers
-at peak, and stayed 9,959,680 B below its 4 GiB budget. The GPU remained
-unused: the pinned native build is CPU-only, and RAMforge has no GPU execution
-backend.
+- Every legacy comparison generated byte-identical stdout at all four budgets
+  (SmolLM2 `da6b6d7d…`, Qwen2.5 `209447e5…`). The 100M Qwen run used 222
+  layer-cache evictions and a 76.70 MiB managed peak under the 100.00 MiB
+  budget; the 1G run used 197 evictions; 4G/8G used none.
+- The GPT-NeoX forgecore runs generated byte-identical stdout (`c69c103d…`) at
+  all four budgets. This confirms that the forgeCORE backend does **not**
+  enforce the requested budget; it is not out-of-core evidence.
+- The GPT-NeoX legacy case is the intended controlled rejection: exit 1 in
+  0.01 s, `unsupported-architecture` classification, no weights loaded, no
+  OOM, no fallback.
+- The 20B GPT-NeoX GGUF (13,135,032,320 B file, 13,133,230,080 tensor bytes)
+  was inspect/plan-only at all four budgets. It was not run; see below.
+- Previous evidence, not re-run in this matrix: Qwen2.5-7B Q4_K_M two-shard
+  legacy at 4G, exit 0, 5:18.67 wall, 4,279,892 KiB max RSS, 4,285,007,616 B
+  managed peak, 24 cached layers, 88 evictions. This exercises split
+  discovery/cross-shard reads, not forgeCORE streaming.
+- ForgeCore `Swaps` was 0. Its RSS includes loader, page cache, Rust heap, and
+  native allocations; it is not model residency. The native build is CPU-only,
+  so none of these runs is GPU validation.
 
-A controlled failure at `--ram 100M` on Qwen2.5-7B exited 1 in 0.41 s with
-`managed lower bound 149127168 exceeds RAMforge budget 104857600` and
-94,464 KiB max RSS. It did not OOM, hang, or fall back. The 100M Qwen2.5-1.5B
-success above is not a claim that every model fits in 100M.
+#### GPT-NeoX/Pythia execution evidence
 
-The real 20B `gptneox` GGUF (13,135,032,320 B, 12.23 GiB) demonstrates the
-inspect/plan/run boundary. `inspect` and `plan --ram 100M` both exit 0 and
-report the architecture as inspectable/plannable but not executable. `run`
-exits 1 in 0.02 s with 26,148 KiB max RSS and `Swaps: 0`, error:
-`unsupported execution architecture 'gptneox': inspection=true planning=true
-execution=not-yet... currently supported execution architectures: [llama,
-qwen2]`. No weights were loaded and no fallback occurred.
+Fixture: `mradermacher/pythia-70m-deduped-GGUF`,
+`pythia-70m-deduped.Q8_0.gguf`, 76,722,400 B, SHA-256
+`94788a58bb81431b7058837ec2371c303edb20384b615f0afabfa81539294e0d`,
+GGUF v3, 6 layers, 512 embedding, 8 heads, 2048 FFN, 16 rotary dimensions,
+parallel residual enabled.
+
+```sh
+ramforge run /path/to/pythia-70m.Q8_0.gguf --ram 1G \
+  --prompt "The capital of France is" --max-tokens 8 \
+  --temperature 0 --backend forgecore --memory-report
+```
+
+Result: exit 0, **5 prompt tokens** `[510, 5347, 273, 6181, 310]`, output
+` the capital of the French Empire.`, 8 tokens, 0.14 s wall, 167,668 KiB max
+RSS, 1 GiB requested but **not enforced**, logical tensor bytes 74,948,608 B,
+`Swaps: 0`. The native llama.cpp probe encodes the same five ids and produces
+the same greedy prefix. A second greedy run produces identical ids.
+
+The tokenizer fix: without an explicit `tokenizer.ggml.add_bos_token`, BPE
+vocabularies now default to no BOS, matching llama.cpp; SentencePiece
+vocabularies still default to BOS. The previous unconditional `true` inserted
+token `0` into Pythia prompts.
+
+Independent numerical check: a NumPy GPT-NeoX forward pass built from the GGUF
+metadata and dequantized Q8_0 weights reproduces the native final-token
+logits for the same five ids: top-1 id **253** in both, top-10 overlap
+**9/10**, cosine similarity **1.000000046**, and max absolute difference
+**0.929** on logits of magnitude ~1,579 (about 0.06% relative), consistent
+with ggml's f16 GELU lookup and floating-point reduction order. This is a
+graph/architecture check, not bit-exact parity and not broad quality
+validation.
+
+The 20B GPT-NeoX GGUF has 13,135,032,320 file bytes and 13,133,230,080 tensor
+bytes. It is inspectable and plannable at 8G/4G/1G/100M. It was **not
+executed**: forgeCORE loads weights eagerly, does not enforce the budget, and
+the host has 15.39 GiB total RAM. Safe execution would require a backend that
+actually enforces residency/streaming; the current forgeCORE path has no such
+guarantee.
 
 Chat-template support was validated on the real Qwen2.5-1.5B GGUF. The model's
 own `tokenizer.chat_template` rendered a 177-byte ChatML prompt, tokenized the
@@ -167,21 +229,34 @@ Generic inspection and planning are intentionally broader than execution. An arc
 
 The explicit registry is `ramforge-runtime/src/support.rs`:
 
-| Architecture/alias | Inspect | Plan | Direct run status in registry |
-|---|---:|---:|---|
-| `llama` | yes | yes | supported |
-| `qwen2`, including alias `qwen2.5` | yes | yes | supported |
-| `mistral` | yes | yes | `via-llama-gguf` classification; not a direct independent Mistral implementation |
-| `qwen3` | yes | yes | not yet |
-| `qwen35` / `qwen3.5` / `qwen3_5` | yes | yes | not yet; explicitly not aliased to Qwen2 |
-| `gemma` family | yes | yes | not yet |
-| `phi` family | yes | yes | not yet |
+| Architecture/alias | Inspect | Plan | Legacy executor | forgeCORE/libllama | Evidence |
+|---|---:|---:|---|---|---|
+| `llama` | yes | yes | yes | yes | SmolLM2-135M Q4_K_M, real |
+| `qwen2`, including alias `qwen2.5` | yes | yes | yes | yes | Qwen2.5-1.5B Q4_0, real |
+| `gptneox` / `gpt_neox` | yes | yes | **not-yet** | **yes** | Pythia-70M-deduped Q8_0, real |
+| `mistral` | yes | yes | not-yet | not-yet | literal `mistral` tag has no validated execution path; Mistral GGUFs normally declare `llama` |
+| `qwen3` | yes | yes | not-yet | not-yet | not validated |
+| `qwen35` / `qwen3.5` / `qwen3_5` | yes | yes | not-yet | not-yet | hybrid attention/SSM; explicitly not aliased to Qwen2 |
+| `gemma` family | yes | yes | not-yet | not-yet | not validated |
+| `phi` family | yes | yes | not-yet | not-yet | not validated |
 
-The current runtime model parser is `LlamaConfig` in `crates/ramforge-runtime/src/model.rs`. It accepts the dense Llama/Qwen2 tensor contract and reads architecture-specific or fallback metadata keys. The registry labels Qwen2.5 as a Qwen2-shaped execution target, but the correctness investigation shows that this path must not be treated as numerically validated for the named Qwen2.5 model.
+The legacy runtime model parser is `LlamaConfig` in
+`crates/ramforge-runtime/src/model.rs`. It accepts the dense Llama/Qwen2 tensor
+contract and reads architecture-specific or fallback metadata keys. A
+`gptneox` model is rejected there before tensor payloads are read; the error
+names `--backend forgecore` and the registry reports `legacy-execution=not-yet
+forgecore-execution=yes`. The legacy Qwen2.5 path still must not be treated as
+broadly numerically validated for every prompt.
+
+`gptneox` is not approximated in RAMforge. The forgeCORE/libllama backend
+delegates execution to the pinned native `src/models/gptneox.cpp`
+implementation, which covers fused QKV, GPT-NeoX-style partial RoPE, parallel
+residual, and GELU MLP. RAMforge still owns orchestration, tokenization,
+sampling, CLI output, and the explicit backend choice.
 
 ### Tensor/quantization formats
 
-The source-level inference registry marks these as supported:
+The legacy executor's source-level inference registry marks these as supported:
 
 - `F32`
 - `F16`
@@ -196,9 +271,18 @@ The source-level inference registry marks these as supported:
 - `Q6_K`
 - `Q8_K`
 
-`Q4_1`, `Q5_1`, `Q8_1`, IQ formats, and other unimplemented GGUF types remain unsupported for inference even though the generic type enum can preserve unknown/future tags for inspection.
+`Q4_1`, `Q5_1`, `Q8_1`, IQ formats, and other unimplemented GGUF types remain
+unsupported by the **legacy executor** even though the generic type enum can
+preserve unknown/future tags for inspection. This list is not the forgeCORE
+type-support list: once a model reaches `--backend forgecore`, tensor decoding
+belongs to the pinned llama.cpp runtime. RAMforge claims end-to-end real-model
+evidence for `Q4_0` (Qwen2.5-1.5B), `Q4_K_M` (SmolLM2-135M), and `Q8_0`
+(Pythia-70M), not a complete native type enumeration.
 
-`Q5_0` was added to the inference registry after validating the real `SmolLM2-135M-Instruct-Q4_K_M.gguf` model through the legacy backend. Its block decode is checked against a vector produced by the pinned native `ggml` `dequantize_row_q5_0` implementation.
+`Q5_0` was added to the legacy inference registry after validating the real
+`SmolLM2-135M-Instruct-Q4_K_M.gguf` model. Its block decode is checked against a
+vector produced by the pinned native `ggml` `dequantize_row_q5_0`
+implementation.
 
 ## Current subsystem state
 
@@ -218,6 +302,10 @@ The following infrastructure is implemented with extensive unit/integration cove
 
 ### Experimental or not fully validated
 
+- GPT-NeoX/Pythia execution is validated through forgeCORE on one 70M Q8_0
+  fixture, including native tokenizer/greedy parity and an independent NumPy
+  logits check. The 20B GPT-NeoX model is not executed, and this is not broad
+  GPT-NeoX quality validation.
 - Real-model numerical quality and compatibility, especially Qwen2.5-1.5B, are not established.
 - The current scalar/reference remodel has synthetic parity tests but does not explain the recorded Qwen2.5 divergence.
 - Real-model generated-text quality is not validated by the repository test suite.
