@@ -13,10 +13,10 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **442 tests, 0 failed, 7 ignored**; the ignored
+  environment variables passes **442 tests, 0 failed, 8 ignored**; the ignored
   tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark,
   the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and
-  two CLI enforcement tests. Fixture-gated tests report SKIP when their
+  three CLI enforcement tests. Fixture-gated tests report SKIP when their
   environment variables are unset.
 - The registry now tracks `legacy_run` and `forgecore_run` separately.
   `gptneox`/`gpt_neox` is `legacy_run=not-yet`, `forgecore_run=yes`; the legacy
@@ -157,8 +157,9 @@ GPT-NeoX-20B: 13,135,032,320 B file, 13,133,230,080 tensor bytes, SHA-256
 `--ram 8G --enforce-ram --enforce-timeout 300 --ctx 128 --no-repack`, 1 token.
 Actual context 256; 5 prompt tokens; output ` Paris`; wall 16.94 s; load plus
 tokenization 6.64 s; TTFT 10.03 s; mapping 12.23 GiB with 7.65 GiB resident at
-the end-of-run smaps sample (62.5%); cgroup peak exactly 8 GiB; anon 319.08 MiB; file 7.65 GiB; kernel
-36.45 MiB; 190 major faults; cgroup swap peak 0; max RSS 7.97 GiB. One run,
+the end-of-run smaps sample (62.5%); cgroup peak exactly 8 GiB; anon 319.08 MiB;
+file 7.65 GiB; kernel 36.45 MiB; 190 major faults; cgroup swap peak 0; max RSS
+7.97 GiB. One run,
 one token: a fit/mechanism result, not throughput or quality evidence. Host
 swap usage rose from about 3.5 GiB to 5.4 GiB during the test under global
 page-cache pressure; the supervised cgroup itself used zero swap and no swap
@@ -166,8 +167,14 @@ configuration changed.
 
 The cgroup cap does not include shared file pages charged to another cgroup.
 The pinned loader prefaults the whole file with `MAP_POPULATE`; RAMforge has no
-per-layer eviction hook on the forgeCORE path. The 20B model was not run at
-4G, 1G, or 100M. See the README for commands and caveats.
+per-layer eviction hook on the forgeCORE path. `memory.swap.max=0` is written
+when the swap controller exposes it; `Peak swap` is reported. The enforced
+timeout path is tested: Qwen2.5-1.5B at 512M with `--enforce-timeout 1` exits
+124, reports `Result: timeout; cgroup killed`, and leaves no cgroup behind.
+The 20B model was not run at 4G, 1G, or 100M. Qwen2.5-7B,
+DeepSeek-Coder-V2-Lite, and Qwen2.5-Coder-32B were not run; DeepSeek's
+`deepseek2` architecture is inspect/plan-only in the validated registry. See
+the README for commands and caveats.
 
 #### GPT-NeoX/Pythia execution evidence
 

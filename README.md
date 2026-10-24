@@ -197,7 +197,17 @@ configuration was changed.
 - `--enforce-ram` requires cgroup v2 memory delegation. If unavailable, the
   command fails with an actionable error and does not silently fall back to
   diagnostic-only mode. cgroup v1 is unsupported.
+- `memory.swap.max=0` is written when the swap controller exposes it, and
+  `Peak swap` is reported. If that file is absent, `memory.max` still caps
+  charged RAM but swap is not additionally excluded.
+- The enforced timeout path is tested: Qwen2.5-1.5B at 512M with
+  `--enforce-timeout 1` exits 124, reports `Result: timeout; cgroup killed`,
+  and leaves no cgroup behind.
 - The 20B model was measured only at 8G. It was not run at 4G, 1G, or 100M.
+- Not run in this sprint: Qwen2.5-7B, DeepSeek-Coder-V2-Lite, and
+  Qwen2.5-Coder-32B. DeepSeek-Coder-V2-Lite is a 10,364,416,768 B
+  `deepseek2` model that inspects/plans but is not in the validated forgeCORE
+  execution registry. The 32B model was not attempted without a measured plan.
 - GPU/VRAM execution remains out of scope.
 
 ## Architecture and quantization matrix
@@ -574,7 +584,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **442 tests, 0 failed, 7 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and two CLI enforcement tests. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **442 tests, 0 failed, 8 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and three CLI enforcement tests. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

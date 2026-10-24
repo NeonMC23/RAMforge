@@ -86,6 +86,43 @@ fn enforced_real_model_run_reports_the_cgroup_peak() {
 }
 
 #[test]
+#[ignore = "requires cgroup v2 delegation, a slow-loading real model, and libggml"]
+fn enforced_timeout_kills_the_cgroup_and_returns_124() {
+    let model = std::env::var("FORGE_TIMEOUT_MODEL")
+        .or_else(|_| std::env::var("FORGE_OOM_MODEL"))
+        .expect("set FORGE_TIMEOUT_MODEL or FORGE_OOM_MODEL");
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "512M",
+            "--enforce-ram",
+            "--enforce-timeout",
+            "1",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(124), "stderr: {stderr}");
+    assert!(
+        stderr.contains("Result: timeout; cgroup killed"),
+        "timeout must be reported: {stderr}"
+    );
+}
+
+#[test]
 #[ignore = "requires cgroup v2 delegation, a model larger than the limit, and libggml"]
 fn enforced_oom_is_a_failure_not_a_success() {
     let model = std::env::var("FORGE_OOM_MODEL").expect("set FORGE_OOM_MODEL");
