@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use ramforge_core::{parse_gguf_file, parse_memory_size, GgufModel, Tokenizer};
+use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::{DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreModel};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -418,6 +419,7 @@ fn run_forgecore_inference(
     memory_report: bool,
 ) -> anyhow::Result<()> {
     let model_load_started = Instant::now();
+    let rss_before_load = process_rss();
 
     // The explicit ForgeCore backend is the only owner of model execution in
     // this branch. RAMforge still owns device selection, prompt tokenization,
@@ -429,6 +431,7 @@ fn run_forgecore_inference(
         .map_err(|error| anyhow::anyhow!(error))?;
     let model = ForgeCoreModel::load_for_execution(&model_path, execution, &registry)
         .map_err(|error| anyhow::anyhow!(error))?;
+    let rss_after_load = process_rss();
     let metadata = model.metadata().clone();
 
     let gguf = parse_gguf_file(&model_path).map_err(|error| anyhow::anyhow!(error))?;
@@ -587,6 +590,7 @@ fn run_forgecore_inference(
             .map_err(|error| anyhow::anyhow!(error))?;
     }
 
+    let rss_after_decode = process_rss();
     let trailing = decoder.finish();
     if !trailing.is_empty() {
         write!(stdout, "{trailing}")?;
@@ -620,9 +624,16 @@ fn run_forgecore_inference(
         );
     }
     if memory_report {
-        eprintln!(
-            "Memory report unavailable for ForgeCore backend: native model/context/KV/backend allocations are intentionally not claimed by RAMforge"
+        let report = ForgeCoreMemoryReport::new(
+            ram_bytes,
+            gguf.total_tensor_bytes(),
+            metadata.size_bytes,
+            rss_before_load,
+            rss_after_load,
+            rss_after_decode,
+            model.device(),
         );
+        output_forgecore_memory_report(&report);
     }
 
     Ok(())
@@ -857,6 +868,77 @@ fn output_memory_report(report: &ramforge_runtime::memory_report::MemoryReport) 
             .unwrap_or_else(|| "unavailable".to_string())
     );
     eprintln!("  Note: RAMforge MemoryBudget does not control Linux page cache or total RSS.");
+}
+
+fn output_forgecore_memory_report(report: &ForgeCoreMemoryReport) {
+    eprintln!();
+    eprintln!("ForgeCore memory report (measured/native-reported facts):");
+    eprintln!(
+        "  Requested RAM budget: {} (NOT enforced by the ForgeCore backend)",
+        format_bytes(report.requested_budget_bytes)
+    );
+    eprintln!(
+        "  Logical GGUF tensor bytes: {}",
+        report
+            .logical_model_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    eprintln!(
+        "  Native model bytes (libllama): {}",
+        format_bytes(report.native_model_bytes)
+    );
+    eprintln!(
+        "  Logical model exceeds requested budget: {}",
+        report
+            .logical_model_exceeds_budget()
+            .map(yes_no)
+            .unwrap_or("unknown")
+    );
+    eprintln!(
+        "  Process RSS: before_load={} after_load={} after_decode={}",
+        optional_bytes(report.rss_before_load_bytes),
+        optional_bytes(report.rss_after_load_bytes),
+        optional_bytes(report.rss_after_decode_bytes)
+    );
+    eprintln!(
+        "  Measured RSS delta: load={} decode={}",
+        optional_signed_bytes(report.rss_delta_after_load_bytes()),
+        optional_signed_bytes(report.rss_delta_after_decode_bytes())
+    );
+    eprintln!(
+        "  System memory: total={} available={}",
+        optional_bytes(report.system_total_bytes),
+        optional_bytes(report.system_available_bytes)
+    );
+    eprintln!(
+        "  Device memory: total={} free={}",
+        format_measurement(&report.device_memory_total),
+        format_measurement(&report.device_memory_free)
+    );
+    eprintln!(
+        "  Not exposed by the pinned native API: {}",
+        report.unexposed_categories().join(", ")
+    );
+    eprintln!(
+        "  Note: RSS includes the loader, page-cache effects, Rust heap, and all other process memory; it is not model residency."
+    );
+}
+
+fn optional_bytes(bytes: Option<u64>) -> String {
+    bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn optional_signed_bytes(delta: Option<i128>) -> String {
+    match delta {
+        Some(value) if value >= 0 => {
+            format!("+{}", format_bytes(value.unsigned_abs() as u64))
+        }
+        Some(value) => format!("-{}", format_bytes(value.unsigned_abs() as u64)),
+        None => "unavailable".to_string(),
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {

@@ -1,8 +1,31 @@
 # Project state
 
-**As-of date:** 2026-10-02.  
+**As-of date:** 2026-10-02; local verification refreshed 2026-10-24.  
 **Repository:** RAMforge workspace at the handoff source checkout.  
 **Status labels:** see [README.md](README.md).
+
+## Local verification (2026-10-24)
+
+- The workspace builds and tests against the pinned `forge-core` revision
+  `d320309` (v3.1.2) with Rust/Cargo 1.98.1 and the workspace native tree at
+  `/home/neon/Documents/CODE LOCAL/forge/native` (llama.cpp/ggml v0.5.0).
+- `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
+  process-local `LD_LIBRARY_PATH`, then runs `cargo test`: **395 passed,
+  0 failed, 2 ignored** (the real-model Qwen2.5 diagnostic and the quantized
+  microbenchmark).
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: **not clean**; the repository has pre-existing
+  formatting differences in several files. They are not mass-reformatted here.
+- The ForgeCore CLI `--memory-report` path now reports separate logical GGUF,
+  native `size_bytes()`, measured process-RSS, and device facts, and states
+  that the requested RAM budget is **not enforced** by that backend.
+- The `forge-core` pin is intentionally retained at v3.1.2. The newer local
+  v3.1.3 adds GGUF/quant inspection APIs that RAMforge's adapter does not
+  consume. A temporary path-override check showed RAMforge compiles against
+  v3.1.3, so the pin is a stability choice, not a compatibility requirement.
+  Revisit only when RAMforge needs a newer API.
+- See [../../scripts/test.sh](../../scripts/test.sh) for the reproducible test
+  invocation.
 
 **Current ForgeCore note:** static ForgeCore device discovery, explicit
 selection, and execution metadata are implemented. The verified ForgeCore
