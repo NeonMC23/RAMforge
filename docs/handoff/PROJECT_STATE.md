@@ -73,6 +73,14 @@ A controlled failure at `--ram 100M` on Qwen2.5-7B exited 1 in 0.41 s with
 94,464 KiB max RSS. It did not OOM, hang, or fall back. The 100M Qwen2.5-1.5B
 success above is not a claim that every model fits in 100M.
 
+The real 20B `gptneox` GGUF (13,135,032,320 B, 12.23 GiB) demonstrates the
+inspect/plan/run boundary. `inspect` and `plan --ram 100M` both exit 0 and
+report the architecture as inspectable/plannable but not executable. `run`
+exits 1 in 0.02 s with 26,148 KiB max RSS and `Swaps: 0`, error:
+`unsupported execution architecture 'gptneox': inspection=true planning=true
+execution=not-yet... currently supported execution architectures: [llama,
+qwen2]`. No weights were loaded and no fallback occurred.
+
 Chat-template support was validated on the real Qwen2.5-1.5B GGUF. The model's
 own `tokenizer.chat_template` rendered a 177-byte ChatML prompt, tokenized the
 control markers as their model IDs, generated 2 tokens (then EOS), and output
