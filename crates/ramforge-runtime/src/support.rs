@@ -2,13 +2,24 @@
 //!
 //! GGUF parsing/inspection is architecture-neutral. Execution support is
 //! deliberately narrower and must never be inferred from a similar name.
+//!
+//! Two execution backends are tracked separately:
+//!
+//! * the **legacy** RAMforge executor implements a small, RAMforge-owned
+//!   transformer subset (`llama`, `qwen2`) with managed out-of-core residency;
+//! * the **forgeCORE/libllama** backend delegates execution to upstream
+//!   llama.cpp and therefore covers the architectures that the pinned native
+//!   revision genuinely implements.
+//!
+//! A `forgecore_run = yes` claim requires real-model execution evidence. It is
+//! not inferred from an architecture identifier merely being present in
+//! upstream dispatch tables.
 
 use ramforge_core::{model::GgufModel, types::GgmlType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunSupport {
     Supported,
-    ViaLlamaGguf,
     NotYet,
 }
 
@@ -16,12 +27,11 @@ impl RunSupport {
     pub fn label(self) -> &'static str {
         match self {
             Self::Supported => "yes",
-            Self::ViaLlamaGguf => "via-llama-gguf",
             Self::NotYet => "not-yet",
         }
     }
 
-    fn is_directly_supported(self) -> bool {
+    pub fn is_supported(self) -> bool {
         self == Self::Supported
     }
 }
@@ -33,7 +43,10 @@ pub struct ArchitectureCapability {
     pub inspect: bool,
     pub plan: bool,
     pub tokenizer: &'static str,
-    pub run: RunSupport,
+    /// RAMforge's own managed-memory executor.
+    pub legacy_run: RunSupport,
+    /// forgeCORE/libllama backend, only after real-model validation.
+    pub forgecore_run: RunSupport,
     pub notes: &'static str,
 }
 
@@ -44,8 +57,9 @@ pub const ARCHITECTURES: &[ArchitectureCapability] = &[
         inspect: true,
         plan: true,
         tokenizer: "sentencepiece/bpe",
-        run: RunSupport::Supported,
-        notes: "dense llama-compatible transformer",
+        legacy_run: RunSupport::Supported,
+        forgecore_run: RunSupport::Supported,
+        notes: "dense llama-compatible transformer; validated on both backends",
     },
     ArchitectureCapability {
         name: "qwen2",
@@ -53,8 +67,19 @@ pub const ARCHITECTURES: &[ArchitectureCapability] = &[
         inspect: true,
         plan: true,
         tokenizer: "bpe",
-        run: RunSupport::Supported,
+        legacy_run: RunSupport::Supported,
+        forgecore_run: RunSupport::Supported,
         notes: "dense qwen2 transformer (including qwen2.5), including validated Q/K/V biases",
+    },
+    ArchitectureCapability {
+        name: "gptneox",
+        aliases: &["gpt_neox"],
+        inspect: true,
+        plan: true,
+        tokenizer: "bpe",
+        legacy_run: RunSupport::NotYet,
+        forgecore_run: RunSupport::Supported,
+        notes: "GPT-NeoX/Pythia parallel-residual transformer; executed through forgeCORE/libllama (use --backend forgecore)",
     },
     ArchitectureCapability {
         name: "mistral",
@@ -62,8 +87,9 @@ pub const ARCHITECTURES: &[ArchitectureCapability] = &[
         inspect: true,
         plan: true,
         tokenizer: "sentencepiece",
-        run: RunSupport::ViaLlamaGguf,
-        notes: "runnable only when the GGUF declares llama-compatible architecture/tensors",
+        legacy_run: RunSupport::NotYet,
+        forgecore_run: RunSupport::NotYet,
+        notes: "Mistral GGUFs normally declare general.architecture=llama; a literal 'mistral' tag has no validated execution path",
     },
     ArchitectureCapability {
         name: "qwen3",
@@ -71,8 +97,9 @@ pub const ARCHITECTURES: &[ArchitectureCapability] = &[
         inspect: true,
         plan: true,
         tokenizer: "inspect-only",
-        run: RunSupport::NotYet,
-        notes: "execution backend not implemented",
+        legacy_run: RunSupport::NotYet,
+        forgecore_run: RunSupport::NotYet,
+        notes: "inspect/plan only; forgeCORE/libllama execution has not been validated",
     },
     ArchitectureCapability {
         name: "qwen35",
@@ -80,7 +107,8 @@ pub const ARCHITECTURES: &[ArchitectureCapability] = &[
         inspect: true,
         plan: true,
         tokenizer: "inspect-only",
-        run: RunSupport::NotYet,
+        legacy_run: RunSupport::NotYet,
+        forgecore_run: RunSupport::NotYet,
         notes: "hybrid attention/SSM architecture; intentionally not aliased to qwen2",
     },
     ArchitectureCapability {
@@ -89,8 +117,9 @@ pub const ARCHITECTURES: &[ArchitectureCapability] = &[
         inspect: true,
         plan: true,
         tokenizer: "inspect-only",
-        run: RunSupport::NotYet,
-        notes: "execution backend not implemented",
+        legacy_run: RunSupport::NotYet,
+        forgecore_run: RunSupport::NotYet,
+        notes: "inspect/plan only; forgeCORE/libllama execution has not been validated",
     },
     ArchitectureCapability {
         name: "phi",
@@ -98,8 +127,9 @@ pub const ARCHITECTURES: &[ArchitectureCapability] = &[
         inspect: true,
         plan: true,
         tokenizer: "inspect-only",
-        run: RunSupport::NotYet,
-        notes: "execution backend not implemented",
+        legacy_run: RunSupport::NotYet,
+        forgecore_run: RunSupport::NotYet,
+        notes: "inspect/plan only; forgeCORE/libllama execution has not been validated",
     },
 ];
 
@@ -171,41 +201,65 @@ pub fn architecture_capability(name: &str) -> Option<&'static ArchitectureCapabi
     })
 }
 
+/// Architectures executable by RAMforge's legacy managed-memory executor.
 pub fn execution_architectures() -> Vec<&'static str> {
     ARCHITECTURES
         .iter()
-        .filter(|capability| capability.run.is_directly_supported())
+        .filter(|capability| capability.legacy_run.is_supported())
         .map(|capability| capability.name)
         .collect()
 }
 
+/// Architectures with validated forgeCORE/libllama execution.
+pub fn forgecore_execution_architectures() -> Vec<&'static str> {
+    ARCHITECTURES
+        .iter()
+        .filter(|capability| capability.forgecore_run.is_supported())
+        .map(|capability| capability.name)
+        .collect()
+}
+
+/// Preflight used only by the legacy executor.
+///
+/// When an architecture is valid through the ForgeCore/libllama backend, the
+/// error names that backend explicitly instead of implying that no execution
+/// path exists. It never switches backends on the caller's behalf.
 pub fn ensure_execution_supported(architecture: &str) -> Result<(), String> {
-    if architecture_capability(architecture)
-        .map(|capability| capability.run.is_directly_supported())
-        .unwrap_or(false)
-    {
+    let Some(capability) = architecture_capability(architecture) else {
+        return Err(format!(
+            "unsupported execution architecture '{}': inspection=true planning=true legacy-execution=not-yet forgecore-execution=not-yet (unknown execution architecture); currently supported legacy execution architectures: [{}]. GGUF inspection and planning remain available even when execution is unsupported",
+            architecture,
+            execution_architectures().join(", ")
+        ));
+    };
+
+    if capability.legacy_run.is_supported() {
         return Ok(());
     }
 
-    let supported = execution_architectures().join(", ");
-    let detail = architecture_capability(architecture)
-        .map(|capability| {
-            format!(
-                "inspection={} planning={} execution={} ({})",
-                capability.inspect,
-                capability.plan,
-                capability.run.label(),
-                capability.notes
-            )
-        })
-        .unwrap_or_else(|| {
-            "inspection=true planning=true execution=not-yet (unknown execution architecture)"
-                .to_string()
-        });
+    let detail = format!(
+        "inspection={} planning={} legacy-execution={} forgecore-execution={} ({})",
+        capability.inspect,
+        capability.plan,
+        capability.legacy_run.label(),
+        capability.forgecore_run.label(),
+        capability.notes
+    );
+
+    if capability.forgecore_run.is_supported() {
+        return Err(format!(
+            "architecture '{}' is not supported by RAMforge's legacy executor, but it is validated for execution through the forgeCORE/libllama backend: {}; re-run with `--backend forgecore`. Legacy execution architectures: [{}]. GGUF inspection and planning remain available",
+            architecture,
+            detail,
+            execution_architectures().join(", ")
+        ));
+    }
 
     Err(format!(
-        "unsupported execution architecture '{}': {}; currently supported execution architectures: [{}]. GGUF inspection and planning remain available even when execution is unsupported",
-        architecture, detail, supported
+        "unsupported execution architecture '{}': {}; currently supported legacy execution architectures: [{}]. GGUF inspection and planning remain available even when execution is unsupported",
+        architecture,
+        detail,
+        execution_architectures().join(", ")
     ))
 }
 
@@ -253,22 +307,35 @@ pub fn unsupported_inference_tensor_formats(model: &GgufModel) -> Vec<String> {
 }
 
 /// Model-specific execution support. Architecture-level registry answers are
-/// not enough: a supported architecture can still contain a tensor format the
-/// legacy runtime cannot decode.
+/// not enough: a legacy-supported architecture can still contain a tensor
+/// format the legacy runtime cannot decode.
+///
+/// `unsupported_tensor_formats` is a legacy-executor concept. The
+/// forgeCORE/libllama backend delegates tensor-type support to the pinned
+/// native runtime and must not be labelled unsupported from this list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelExecutionSupport {
     pub architecture: Option<String>,
-    pub architecture_run: RunSupport,
+    pub legacy_run: RunSupport,
+    pub forgecore_run: RunSupport,
     pub unsupported_tensor_formats: Vec<String>,
 }
 
 impl ModelExecutionSupport {
-    pub fn is_supported(&self) -> bool {
-        self.architecture_run == RunSupport::Supported && self.unsupported_tensor_formats.is_empty()
+    /// Legacy backend + every tensor format decodable by RAMforge's kernels.
+    pub fn is_legacy_supported(&self) -> bool {
+        self.legacy_run == RunSupport::Supported && self.unsupported_tensor_formats.is_empty()
     }
 
+    /// Architecture-level claim for forgeCORE/libllama. Tensor-type support is
+    /// the pinned native backend's responsibility, not this registry's.
+    pub fn is_forgecore_supported(&self) -> bool {
+        self.forgecore_run == RunSupport::Supported
+    }
+
+    /// Legacy label retained for existing inspect/plan JSON consumers.
     pub fn label(&self) -> &'static str {
-        if self.is_supported() {
+        if self.is_legacy_supported() {
             "yes"
         } else {
             "no"
@@ -278,14 +345,15 @@ impl ModelExecutionSupport {
 
 pub fn model_execution_support(model: &GgufModel) -> ModelExecutionSupport {
     let architecture = model.info().architecture;
-    let architecture_run = architecture
-        .as_deref()
-        .and_then(architecture_capability)
-        .map(|capability| capability.run)
-        .unwrap_or(RunSupport::NotYet);
+    let capability = architecture.as_deref().and_then(architecture_capability);
     ModelExecutionSupport {
         architecture,
-        architecture_run,
+        legacy_run: capability
+            .map(|capability| capability.legacy_run)
+            .unwrap_or(RunSupport::NotYet),
+        forgecore_run: capability
+            .map(|capability| capability.forgecore_run)
+            .unwrap_or(RunSupport::NotYet),
         unsupported_tensor_formats: unsupported_inference_tensor_formats(model),
     }
 }
@@ -357,21 +425,56 @@ mod tests {
     }
 
     #[test]
+    fn test_gptneox_registry_separates_legacy_from_forgecore() {
+        let capability = architecture_capability("gptneox").unwrap();
+        assert!(capability.inspect);
+        assert!(capability.plan);
+        assert_eq!(capability.legacy_run, RunSupport::NotYet);
+        assert_eq!(capability.forgecore_run, RunSupport::Supported);
+        assert!(forgecore_execution_architectures().contains(&"gptneox"));
+
+        let model = model_with_tensor_type("gptneox", GgmlType::Q8_0);
+        let support = model_execution_support(&model);
+        assert!(!support.is_legacy_supported());
+        assert!(support.is_forgecore_supported());
+        assert_eq!(support.label(), "no");
+
+        let error = ensure_execution_supported("gptneox").unwrap_err();
+        assert!(error.contains("forgeCORE/libllama"));
+        assert!(error.contains("--backend forgecore"));
+        assert!(error.contains("legacy-execution=not-yet"));
+        assert!(error.contains("forgecore-execution=yes"));
+        // The message must still contain the phrase handled by the smoke
+        // harness's unsupported-architecture classifier.
+        assert!(error.contains("not supported by RAMforge's legacy executor"));
+    }
+
+    #[test]
+    fn test_gpt_neox_alias_resolves_to_the_same_capability() {
+        assert_eq!(
+            architecture_capability("gpt_neox").map(|capability| capability.name),
+            Some("gptneox")
+        );
+    }
+
+    #[test]
     fn test_qwen35_is_inspectable_but_not_runnable() {
         let capability = architecture_capability("qwen3.5").unwrap();
         assert!(capability.inspect);
         assert!(capability.plan);
-        assert_eq!(capability.run, RunSupport::NotYet);
+        assert_eq!(capability.legacy_run, RunSupport::NotYet);
+        assert_eq!(capability.forgecore_run, RunSupport::NotYet);
         let error = ensure_execution_supported("qwen35").unwrap_err();
         assert!(error.contains("hybrid attention/SSM"));
         assert!(error.contains("inspection=true"));
-        assert!(error.contains("currently supported execution architectures"));
+        assert!(error.contains("currently supported legacy execution architectures"));
     }
 
     #[test]
-    fn test_mistral_requires_llama_compatible_gguf_declaration() {
+    fn test_mistral_literal_tag_is_not_claimed_runnable() {
         let capability = architecture_capability("mistral").unwrap();
-        assert_eq!(capability.run, RunSupport::ViaLlamaGguf);
+        assert_eq!(capability.legacy_run, RunSupport::NotYet);
+        assert_eq!(capability.forgecore_run, RunSupport::NotYet);
         assert!(ensure_execution_supported("mistral").is_err());
     }
 
@@ -397,8 +500,8 @@ mod tests {
     fn test_model_specific_execution_rejects_unsupported_tensor_format() {
         let model = model_with_tensor_type("llama", GgmlType::Q4_1);
         let support = model_execution_support(&model);
-        assert!(!support.is_supported());
-        assert_eq!(support.architecture_run, RunSupport::Supported);
+        assert!(!support.is_legacy_supported());
+        assert_eq!(support.legacy_run, RunSupport::Supported);
         assert_eq!(support.unsupported_tensor_formats, vec!["Q4_1"]);
         let error = ensure_model_execution_supported(&model).unwrap_err();
         assert!(error.contains("Q4_1"));
@@ -409,7 +512,8 @@ mod tests {
     fn test_supported_architecture_and_tensor_format_is_executable() {
         let model = model_with_tensor_type("qwen2", GgmlType::Q5_0);
         let support = model_execution_support(&model);
-        assert!(support.is_supported());
+        assert!(support.is_legacy_supported());
+        assert!(support.is_forgecore_supported());
         assert_eq!(support.label(), "yes");
         assert!(ensure_model_execution_supported(&model).is_ok());
     }

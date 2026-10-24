@@ -14,7 +14,7 @@ use ramforge_core::GgufModel;
 use crate::layer::group_layers;
 use crate::layer_read::build_layer_read_plan;
 use crate::plan::{ExecutionMemoryPlan, PlanResult};
-use crate::support::{architecture_capability, ggml_type_supported_for_inference, RunSupport};
+use crate::support::{architecture_capability, ggml_type_supported_for_inference};
 
 pub const PROFILE_SCHEMA_VERSION: u32 = 2;
 pub const EXECUTION_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -402,7 +402,7 @@ impl ModelProfile {
         let execution_compatibility =
             match architecture.as_deref().and_then(architecture_capability) {
                 Some(capability)
-                    if capability.run == RunSupport::Supported
+                    if capability.legacy_run.is_supported()
                         && unsupported_tensor_formats.is_empty() =>
                 {
                     ModelExecutionCompatibility::Executable

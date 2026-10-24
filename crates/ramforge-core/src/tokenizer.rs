@@ -306,10 +306,16 @@ impl Tokenizer {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
 
+        // Match the pinned llama.cpp/ggml vocabulary defaults when the GGUF
+        // omits the explicit key: SentencePiece vocabularies prepend BOS,
+        // while BPE vocabularies (GPT-2/Qwen2 style, including GPT-NeoX) do
+        // not. Defaulting every model to `true` inserted an extra token into
+        // GPT-NeoX/Pythia prompts that upstream never adds.
+        let is_bpe = model == "gpt2" || pre.as_deref() == Some("qwen2") || merges.is_some();
         let add_bos = gguf
             .get_metadata("tokenizer.ggml.add_bos_token")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .unwrap_or(!is_bpe);
         let add_eos = gguf
             .get_metadata("tokenizer.ggml.add_eos_token")
             .and_then(|v| v.as_bool())
@@ -1007,6 +1013,93 @@ mod tests {
         assert_eq!(tokenizer.vocab_size(), 7);
         assert_eq!(tokenizer.bos_id, Some(1));
         assert_eq!(tokenizer.eos_id, Some(2));
+        // SentencePiece vocabularies without an explicit key prepend BOS,
+        // matching llama.cpp's SPM default.
+        assert!(tokenizer.add_bos);
+        assert_eq!(tokenizer.encode("hello", true).first(), Some(&1));
+    }
+
+    #[test]
+    fn test_bpe_tokenizer_defaults_to_no_bos_without_metadata() {
+        // GPT-NeoX/Pythia GGUFs set `tokenizer.ggml.model = gpt2` and omit
+        // `tokenizer.ggml.add_bos_token`. Upstream therefore adds no BOS;
+        // inserting one changes the prompt and the generated tokens.
+        let tmp = make_gguf_with_bpe_tokenizer();
+        let model = crate::gguf::parse_gguf_file(tmp.path()).unwrap();
+        let tokenizer = Tokenizer::from_gguf(&model).unwrap();
+        assert!(!tokenizer.add_bos);
+        assert_eq!(tokenizer.encode("hello", true), vec![10]);
+        assert_eq!(tokenizer.encode("hello", false), vec![10]);
+    }
+
+    #[test]
+    fn test_explicit_add_bos_metadata_overrides_default() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&8u64.to_le_bytes());
+
+        fn write_string<W: Write>(w: &mut W, s: &str) {
+            w.write_all(&(s.len() as u64).to_le_bytes()).unwrap();
+            w.write_all(s.as_bytes()).unwrap();
+        }
+        fn write_u32<W: Write>(w: &mut W, v: u32) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
+        fn write_u64<W: Write>(w: &mut W, v: u64) {
+            w.write_all(&v.to_le_bytes()).unwrap();
+        }
+        fn write_bool<W: Write>(w: &mut W, v: bool) {
+            w.write_all(&[u8::from(v)]).unwrap();
+        }
+
+        write_string(&mut buf, "tokenizer.ggml.model");
+        write_u32(&mut buf, 8);
+        write_string(&mut buf, "gpt2");
+        write_string(&mut buf, "tokenizer.ggml.tokens");
+        write_u32(&mut buf, 9);
+        write_u32(&mut buf, 8);
+        write_u64(&mut buf, 4);
+        for tok in ["<unk>", "<s>", "</s>", "hello"] {
+            write_string(&mut buf, tok);
+        }
+        write_string(&mut buf, "tokenizer.ggml.scores");
+        write_u32(&mut buf, 9);
+        write_u32(&mut buf, 6);
+        write_u64(&mut buf, 4);
+        for _ in 0..4 {
+            write_u32(&mut buf, 0f32.to_bits());
+        }
+        write_string(&mut buf, "tokenizer.ggml.token_type");
+        write_u32(&mut buf, 9);
+        write_u32(&mut buf, 5);
+        write_u64(&mut buf, 4);
+        for _ in 0..4 {
+            write_u32(&mut buf, 1);
+        }
+        write_string(&mut buf, "tokenizer.ggml.merges");
+        write_u32(&mut buf, 9);
+        write_u32(&mut buf, 8);
+        write_u64(&mut buf, 0);
+        write_string(&mut buf, "tokenizer.ggml.bos_token_id");
+        write_u32(&mut buf, 4);
+        write_u32(&mut buf, 1);
+        write_string(&mut buf, "tokenizer.ggml.eos_token_id");
+        write_u32(&mut buf, 4);
+        write_u32(&mut buf, 2);
+        write_string(&mut buf, "tokenizer.ggml.add_bos_token");
+        write_u32(&mut buf, 7);
+        write_bool(&mut buf, true);
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&buf).unwrap();
+        tmp.flush().unwrap();
+
+        let model = crate::gguf::parse_gguf_file(tmp.path()).unwrap();
+        let tokenizer = Tokenizer::from_gguf(&model).unwrap();
+        assert!(tokenizer.add_bos);
+        assert_eq!(tokenizer.encode("hello", true), vec![1, 3]);
     }
 
     #[test]

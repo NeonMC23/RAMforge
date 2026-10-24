@@ -247,3 +247,68 @@ fn forgecore_boundary_keeps_native_ffi_out_of_ramforge() {
     assert!(!adapter.contains("forge_sys"));
     assert!(!adapter.contains("extern \"C\""));
 }
+
+/// Opt-in GPT-NeoX/Pythia execution through RAMforge's safe adapter.
+///
+/// This is the integration boundary that RAMforge's `--backend forgecore`
+/// uses. The legacy executor rejects `gptneox` intentionally; the ForgeCore
+/// backend must load, decode, and generate without falling back or
+/// approximating the architecture.
+#[test]
+#[ignore = "requires FORGE_GPTNEOX_MODEL=<gptneox gguf>; opt-in real-model test"]
+fn forgecore_gptneox_generates_tokens_through_the_adapter() {
+    let Ok(path) = std::env::var("FORGE_GPTNEOX_MODEL") else {
+        println!("SKIP: FORGE_GPTNEOX_MODEL not set (opt-in GPT-NeoX fixture)");
+        return;
+    };
+    let path = PathBuf::from(path);
+    let model = ForgeCoreModel::load(&path).expect("GPT-NeoX fixture must load");
+    let metadata = model.metadata().clone();
+    assert!(
+        metadata
+            .description
+            .to_ascii_lowercase()
+            .contains("gptneox"),
+        "fixture must be a GPT-NeoX model, got: {}",
+        metadata.description
+    );
+    assert!(metadata.layer_count > 0);
+    assert!(metadata.vocab_size > 0);
+
+    let gguf = parse_gguf_file(&path).expect("RAMforge GGUF inspection");
+    let tokenizer = ramforge_core::Tokenizer::from_gguf(&gguf).expect("RAMforge tokenizer");
+    let prompt = tokenizer.encode("The capital of France is", true);
+    assert!(!prompt.is_empty());
+    assert_eq!(tokenizer.vocab_size(), metadata.vocab_size as usize);
+    println!("ramforge gptneox prompt ids: {prompt:?}");
+
+    let mut session = model
+        .open_context(ForgeCoreContextOptions::default())
+        .expect("GPT-NeoX context");
+    let mut logits = session
+        .decode_tokens(&prompt, 0)
+        .expect("GPT-NeoX prompt decode");
+    assert!(logits.values().iter().all(|value| value.is_finite()));
+
+    let vocab = metadata.vocab_size as usize;
+    let mut generated = Vec::new();
+    let start_position = prompt.len();
+    for position in start_position..start_position + 4 {
+        let mut best = 0usize;
+        for (index, value) in logits.values().iter().enumerate().skip(1) {
+            if *value > logits.values()[best] {
+                best = index;
+            }
+        }
+        assert!(best < vocab);
+        generated.push(best as u32);
+        logits = session
+            .decode_token(
+                best as u32,
+                u32::try_from(position).expect("generated position fits u32"),
+            )
+            .expect("GPT-NeoX generated-token decode");
+    }
+    assert_eq!(generated.len(), 4);
+    println!("forgecore gptneox generated ids: {generated:?}");
+}

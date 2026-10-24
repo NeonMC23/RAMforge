@@ -514,6 +514,11 @@ fn run_forgecore_inference(
     let metadata = model.metadata().clone();
 
     let gguf = model_set.merged_model();
+    let architecture = gguf
+        .info()
+        .architecture
+        .unwrap_or_else(|| "unknown".to_string());
+    let architecture_support = ramforge_runtime::support::model_execution_support(&gguf);
     let raw_prompt = prompt;
     let prompt = prepare_prompt(&gguf, raw_prompt.clone(), chat, system)?;
     let tokenizer = Tokenizer::from_gguf(&gguf).map_err(|error| anyhow::anyhow!(error))?;
@@ -577,6 +582,18 @@ fn run_forgecore_inference(
         ram_str, ram_bytes
     );
     eprintln!("Prompt: {:?}", raw_prompt);
+    eprintln!(
+        "Architecture: {} (legacy-run={}, forgecore-run={})",
+        architecture,
+        architecture_support.legacy_run.label(),
+        architecture_support.forgecore_run.label()
+    );
+    if !architecture_support.is_forgecore_supported() {
+        eprintln!(
+            "Warning: architecture '{}' has no RAMforge-validated forgeCORE execution evidence; the request is delegated to the pinned llama.cpp runtime and may fail",
+            architecture
+        );
+    }
     if chat {
         eprintln!("Chat template: applied (rendered {} bytes)", prompt.len());
         eprintln!("Chat prompt: {:?}", prompt);
@@ -733,27 +750,39 @@ fn run_forgecore_inference(
 }
 
 fn output_support() {
-    use ramforge_runtime::support::{ARCHITECTURES, QUANTIZATIONS};
+    use ramforge_runtime::support::{
+        execution_architectures, forgecore_execution_architectures, ARCHITECTURES, QUANTIZATIONS,
+    };
 
     println!("RAMforge capability registry");
     println!("Architecture support:");
     println!(
-        "  {:<10} {:<9} {:<9} {:<18} Tokenizer",
-        "Architecture", "Inspect", "Plan", "Run"
+        "  {:<10} {:<9} {:<9} {:<12} {:<24} Tokenizer",
+        "Architecture", "Inspect", "Plan", "Legacy run", "ForgeCore/libllama run"
     );
     for capability in ARCHITECTURES {
         println!(
-            "  {:<10} {:<9} {:<9} {:<18} {}",
+            "  {:<10} {:<9} {:<9} {:<12} {:<24} {}",
             capability.name,
             yes_no(capability.inspect),
             yes_no(capability.plan),
-            capability.run.label(),
+            capability.legacy_run.label(),
+            capability.forgecore_run.label(),
             capability.tokenizer
         );
         println!("    {}", capability.notes);
     }
     println!();
-    println!("Quantization support:");
+    println!(
+        "  Legacy execution architectures: [{}]",
+        execution_architectures().join(", ")
+    );
+    println!(
+        "  Validated forgeCORE/libllama architectures: [{}]",
+        forgecore_execution_architectures().join(", ")
+    );
+    println!();
+    println!("Quantization support (RAMforge legacy executor):");
     for capability in QUANTIZATIONS {
         println!(
             "  {:<18} inference={}",
@@ -763,7 +792,8 @@ fn output_support() {
     }
     println!();
     println!("Inspection/planning are generic GGUF operations and do not imply execution support.");
-    println!("Run=yes is architecture-level; tensor-format support is model-specific. Use `inspect` or `plan` for the final legacy-execution verdict.");
+    println!("Legacy run=yes is architecture-level; tensor-format support is model-specific. Use `inspect` or `plan` for the final legacy-execution verdict.");
+    println!("ForgeCore/libllama run=yes means real-model execution has been validated for at least one fixture of that architecture. The backend delegates tensor-type support to the pinned native runtime; it does not use RAMforge's legacy quantization list.");
 }
 
 fn output_generation_profile(
@@ -1133,17 +1163,24 @@ fn output_human(model: &GgufModel, max_tensors: usize, model_set: Option<&GgufMo
     println!("  Architecture: {}", architecture);
     if let Some(capability) = ramforge_runtime::support::architecture_capability(architecture) {
         println!(
-            "  Architecture support: inspect={} plan={} run={} ({})",
+            "  Architecture support: inspect={} plan={} legacy-run={} forgecore-run={} ({})",
             yes_no(capability.inspect),
             yes_no(capability.plan),
-            capability.run.label(),
+            capability.legacy_run.label(),
+            capability.forgecore_run.label(),
             capability.notes
         );
     } else {
-        println!("  Architecture support: inspect=yes plan=yes run=not-yet");
+        println!(
+            "  Architecture support: inspect=yes plan=yes legacy-run=not-yet forgecore-run=not-yet"
+        );
     }
     let model_support = ramforge_runtime::support::model_execution_support(model);
-    println!("  Model execution support: {}", model_support.label());
+    println!("  Legacy execution support: {}", model_support.label());
+    println!(
+        "  ForgeCore/libllama execution support: {}",
+        yes_no(model_support.is_forgecore_supported())
+    );
     if !model_support.unsupported_tensor_formats.is_empty() {
         println!(
             "  Unsupported tensor formats for legacy execution: {}",
@@ -1312,12 +1349,16 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     println!("  Architecture: {}", architecture);
     let model_support = ramforge_runtime::support::model_execution_support(model);
     println!(
-        "  Execution support: {} (inspection/planning remain available)",
+        "  Legacy execution support: {} (inspection/planning remain available)",
         model_support.label()
+    );
+    println!(
+        "  ForgeCore/libllama execution support: {} (RAM budget is diagnostics-only on this backend)",
+        yes_no(model_support.is_forgecore_supported())
     );
     if !model_support.unsupported_tensor_formats.is_empty() {
         println!(
-            "  Unsupported tensor formats: {}",
+            "  Unsupported tensor formats for legacy execution: {}",
             model_support.unsupported_tensor_formats.join(", ")
         );
     }
@@ -1359,7 +1400,7 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     }
     println!();
 
-    println!("Execution memory preflight:");
+    println!("Legacy execution memory preflight:");
     if let Some(execution) = &plan.execution_memory {
         println!(
             "  Policy-resident persistent weights: {} across {} tensors",
@@ -1483,7 +1524,7 @@ fn output_json(
 
     let summary = model.type_summary();
     let model_support = ramforge_runtime::support::model_execution_support(model);
-    let execution_supported = model_support.is_supported();
+    let execution_supported = model_support.is_legacy_supported();
 
     let shards_json: Option<Vec<_>> = model_set.map(|set| {
         set.shards
@@ -1532,6 +1573,8 @@ fn output_json(
         "vocab_size": info.vocab_size,
         "type_summary": summary,
         "execution_supported": execution_supported,
+        "execution_supported_scope": "legacy-ramforge-executor",
+        "forgecore_execution_supported": model_support.is_forgecore_supported(),
         "unsupported_tensor_formats": model_support.unsupported_tensor_formats,
         "total_tensor_bytes": model.total_tensor_bytes(),
         "tensors": tensors_json,
@@ -1586,7 +1629,7 @@ fn output_plan_json(
     };
 
     let model_support = ramforge_runtime::support::model_execution_support(model);
-    let execution_supported = model_support.is_supported();
+    let execution_supported = model_support.is_legacy_supported();
     let output = json!({
         "model": {
             "path": model.path,
@@ -1595,6 +1638,8 @@ fn output_plan_json(
             "tensor_count": plan.tensor_count,
             "total_tensor_bytes": plan.total_tensor_bytes,
             "execution_supported": execution_supported,
+            "execution_supported_scope": "legacy-ramforge-executor",
+            "forgecore_execution_supported": model_support.is_forgecore_supported(),
             "unsupported_tensor_formats": model_support.unsupported_tensor_formats,
         },
         "ram_budget": {

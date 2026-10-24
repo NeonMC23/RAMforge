@@ -1,8 +1,14 @@
-//! LLaMA/Qwen2 architecture configuration and tensor validation.
+//! LLaMA/Qwen2 architecture configuration and tensor validation for the
+//! legacy RAMforge executor.
 //!
-//! Supported architecture families:
+//! Supported legacy architecture families:
 //! - "llama" (dense transformer)
 //! - "qwen2" (same tensor layout as llama, with qwen2.* metadata keys)
+//!
+//! Architectures not implemented by this executor are rejected here before any
+//! tensor payload is read. Some of them (notably `gptneox`) are executable
+//! through the separate forgeCORE/libllama backend; the rejection message says
+//! so explicitly and never switches backends implicitly.
 //!
 //! Supported GGUF metadata values:
 //! - general.architecture = "llama" or "qwen2"

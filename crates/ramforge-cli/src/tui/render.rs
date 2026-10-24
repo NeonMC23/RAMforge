@@ -252,7 +252,7 @@ fn render_model_info(app: &TuiApp, output: &mut String) {
     );
     field(
         output,
-        "Execution",
+        "Legacy execution",
         match model.execution_compatibility {
             ModelExecutionCompatibility::Executable => "Supported",
             ModelExecutionCompatibility::InspectPlanOnly => "Not supported (inspect/plan only)",
