@@ -8,7 +8,9 @@ use ramforge_core::{
     resource::{ByteMeasurement, ResourceBudgets},
 };
 
+use crate::cgroup::CgroupStats;
 use crate::execution::DeviceInfo;
+use crate::page_residency::MappingResidency;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MemoryReport {
@@ -41,6 +43,25 @@ impl MemoryReport {
     }
 }
 
+/// How the requested budget is enforced, if at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BudgetEnforcement {
+    /// The value is recorded and used for planning, but the OS does not cap it.
+    #[default]
+    DiagnosticOnly,
+    /// A cgroup v2 `memory.max` hard limit was active for the measured process.
+    CgroupV2,
+}
+
+impl BudgetEnforcement {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DiagnosticOnly => "diagnostic-only",
+            Self::CgroupV2 => "cgroup-v2-memory.max",
+        }
+    }
+}
+
 /// Memory facts for the ForgeCore/libllama execution path.
 ///
 /// This report deliberately separates facts that are often conflated:
@@ -48,23 +69,34 @@ impl MemoryReport {
 /// - `logical_model_bytes` is the sum of GGUF tensor payload lengths read by
 ///   RAMforge's inspector. It is a file/logical size, not an allocation.
 /// - `native_model_bytes` is libllama's own `size_bytes()` accounting.
-/// - RSS values are measured process facts from `/proc/self/status`; they
-///   include the loader, page cache effects, Rust heap, and everything else in
-///   the process. They are not an attribution of model residency.
+/// - `model_residency` is the measured RSS/PSS of process mappings backed by
+///   the model file. llama.cpp uses a file-backed mmap by default, so these
+///   pages are reclaimable rather than an anonymous copy of the weights.
+/// - RSS and peak-RSS values are measured process facts from
+///   `/proc/self/status`; they include the loader, page cache effects, Rust
+///   heap, and everything else in the process.
+/// - `cgroup` is present only when the run used an explicit cgroup v2 limit.
+///   `memory.peak` is the kernel's charged-memory peak for the cgroup.
 /// - device totals/free bytes are native snapshots exposed by forgeCORE.
 ///
-/// The pinned llama.cpp C API does not expose KV-cache, graph-scratch, staging,
-/// or mapped-page residency bytes. Those fields are therefore absent rather
-/// than estimated. The requested RAM budget is recorded but is **not**
-/// enforced on this backend: libllama loads the model eagerly.
+/// A mmap-backed model is not proof that RSS is bounded. The kernel reclaims
+/// clean file pages under pressure, but the pinned C API exposes no per-layer
+/// eviction hook. A cgroup limit is a hard process-group cap; RAMforge does not
+/// perform layer-at-a-time staging on the ForgeCore path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeCoreMemoryReport {
     pub requested_budget_bytes: u64,
+    pub enforcement: BudgetEnforcement,
     pub logical_model_bytes: Option<u64>,
     pub native_model_bytes: u64,
+    pub load_mode: Option<String>,
+    pub weight_repacking: Option<String>,
     pub rss_before_load_bytes: Option<u64>,
     pub rss_after_load_bytes: Option<u64>,
     pub rss_after_decode_bytes: Option<u64>,
+    pub rss_peak_bytes: Option<u64>,
+    pub model_residency: Option<MappingResidency>,
+    pub cgroup: Option<CgroupStats>,
     pub system_total_bytes: Option<u64>,
     pub system_available_bytes: Option<u64>,
     pub device_memory_total: ByteMeasurement,
@@ -85,11 +117,17 @@ impl ForgeCoreMemoryReport {
         let (system_total_bytes, system_available_bytes) = system_memory();
         Self {
             requested_budget_bytes,
+            enforcement: BudgetEnforcement::DiagnosticOnly,
             logical_model_bytes,
             native_model_bytes,
+            load_mode: None,
+            weight_repacking: None,
             rss_before_load_bytes,
             rss_after_load_bytes,
             rss_after_decode_bytes,
+            rss_peak_bytes: process_rss_peak(),
+            model_residency: None,
+            cgroup: None,
             system_total_bytes,
             system_available_bytes,
             device_memory_total: device.memory_total.clone(),
@@ -97,9 +135,39 @@ impl ForgeCoreMemoryReport {
         }
     }
 
-    /// The ForgeCore backend does not enforce RAMforge's RAM budget.
+    /// Attach an active cgroup v2 limit and its measured counters.
+    pub fn with_cgroup(mut self, stats: CgroupStats) -> Self {
+        self.enforcement = BudgetEnforcement::CgroupV2;
+        self.cgroup = Some(stats);
+        self
+    }
+
+    /// Attach measured residency for the model file mapping.
+    pub fn with_model_residency(mut self, residency: MappingResidency) -> Self {
+        self.model_residency = Some(residency);
+        self
+    }
+
+    /// Record the requested native load mode.
+    pub fn with_load_mode(mut self, load_mode: impl Into<String>) -> Self {
+        self.load_mode = Some(load_mode.into());
+        self
+    }
+
+    /// Record whether native CPU weight repacking was enabled.
+    pub fn with_weight_repacking(mut self, label: impl Into<String>) -> Self {
+        self.weight_repacking = Some(label.into());
+        self
+    }
+
+    /// True only when a real cgroup v2 limit was active for this run.
     pub const fn enforces_budget(&self) -> bool {
-        false
+        matches!(self.enforcement, BudgetEnforcement::CgroupV2)
+    }
+
+    /// True when the kernel reported a cgroup limit or OOM event.
+    pub fn cgroup_exceeded(&self) -> bool {
+        self.cgroup.as_ref().is_some_and(CgroupStats::exceeded)
     }
 
     /// True when the logical GGUF payload is larger than the requested budget.
@@ -122,10 +190,9 @@ impl ForgeCoreMemoryReport {
     /// Native memory categories that the pinned C API does not expose.
     pub const fn unexposed_categories(&self) -> &'static [&'static str] {
         &[
-            "KV cache",
+            "KV cache bytes (only the cgroup total is visible)",
             "graph scratch/workspace",
             "staging buffers",
-            "mapped-page residency",
         ]
     }
 }
@@ -142,6 +209,18 @@ pub fn process_rss() -> Option<u64> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn process_rss() -> Option<u64> {
+    None
+}
+
+/// Peak resident set size for this process (`VmHWM`).
+#[cfg(target_os = "linux")]
+pub fn process_rss_peak() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_kib_field(&status, "VmHWM:")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_rss_peak() -> Option<u64> {
     None
 }
 
@@ -213,7 +292,32 @@ mod tests {
         assert_eq!(report.rss_delta_after_decode_bytes(), Some(800));
         assert_eq!(report.logical_model_bytes, Some(250));
         assert_eq!(report.native_model_bytes, 240);
-        assert!(report.unexposed_categories().contains(&"KV cache"));
+        assert!(report
+            .unexposed_categories()
+            .iter()
+            .any(|item| item.starts_with("KV cache")));
+    }
+
+    #[test]
+    fn cgroup_attachment_is_the_only_enforcement_claim() {
+        let registry = crate::execution::DeviceRegistry::cpu_only();
+        let device = &registry.devices()[0];
+        let report = ForgeCoreMemoryReport::new(100, Some(250), 240, None, None, None, device);
+        assert_eq!(report.enforcement, BudgetEnforcement::DiagnosticOnly);
+        assert!(!report.enforces_budget());
+
+        let report = report.with_cgroup(crate::cgroup::CgroupStats {
+            limit_bytes: Some(100),
+            peak_bytes: Some(90),
+            events: Some(crate::cgroup::CgroupEvents {
+                max: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(report.enforcement, BudgetEnforcement::CgroupV2);
+        assert!(report.enforces_budget());
+        assert!(report.cgroup_exceeded());
     }
 
     #[test]

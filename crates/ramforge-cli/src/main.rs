@@ -4,7 +4,11 @@ use ramforge_core::{
     Tokenizer,
 };
 use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
-use ramforge_runtime::{DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreModel};
+use ramforge_runtime::page_residency::{evict_file_cache, model_mapping_residency};
+use ramforge_runtime::{
+    DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreModel,
+    ForgeCoreModelOptions,
+};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -88,6 +92,22 @@ enum Commands {
         #[arg(long, default_value = "cpu")]
         device: String,
 
+        /// Context length override in tokens (ForgeCore only; default: model training context)
+        #[arg(long)]
+        ctx: Option<u32>,
+
+        /// Disable llama.cpp CPU weight repacking; keeps quantized weights in the file-backed mapping
+        #[arg(long)]
+        no_repack: bool,
+
+        /// Enforce --ram as a hard cgroup v2 memory.max limit for the run
+        #[arg(long)]
+        enforce_ram: bool,
+
+        /// Wall-clock timeout for an enforced run, in seconds
+        #[arg(long, default_value_t = 900, requires = "enforce_ram")]
+        enforce_timeout: u64,
+
         /// Maximum tokens to generate
         #[arg(long, default_value_t = 32)]
         max_tokens: usize,
@@ -147,6 +167,10 @@ fn main() {
             system,
             backend,
             device,
+            ctx,
+            no_repack,
+            enforce_ram,
+            enforce_timeout,
             max_tokens,
             temperature,
             top_k,
@@ -155,6 +179,34 @@ fn main() {
             profile,
             memory_report,
         } => {
+            // The outer process creates the kernel limit and re-execs the same
+            // command. The child sees RAMFORGE_SUPERVISED and runs normally.
+            if enforce_ram && !ramforge_cli::supervisor::is_supervised() {
+                let ram_bytes = match parse_memory_size(&ram) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        eprintln!("Error: invalid --ram '{}': {}", ram, error);
+                        std::process::exit(1);
+                    }
+                };
+                if enforce_timeout == 0 {
+                    eprintln!("Error: --enforce-timeout must be greater than zero");
+                    std::process::exit(2);
+                }
+                match ramforge_cli::supervisor::run_supervised(
+                    ram_bytes,
+                    Duration::from_secs(enforce_timeout),
+                ) {
+                    Ok(outcome) => {
+                        ramforge_cli::supervisor::print_report(&outcome, ram_bytes);
+                        std::process::exit(outcome.exit_code);
+                    }
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             if let Err(e) = run_inference(
                 model,
                 ram,
@@ -163,6 +215,8 @@ fn main() {
                 system,
                 backend,
                 device,
+                ctx,
+                no_repack,
                 max_tokens,
                 temperature,
                 top_k,
@@ -250,6 +304,8 @@ fn run_inference(
     system: Option<String>,
     backend: InferenceBackend,
     device: String,
+    ctx: Option<u32>,
+    no_repack: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -273,6 +329,8 @@ fn run_inference(
             chat,
             system,
             device_selection.clone(),
+            ctx,
+            no_repack,
             max_tokens,
             temperature,
             top_k,
@@ -288,12 +346,32 @@ fn run_inference(
             device
         ));
     }
+    if ctx.is_some() {
+        return Err(anyhow::anyhow!(
+            "--ctx is only supported with --backend forgecore; the legacy executor uses the model's stored context length"
+        ));
+    }
+    if no_repack {
+        return Err(anyhow::anyhow!(
+            "--no-repack is only supported with --backend forgecore"
+        ));
+    }
 
     // Diagnostics to stderr
     eprintln!("RAMforge – Usable Out-of-Core Inference");
     eprintln!("========================================================");
     eprintln!("Model: {}", model_path.display());
-    eprintln!("RAM budget: {} ({} bytes)", ram_str, ram_bytes);
+    if let Some(limit) = ramforge_cli::supervisor::enforced_budget_bytes() {
+        eprintln!(
+            "RAM budget: {} ({} bytes; ENFORCED cgroup v2 memory.max={} bytes)",
+            ram_str, ram_bytes, limit
+        );
+    } else {
+        eprintln!(
+            "RAM budget: {} ({} bytes; managed budget; pass --enforce-ram for a hard OS cap)",
+            ram_str, ram_bytes
+        );
+    }
     eprintln!("Max tokens: {}", max_tokens);
     eprintln!("Temperature: {}", temperature);
     if let Some(k) = top_k {
@@ -487,6 +565,8 @@ fn run_forgecore_inference(
     chat: bool,
     system: Option<String>,
     device: DeviceSelection,
+    ctx: Option<u32>,
+    no_repack: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -508,8 +588,36 @@ fn run_forgecore_inference(
         ExecutionConfig::new(device, 1, None, false).map_err(|error| anyhow::anyhow!(error))?;
     let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
     let primary_path = model_set.primary_path().to_path_buf();
-    let model = ForgeCoreModel::load_for_execution(&primary_path, execution, &registry)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    if ramforge_cli::supervisor::enforced_budget_bytes().is_some() {
+        let mut evicted = 0usize;
+        for shard in &model_set.shards {
+            match evict_file_cache(&shard.path) {
+                Ok(()) => evicted += 1,
+                Err(error) => eprintln!(
+                    "Warning: could not drop page cache for {}: {}",
+                    shard.path.display(),
+                    error
+                ),
+            }
+        }
+        eprintln!(
+            "Cold-cache priming: requested cache drop for {} of {} shard(s)",
+            evicted,
+            model_set.shards.len()
+        );
+    }
+    let model_options = ForgeCoreModelOptions {
+        check_tensors: execution.check_tensors,
+        use_extra_bufts: !no_repack,
+        ..ForgeCoreModelOptions::default()
+    };
+    let model = ForgeCoreModel::load_for_execution_with_options(
+        &primary_path,
+        execution,
+        &registry,
+        model_options,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
     let rss_after_load = process_rss();
     let metadata = model.metadata().clone();
 
@@ -541,7 +649,10 @@ fn run_forgecore_inference(
     }
 
     let mut session = model
-        .open_selected_context()
+        .open_context(ForgeCoreContextOptions {
+            n_ctx: ctx,
+            n_threads: 1,
+        })
         .map_err(|error| anyhow::anyhow!(error))?;
     let context_length = session.context_length() as usize;
     if prompt_tokens.len() > context_length {
@@ -577,10 +688,17 @@ fn run_forgecore_inference(
             model_set.total_file_bytes()
         );
     }
-    eprintln!(
-        "RAM budget: {} ({} bytes; planning/diagnostics only for ForgeCore)",
-        ram_str, ram_bytes
-    );
+    if let Some(limit) = ramforge_cli::supervisor::enforced_budget_bytes() {
+        eprintln!(
+            "RAM budget: {} ({} bytes; ENFORCED cgroup v2 memory.max={} bytes)",
+            ram_str, ram_bytes, limit
+        );
+    } else {
+        eprintln!(
+            "RAM budget: {} ({} bytes; planning/diagnostics only for ForgeCore; pass --enforce-ram for a hard OS limit)",
+            ram_str, ram_bytes
+        );
+    }
     eprintln!("Prompt: {:?}", raw_prompt);
     eprintln!(
         "Architecture: {} (legacy-run={}, forgecore-run={})",
@@ -622,6 +740,20 @@ fn run_forgecore_inference(
         metadata.kv_head_count
     );
     eprintln!("Model description: {}", metadata.description);
+    eprintln!(
+        "Model load mode: {} (weights file-backed when the platform supports mmap)",
+        metadata.load_mode_label()
+    );
+    eprintln!(
+        "CPU weight repacking: {}",
+        metadata.weight_repacking_label()
+    );
+    eprintln!(
+        "Context length: {} (requested {})",
+        context_length,
+        ctx.map(|value| value.to_string())
+            .unwrap_or_else(|| "model default".to_string())
+    );
     eprintln!("Selection request: {}", model.execution_config().device);
     eprintln!(
         "Selected backend/device: {} / {} ({:?}, registry_index={:?})",
@@ -734,7 +866,7 @@ fn run_forgecore_inference(
         );
     }
     if memory_report {
-        let report = ForgeCoreMemoryReport::new(
+        let mut report = ForgeCoreMemoryReport::new(
             ram_bytes,
             gguf.total_tensor_bytes(),
             metadata.size_bytes,
@@ -743,6 +875,14 @@ fn run_forgecore_inference(
             rss_after_decode,
             model.device(),
         );
+        if let Some(stats) = ramforge_cli::supervisor::child_report_stats() {
+            report = report.with_cgroup(stats);
+        }
+        report = report.with_load_mode(metadata.load_mode_label());
+        report = report.with_weight_repacking(metadata.weight_repacking_label());
+        if let Some(residency) = model_mapping_residency(&primary_path) {
+            report = report.with_model_residency(residency);
+        }
         output_forgecore_memory_report(&report);
     }
 
@@ -998,8 +1138,22 @@ fn output_forgecore_memory_report(report: &ForgeCoreMemoryReport) {
     eprintln!();
     eprintln!("ForgeCore memory report (measured/native-reported facts):");
     eprintln!(
-        "  Requested RAM budget: {} (NOT enforced by the ForgeCore backend)",
-        format_bytes(report.requested_budget_bytes)
+        "  Requested RAM budget: {} ({})",
+        format_bytes(report.requested_budget_bytes),
+        match report.enforcement {
+            ramforge_runtime::memory_report::BudgetEnforcement::CgroupV2 =>
+                "enforced by cgroup v2 memory.max",
+            ramforge_runtime::memory_report::BudgetEnforcement::DiagnosticOnly =>
+                "diagnostic-only; not enforced",
+        }
+    );
+    eprintln!(
+        "  Model load mode: {}",
+        report.load_mode.as_deref().unwrap_or("unavailable")
+    );
+    eprintln!(
+        "  CPU weight repacking: {}",
+        report.weight_repacking.as_deref().unwrap_or("unavailable")
     );
     eprintln!(
         "  Logical GGUF tensor bytes: {}",
@@ -1020,16 +1174,70 @@ fn output_forgecore_memory_report(report: &ForgeCoreMemoryReport) {
             .unwrap_or("unknown")
     );
     eprintln!(
-        "  Process RSS: before_load={} after_load={} after_decode={}",
+        "  Process RSS: before_load={} after_load={} after_decode={} peak={}",
         optional_bytes(report.rss_before_load_bytes),
         optional_bytes(report.rss_after_load_bytes),
-        optional_bytes(report.rss_after_decode_bytes)
+        optional_bytes(report.rss_after_decode_bytes),
+        optional_bytes(report.rss_peak_bytes)
     );
     eprintln!(
         "  Measured RSS delta: load={} decode={}",
         optional_signed_bytes(report.rss_delta_after_load_bytes()),
         optional_signed_bytes(report.rss_delta_after_decode_bytes())
     );
+    if let Some(residency) = &report.model_residency {
+        eprintln!(
+            "  Model mapping residency: mapped={} resident={} pss={} mappings={} ({:.1}% of mapping)",
+            format_bytes(residency.mapped_bytes),
+            format_bytes(residency.rss_bytes),
+            format_bytes(residency.pss_bytes),
+            residency.mapping_count,
+            residency
+                .resident_fraction()
+                .map(|fraction| fraction * 100.0)
+                .unwrap_or(0.0)
+        );
+        eprintln!(
+            "    clean_shared={} clean_private={} dirty_private={} anonymous={}",
+            format_bytes(residency.shared_clean_bytes),
+            format_bytes(residency.private_clean_bytes),
+            format_bytes(residency.private_dirty_bytes),
+            format_bytes(residency.anonymous_bytes)
+        );
+    } else {
+        eprintln!("  Model mapping residency: unavailable (no matching file mapping)");
+    }
+    if let Some(cgroup) = &report.cgroup {
+        eprintln!(
+            "  Cgroup: limit={} peak={} current={} swap_peak={}",
+            optional_bytes(cgroup.limit_bytes),
+            optional_bytes(cgroup.peak_bytes),
+            optional_bytes(cgroup.current_bytes),
+            optional_bytes(cgroup.swap_peak_bytes)
+        );
+        if let Some(events) = cgroup.events {
+            eprintln!(
+                "  Cgroup events: max={} high={} oom={} oom_kill={} oom_group_kill={}",
+                events.max, events.high, events.oom, events.oom_kill, events.oom_group_kill
+            );
+        }
+        eprintln!(
+            "  Cgroup stat: anon={} file={} shmem={} file_mapped={} kernel={} pgfault={} pgmajfault={}",
+            optional_bytes(cgroup.anon_bytes),
+            optional_bytes(cgroup.file_bytes),
+            optional_bytes(cgroup.shmem_bytes),
+            optional_bytes(cgroup.file_mapped_bytes),
+            optional_bytes(cgroup.kernel_bytes),
+            cgroup
+                .pgfault
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
+            cgroup
+                .pgmajfault
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_string())
+        );
+    }
     eprintln!(
         "  System memory: total={} available={}",
         optional_bytes(report.system_total_bytes),
@@ -1045,7 +1253,7 @@ fn output_forgecore_memory_report(report: &ForgeCoreMemoryReport) {
         report.unexposed_categories().join(", ")
     );
     eprintln!(
-        "  Note: RSS includes the loader, page-cache effects, Rust heap, and all other process memory; it is not model residency."
+        "  Note: RSS includes the loader, page-cache effects, Rust heap, and all other process memory. A file-backed model mapping is reclaimable, but the pinned native API exposes no per-layer eviction hook; cgroup v2 supplies the hard cap when --enforce-ram is set."
     );
 }
 

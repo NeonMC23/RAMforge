@@ -17,6 +17,7 @@
 
 pub(crate) mod accounting;
 pub mod backend;
+pub mod cgroup;
 pub mod calibration;
 pub(crate) mod compute_dispatch;
 pub mod discovery;
@@ -32,6 +33,7 @@ pub mod model;
 pub mod model_executor;
 pub mod ops;
 pub mod orchestration;
+pub mod page_residency;
 pub mod persistent;
 pub mod plan;
 pub mod plan_compiler;

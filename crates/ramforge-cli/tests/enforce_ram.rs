@@ -1,0 +1,119 @@
+//! CLI-level checks for the enforced-budget surface.
+//!
+//! Real-model checks are ignored by default and use paths from the
+//! environment. They run the built `ramforge` binary, so they also exercise
+//! the supervisor re-exec path.
+
+use std::process::Command;
+
+fn ramforge() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_ramforge"))
+}
+
+#[test]
+fn help_lists_memory_control_flags() {
+    let output = ramforge().args(["run", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for flag in ["--enforce-ram", "--enforce-timeout", "--ctx", "--no-repack"] {
+        assert!(text.contains(flag), "help must list {flag}: {text}");
+    }
+}
+
+#[test]
+fn zero_enforcement_timeout_is_rejected_before_any_model_access() {
+    let output = ramforge()
+        .args([
+            "run",
+            "/nonexistent/model.gguf",
+            "--ram",
+            "64M",
+            "--prompt",
+            "hi",
+            "--enforce-ram",
+            "--enforce-timeout",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("--enforce-timeout must be greater than zero"),
+        "unexpected stderr: {text}"
+    );
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn enforced_real_model_run_reports_the_cgroup_peak() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "512M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+            "--memory-report",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "enforced run failed: {stderr}");
+    for expected in [
+        "Memory enforcement: cgroup v2",
+        "Peak charged:",
+        "CPU weight repacking: disabled",
+        "Result: exit 0",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing {expected:?} in: {stderr}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a model larger than the limit, and libggml"]
+fn enforced_oom_is_a_failure_not_a_success() {
+    let model = std::env::var("FORGE_OOM_MODEL").expect("set FORGE_OOM_MODEL");
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "128M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(137), "stderr: {stderr}");
+    assert!(
+        stderr.contains("cgroup OOM kill") || stderr.contains("oom_kill="),
+        "OOM must be reported: {stderr}"
+    );
+}

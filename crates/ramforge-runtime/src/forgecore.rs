@@ -11,7 +11,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use forge_core::{BatchBuilder, Context, GpuLayers, Model, ModelOptions};
+use forge_core::{BatchBuilder, Context, GpuLayers, Model, ModelLoadMode, ModelOptions};
 
 use crate::execution::{
     CapabilityState, DeviceInfo, DeviceRegistry, DeviceSelection, DeviceSelectionError,
@@ -41,10 +41,10 @@ impl fmt::Display for ForgeCoreAdapterError {
             Self::Configuration(message) => write!(formatter, "ForgeCore configuration: {message}"),
             Self::DeviceSelection(message) => {
                 write!(formatter, "ForgeCore device selection: {message}")
-            },
+            }
             Self::UnsupportedDevice(message) => {
                 write!(formatter, "ForgeCore unsupported device: {message}")
-            },
+            }
             Self::Model(message) => write!(formatter, "ForgeCore model: {message}"),
             Self::Context(message) => write!(formatter, "ForgeCore context: {message}"),
             Self::Batch(message) => write!(formatter, "ForgeCore batch: {message}"),
@@ -57,10 +57,27 @@ impl fmt::Display for ForgeCoreAdapterError {
 impl std::error::Error for ForgeCoreAdapterError {}
 
 /// CPU model-loading options exposed by the RAMforge adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForgeCoreModelOptions {
     /// Ask libllama to validate tensor payloads while loading.
     pub check_tensors: bool,
+    /// How the model file is mapped. The adapter defaults to an explicit
+    /// file-backed mapping so weight residency stays reclaimable by the OS.
+    pub load_mode: ModelLoadMode,
+    /// Let libllama build CPU-specific repacked weight buffers. Disabling
+    /// this keeps quantized weights in the file-backed mapping and removes a
+    /// large anonymous allocation, at the cost of slower generic kernels.
+    pub use_extra_bufts: bool,
+}
+
+impl Default for ForgeCoreModelOptions {
+    fn default() -> Self {
+        Self {
+            check_tensors: false,
+            load_mode: ModelLoadMode::Mmap,
+            use_extra_bufts: true,
+        }
+    }
 }
 
 /// Metadata copied from the ForgeCore model handle for RAMforge diagnostics
@@ -76,7 +93,29 @@ pub struct ForgeCoreModelMetadata {
     pub layer_count: u32,
     pub head_count: u32,
     pub kv_head_count: u32,
+    pub load_mode: ModelLoadMode,
+    pub use_extra_bufts: bool,
     pub description: String,
+}
+
+impl ForgeCoreModelMetadata {
+    pub fn load_mode_label(&self) -> &'static str {
+        match self.load_mode {
+            ModelLoadMode::Auto => "auto",
+            ModelLoadMode::NoMmap => "none",
+            ModelLoadMode::Mmap => "mmap",
+            ModelLoadMode::Mlock => "mlock",
+            ModelLoadMode::MmapMlock => "mmap+mlock",
+        }
+    }
+
+    pub fn weight_repacking_label(&self) -> &'static str {
+        if self.use_extra_bufts {
+            "enabled (anonymous CPU repack buffers)"
+        } else {
+            "disabled (quantized weights stay file-backed)"
+        }
+    }
 }
 
 /// RAMforge-owned handle for one ForgeCore/libllama model.
@@ -124,6 +163,26 @@ impl ForgeCoreModel {
         execution: ExecutionConfig,
         registry: &DeviceRegistry,
     ) -> Result<Self, ForgeCoreAdapterError> {
+        let check_tensors = execution.check_tensors;
+        Self::load_for_execution_with_options(
+            path,
+            execution,
+            registry,
+            ForgeCoreModelOptions {
+                check_tensors,
+                ..ForgeCoreModelOptions::default()
+            },
+        )
+    }
+
+    /// Load with explicit CPU adapter options while keeping the same device
+    /// validation as [`Self::load_for_execution`].
+    pub fn load_for_execution_with_options(
+        path: impl AsRef<Path>,
+        execution: ExecutionConfig,
+        registry: &DeviceRegistry,
+        options: ForgeCoreModelOptions,
+    ) -> Result<Self, ForgeCoreAdapterError> {
         let selected = match execution.resolve(registry) {
             Ok(selected) => selected,
             Err(ExecutionConfigError::DeviceSelection(
@@ -147,9 +206,6 @@ impl ForgeCoreModel {
                 selected.info().id
             )));
         }
-        let options = ForgeCoreModelOptions {
-            check_tensors: execution.check_tensors,
-        };
         Self::load_native(path, options, execution, selected.info().clone())
     }
 
@@ -166,6 +222,8 @@ impl ForgeCoreModel {
         // could change as the public API grows.
         model_options.gpu_layers = GpuLayers::Cpu;
         model_options.check_tensors = options.check_tensors;
+        model_options.load_mode = options.load_mode;
+        model_options.use_extra_bufts = Some(options.use_extra_bufts);
         let model = Model::load_with_options(&path, &model_options)
             .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))?;
 
@@ -190,6 +248,8 @@ impl ForgeCoreModel {
             kv_head_count: model
                 .n_head_kv()
                 .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))?,
+            load_mode: options.load_mode,
+            use_extra_bufts: options.use_extra_bufts,
             description: model
                 .description()
                 .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))?,
