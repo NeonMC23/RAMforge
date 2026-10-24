@@ -12,8 +12,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::error::DataSourceError;
-use crate::gguf::parse_gguf_file;
 use crate::model::{GgufModel, TensorDescriptor};
+use crate::model_set::{discover_model_set, GgufShardLayout};
 use crate::types::GgmlType;
 
 /// Optional datasource read-path counters. `elapsed` includes destination
@@ -52,16 +52,26 @@ struct FileState {
     position: Option<u64>,
 }
 
+#[derive(Debug)]
+struct ShardSource {
+    layout: GgufShardLayout,
+    state: Mutex<FileState>,
+}
+
 /// A file-backed data source for GGUF tensor data
 ///
 /// Holds the parsed model (metadata + descriptors) and provides methods to
 /// read tensor payloads on demand. The entire model is never loaded into RAM
 /// at once; only requested tensors or byte ranges are read. A mutex-protected
-/// file handle is reused so repeated tensor reads do not reopen the GGUF.
+/// file handle is reused for each shard so repeated tensor reads do not reopen
+/// the GGUF. For split models, shard data sections are exposed through a
+/// contiguous virtual offset space and reads are dispatched across shard
+/// boundaries.
 #[derive(Debug)]
 pub struct GgufDataSource {
     model: GgufModel,
-    file: Mutex<FileState>,
+    shards: Vec<ShardSource>,
+    /// Size of the virtual address space exposed to descriptors.
     file_size: u64,
     profiling_enabled: AtomicBool,
     profile_bytes_read: AtomicU64,
@@ -85,17 +95,23 @@ impl GgufDataSource {
     /// Parses header, metadata, and tensor descriptors (file-backed), but does
     /// not load tensor payloads.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DataSourceError> {
-        let path_buf = path.as_ref().to_path_buf();
-        let model =
-            parse_gguf_file(&path_buf).map_err(|e| DataSourceError::General(e.to_string()))?;
-        let file_size = model.file_size;
-        let file = File::open(&path_buf)?;
+        let set = discover_model_set(path).map_err(|e| DataSourceError::General(e.to_string()))?;
+        let model = set.merged_model();
+        let file_size = set.virtual_size();
+        let mut shards = Vec::with_capacity(set.shards.len());
+        for layout in set.shard_layouts() {
+            let file = File::open(&layout.path)?;
+            shards.push(ShardSource {
+                layout,
+                state: Mutex::new(FileState {
+                    file,
+                    position: Some(0),
+                }),
+            });
+        }
         Ok(Self {
             model,
-            file: Mutex::new(FileState {
-                file,
-                position: Some(0),
-            }),
+            shards,
             file_size,
             profiling_enabled: AtomicBool::new(false),
             profile_bytes_read: AtomicU64::new(0),
@@ -228,12 +244,19 @@ impl GgufDataSource {
             .then(Instant::now)
     }
 
-    fn record_read(&self, started: Option<Instant>, bytes: u64, failed: bool) {
+    fn record_read(
+        &self,
+        started: Option<Instant>,
+        bytes: u64,
+        failed: bool,
+        physical_operations: u64,
+    ) {
         let Some(started) = started else {
             return;
         };
         self.profile_bytes_read.fetch_add(bytes, Ordering::Relaxed);
-        self.profile_read_operations.fetch_add(1, Ordering::Relaxed);
+        self.profile_read_operations
+            .fetch_add(physical_operations, Ordering::Relaxed);
         if failed {
             self.profile_read_failures.fetch_add(1, Ordering::Relaxed);
         }
@@ -554,6 +577,84 @@ impl GgufDataSource {
         Ok(buffer)
     }
 
+    /// Read a virtual byte range across one or more shard files.
+    ///
+    /// Returns the number of physical shard reads issued. The virtual mapping
+    /// is established by [`GgufModelSet::shard_layouts`].
+    fn read_exact_into(
+        &self,
+        file_offset: u64,
+        destination: &mut [u8],
+    ) -> Result<u64, DataSourceError> {
+        if destination.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        let mut physical_operations = 0u64;
+        while written < destination.len() {
+            let virtual_offset = file_offset
+                .checked_add(written as u64)
+                .ok_or_else(|| {
+                    DataSourceError::InvalidRange(format!(
+                        "virtual read position overflow after offset {}",
+                        file_offset
+                    ))
+                })?;
+            let shard = self
+                .shards
+                .iter()
+                .find(|shard| {
+                    virtual_offset >= shard.layout.virtual_start
+                        && virtual_offset < shard.layout.virtual_end
+                })
+                .ok_or_else(|| {
+                    DataSourceError::OutOfBounds {
+                        name: "<range>".to_string(),
+                        file_offset: virtual_offset,
+                        byte_length: (destination.len() - written) as u64,
+                        file_size: self.file_size,
+                    }
+                })?;
+            let available = shard.layout.virtual_end.saturating_sub(virtual_offset);
+            let chunk_length = usize::try_from(available)
+                .unwrap_or(usize::MAX)
+                .min(destination.len() - written);
+            let physical_offset = virtual_offset
+                .checked_sub(shard.layout.virtual_start)
+                .and_then(|relative| relative.checked_add(shard.layout.physical_data_start))
+                .ok_or_else(|| {
+                    DataSourceError::InvalidOffset(format!(
+                        "physical shard offset overflow for virtual offset {}",
+                        virtual_offset
+                    ))
+                })?;
+
+            let mut state = shard.state.lock().map_err(|_| {
+                DataSourceError::General("GGUF file handle lock poisoned".to_string())
+            })?;
+            self.ensure_file_position(&mut state, physical_offset)?;
+            if let Err(error) = state
+                .file
+                .read_exact(&mut destination[written..written + chunk_length])
+            {
+                state.position = None;
+                return Err(DataSourceError::Io(error));
+            }
+            let next_position = physical_offset
+                .checked_add(chunk_length as u64)
+                .ok_or_else(|| {
+                    DataSourceError::InvalidRange(format!(
+                        "file position overflow after reading offset {} length {}",
+                        physical_offset, chunk_length
+                    ))
+                })?;
+            state.position = Some(next_position);
+            written += chunk_length;
+            physical_operations += 1;
+        }
+        Ok(physical_operations)
+    }
+
     fn read_range_into(
         &self,
         file_offset: u64,
@@ -562,7 +663,7 @@ impl GgufDataSource {
     ) -> Result<(), DataSourceError> {
         let started = self.profile_start();
         let capacity_before = buffer.capacity();
-        let result: Result<(), DataSourceError> = (|| {
+        let result: Result<u64, DataSourceError> = (|| {
             let length_usize = usize::try_from(length).map_err(|_| {
                 DataSourceError::InvalidRange(format!(
                     "requested byte range length {} does not fit this platform",
@@ -576,51 +677,40 @@ impl GgufDataSource {
                     length_usize, e
                 ))
             })?;
-
-            let mut state = self.file.lock().map_err(|_| {
-                DataSourceError::General("GGUF file handle lock poisoned".to_string())
-            })?;
-            self.ensure_file_position(&mut state, file_offset)?;
-            let read_result = {
-                let mut limited = (&mut state.file).take(length);
-                limited.read_to_end(buffer)
+            let spare = &mut buffer.spare_capacity_mut()[..length_usize];
+            // SAFETY: the spare region is exactly `length_usize` writable
+            // bytes, the vector length stays zero until every byte is read,
+            // and an error drops no uninitialized `u8` value (all bit patterns
+            // are valid, but the length still remains zero on error).
+            let destination = unsafe {
+                std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), length_usize)
             };
-            if let Err(error) = read_result {
-                state.position = None;
-                return Err(DataSourceError::Io(error));
-            }
-            if buffer.len() != length_usize {
-                state.position = None;
-                return Err(DataSourceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer",
-                )));
-            }
-            let next_position = file_offset.checked_add(length).ok_or_else(|| {
-                DataSourceError::InvalidRange(format!(
-                    "file position overflow after reading offset {} length {}",
-                    file_offset, length
-                ))
-            })?;
-            state.position = Some(next_position);
-            Ok(())
+            self.read_exact_into(file_offset, destination)
         })();
         let bytes = if result.is_ok() { length } else { 0 };
-        if result.is_ok() && self.profiling_enabled.load(Ordering::Relaxed) {
-            if usize::try_from(length)
-                .ok()
-                .is_some_and(|required| required > 0 && capacity_before >= required)
-            {
-                self.profile_read_buffer_reuses
-                    .fetch_add(1, Ordering::Relaxed);
+        if result.is_ok() {
+            // SAFETY: `read_exact_into` filled every byte of the reserved
+            // region before this point.
+            unsafe {
+                buffer.set_len(length as usize);
             }
-            if buffer.capacity() > capacity_before {
-                self.profile_read_buffer_growths
-                    .fetch_add(1, Ordering::Relaxed);
+            if self.profiling_enabled.load(Ordering::Relaxed) {
+                if usize::try_from(length)
+                    .ok()
+                    .is_some_and(|required| required > 0 && capacity_before >= required)
+                {
+                    self.profile_read_buffer_reuses
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if buffer.capacity() > capacity_before {
+                    self.profile_read_buffer_growths
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
-        self.record_read(started, bytes, result.is_err());
-        result
+        let physical_operations = result.as_ref().copied().unwrap_or(0);
+        self.record_read(started, bytes, result.is_err(), physical_operations);
+        result.map(|_| ())
     }
 
     /// Read exact little-endian F32 data into uninitialized final storage.
@@ -632,7 +722,7 @@ impl GgufDataSource {
         let started = self.profile_start();
         let profiled_result = self
             .read_f32_range_unprofiled(file_offset, element_count)
-            .and_then(|values| {
+            .and_then(|(values, operations)| {
                 element_count
                     .checked_mul(std::mem::size_of::<f32>() as u64)
                     .ok_or_else(|| {
@@ -641,13 +731,13 @@ impl GgufDataSource {
                             element_count
                         ))
                     })
-                    .map(|bytes| (values, bytes))
+                    .map(|bytes| (values, bytes, operations))
             });
-        let (result, bytes) = match profiled_result {
-            Ok((values, bytes)) => (Ok(values), bytes),
-            Err(error) => (Err(error), 0),
+        let (result, bytes, operations) = match profiled_result {
+            Ok((values, bytes, operations)) => (Ok(values), bytes, operations),
+            Err(error) => (Err(error), 0, 0),
         };
-        self.record_read(started, bytes, result.is_err());
+        self.record_read(started, bytes, result.is_err(), operations);
         result
     }
 
@@ -655,7 +745,7 @@ impl GgufDataSource {
         &self,
         file_offset: u64,
         element_count: u64,
-    ) -> Result<Vec<f32>, DataSourceError> {
+    ) -> Result<(Vec<f32>, u64), DataSourceError> {
         let element_count = usize::try_from(element_count).map_err(|_| {
             DataSourceError::InvalidRange(format!(
                 "F32 element count {} does not fit this platform",
@@ -670,17 +760,8 @@ impl GgufDataSource {
                     element_count
                 ))
             })?;
-        let byte_length_u64 = u64::try_from(byte_length).map_err(|_| {
-            DataSourceError::InvalidRange("F32 read byte length exceeds u64".to_string())
-        })?;
-        let next_position = file_offset.checked_add(byte_length_u64).ok_or_else(|| {
-            DataSourceError::InvalidRange(format!(
-                "F32 file position overflow after offset {} and length {}",
-                file_offset, byte_length_u64
-            ))
-        })?;
         if element_count == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         let mut values = Vec::<f32>::new();
@@ -691,33 +772,23 @@ impl GgufDataSource {
             ))
         })?;
 
-        let mut state = self
-            .file
-            .lock()
-            .map_err(|_| DataSourceError::General("GGUF file handle lock poisoned".to_string()))?;
-        self.ensure_file_position(&mut state, file_offset)?;
-        let read_result = {
+        let operations = {
             let spare = &mut values.spare_capacity_mut()[..element_count];
             // SAFETY:
             // - `spare` refers to `element_count` properly aligned f32 slots;
             // - their total size is exactly `byte_length` bytes;
-            // - the vector length remains zero while `read_exact` runs, so an
+            // - the vector length remains zero while the read runs, so an
             //   error drops no partially initialized f32 values;
             // - every possible 32-bit pattern is a valid Rust f32 value;
             // - on success every byte is initialized before `set_len` below.
             let destination = unsafe {
                 std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), byte_length)
             };
-            state.file.read_exact(destination)
+            self.read_exact_into(file_offset, destination)?
         };
-        if let Err(error) = read_result {
-            state.position = None;
-            return Err(DataSourceError::Io(error));
-        }
-        state.position = Some(next_position);
 
-        // SAFETY: `read_exact` above initialized every byte of every reserved
-        // f32 slot, and all f32 bit patterns are valid.
+        // SAFETY: the read above initialized every byte of every reserved f32
+        // slot, and all f32 bit patterns are valid.
         unsafe {
             values.set_len(element_count);
         }
@@ -729,7 +800,7 @@ impl GgufDataSource {
             *value = f32::from_bits(u32::from_le(value.to_bits()));
         }
 
-        Ok(values)
+        Ok((values, operations))
     }
 
     /// List all tensor names

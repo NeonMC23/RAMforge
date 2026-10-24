@@ -556,6 +556,7 @@ impl StreamingLlamaModel {
         &self,
         budget: &mut MemoryBudget,
         required_bytes: u64,
+        stats: &mut ResidencyStats,
     ) -> Result<(), String> {
         let mut cache = self
             .layer_cache
@@ -565,6 +566,8 @@ impl StreamingLlamaModel {
         self.profiler.record_cache_evictions(evictions);
         self.profiler
             .record_cache_state(cache.entry_count(), cache.used_bytes());
+        stats.on_cache_evictions(evictions);
+        stats.on_cache_state(cache.entry_count(), cache.used_bytes());
         Ok(())
     }
 
@@ -1014,11 +1017,15 @@ impl StreamingLlamaModel {
             .checked_add(staged_requested_bytes)
             .ok_or_else(|| "forward temporary byte size overflow".to_string())?;
 
-        self.ensure_layer_cache_headroom(budget, act_bytes)?;
+        self.ensure_layer_cache_headroom(budget, act_bytes, stats)?;
         budget.with_temp("tmp:forward", act_bytes, |budget| {
             // Embedding lookup (streams one row if non-resident; charges its
             // own `tmp:embd_row` inside this scope).
-            self.ensure_layer_cache_headroom(budget, self.embedding_workspace_bytes(n_embd)?)?;
+            self.ensure_layer_cache_headroom(
+                budget,
+                self.embedding_workspace_bytes(n_embd)?,
+                stats,
+            )?;
             let allocation_started = self.profiler.start();
             let mut hidden = zeroed_f32_buffer(n_embd, "hidden activation")?;
             self.token_embd.get_embedding_into(
@@ -1096,11 +1103,13 @@ impl StreamingLlamaModel {
                     if result.is_some() {
                         self.profiler
                             .record_cache_state(cache.entry_count(), cache.used_bytes());
+                        stats.on_cache_state(cache.entry_count(), cache.used_bytes());
                     }
                     result
                 };
                 if let Some(result) = cached_result {
                     self.profiler.record_cache_hit();
+                    stats.on_cache_hit();
                     self.profiler
                         .record_since(ProfileEvent::LayerCompute, compute_started);
                     result?;
@@ -1129,8 +1138,9 @@ impl StreamingLlamaModel {
                 }
 
                 self.profiler.record_cache_miss();
+                stats.on_cache_miss();
                 let required_load_bytes = self.layer_memory_estimates[layer_idx].load_peak_bytes;
-                self.ensure_layer_cache_headroom(budget, required_load_bytes)?;
+                self.ensure_layer_cache_headroom(budget, required_load_bytes, stats)?;
                 let load_started = self.profiler.start();
                 let layer_result = self.load_layer(layer_idx, data_source, budget, stats);
                 self.profiler
@@ -1229,15 +1239,18 @@ impl StreamingLlamaModel {
                     let result = cache.insert_loaded(layer_idx, layer, layer_bytes, budget);
                     match &result {
                         Ok(InsertOutcome::Cached { evictions }) => {
-                            self.profiler.record_cache_evictions(*evictions)
+                            self.profiler.record_cache_evictions(*evictions);
+                            stats.on_cache_evictions(*evictions);
                         }
                         Ok(InsertOutcome::Skipped { evictions, .. }) => {
-                            self.profiler.record_cache_evictions(*evictions)
+                            self.profiler.record_cache_evictions(*evictions);
+                            stats.on_cache_evictions(*evictions);
                         }
                         Err(_) => {}
                     }
                     self.profiler
                         .record_cache_state(cache.entry_count(), cache.used_bytes());
+                    stats.on_cache_state(cache.entry_count(), cache.used_bytes());
                     result
                 };
                 match insert_result {
@@ -1324,6 +1337,7 @@ impl StreamingLlamaModel {
         backend: &B,
         data_source: &GgufDataSource,
         budget: &mut MemoryBudget,
+        stats: &mut ResidencyStats,
         logits_out: &mut [f32],
     ) -> Result<(), String> {
         let vocab_size = self.config.vocab_size;
@@ -1335,7 +1349,7 @@ impl StreamingLlamaModel {
             ));
         }
 
-        self.ensure_layer_cache_headroom(budget, self.logits_workspace_min_bytes()?)?;
+        self.ensure_layer_cache_headroom(budget, self.logits_workspace_min_bytes()?, stats)?;
         let weight = self.output.as_ref().unwrap_or(&self.token_embd);
         match weight {
             PersistentWeight::Resident(td) => {

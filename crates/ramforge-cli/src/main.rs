@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use ramforge_core::{parse_gguf_file, parse_memory_size, GgufModel, Tokenizer};
+use ramforge_core::{
+    discover_model_set, parse_memory_size, GgufModel, GgufModelSet, Tokenizer,
+};
 use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::{DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreModel};
 use std::io::{self, Write};
@@ -164,12 +166,13 @@ fn main() {
 }
 
 fn run_inspect(model_path: PathBuf, json_output: bool, max_tensors: usize) -> anyhow::Result<()> {
-    let gguf = parse_gguf_file(&model_path).map_err(|e| anyhow::anyhow!(e))?;
+    let model_set = discover_model_set(&model_path).map_err(|e| anyhow::anyhow!(e))?;
+    let gguf = model_set.merged_model();
 
     if json_output {
-        output_json(&gguf, max_tensors)?;
+        output_json(&gguf, max_tensors, Some(&model_set))?;
     } else {
-        output_human(&gguf, max_tensors);
+        output_human(&gguf, max_tensors, Some(&model_set));
     }
 
     Ok(())
@@ -179,7 +182,8 @@ fn run_plan(model_path: PathBuf, ram_str: String, json_output: bool) -> anyhow::
     let ram_bytes = parse_memory_size(&ram_str)
         .map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
 
-    let gguf = parse_gguf_file(&model_path).map_err(|e| anyhow::anyhow!(e))?;
+    let model_set = discover_model_set(&model_path).map_err(|e| anyhow::anyhow!(e))?;
+    let gguf = model_set.merged_model();
 
     let plan =
         ramforge_runtime::plan::plan_model(&gguf, ram_bytes).map_err(|e| anyhow::anyhow!(e))?;
@@ -374,7 +378,24 @@ fn run_inference(
         );
         eprintln!("  Layer loads: {}", stats.num_layer_loads);
         eprintln!("  Layer releases: {}", stats.num_layer_releases);
-        eprintln!("  Layers retained in cache: {}", stats.num_layer_cached);
+        eprintln!(
+            "  Cache placements (cumulative transitions): {}",
+            stats.num_layer_cached
+        );
+        eprintln!(
+            "  Current cached layers: {} ({} bytes)",
+            stats.current_cached_layer_count, stats.current_cached_bytes
+        );
+        eprintln!(
+            "  Peak cached layers: {} ({} bytes, {:.2} MiB)",
+            stats.peak_cached_layer_count,
+            stats.peak_cached_bytes,
+            stats.peak_cached_bytes as f64 / (1024.0 * 1024.0)
+        );
+        eprintln!(
+            "  Cache hits: {} misses: {} evictions: {}",
+            stats.cache_hits, stats.cache_misses, stats.cache_evictions
+        );
         eprintln!(
             "  Fits check: total {} > budget {} ? {}",
             stats.total_model_weight_bytes,
@@ -429,12 +450,14 @@ fn run_forgecore_inference(
     let registry = DeviceRegistry::discover();
     let execution =
         ExecutionConfig::new(device, 1, None, false).map_err(|error| anyhow::anyhow!(error))?;
-    let model = ForgeCoreModel::load_for_execution(&model_path, execution, &registry)
+    let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let primary_path = model_set.primary_path().to_path_buf();
+    let model = ForgeCoreModel::load_for_execution(&primary_path, execution, &registry)
         .map_err(|error| anyhow::anyhow!(error))?;
     let rss_after_load = process_rss();
     let metadata = model.metadata().clone();
 
-    let gguf = parse_gguf_file(&model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let gguf = model_set.merged_model();
     let tokenizer = Tokenizer::from_gguf(&gguf).map_err(|error| anyhow::anyhow!(error))?;
     let mut prompt_tokens = tokenizer.encode(&prompt, true);
     if prompt_tokens.is_empty() {
@@ -483,6 +506,14 @@ fn run_forgecore_inference(
     eprintln!("RAMforge – ForgeCore static device inference");
     eprintln!("========================================================");
     eprintln!("Model: {}", model_path.display());
+    if model_set.is_sharded() {
+        eprintln!(
+            "Model set: {} shards, primary={}, total_file_bytes={}",
+            model_set.shards.len(),
+            primary_path.display(),
+            model_set.total_file_bytes()
+        );
+    }
     eprintln!(
         "RAM budget: {} ({} bytes; planning/diagnostics only for ForgeCore)",
         ram_str, ram_bytes
@@ -986,13 +1017,37 @@ fn format_measurement(measurement: &ramforge_core::ByteMeasurement) -> String {
     }
 }
 
-fn output_human(model: &GgufModel, max_tensors: usize) {
+fn output_human(model: &GgufModel, max_tensors: usize, model_set: Option<&GgufModelSet>) {
     let info = model.info();
 
     println!("RAMforge – GGUF Model Inspection");
     println!("================================");
     println!();
     println!("Model: {}", model.path.display());
+    if let Some(model_set) = model_set {
+        let sharded = model_set.is_sharded();
+        println!(
+            "Model set: {} shard(s), {} total file bytes{}",
+            model_set.shards.len(),
+            model_set.total_file_bytes(),
+            if sharded { " (split GGUF)" } else { "" }
+        );
+        if sharded {
+            for (index, shard) in model_set.shards.iter().enumerate() {
+                let split_no = shard
+                    .get_metadata(ramforge_core::model_set::SPLIT_NO_KEY)
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(index as u64);
+                println!(
+                    "  shard {}: {} ({} bytes, {} tensors)",
+                    split_no,
+                    shard.path.display(),
+                    shard.file_size,
+                    shard.tensors.len()
+                );
+            }
+        }
+    }
     println!(
         "File size: {} bytes ({:.2} MB)",
         model.file_size,
@@ -1000,7 +1055,15 @@ fn output_human(model: &GgufModel, max_tensors: usize) {
     );
     println!("GGUF version: {}", model.version);
     println!("Alignment: {} bytes", model.alignment);
-    println!("Data start offset: {} bytes", model.data_start_offset);
+    println!(
+        "Data start offset: {} bytes{}",
+        model.data_start_offset,
+        if model_set.is_some_and(GgufModelSet::is_sharded) {
+            " (virtual concatenated shard data)"
+        } else {
+            ""
+        }
+    );
     println!();
 
     println!("Metadata:");
@@ -1323,7 +1386,11 @@ fn output_plan_human(plan: &ramforge_runtime::plan::PlanResult, model: &GgufMode
     println!("Note: the RAMforge budget covers tracked weights, KV cache, and temporary runtime allocations. For inference, use 'ramforge run'.");
 }
 
-fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {
+fn output_json(
+    model: &GgufModel,
+    max_tensors: usize,
+    model_set: Option<&GgufModelSet>,
+) -> anyhow::Result<()> {
     use serde_json::json;
 
     let info = model.info();
@@ -1356,9 +1423,33 @@ fn output_json(model: &GgufModel, max_tensors: usize) -> anyhow::Result<()> {
     let model_support = ramforge_runtime::support::model_execution_support(model);
     let execution_supported = model_support.is_supported();
 
+    let shards_json: Option<Vec<_>> = model_set.map(|set| {
+        set.shards
+            .iter()
+            .enumerate()
+            .map(|(index, shard)| {
+                let split_no = shard
+                    .get_metadata(ramforge_core::model_set::SPLIT_NO_KEY)
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(index as u64);
+                json!({
+                    "split_no": split_no,
+                    "path": shard.path,
+                    "file_size": shard.file_size,
+                    "data_start_offset": shard.data_start_offset,
+                    "tensor_count": shard.tensors.len(),
+                })
+            })
+            .collect()
+    });
+
     let output = json!({
         "path": model.path,
         "file_size": model.file_size,
+        "sharded": model_set.is_some_and(GgufModelSet::is_sharded),
+        "shard_count": model_set.map_or(1, |set| set.shards.len()),
+        "total_file_size": model_set.map_or(model.file_size, GgufModelSet::total_file_bytes),
+        "shards": shards_json,
         "version": model.version,
         "alignment": model.alignment,
         "data_start_offset": model.data_start_offset,

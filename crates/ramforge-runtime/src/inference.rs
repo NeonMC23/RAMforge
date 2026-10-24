@@ -602,12 +602,17 @@ impl InferenceEngine {
                             backend,
                             data_source,
                             budget,
+                            &mut residency_stats,
                             &mut logits,
                         )?;
                         profiler.record_since(ProfileEvent::Logits, logits_started);
 
                         let sampling_started = profiler.start();
-                        model.ensure_layer_cache_headroom(budget, sampler_scratch)?;
+                        model.ensure_layer_cache_headroom(
+                            budget,
+                            sampler_scratch,
+                            &mut residency_stats,
+                        )?;
                         let next_token = budget.with_temp(
                             "tmp:sampling",
                             sampler_scratch,
@@ -664,7 +669,11 @@ impl InferenceEngine {
                                 .min(needed_len);
                             let new_bytes = u64::try_from(kv_cache.try_bytes_for_tokens(target)?)
                                 .map_err(|_| "grown KV cache byte size exceeds u64".to_string())?;
-                            model.ensure_layer_cache_headroom(budget, new_bytes)?;
+                            model.ensure_layer_cache_headroom(
+                                budget,
+                                new_bytes,
+                                &mut residency_stats,
+                            )?;
                             let old_capacity = kv_cache.capacity_tokens();
                             kv_cache
                                 .grow_to_with_budget(target, budget, "kv_cache")
@@ -2029,7 +2038,7 @@ pub(crate) mod tests {
                         &mut stats,
                         &mut hidden,
                     )?;
-                    model.compute_logits(&hidden, backend, ds, budget, &mut logits)?;
+                    model.compute_logits(&hidden, backend, ds, budget, &mut stats, &mut logits)?;
 
                     let ref_hidden =
                         reference_forward_biased(&w, token, pos, &mut ref_k, &mut ref_v, eps);
@@ -2512,7 +2521,7 @@ pub(crate) mod tests {
                         &mut stats,
                         &mut hidden,
                     )?;
-                    model.compute_logits(&hidden, backend, ds, budget, &mut logits)?;
+                    model.compute_logits(&hidden, backend, ds, budget, &mut stats, &mut logits)?;
 
                     let ref_h = reference_forward_gqa(&w, token, pos, &mut ref_k, &mut ref_v, eps);
                     for (i, (&actual, &expected)) in hidden.iter().zip(&ref_h).enumerate() {
@@ -2957,7 +2966,7 @@ mod autoregressive_invariants {
             assert_eq!(kv.seq_len(), pos, "before decode step {}", step);
 
             model
-                .compute_logits(&hidden, backend, ds, budget, &mut logits)
+                .compute_logits(&hidden, backend, ds, budget, &mut stats, &mut logits)
                 .unwrap();
             let next = crate::sampling::Sampler::greedy().sample(&logits);
 
@@ -3615,7 +3624,14 @@ mod qwen25_bounded_diagnostic {
         let result_norm = hidden.clone();
         let final_prompt_hidden = summarize(&hidden);
         let mut logits = vec![0.0f32; vocab_size];
-        model.compute_logits(&hidden, backend, data_source, budget, &mut logits)?;
+        model.compute_logits(
+            &hidden,
+            backend,
+            data_source,
+            budget,
+            &mut residency_stats,
+            &mut logits,
+        )?;
         let final_prompt_logits = summarize_logits(&logits);
         let sampler = Sampler::greedy();
         let first_generated_token = sampler.sample(&logits);
@@ -3636,7 +3652,14 @@ mod qwen25_bounded_diagnostic {
         )?;
         let first_kv_after = kv_cache.seq_len();
         let first_hidden = summarize(&hidden);
-        model.compute_logits(&hidden, backend, data_source, budget, &mut logits)?;
+        model.compute_logits(
+            &hidden,
+            backend,
+            data_source,
+            budget,
+            &mut residency_stats,
+            &mut logits,
+        )?;
         let first_logits = summarize_logits(&logits);
         let second_generated_token = sampler.sample(&logits);
 
@@ -3656,7 +3679,14 @@ mod qwen25_bounded_diagnostic {
         )?;
         let second_kv_after = kv_cache.seq_len();
         let second_hidden = summarize(&hidden);
-        model.compute_logits(&hidden, backend, data_source, budget, &mut logits)?;
+        model.compute_logits(
+            &hidden,
+            backend,
+            data_source,
+            budget,
+            &mut residency_stats,
+            &mut logits,
+        )?;
         let second_logits = summarize_logits(&logits);
 
         let trace = BoundedTrace {
