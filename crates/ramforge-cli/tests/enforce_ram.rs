@@ -15,7 +15,13 @@ fn help_lists_memory_control_flags() {
     let output = ramforge().args(["run", "--help"]).output().unwrap();
     assert!(output.status.success());
     let text = String::from_utf8_lossy(&output.stdout);
-    for flag in ["--enforce-ram", "--enforce-timeout", "--ctx", "--no-repack"] {
+    for flag in [
+        "--enforce-ram",
+        "--enforce-timeout",
+        "--ctx",
+        "--no-repack",
+        "--no-prefetch",
+    ] {
         assert!(text.contains(flag), "help must list {flag}: {text}");
     }
 }
@@ -40,6 +46,28 @@ fn zero_enforcement_timeout_is_rejected_before_any_model_access() {
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(
         text.contains("--enforce-timeout must be greater than zero"),
+        "unexpected stderr: {text}"
+    );
+}
+
+#[test]
+fn no_prefetch_is_rejected_for_the_legacy_backend() {
+    let output = ramforge()
+        .args([
+            "run",
+            "/nonexistent/model.gguf",
+            "--ram",
+            "64M",
+            "--prompt",
+            "hi",
+            "--no-prefetch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("--no-prefetch is only supported with --backend forgecore"),
         "unexpected stderr: {text}"
     );
 }

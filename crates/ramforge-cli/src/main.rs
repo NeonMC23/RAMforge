@@ -100,6 +100,10 @@ enum Commands {
         #[arg(long)]
         no_repack: bool,
 
+        /// Skip whole-file prefaulting of the model mapping (forgeCORE patched native mode)
+        #[arg(long)]
+        no_prefetch: bool,
+
         /// Enforce --ram as a hard cgroup v2 memory.max limit for the run
         #[arg(long)]
         enforce_ram: bool,
@@ -169,6 +173,7 @@ fn main() {
             device,
             ctx,
             no_repack,
+            no_prefetch,
             enforce_ram,
             enforce_timeout,
             max_tokens,
@@ -217,6 +222,7 @@ fn main() {
                 device,
                 ctx,
                 no_repack,
+                no_prefetch,
                 max_tokens,
                 temperature,
                 top_k,
@@ -306,6 +312,7 @@ fn run_inference(
     device: String,
     ctx: Option<u32>,
     no_repack: bool,
+    no_prefetch: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -331,6 +338,7 @@ fn run_inference(
             device_selection.clone(),
             ctx,
             no_repack,
+            no_prefetch,
             max_tokens,
             temperature,
             top_k,
@@ -354,6 +362,11 @@ fn run_inference(
     if no_repack {
         return Err(anyhow::anyhow!(
             "--no-repack is only supported with --backend forgecore"
+        ));
+    }
+    if no_prefetch {
+        return Err(anyhow::anyhow!(
+            "--no-prefetch is only supported with --backend forgecore"
         ));
     }
 
@@ -567,6 +580,7 @@ fn run_forgecore_inference(
     device: DeviceSelection,
     ctx: Option<u32>,
     no_repack: bool,
+    no_prefetch: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -606,11 +620,14 @@ fn run_forgecore_inference(
             model_set.shards.len()
         );
     }
-    let model_options = ForgeCoreModelOptions {
+    let mut model_options = ForgeCoreModelOptions {
         check_tensors: execution.check_tensors,
         use_extra_bufts: !no_repack,
         ..ForgeCoreModelOptions::default()
     };
+    if no_prefetch {
+        model_options = model_options.with_no_prefetch();
+    }
     let model = ForgeCoreModel::load_for_execution_with_options(
         &primary_path,
         execution,

@@ -7,13 +7,14 @@
 ## Local verification (2026-10-25)
 
 - The workspace builds and tests against the pinned `forge-core` revision
-  `8d67cb4` with Rust/Cargo 1.98.1 and the workspace native tree at
-  `/home/neon/Documents/CODE LOCAL/forge/native` (llama.cpp/ggml v0.5.0).
+  `1eedc19` with Rust/Cargo 1.98.1 and the workspace native tree at
+  `/home/neon/Documents/CODE LOCAL/forge/native` (llama.cpp/ggml v0.5.0 plus
+  the documented mmap-no-prefetch patch).
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **442 tests, 0 failed, 8 ignored**; the ignored
+  environment variables passes **444 tests, 0 failed, 8 ignored**; the ignored
   tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark,
   the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and
   three CLI enforcement tests. Fixture-gated tests report SKIP when their
@@ -46,11 +47,11 @@
   device facts, and (when active) cgroup limit/peak/events/page faults. Without
   `--enforce-ram` it labels the requested budget diagnostic-only; with the flag
   it labels the cgroup v2 `memory.max` enforcement.
-- The `forge-core` pin moved to `8d67cb4` to consume the new
-  `ModelOptions::use_extra_bufts` control. The native llama.cpp pin remains
-  v0.5.0; this is a safe Rust API addition, not a native upgrade. The adapter
-  uses the option to implement `--no-repack`, which keeps quantized weights in
-  the file-backed mapping.
+- The `forge-core` pin moved to `1eedc19` to consume
+  `ModelOptions::use_extra_bufts` and `ModelLoadMode::MmapNoPrefetch`. The
+  native llama.cpp upstream HEAD remains v0.5.0; the no-prefetch mode is a
+  documented 9-line patch applied by `setup-native.sh`, not a native upgrade.
+  The adapter uses the options to implement `--no-repack` and `--no-prefetch`.
 - See [../../scripts/test.sh](../../scripts/test.sh) for the reproducible test
   invocation.
 
@@ -131,7 +132,8 @@ Prompt `The capital of France is`, 1 greedy token, `--ctx 256`,
 | Pythia-70M Q8_0 | 4G | 0 | 137,224,192 | 0 | 0 | 71.48 MiB (100%) | ` the` |
 | Pythia-70M Q8_0 | 1G | 0 | 137,224,192 | 0 | 0 | 71.48 MiB (100%) | ` the` |
 | Pythia-70M Q8_0 | 100M | 0 | 104,857,600 | 373 | 0 | 33.24 MiB (46.5%) | ` the` |
-| GPT-NeoX-20B Q4_K_M | 8G | 0 | 8,589,934,592 | 54,721 | 0 | 7.65 GiB (62.5%) | ` Paris` |
+| GPT-NeoX-20B Q4_K_M (prefetch) | 8G | 0 | 8,589,934,592 | 54,721 | 0 | 7.65 GiB (62.5%) | ` Paris` |
+| GPT-NeoX-20B Q4_K_M (`--no-prefetch`) | 8G | 0 | 8,589,934,592 | 7,979 | 0 | 7.64 GiB (62.4%) | ` Paris` |
 
 "Model resident" is the end-of-run `/proc/self/smaps` sample, not a peak;
 "Peak charged" is the cgroup `memory.peak`.
@@ -156,29 +158,49 @@ inputs were 5,211,776 512-byte blocks at 1G, 17,160,536 at 512M, and
 50,728,408 blocks for a 13.1 GB file. These counters show the refault I/O cost
 of bounded residency.
 
+### No-prefetch load mode (2026-10-25)
+
+forgeCORE now exposes `ModelLoadMode::MmapNoPrefetch`, backed by the documented
+`patches/llama-mmap-no-prefetch.patch` and `LLAMA_LOAD_MODE_MMAP_NO_PREFETCH`.
+RAMforge wires it as opt-in `--no-prefetch`; the default remains prefaulted
+`Mmap`. The mode avoids `MAP_POPULATE`; it does not implement per-layer
+residency or replace the cgroup cap.
+
+Qwen2.5-1.5B, 1G, `--no-repack`, 8 greedy tokens:
+
+| Mode | Load | RSS after load | TTFT | Decode | Wall | Peak cgroup | Major faults |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| prefetch | 706.7 ms | 1,017.01 MiB | 348.3 ms | 3.71 tok/s | 3.06 s | 1 GiB | 552 |
+| `--no-prefetch` | 342.3 ms | 80.35 MiB | 709.3 ms | 3.29 tok/s | 3.32 s | 1 GiB | 834 |
+
+Output was identical in both runs. The no-prefetch run moved the initial
+weight-fault cost from load to prompt processing.
+
 GPT-NeoX-20B: 13,135,032,320 B file, 13,133,230,080 tensor bytes, SHA-256
-`1a35c13535c26bb925a2379d9f021de67a0390124ffe2051aa94412002652d6d`, run with
-`--ram 8G --enforce-ram --enforce-timeout 300 --ctx 128 --no-repack`, 1 token.
-Actual context 256; 5 prompt tokens; output ` Paris`; wall 16.94 s; load plus
-tokenization 6.64 s; TTFT 10.03 s; mapping 12.23 GiB with 7.65 GiB resident at
-the end-of-run smaps sample (62.5%); cgroup peak exactly 8 GiB; anon 319.08 MiB;
-file 7.65 GiB; kernel 36.45 MiB; 190 major faults; cgroup swap peak 0; max RSS
-7.97 GiB. One run,
-one token: a fit/mechanism result, not throughput or quality evidence. Host
-swap usage rose from about 3.5 GiB to 5.4 GiB during the test under global
-page-cache pressure; the supervised cgroup itself used zero swap and no swap
-configuration changed.
+`1a35c13535c26bb925a2379d9f021de67a0390124ffe2051aa94412002652d6d`, 8G cap,
+`--enforce-timeout 300 --ctx 128 --no-repack`, 1 token.
+
+| Mode | Wall | Setup | TTFT | RSS after load | Max events | Input blocks | Output |
+|---|---:|---:|---:|---:|---:|---:|---|
+| prefetch | 16.94 s | 6.64 s | 10.03 s | 7.95 GiB | 54,721 | 50,728,408 | ` Paris` |
+| `--no-prefetch` | 7.72 s | 0.126 s | 7.385 s | 35.36 MiB | 7,979 | 25,383,576 | ` Paris` |
+
+Both peaked at exactly 8 GiB with no OOM kill. No-prefetch mapping residency
+after decode was 7.64 GiB (62.4%); anon 329.79 MiB; file 7.64 GiB; kernel
+33.86 MiB; 159 major faults; cgroup swap peak 0; max RSS 7.97 GiB. These are
+one-token fit/mechanism results, not throughput or quality evidence.
 
 The cgroup cap does not include shared file pages charged to another cgroup.
-The pinned loader prefaults the whole file with `MAP_POPULATE`; RAMforge has no
-per-layer eviction hook on the forgeCORE path. `memory.swap.max=0` is written
-when the swap controller exposes it; `Peak swap` is reported. The enforced
-timeout path is tested: Qwen2.5-1.5B at 512M with `--enforce-timeout 1` exits
-124, reports `Result: timeout; cgroup killed`, and leaves no cgroup behind.
-The 20B model was not run at 4G, 1G, or 100M. Qwen2.5-7B,
-DeepSeek-Coder-V2-Lite, and Qwen2.5-Coder-32B were not run; DeepSeek's
-`deepseek2` architecture is inspect/plan-only in the validated registry. See
-the README for commands and caveats.
+The default loader still prefaults with `MAP_POPULATE`; no-prefetch is opt-in
+and requires the patched native tree. RAMforge has no per-layer eviction hook
+on the forgeCORE path. `memory.swap.max=0` is written when the swap controller
+exposes it; `Peak swap` is reported. The enforced timeout path is tested:
+Qwen2.5-1.5B at 512M with `--enforce-timeout 1` exits 124, reports
+`Result: timeout; cgroup killed`, and leaves no cgroup behind. The 20B model
+was not run at 4G, 1G, or 100M. Qwen2.5-7B, DeepSeek-Coder-V2-Lite, and
+Qwen2.5-Coder-32B were not run; DeepSeek's `deepseek2` architecture is
+inspect/plan-only in the validated registry. See the README for commands and
+caveats.
 
 #### GPT-NeoX/Pythia execution evidence
 
@@ -217,11 +239,11 @@ validation.
 
 The 20B GPT-NeoX GGUF has 13,135,032,320 file bytes and 13,133,230,080 tensor
 bytes. It is inspectable and plannable at 8G/4G/1G/100M. It was executed at 8G
-under `--enforce-ram --no-repack`: 7.65 GiB of the 12.23 GiB mapping resident,
-54,721 limit events, no OOM kill, one token ` Paris` in 16.94 s. This relies on
-OS demand paging of the file-backed mapping, not a RAMforge per-layer staging
-engine. The loader still prefaults the whole file, and 4G/1G/100M 20B runs were
-not attempted.
+under `--enforce-ram --no-repack --no-prefetch`: 7.64 GiB of the 12.23 GiB
+mapping resident, 7,979 limit events, no OOM kill, one token ` Paris` in
+7.72 s (16.94 s with prefetch). This relies on OS demand paging of the
+file-backed mapping, not a RAMforge per-layer staging engine. The default
+loader still prefaults the whole file; 4G/1G/100M 20B runs were not attempted.
 
 Chat-template support was validated on the real Qwen2.5-1.5B GGUF. The model's
 own `tokenizer.chat_template` rendered a 177-byte ChatML prompt, tokenized the
@@ -255,11 +277,12 @@ Read-only model hashes from the matrix inventory:
 
 **Current ForgeCore note:** static ForgeCore device discovery, explicit
 selection, and execution metadata are implemented. The pinned ForgeCore
-revision `8d67cb4` exposes public static model-load/offload options and CPU
-weight-repacking control, but the RAMforge adapter remains deliberately CPU-only
-in this refresh; GPU facts may be discoverable but non-CPU model execution is
-explicitly unsupported, with no CPU fallback. The separate `--enforce-ram`
-cgroup supervisor is the enforced host-memory path. See
+revision `1eedc19` exposes public static model-load/offload options, CPU
+weight-repacking control, and `MmapNoPrefetch`, but the RAMforge adapter remains
+deliberately CPU-only in this refresh; GPU facts may be discoverable but
+non-CPU model execution is explicitly unsupported, with no CPU fallback. The
+separate `--enforce-ram` cgroup supervisor is the enforced host-memory path;
+`--no-prefetch` only controls the initial mmap fault behavior. See
 [README.md](../../README.md) and the historical
 [PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md).
 
@@ -380,7 +403,7 @@ The following infrastructure is implemented with extensive unit/integration cove
 - Bounded calibration tasks and persisted execution-plan compatibility checks.
 - CLI/TUI diagnostic collection, profiling, memory visibility, run history, persistence, and error staging.
 - cgroup v2 hard-budget supervision (`--enforce-ram`) with `memory.peak`, limit/OOM events, page-fault counters, timeout kill, and explicit failure reporting; covered by process-level tests.
-- Explicit file-backed mmap loading, `--no-repack` CPU weight-repacking control, model-mapping RSS/PSS measurement, and cold-cache priming for enforced runs.
+- Explicit file-backed mmap loading, `--no-repack` CPU weight-repacking control, opt-in `--no-prefetch` mapping mode, model-mapping RSS/PSS measurement, and cold-cache priming for enforced runs.
 - ForgeCore-observed TTFT, prompt-processing, decode-token-rate, and wall-clock profiling.
 
 “Production-oriented” here means that these are concrete implemented subsystems with tests. It is not a blanket production-readiness or model-quality guarantee.

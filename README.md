@@ -2,7 +2,7 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **GPT-NeoX/Pythia execution and enforced budgets (2026-10-25):** `gptneox` GGUFs are executable through the explicit `--backend forgecore` path, which delegates to the pinned llama.cpp/ggml implementation. The legacy RAMforge executor still rejects the architecture before reading weights, with an actionable error naming the required backend; it never falls back or approximates GPT-NeoX math. Real Pythia-70M Q8_0 runs match the native tokenization and greedy continuation, and an independent NumPy forward pass confirms the final-token logits (top-1 exact, cosine similarity 1.000000046). The 20B GPT-NeoX GGUF (13.13 GB tensor bytes) now executes under an 8 GiB hard cgroup v2 cap with `--enforce-ram --no-repack`: 7.65 GiB of the model mapping resident at the end-of-run sample, 54,721 limit events, no OOM kill, and one greedy token ` Paris` in 16.94 s. This is out-of-core execution under a kernel-enforced cap, not a throughput or quality guarantee. See [Enforced host-memory budgets](#enforced-host-memory-budgets-cgroup-v2).
+> **GPT-NeoX/Pythia execution and enforced budgets (2026-10-25):** `gptneox` GGUFs are executable through the explicit `--backend forgecore` path, which delegates to the pinned llama.cpp/ggml implementation. The legacy RAMforge executor still rejects the architecture before reading weights, with an actionable error naming the required backend; it never falls back or approximates GPT-NeoX math. Real Pythia-70M Q8_0 runs match the native tokenization and greedy continuation, and an independent NumPy forward pass confirms the final-token logits (top-1 exact, cosine similarity 1.000000046). The 20B GPT-NeoX GGUF (13.13 GB tensor bytes) now executes under an 8 GiB hard cgroup v2 cap with `--enforce-ram --no-repack --no-prefetch`: 7.64 GiB of the model mapping resident at the end-of-run sample, 7,979 limit events, no OOM kill, and one greedy token ` Paris` in 7.72 s. The same 8 GiB run with prefetching took 16.94 s. This is out-of-core execution under a kernel-enforced cap, not a throughput or quality guarantee. See [Enforced host-memory budgets](#enforced-host-memory-budgets-cgroup-v2).
 >
 > **Usable Out-of-Core Inference:** `ramforge run` now streams decoded assistant text to stdout with UTF-8 byte-token accumulation. Optional `--profile` reports measured GGUF I/O, layer load/compute/release, quantized/F32 matvec, allocation, sampling, token latency, bytes read, and peak managed memory. `--memory-report` separates RAMforge-managed memory, process RSS, and system memory. `ramforge support` exposes the architecture/quantization registry; qwen35 remains inspectable/plannable but intentionally not executable.
 >
@@ -108,6 +108,10 @@ Flags:
 - `--ctx TOKENS`: ForgeCore context override. The legacy executor rejects it.
   Context size controls the KV cache and is essential for small budgets.
 - `--no-repack`: disable llama.cpp CPU weight repacking.
+- `--no-prefetch`: select `ModelLoadMode::MmapNoPrefetch`, which skips the
+  native whole-file `MAP_POPULATE`. This requires the documented forgeCORE
+  native patch; default `--backend forgecore` behavior remains prefaulted
+  mmap.
 
 ### Enforced budget matrix
 
@@ -126,7 +130,8 @@ Exact bytes: `8G` = 8,589,934,592; `4G` = 4,294,967,296; `1G` =
 | Pythia-70M Q8_0 | 4G | 4,294,967,296 | 0 | 137,224,192 | 0 | 0 | 71.48 MiB (100%) | ` the` |
 | Pythia-70M Q8_0 | 1G | 1,073,741,824 | 0 | 137,224,192 | 0 | 0 | 71.48 MiB (100%) | ` the` |
 | Pythia-70M Q8_0 | 100M | 104,857,600 | 0 | 104,857,600 | 373 | 0 | 33.24 MiB (46.5%) | ` the` |
-| GPT-NeoX-20B Q4_K_M | 8G | 8,589,934,592 | 0 | 8,589,934,592 | 54,721 | 0 | 7.65 GiB (62.5%) | ` Paris` |
+| GPT-NeoX-20B Q4_K_M (prefetch) | 8G | 8,589,934,592 | 0 | 8,589,934,592 | 54,721 | 0 | 7.65 GiB (62.5%) | ` Paris` |
+| GPT-NeoX-20B Q4_K_M (`--no-prefetch`) | 8G | 8,589,934,592 | 0 | 8,589,934,592 | 7,979 | 0 | 7.64 GiB (62.4%) | ` Paris` |
 
 "Model mapping resident" is a point-in-time `/proc/self/smaps` sample taken
 after decode, not a peak. "Peak charged" is the cgroup's `memory.peak`.
@@ -150,7 +155,8 @@ dominated by cgroup reclaim, not cache temperature.
 |---|---:|---:|---|---:|---:|---:|---:|
 | Unbounded, `--no-repack` | 1G requested (diagnostic) | n/a | 1,011.16 MiB (100%) | 230 ms | 11.84 tok/s | 1.50 s | 1.16 GiB |
 | Enforced, repack enabled | 1G | 1 GiB | 147.67 MiB (14.6%) | 430.9 ms | 3.43 tok/s | 3.86 s | 1.005 GiB |
-| Enforced, `--no-repack` | 1G | 1 GiB | 845.59 MiB (83.6%) | 345.1 ms | 3.63 tok/s | 3.07 s | 1.006 GiB |
+| Enforced, `--no-repack`, prefetch | 1G | 1 GiB | 845.59 MiB (83.6%) | 345.1 ms | 3.63 tok/s | 3.07 s | 1.006 GiB |
+| Enforced, `--no-repack`, `--no-prefetch` | 1G | 1 GiB | 843.42 MiB (83.4%) | 709.3 ms | 3.29 tok/s | 3.32 s | 1.01 GiB |
 | Enforced, `--no-repack` | 512M | 512 MiB | 334.74 MiB (33.1%) | 656 ms | 1.59 tok/s | 5.87 s | 530 MB |
 | Enforced, `--no-repack` | 256M | 256 MiB | 84.36 MiB (8.3%) | 790 ms | 1.53 tok/s | 6.17 s | 270 MB |
 
@@ -163,9 +169,25 @@ targets. All successful Qwen rows produced the same text.
 `/usr/bin/time -v` file-system input counts show the refault amplification:
 5,211,776 512-byte blocks at 1G (about 2.7 GB), 17,160,536 at 512M (about
 8.8 GB), and 18,262,968 at 256M (about 9.4 GB), against a 1.07 GB model file.
-The 20B run reported 50,728,408 blocks (about 26 GB) for a 13.1 GB file. These
-are kernel block counters, not model bytes, and confirm that the bounded runs
-trade I/O for resident memory.
+The 20B prefetch run reported 50,728,408 blocks (about 26 GB) for a 13.1 GB
+file. These are kernel block counters, not model bytes, and confirm that the
+bounded runs trade I/O for resident memory.
+
+The `--no-prefetch` mode removes the initial whole-file fault:
+Qwen2.5-1.5B at 1G loaded in 342.3 ms instead of 706.7 ms, with process RSS
+after load of 80.35 MiB instead of 1,017.01 MiB. TTFT rose from 348 ms to
+709 ms because prompt processing then faulted the weights on demand; decode was
+3.29 tok/s instead of 3.71 tok/s and wall was 3.32 s instead of 3.07 s. The
+cgroup peak stayed exactly 1 GiB, the output was identical, and major faults
+rose from 552 to 834. This is controlled demand paging, not per-layer
+residency.
+
+For GPT-NeoX-20B at 8G, prefetch took 16.94 s wall, 6.64 s setup, and
+50,728,408 input blocks; `--no-prefetch` took 7.72 s wall, 0.126 s setup, and
+25,383,576 input blocks. Load-time RSS fell from 7.95 GiB to 35.36 MiB, and
+cgroup `max` events fell from 54,721 to 7,979. TTFT was 7.385 s, mapping
+residency after decode was 7.64 GiB (62.4%), cgroup peak was exactly 8 GiB,
+and the output was the same ` Paris`.
 
 ### GPT-NeoX-20B under 8 GiB
 
@@ -176,29 +198,43 @@ was executed with:
 ```sh
 ramforge run models/gpt-neox-20b.i1-Q4_K_M/gpt-neox-20b.i1-Q4_K_M.gguf \
   --ram 8G --enforce-ram --enforce-timeout 300 --ctx 128 --no-repack \
-  --prompt "The capital of France is" --max-tokens 1 --temperature 0 \
-  --backend forgecore --memory-report --profile
+  --no-prefetch --prompt "The capital of France is" --max-tokens 1 \
+  --temperature 0 --backend forgecore --memory-report --profile
 ```
 
-Result: exit 0; actual context 256; 5 prompt tokens; output ` Paris`; wall
-16.94 s; model load plus tokenization 6.64 s; TTFT 10.03 s; model mapping
-12.23 GiB with 7.65 GiB resident (62.5%); cgroup peak exactly 8 GiB; anonymous
-319.08 MiB; file-backed 7.65 GiB; kernel 36.45 MiB; 54,721 `max` events; 190
-major page faults; cgroup swap peak 0; process max RSS 7.97 GiB. This is one
-greedy token from one run. It is evidence that a model larger than the cap can
-execute with bounded charged memory; it is not throughput, quality, or
-bit-exact numerical parity evidence. During the test the host's overall swap
-usage rose from about 3.5 GiB to 5.4 GiB (other processes under page-cache
-pressure); the supervised cgroup itself reported zero swap and no swap
-configuration was changed.
+Remove `--no-prefetch` for the prefetch comparison.
+
+With the default prefetch mapping: exit 0; actual context 256; 5 prompt
+tokens; output ` Paris`; wall 16.94 s; model load plus tokenization 6.64 s;
+TTFT 10.03 s; model mapping 12.23 GiB with 7.65 GiB resident (62.5%); cgroup
+peak exactly 8 GiB; anonymous 319.08 MiB; file-backed 7.65 GiB; kernel
+36.45 MiB; 54,721 `max` events; 190 major faults; cgroup swap peak 0; max RSS
+7.97 GiB.
+
+With `--no-prefetch`, the same model, prompt, context, budget, and timeout
+completed in 7.72 s wall with 0.126 s setup and 7.385 s TTFT. Process RSS after
+load was 35.36 MiB; mapping residency after decode was 7.64 GiB (62.4%);
+cgroup peak was exactly 8 GiB; anonymous 329.79 MiB; file-backed 7.64 GiB;
+7,979 `max` events; 159 major faults; cgroup swap peak 0; max RSS 7.97 GiB;
+input blocks 25,383,576. Output was the same ` Paris`.
+
+These are one greedy token from one run each. They are evidence that a model
+larger than the cap can execute with bounded charged memory; they are not
+throughput, quality, or bit-exact numerical parity evidence. During the tests
+the host's overall swap usage moved within roughly 3.5-5.4 GiB (other processes
+under page-cache pressure); the supervised cgroup reported zero swap and no
+swap configuration was changed.
 
 ### Enforcement limits
 
 - The cgroup caps charged memory, not all host page cache. Shared file pages
   charged to another cgroup are outside this cap; mapping RSS/PSS is reported
   separately.
-- The pinned loader prefaults the whole mapping at load. Large models therefore
-  pay a long load and reclaim/refault cost even when peak residency is bounded.
+- The default pinned loader prefaults the whole mapping at load. Large models
+  therefore pay a long load and reclaim/refault cost even when peak residency
+  is bounded. `--no-prefetch` avoids the initial whole-file fault and moves the
+  cost to prompt/decode demand faults; it does not reduce total I/O when the
+  model is fully exercised.
 - There is no RAMforge-managed per-layer eviction or staging queue on the
   forgeCORE path. The kernel's demand paging is the residency mechanism.
 - `--enforce-ram` requires cgroup v2 memory delegation. If unavailable, the
@@ -591,7 +627,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **442 tests, 0 failed, 8 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and three CLI enforcement tests. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **444 tests, 0 failed, 8 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and three CLI enforcement tests. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

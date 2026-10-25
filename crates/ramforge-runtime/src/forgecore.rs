@@ -80,6 +80,14 @@ impl Default for ForgeCoreModelOptions {
     }
 }
 
+impl ForgeCoreModelOptions {
+    /// Select the documented mmap mode that skips whole-file prefaulting.
+    pub fn with_no_prefetch(mut self) -> Self {
+        self.load_mode = ModelLoadMode::MmapNoPrefetch;
+        self
+    }
+}
+
 /// Metadata copied from the ForgeCore model handle for RAMforge diagnostics
 /// and compatibility checks. The values are observations from ForgeCore, not
 /// a second execution configuration.
@@ -104,6 +112,7 @@ impl ForgeCoreModelMetadata {
             ModelLoadMode::Auto => "auto",
             ModelLoadMode::NoMmap => "none",
             ModelLoadMode::Mmap => "mmap",
+            ModelLoadMode::MmapNoPrefetch => "mmap-no-prefetch",
             ModelLoadMode::Mlock => "mlock",
             ModelLoadMode::MmapMlock => "mmap+mlock",
         }
@@ -520,6 +529,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ForgeCoreAdapterError::UnsupportedDevice(_)));
+    }
+
+    #[test]
+    fn mmap_no_prefetch_is_opt_in() {
+        let default = ForgeCoreModelOptions::default();
+        assert_eq!(default.load_mode, ModelLoadMode::Mmap);
+        let no_prefetch = default.with_no_prefetch();
+        assert_eq!(no_prefetch.load_mode, ModelLoadMode::MmapNoPrefetch);
+        assert_eq!(
+            ForgeCoreModelMetadata {
+                n_params: 0,
+                vocab_size: 0,
+                size_bytes: 0,
+                context_length: 0,
+                embedding_length: 0,
+                layer_count: 0,
+                head_count: 0,
+                kv_head_count: 0,
+                load_mode: ModelLoadMode::MmapNoPrefetch,
+                use_extra_bufts: false,
+                description: String::new(),
+            }
+            .load_mode_label(),
+            "mmap-no-prefetch"
+        );
     }
 
     #[test]
