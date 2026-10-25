@@ -391,8 +391,10 @@ Graph manifests now feed an in-memory execution profile
 graph executions is split by execution id before analysis, so transient native
 node ids are never merged across graphs. Profiles store stable tensor names,
 graph-order access ranges, observation counts, completeness, and invalidation
-state. They are validated against model identity and inventory generation
-before `reuse-aware` planning. No profile persistence is implemented. See
+state. Incomplete, cyclic, or ambiguous captures are rejected as profile
+evidence. Profiles are validated against model identity and inventory
+generation before `reuse-aware` planning. No profile persistence is
+implemented. See
 [GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md).
 
 SmolLM2-135M Q4_K_M, 272 file-backed tensors, context 256, 4 greedy tokens,
@@ -865,7 +867,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **481 tests, 0 failed, 16 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **482 tests, 0 failed, 16 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

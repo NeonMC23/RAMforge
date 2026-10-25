@@ -1422,6 +1422,14 @@ fn run_forgecore_inference(
         let manifest = GraphManifest::from_trace(&events);
         eprintln!("Graph trace summary: {:?}", summary);
         eprintln!("Graph manifest: {:?}", manifest.summary());
+        if summary
+            .as_ref()
+            .is_some_and(|summary| summary.executions > 1)
+        {
+            eprintln!(
+                "Graph manifest note: capture spans multiple graph executions; merged edges are intentionally conservative and the profile analyzes each execution separately"
+            );
+        }
         if let Some(manager) = residency_manager.as_ref() {
             let mut profile =
                 ExecutionProfile::new(manager.model_id().clone(), manager.inventory().generation);

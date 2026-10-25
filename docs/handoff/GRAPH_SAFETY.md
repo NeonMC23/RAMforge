@@ -49,6 +49,8 @@ The trace callback is diagnostic. It is not a native lifetime-token API.
   captured execution(s);
 - dependency edges are marked known only when the mapping is unambiguous;
 - unresolved external inputs are recorded by name;
+- dependency cycles are detected and counted; a cyclic manifest is not usable
+  as a complete profile;
 - tensor-to-consumer relationships come from source/dependency names;
 - graph-order last use is the maximum consumer node index for a tensor;
 - completion is proven only for the consumer’s synchronized node id.
@@ -57,8 +59,11 @@ A manifest whose capture contains multiple executions or duplicate native ids
 can have `edges_known=false`. This is deliberate: merging transient ids across
 graphs is invalid. `intra_decode_safe` is always `false`.
 
-`GraphManifestSummary` reports node/tensor counts, edge/completion confidence,
-graph-order and unknown last-use counts, and the safety flag.
+`GraphManifestSummary` reports node/tensor counts, edge/completion/cycle
+confidence, graph-order and unknown last-use counts, and the safety flag. A
+multi-execution capture is summarized conservatively as one merged manifest for
+diagnostics, while `ExecutionProfile` analyzes each execution separately; the
+CLI prints an explicit note when this distinction applies.
 
 ## Execution profiles
 

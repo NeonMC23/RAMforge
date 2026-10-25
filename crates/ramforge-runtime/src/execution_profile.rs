@@ -80,6 +80,7 @@ impl ExecutionProfile {
         let usable = trace_complete
             && manifest.edges_known
             && manifest.completion_proven
+            && manifest.dependency_cycles() == 0
             && !manifest.intra_decode_safe;
         self.last_node_count = manifest.nodes.len();
         self.last_tensor_count = manifest.tensor_to_nodes.len();
@@ -185,7 +186,7 @@ mod tests {
             op_name: None,
             bytes: 4096,
             dependencies: vec![name.to_string()],
-            dependency_ids: vec![1],
+            dependency_ids: vec![2],
             phase: TracePhase::Requested,
             completion: TraceCompletion::NotCompleted,
         };

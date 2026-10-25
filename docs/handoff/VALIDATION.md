@@ -269,7 +269,7 @@ Passed:
 
 ```text
 cargo check --workspace
-cargo test --workspace                  # 481 passed, 0 failed, 16 ignored
+cargo test --workspace                  # 482 passed, 0 failed, 16 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p ramforge-cli --test enforce_ram \
   json_report_is_versioned_and_keeps_measurements_distinct -- --ignored --exact

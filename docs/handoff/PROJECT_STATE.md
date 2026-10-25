@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **481 tests, 0 failed, 16 ignored**. The ignored
+  environment variables passes **482 tests, 0 failed, 16 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when

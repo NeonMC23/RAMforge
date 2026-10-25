@@ -132,11 +132,42 @@ impl GraphManifest {
         }
     }
 
+    /// Count dependency back-edges. A valid scheduler graph should be acyclic;
+    /// malformed captures must not be treated as complete profiles.
+    pub fn dependency_cycles(&self) -> usize {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Mark {
+            Unvisited,
+            Visiting,
+            Done,
+        }
+        fn visit(node: usize, nodes: &[GraphNode], marks: &mut [Mark], cycles: &mut usize) {
+            marks[node] = Mark::Visiting;
+            for dependency in &nodes[node].dependencies {
+                match marks.get(*dependency).copied().unwrap_or(Mark::Done) {
+                    Mark::Unvisited => visit(*dependency, nodes, marks, cycles),
+                    Mark::Visiting => *cycles += 1,
+                    Mark::Done => {}
+                }
+            }
+            marks[node] = Mark::Done;
+        }
+        let mut marks = vec![Mark::Unvisited; self.nodes.len()];
+        let mut cycles = 0;
+        for node in 0..self.nodes.len() {
+            if marks[node] == Mark::Unvisited {
+                visit(node, &self.nodes, &mut marks, &mut cycles);
+            }
+        }
+        cycles
+    }
+
     pub fn summary(&self) -> GraphManifestSummary {
         GraphManifestSummary {
             nodes: self.nodes.len(),
             tensors: self.tensor_to_nodes.len(),
             edges_known: self.edges_known,
+            dependency_cycles: self.dependency_cycles(),
             completion_proven: self.completion_proven,
             intra_decode_safe: self.intra_decode_safe,
             graph_order_last_use: self
@@ -158,6 +189,7 @@ pub struct GraphManifestSummary {
     pub nodes: usize,
     pub tensors: usize,
     pub edges_known: bool,
+    pub dependency_cycles: usize,
     pub completion_proven: bool,
     pub intra_decode_safe: bool,
     pub graph_order_last_use: usize,
@@ -241,5 +273,29 @@ mod tests {
         let manifest = GraphManifest::from_trace(&[]);
         assert!(manifest.nodes.is_empty());
         assert!(!manifest.intra_decode_safe);
+    }
+
+    #[test]
+    fn dependency_cycles_are_detected() {
+        let node = |id: usize, dependencies: Vec<usize>| GraphNode {
+            id,
+            native_id: id as u64,
+            name: None,
+            op: None,
+            bytes: 0,
+            dependencies,
+            unresolved_dependencies: Vec::new(),
+            layer: None,
+        };
+        let manifest = GraphManifest {
+            execution_id: Some(1),
+            nodes: vec![node(0, vec![1]), node(1, vec![0])],
+            tensor_to_nodes: BTreeMap::new(),
+            last_use: BTreeMap::new(),
+            edges_known: true,
+            completion_proven: true,
+            intra_decode_safe: false,
+        };
+        assert_eq!(manifest.dependency_cycles(), 1);
     }
 }
