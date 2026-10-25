@@ -104,6 +104,10 @@ enum Commands {
         #[arg(long)]
         no_prefetch: bool,
 
+        /// Release resident model-mapping pages after load (forgeCORE patched native mode)
+        #[arg(long)]
+        release_mapping_pages: bool,
+
         /// Enforce --ram as a hard cgroup v2 memory.max limit for the run
         #[arg(long)]
         enforce_ram: bool,
@@ -174,6 +178,7 @@ fn main() {
             ctx,
             no_repack,
             no_prefetch,
+            release_mapping_pages,
             enforce_ram,
             enforce_timeout,
             max_tokens,
@@ -223,6 +228,7 @@ fn main() {
                 ctx,
                 no_repack,
                 no_prefetch,
+                release_mapping_pages,
                 max_tokens,
                 temperature,
                 top_k,
@@ -313,6 +319,7 @@ fn run_inference(
     ctx: Option<u32>,
     no_repack: bool,
     no_prefetch: bool,
+    release_mapping_pages: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -339,6 +346,7 @@ fn run_inference(
             ctx,
             no_repack,
             no_prefetch,
+            release_mapping_pages,
             max_tokens,
             temperature,
             top_k,
@@ -367,6 +375,11 @@ fn run_inference(
     if no_prefetch {
         return Err(anyhow::anyhow!(
             "--no-prefetch is only supported with --backend forgecore"
+        ));
+    }
+    if release_mapping_pages {
+        return Err(anyhow::anyhow!(
+            "--release-mapping-pages is only supported with --backend forgecore"
         ));
     }
 
@@ -581,6 +594,7 @@ fn run_forgecore_inference(
     ctx: Option<u32>,
     no_repack: bool,
     no_prefetch: bool,
+    release_mapping_pages: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -628,7 +642,7 @@ fn run_forgecore_inference(
     if no_prefetch {
         model_options = model_options.with_no_prefetch();
     }
-    let model = ForgeCoreModel::load_for_execution_with_options(
+    let mut model = ForgeCoreModel::load_for_execution_with_options(
         &primary_path,
         execution,
         &registry,
@@ -636,6 +650,24 @@ fn run_forgecore_inference(
     )
     .map_err(|error| anyhow::anyhow!(error))?;
     let rss_after_load = process_rss();
+    if release_mapping_pages {
+        let before = model_mapping_residency(&primary_path);
+        model
+            .release_mapping_pages()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let after = model_mapping_residency(&primary_path);
+        eprintln!(
+            "Mapping page release: resident_before={} resident_after={}",
+            before
+                .as_ref()
+                .map(|residency| format_bytes(residency.rss_bytes))
+                .unwrap_or_else(|| "unavailable".to_string()),
+            after
+                .as_ref()
+                .map(|residency| format_bytes(residency.rss_bytes))
+                .unwrap_or_else(|| "unavailable".to_string())
+        );
+    }
     let metadata = model.metadata().clone();
 
     let gguf = model_set.merged_model();

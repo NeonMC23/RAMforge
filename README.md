@@ -112,6 +112,11 @@ Flags:
   native whole-file `MAP_POPULATE`. This requires the documented forgeCORE
   native patch; default `--backend forgecore` behavior remains prefaulted
   mmap.
+- `--release-mapping-pages`: ask the native model to release resident pages
+  from exactly its own file-backed mappings after load. On Linux this uses
+  `madvise(MADV_DONTNEED)`; it does not unmap memory or invalidate tensor
+  pointers. Unsupported platforms fail explicitly. This is independent of
+  `--no-prefetch` and is a no-op when the mapping is already nonresident.
 
 ### Enforced budget matrix
 
@@ -189,6 +194,37 @@ cgroup `max` events fell from 54,721 to 7,979. TTFT was 7.385 s, mapping
 residency after decode was 7.64 GiB (62.4%), cgroup peak was exactly 8 GiB,
 and the output was the same ` Paris`.
 
+### Model-scoped page release
+
+`--release-mapping-pages` calls the new native
+`llama_model_release_pages()` after load, before context creation. The native
+operation walks only `model->pimpl->mappings`, releases their mapped fragments
+with Linux `madvise(MADV_DONTNEED)`, never unmaps, and returns `ENOTSUP` on
+unsupported platforms. It is not pathname matching and cannot touch another
+model's mappings.
+
+Qwen2.5-1.5B, 1G, `--no-repack`, 8 greedy tokens:
+
+| Mode | Mapping before | Mapping after | TTFT | Decode | Wall | Peak cgroup | Input blocks |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| prefetch + release | 936.70 MiB | 0 B | 498.0 ms | 3.52 tok/s | 3.36 s | 1 GiB | 6,158,504 |
+| no-prefetch + release | 0 B | 0 B | 668.2 ms | 3.31 tok/s | 3.22 s | 1 GiB | 4,795,560 |
+
+Both produced the same text. Release after a prefetch load removes the
+resident mapping before decode, but the later prompt refaults the weights; it
+is not a throughput optimization by itself.
+
+Small fixture, Pythia-70M, 192M enforced: mapping `71.48 MiB -> 0 B`, cgroup
+peak `137,744,384 B`, output ` the`, exit 0.
+
+GPT-NeoX-20B, 8G, 300 s timeout, `--no-repack --release-mapping-pages`
+(default prefetch): mapping `7.93 GiB -> 0 B`; TTFT 6.823 s; wall 12.58 s;
+model mapping resident after decode 7.64 GiB (62.5%); cgroup peak exactly
+8 GiB; 51,732 `max` events; 44,184,776 input blocks; no OOM; output ` Paris`.
+The native test loads two tiny models and reports `A 8192->0, B 8192->8192`,
+then decodes successfully against A, confirming model scoping and pointer
+validity.
+
 ### GPT-NeoX-20B under 8 GiB
 
 The 20B GGUF is 13,135,032,320 B on disk and 13,133,230,080 tensor bytes,
@@ -236,7 +272,8 @@ swap configuration was changed.
   cost to prompt/decode demand faults; it does not reduce total I/O when the
   model is fully exercised.
 - There is no RAMforge-managed per-layer eviction or staging queue on the
-  forgeCORE path. The kernel's demand paging is the residency mechanism.
+  forgeCORE path. `--release-mapping-pages` operates at whole-model mapping
+  granularity; the kernel's demand paging remains the per-page mechanism.
 - `--enforce-ram` requires cgroup v2 memory delegation. If unavailable, the
   command fails with an actionable error and does not silently fall back to
   diagnostic-only mode. cgroup v1 is unsupported.
@@ -627,7 +664,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **444 tests, 0 failed, 8 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and three CLI enforcement tests. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **445 tests, 0 failed, 9 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and four CLI enforcement tests. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

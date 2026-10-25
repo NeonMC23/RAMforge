@@ -7,17 +7,17 @@
 ## Local verification (2026-10-25)
 
 - The workspace builds and tests against the pinned `forge-core` revision
-  `1eedc19` with Rust/Cargo 1.98.1 and the workspace native tree at
+  `393ac28` with Rust/Cargo 1.98.1 and the workspace native tree at
   `/home/neon/Documents/CODE LOCAL/forge/native` (llama.cpp/ggml v0.5.0 plus
   the documented mmap-no-prefetch patch).
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **444 tests, 0 failed, 8 ignored**; the ignored
+  environment variables passes **445 tests, 0 failed, 9 ignored**; the ignored
   tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark,
   the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and
-  three CLI enforcement tests. Fixture-gated tests report SKIP when their
+  four CLI enforcement tests. Fixture-gated tests report SKIP when their
   environment variables are unset.
 - The registry now tracks `legacy_run` and `forgecore_run` separately.
   `gptneox`/`gpt_neox` is `legacy_run=not-yet`, `forgecore_run=yes`; the legacy
@@ -47,7 +47,7 @@
   device facts, and (when active) cgroup limit/peak/events/page faults. Without
   `--enforce-ram` it labels the requested budget diagnostic-only; with the flag
   it labels the cgroup v2 `memory.max` enforcement.
-- The `forge-core` pin moved to `1eedc19` to consume
+- The `forge-core` pin moved to `393ac28` to consume
   `ModelOptions::use_extra_bufts` and `ModelLoadMode::MmapNoPrefetch`. The
   native llama.cpp upstream HEAD remains v0.5.0; the no-prefetch mode is a
   documented 9-line patch applied by `setup-native.sh`, not a native upgrade.
@@ -161,7 +161,7 @@ of bounded residency.
 ### No-prefetch load mode (2026-10-25)
 
 forgeCORE now exposes `ModelLoadMode::MmapNoPrefetch`, backed by the documented
-`patches/llama-mmap-no-prefetch.patch` and `LLAMA_LOAD_MODE_MMAP_NO_PREFETCH`.
+`patches/llama-model-residency.patch` and `LLAMA_LOAD_MODE_MMAP_NO_PREFETCH`.
 RAMforge wires it as opt-in `--no-prefetch`; the default remains prefaulted
 `Mmap`. The mode avoids `MAP_POPULATE`; it does not implement per-layer
 residency or replace the cgroup cap.
@@ -190,10 +190,27 @@ after decode was 7.64 GiB (62.4%); anon 329.79 MiB; file 7.64 GiB; kernel
 33.86 MiB; 159 major faults; cgroup swap peak 0; max RSS 7.97 GiB. These are
 one-token fit/mechanism results, not throughput or quality evidence.
 
+Model-scoped release (`--release-mapping-pages`) uses the native
+`llama_model_release_pages()` over exactly that model's mappings:
+
+- Qwen2.5-1.5B, 1G, prefetch + release: mapping `936.70 MiB -> 0 B`; TTFT
+  498.0 ms; decode 3.52 tok/s; wall 3.36 s; cgroup peak 1 GiB.
+- Qwen2.5-1.5B, 1G, no-prefetch + release: mapping `0 B -> 0 B`; TTFT
+  668.2 ms; decode 3.31 tok/s; wall 3.22 s; cgroup peak 1 GiB.
+- Pythia-70M, 192M: mapping `71.48 MiB -> 0 B`; cgroup peak 137,744,384 B;
+  output ` the`.
+- GPT-NeoX-20B, 8G, prefetch + release: mapping `7.93 GiB -> 0 B`; TTFT
+  6.823 s; wall 12.58 s; cgroup peak exactly 8 GiB; 51,732 `max` events;
+  44,184,776 input blocks; no OOM; output ` Paris`.
+- Fixture scope test: two models, `A 8192->0, B 8192->8192`, followed by a
+  successful decode on A. This confirms only the target model's mapping is
+  released and pointers remain valid.
+
 The cgroup cap does not include shared file pages charged to another cgroup.
 The default loader still prefaults with `MAP_POPULATE`; no-prefetch is opt-in
-and requires the patched native tree. RAMforge has no per-layer eviction hook
-on the forgeCORE path. `memory.swap.max=0` is written when the swap controller
+and requires the patched native tree. Page release is whole-model mapping
+granularity, not per-layer eviction. `memory.swap.max=0` is written when the
+swap controller exposes it; `Peak swap` is reported. `memory.swap.max=0` is written when the swap controller
 exposes it; `Peak swap` is reported. The enforced timeout path is tested:
 Qwen2.5-1.5B at 512M with `--enforce-timeout 1` exits 124, reports
 `Result: timeout; cgroup killed`, and leaves no cgroup behind. The 20B model
@@ -277,7 +294,7 @@ Read-only model hashes from the matrix inventory:
 
 **Current ForgeCore note:** static ForgeCore device discovery, explicit
 selection, and execution metadata are implemented. The pinned ForgeCore
-revision `1eedc19` exposes public static model-load/offload options, CPU
+revision `393ac28` exposes public static model-load/offload options, CPU
 weight-repacking control, and `MmapNoPrefetch`, but the RAMforge adapter remains
 deliberately CPU-only in this refresh; GPU facts may be discoverable but
 non-CPU model execution is explicitly unsupported, with no CPU fallback. The
@@ -403,7 +420,7 @@ The following infrastructure is implemented with extensive unit/integration cove
 - Bounded calibration tasks and persisted execution-plan compatibility checks.
 - CLI/TUI diagnostic collection, profiling, memory visibility, run history, persistence, and error staging.
 - cgroup v2 hard-budget supervision (`--enforce-ram`) with `memory.peak`, limit/OOM events, page-fault counters, timeout kill, and explicit failure reporting; covered by process-level tests.
-- Explicit file-backed mmap loading, `--no-repack` CPU weight-repacking control, opt-in `--no-prefetch` mapping mode, model-mapping RSS/PSS measurement, and cold-cache priming for enforced runs.
+- Explicit file-backed mmap loading, `--no-repack` CPU weight-repacking control, opt-in `--no-prefetch` mapping mode, opt-in `--release-mapping-pages` model-scoped page release, model-mapping RSS/PSS measurement, and cold-cache priming for enforced runs.
 - ForgeCore-observed TTFT, prompt-processing, decode-token-rate, and wall-clock profiling.
 
 “Production-oriented” here means that these are concrete implemented subsystems with tests. It is not a blanket production-readiness or model-quality guarantee.

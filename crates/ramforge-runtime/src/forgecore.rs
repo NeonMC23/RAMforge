@@ -281,6 +281,16 @@ impl ForgeCoreModel {
         &self.metadata
     }
 
+    /// Release resident pages from this model's file-backed mappings.
+    ///
+    /// Must not be called while a decode is in progress. This never unmaps
+    /// memory or invalidates tensor pointers; later access refaults pages.
+    pub fn release_mapping_pages(&mut self) -> Result<(), ForgeCoreAdapterError> {
+        self.model
+            .release_mapping_pages()
+            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
+    }
+
     pub fn device(&self) -> &DeviceInfo {
         &self.device
     }

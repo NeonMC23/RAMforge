@@ -21,6 +21,7 @@ fn help_lists_memory_control_flags() {
         "--ctx",
         "--no-repack",
         "--no-prefetch",
+        "--release-mapping-pages",
     ] {
         assert!(text.contains(flag), "help must list {flag}: {text}");
     }
@@ -68,6 +69,28 @@ fn no_prefetch_is_rejected_for_the_legacy_backend() {
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(
         text.contains("--no-prefetch is only supported with --backend forgecore"),
+        "unexpected stderr: {text}"
+    );
+}
+
+#[test]
+fn release_mapping_pages_is_rejected_for_the_legacy_backend() {
+    let output = ramforge()
+        .args([
+            "run",
+            "/nonexistent/model.gguf",
+            "--ram",
+            "64M",
+            "--prompt",
+            "hi",
+            "--release-mapping-pages",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("--release-mapping-pages is only supported with --backend forgecore"),
         "unexpected stderr: {text}"
     );
 }
@@ -147,6 +170,40 @@ fn enforced_timeout_kills_the_cgroup_and_returns_124() {
     assert!(
         stderr.contains("Result: timeout; cgroup killed"),
         "timeout must be reported: {stderr}"
+    );
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn release_mapping_pages_reports_zero_after_advice() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--release-mapping-pages",
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "run failed: {stderr}");
+    assert!(
+        stderr.contains("Mapping page release:") && stderr.contains("resident_after=0 bytes"),
+        "release report missing: {stderr}"
     );
 }
 
