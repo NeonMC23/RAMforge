@@ -32,13 +32,8 @@ fn load_fixture() -> Option<(ForgeCoreModel, ForgeCoreModelMetadata)> {
 
 #[test]
 fn forgecore_selection_errors_are_propagated_without_fallback() {
-    let missing_id = ExecutionConfig::new(
-        DeviceSelection::by_id("missing-device"),
-        1,
-        None,
-        false,
-    )
-    .expect("selection syntax is valid");
+    let missing_id = ExecutionConfig::new(DeviceSelection::by_id("missing-device"), 1, None, false)
+        .expect("selection syntax is valid");
     let error = ForgeCoreModel::load_for_execution(
         "/definitely/not/a/model.gguf",
         missing_id,
@@ -47,8 +42,8 @@ fn forgecore_selection_errors_are_propagated_without_fallback() {
     .unwrap_err();
     assert!(matches!(error, ForgeCoreAdapterError::DeviceSelection(_)));
 
-    let no_cpu = ExecutionConfig::new(DeviceSelection::Cpu, 1, None, false)
-        .expect("CPU selection is valid");
+    let no_cpu =
+        ExecutionConfig::new(DeviceSelection::Cpu, 1, None, false).expect("CPU selection is valid");
     let error = ForgeCoreModel::load_for_execution(
         "/definitely/not/a/model.gguf",
         no_cpu,
@@ -111,6 +106,7 @@ fn forgecore_adapter_translates_model_batch_and_decode_errors() {
         .open_context(ForgeCoreContextOptions {
             n_ctx: None,
             n_threads: 0,
+            trace_max_events: None,
         })
         .unwrap_err();
     assert!(matches!(
@@ -140,6 +136,7 @@ fn forgecore_adapter_translates_model_batch_and_decode_errors() {
         .open_context(ForgeCoreContextOptions {
             n_ctx: Some(1),
             n_threads: 1,
+            trace_max_events: None,
         })
         .expect("one-token context");
     constrained

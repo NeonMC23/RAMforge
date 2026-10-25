@@ -12,8 +12,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use forge_core::{
-    BatchBuilder, Context, GpuLayers, Model, ModelLoadMode, ModelOptions, PageReleaseResult,
-    TensorMappingInfo,
+    BatchBuilder, Context, ContextTraceOptions, GpuLayers, Model, ModelLoadMode, ModelOptions,
+    PageReleaseResult, TensorMappingInfo, TraceEvent, TraceSummary,
 };
 
 use crate::execution::{
@@ -312,6 +312,13 @@ impl ForgeCoreModel {
             .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
     }
 
+    /// Best-effort page prefetch for selected tensor indices.
+    pub fn prefetch_tensor_pages(&mut self, indices: &[i32]) -> Result<u64, ForgeCoreAdapterError> {
+        self.model
+            .prefetch_tensor_pages(indices)
+            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
+    }
+
     pub fn device(&self) -> &DeviceInfo {
         &self.device
     }
@@ -325,6 +332,7 @@ impl ForgeCoreModel {
         self.open_context(ForgeCoreContextOptions {
             n_ctx: self.execution.context_length,
             n_threads: self.execution.cpu_thread_count,
+            trace_max_events: None,
         })
     }
 
@@ -345,6 +353,9 @@ impl ForgeCoreModel {
                 options.n_threads
             ))
         })?;
+        context_options.trace = options
+            .trace_max_events
+            .map(|max_events| ContextTraceOptions { max_events });
         let context = Context::open(&self.model, &context_options)
             .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))?;
 
@@ -364,6 +375,9 @@ pub struct ForgeCoreContextOptions {
     pub n_ctx: Option<u32>,
     /// CPU worker count forwarded to ForgeCore/libllama.
     pub n_threads: usize,
+    /// Opt-in bounded scheduler eval trace size. `None` preserves the plain
+    /// decode path with no callback installed.
+    pub trace_max_events: Option<usize>,
 }
 
 impl Default for ForgeCoreContextOptions {
@@ -371,6 +385,7 @@ impl Default for ForgeCoreContextOptions {
         Self {
             n_ctx: None,
             n_threads: 1,
+            trace_max_events: None,
         }
     }
 }
@@ -391,6 +406,11 @@ impl ForgeCoreContextOptions {
         if self.n_ctx == Some(0) {
             return Err(ForgeCoreAdapterError::Configuration(
                 "explicit context length must be greater than zero".to_string(),
+            ));
+        }
+        if self.trace_max_events == Some(0) {
+            return Err(ForgeCoreAdapterError::Configuration(
+                "trace_max_events must be greater than zero".to_string(),
             ));
         }
         Ok(())
@@ -456,6 +476,22 @@ impl ForgeCoreSession {
     /// lifecycle boundary for residency code.
     pub fn synchronize(&mut self) {
         self.context.synchronize();
+    }
+
+    pub fn trace_summary(&self) -> Option<TraceSummary> {
+        self.context.trace_summary()
+    }
+
+    pub fn trace_events(&self) -> Vec<TraceEvent> {
+        self.context.trace_events()
+    }
+
+    pub fn take_trace_events(&self) -> Vec<TraceEvent> {
+        self.context.take_trace_events()
+    }
+
+    pub fn clear_trace(&self) {
+        self.context.clear_trace();
     }
 
     pub fn vocab_size(&self) -> u32 {
@@ -608,6 +644,7 @@ mod tests {
             ForgeCoreContextOptions {
                 n_ctx: None,
                 n_threads: 0,
+                trace_max_events: None,
             }
             .validate()
             .unwrap_err(),
@@ -618,6 +655,7 @@ mod tests {
         assert!(ForgeCoreContextOptions {
             n_ctx: Some(0),
             n_threads: 1,
+            trace_max_events: None,
         }
         .validate()
         .is_err());

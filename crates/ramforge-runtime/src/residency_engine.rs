@@ -392,6 +392,67 @@ fn merged_interval_bytes(intervals: &mut [(u64, u64)]) -> u64 {
     total + last - first
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityState {
+    Supported,
+    PartiallySupported,
+    Unsupported,
+    Unknown,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidencyCapabilities {
+    pub tensor_mapping_metadata: CapabilityState,
+    pub file_backed_release: CapabilityState,
+    pub page_prefetch: CapabilityState,
+    pub graph_trace: CapabilityState,
+    pub graph_dependency_analysis: CapabilityState,
+    pub proven_last_use_completion: CapabilityState,
+    pub between_operation_residency: CapabilityState,
+    pub intra_decode_residency: CapabilityState,
+    pub hard_cgroup_enforcement: CapabilityState,
+    pub cpu_execution: CapabilityState,
+    pub gpu_execution: CapabilityState,
+}
+
+impl ResidencyCapabilities {
+    pub fn current() -> Self {
+        let linux = cfg!(target_os = "linux");
+        let cgroup = cgroup::self_cgroup_path()
+            .ok()
+            .and_then(|path| cgroup::stats_at(&path).ok())
+            .is_some();
+        Self {
+            tensor_mapping_metadata: CapabilityState::Supported,
+            file_backed_release: if linux {
+                CapabilityState::Supported
+            } else {
+                CapabilityState::Unsupported
+            },
+            page_prefetch: if linux {
+                CapabilityState::Supported
+            } else {
+                CapabilityState::Unsupported
+            },
+            graph_trace: CapabilityState::Supported,
+            graph_dependency_analysis: CapabilityState::PartiallySupported,
+            // The callback proves observed node completion, not that the next
+            // graph/token cannot reuse a weight.
+            proven_last_use_completion: CapabilityState::PartiallySupported,
+            between_operation_residency: CapabilityState::Supported,
+            intra_decode_residency: CapabilityState::Unsupported,
+            hard_cgroup_enforcement: if cgroup {
+                CapabilityState::Supported
+            } else {
+                CapabilityState::Unknown
+            },
+            cpu_execution: CapabilityState::Supported,
+            gpu_execution: CapabilityState::Unsupported,
+        }
+    }
+}
+
 /// Policy mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResidencyPolicyMode {
@@ -879,6 +940,20 @@ impl ResidencyLifecycle {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingPlan {
+    pub selected: Vec<ResourceKey>,
+    pub selected_bytes: u64,
+    pub skipped_bytes: u64,
+    pub notes: Vec<String>,
+}
+
+impl StagingPlan {
+    pub fn is_empty(&self) -> bool {
+        self.selected.is_empty()
+    }
+}
+
 /// One measured/estimated residency snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResidencySnapshot {
@@ -1064,6 +1139,47 @@ impl ResidencyManager {
 
     pub fn application(&self) -> Option<&ApplicationReport> {
         self.application.as_ref()
+    }
+
+    /// Deterministic bounded staging plan. This is a prefetch hint only; it
+    /// does not reserve memory or guarantee residency.
+    pub fn staging_plan(&self, max_bytes: u64) -> StagingPlan {
+        let mut candidates: Vec<&TensorResource> = self
+            .inventory
+            .resources
+            .iter()
+            .filter(|resource| resource.file_backed && resource.page_bytes > 0)
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.layer
+                .sort_key()
+                .cmp(&b.layer.sort_key())
+                .then_with(|| a.key.tensor_index.cmp(&b.key.tensor_index))
+        });
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0u64;
+        let mut skipped = 0u64;
+        for resource in candidates {
+            if max_bytes == 0 || selected_bytes.saturating_add(resource.page_bytes) > max_bytes {
+                skipped = skipped.saturating_add(resource.page_bytes);
+                continue;
+            }
+            selected.push(resource.key);
+            selected_bytes += resource.page_bytes;
+        }
+        let mut notes = vec![
+            "prefetch is a MADV_WILLNEED hint, not a synchronous load or residency guarantee"
+                .to_string(),
+        ];
+        if skipped > 0 {
+            notes.push("some eligible pages exceeded the staging limit".to_string());
+        }
+        StagingPlan {
+            selected,
+            selected_bytes,
+            skipped_bytes: skipped,
+            notes,
+        }
     }
 
     pub fn admission(&self, current_bytes: Option<u64>) -> AdmissionDecision {

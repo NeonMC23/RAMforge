@@ -28,6 +28,10 @@ fn help_lists_memory_control_flags() {
         "--residency-target",
         "--residency-reserve",
         "--residency-report",
+        "--residency-prefetch",
+        "--graph-trace",
+        "--graph-trace-events",
+        "--graph-trace-detail",
     ] {
         assert!(text.contains(flag), "help must list {flag}: {text}");
     }
@@ -144,7 +148,7 @@ fn residency_policy_is_rejected_for_the_legacy_backend() {
     assert!(!output.status.success());
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(
-        text.contains("residency policy, target, reserve, and report controls are only supported with --backend forgecore"),
+        text.contains("residency policy, target, reserve, prefetch, and report controls are only supported with --backend forgecore"),
         "unexpected stderr: {text}"
     );
 }
@@ -195,6 +199,28 @@ fn residency_reserve_cannot_exceed_target() {
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(
         text.contains("exceeds --residency-target"),
+        "unexpected stderr: {text}"
+    );
+}
+
+#[test]
+fn graph_trace_is_rejected_for_the_legacy_backend() {
+    let output = ramforge()
+        .args([
+            "run",
+            "/nonexistent/model.gguf",
+            "--ram",
+            "64M",
+            "--prompt",
+            "hi",
+            "--graph-trace",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("--graph-trace is only supported with --backend forgecore"),
         "unexpected stderr: {text}"
     );
 }
@@ -348,6 +374,90 @@ fn release_layer_reports_selected_tensor_ranges() {
     ] {
         assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
     }
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn bounded_prefetch_is_reported_separately_from_residency() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--no-prefetch",
+            "--residency-prefetch",
+            "16M",
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "run failed: {stderr}");
+    assert!(
+        stderr.contains("Residency staging plan:"),
+        "missing plan: {stderr}"
+    );
+    assert!(
+        stderr.contains("native_requested=") && stderr.contains("mapping_before="),
+        "missing staging result: {stderr}"
+    );
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn graph_trace_reports_manifest_without_claiming_eviction() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--graph-trace",
+            "--graph-trace-events",
+            "256",
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "run failed: {stderr}");
+    assert!(
+        stderr.contains("Graph trace summary:"),
+        "missing trace: {stderr}"
+    );
+    assert!(
+        stderr.contains("Graph manifest:"),
+        "missing manifest: {stderr}"
+    );
+    assert!(
+        stderr.contains("intra_decode_safe=false"),
+        "trace must not claim intra-decode safety: {stderr}"
+    );
 }
 
 #[test]

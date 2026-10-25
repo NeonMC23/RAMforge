@@ -3,12 +3,13 @@ use ramforge_core::{
     discover_model_set, parse_memory_size, ChatMessage, ChatTemplate, GgufModel, GgufModelSet,
     Tokenizer,
 };
+use ramforge_runtime::graph_manifest::{GraphManifest, LastUseStatus};
 use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::page_residency::{evict_file_cache, model_mapping_residency};
 use ramforge_runtime::residency_engine::{
     AdmissionDecision, DecisionAction, ModelGeneration, ModelId, OperationContext,
-    ResidencyManager, ResidencyPlan, ResidencyPolicy, ResidencyPolicyMode, ResidencyReport,
-    ResidencySnapshot, ResourceInventory,
+    ResidencyCapabilities, ResidencyManager, ResidencyPlan, ResidencyPolicy, ResidencyPolicyMode,
+    ResidencyReport, ResidencySnapshot, ResourceInventory,
 };
 use ramforge_runtime::{
     DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
@@ -55,6 +56,7 @@ impl ResidencyPolicyArg {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Inspect a GGUF model file and report metadata
@@ -154,6 +156,22 @@ enum Commands {
         #[arg(long)]
         residency_report: bool,
 
+        /// Best-effort bounded page prefetch budget (MADV_WILLNEED hint)
+        #[arg(long, value_name = "SIZE")]
+        residency_prefetch: Option<String>,
+
+        /// Enable bounded scheduler graph tracing (adds per-node synchronization overhead)
+        #[arg(long)]
+        graph_trace: bool,
+
+        /// Maximum retained graph trace events
+        #[arg(long, default_value_t = 4096, requires = "graph_trace")]
+        graph_trace_events: usize,
+
+        /// Print individual graph trace events
+        #[arg(long, requires = "graph_trace")]
+        graph_trace_detail: bool,
+
         /// Enforce --ram as a hard cgroup v2 memory.max limit for the run
         #[arg(long)]
         enforce_ram: bool,
@@ -231,6 +249,10 @@ fn main() {
             residency_target,
             residency_reserve,
             residency_report,
+            residency_prefetch,
+            graph_trace,
+            graph_trace_events,
+            graph_trace_detail,
             enforce_ram,
             enforce_timeout,
             max_tokens,
@@ -287,6 +309,10 @@ fn main() {
                 residency_target,
                 residency_reserve,
                 residency_report,
+                residency_prefetch,
+                graph_trace,
+                graph_trace_events,
+                graph_trace_detail,
                 max_tokens,
                 temperature,
                 top_k,
@@ -384,6 +410,10 @@ fn run_inference(
     residency_target: Option<String>,
     residency_reserve: Option<String>,
     residency_report: bool,
+    residency_prefetch: Option<String>,
+    graph_trace: bool,
+    graph_trace_events: usize,
+    graph_trace_detail: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -405,6 +435,16 @@ fn run_inference(
         .transpose()
         .map_err(|error| anyhow::anyhow!("invalid --residency-reserve: {error}"))?
         .unwrap_or(0);
+    let residency_prefetch_bytes = residency_prefetch
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --residency-prefetch: {error}"))?;
+    if residency_prefetch_bytes == Some(0) {
+        return Err(anyhow::anyhow!(
+            "--residency-prefetch must be greater than zero"
+        ));
+    }
     if residency_target_bytes == Some(0) {
         return Err(anyhow::anyhow!(
             "--residency-target must be greater than zero"
@@ -427,6 +467,11 @@ fn run_inference(
             "--residency-target/--residency-reserve require --residency-policy observe|active or --residency-report"
         ));
     }
+    if graph_trace && graph_trace_events == 0 {
+        return Err(anyhow::anyhow!(
+            "--graph-trace-events must be greater than zero"
+        ));
+    }
     let device_selection = device
         .parse::<DeviceSelection>()
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -434,12 +479,18 @@ fn run_inference(
     let residency_requested = residency_policy != ResidencyPolicyArg::Off
         || residency_target_bytes.is_some()
         || residency_reserve_bytes != 0
-        || residency_report;
+        || residency_report
+        || residency_prefetch_bytes.is_some();
     if residency_requested
         && (release_mapping_pages || inspect_layer.is_some() || release_layer.is_some())
     {
         return Err(anyhow::anyhow!(
             "manual mapping release/inspection cannot be combined with residency policy controls"
+        ));
+    }
+    if graph_trace && !matches!(backend, InferenceBackend::ForgeCore) {
+        return Err(anyhow::anyhow!(
+            "--graph-trace is only supported with --backend forgecore"
         ));
     }
     if matches!(backend, InferenceBackend::ForgeCore) {
@@ -461,6 +512,10 @@ fn run_inference(
             residency_target_bytes,
             residency_reserve_bytes,
             residency_report,
+            residency_prefetch_bytes,
+            graph_trace,
+            graph_trace_events,
+            graph_trace_detail,
             max_tokens,
             temperature,
             top_k,
@@ -504,10 +559,11 @@ fn run_inference(
     let residency_requested = residency_policy != ResidencyPolicyArg::Off
         || residency_target_bytes.is_some()
         || residency_reserve_bytes != 0
-        || residency_report;
+        || residency_report
+        || residency_prefetch_bytes.is_some();
     if residency_requested {
         return Err(anyhow::anyhow!(
-            "residency policy, target, reserve, and report controls are only supported with --backend forgecore"
+            "residency policy, target, reserve, prefetch, and report controls are only supported with --backend forgecore"
         ));
     }
     if residency_requested
@@ -772,6 +828,10 @@ fn run_forgecore_inference(
     residency_target: Option<u64>,
     residency_reserve: u64,
     residency_report: bool,
+    residency_prefetch_bytes: Option<u64>,
+    graph_trace: bool,
+    graph_trace_events: usize,
+    graph_trace_detail: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -928,6 +988,7 @@ fn run_forgecore_inference(
         || residency_report
         || residency_target.is_some()
         || residency_reserve != 0
+        || residency_prefetch_bytes.is_some()
     {
         let model_id = ModelId(model.path().display().to_string());
         let mappings = model
@@ -963,6 +1024,36 @@ fn run_forgecore_inference(
     let mut residency_admission: Option<AdmissionDecision> = None;
     let mut pre_operation_plan: Option<ResidencyPlan> = None;
     if let Some(manager) = residency_manager.as_mut() {
+        if let Some(limit) = residency_prefetch_bytes {
+            let plan = manager.staging_plan(limit);
+            eprintln!(
+                "Residency staging plan: selected={} requested_pages={} skipped={}",
+                plan.selected.len(),
+                format_bytes(plan.selected_bytes),
+                format_bytes(plan.skipped_bytes)
+            );
+            for note in &plan.notes {
+                eprintln!("  staging note: {note}");
+            }
+            if !plan.is_empty() {
+                let indices: Vec<i32> = plan.selected.iter().map(|key| key.tensor_index).collect();
+                let before = ResidencySnapshot::capture_paths(&shard_paths);
+                let requested = model
+                    .prefetch_tensor_pages(&indices)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                let after = ResidencySnapshot::capture_paths(&shard_paths);
+                eprintln!(
+                    "Residency staging result: native_requested={} mapping_before={} mapping_after={} delta={}",
+                    format_bytes(requested),
+                    optional_bytes(before.mapping_rss_bytes),
+                    optional_bytes(after.mapping_rss_bytes),
+                    before
+                        .mapping_delta(&after)
+                        .map(|delta| format!("{delta:+} bytes"))
+                        .unwrap_or_else(|| "unavailable".to_string())
+                );
+            }
+        }
         let current = process_rss()
             .or_else(|| ResidencySnapshot::capture_paths(&shard_paths).mapping_rss_bytes)
             .or(Some(manager.inventory().summary.page_bytes));
@@ -1030,6 +1121,7 @@ fn run_forgecore_inference(
         .open_context(ForgeCoreContextOptions {
             n_ctx: ctx,
             n_threads: 1,
+            trace_max_events: graph_trace.then_some(graph_trace_events),
         })
         .map_err(|error| anyhow::anyhow!(error))?;
     let context_length = session.context_length() as usize;
@@ -1285,6 +1377,39 @@ fn run_forgecore_inference(
             format_duration(load_elapsed)
         );
     }
+    if graph_trace {
+        let summary = session.trace_summary();
+        let events = session.trace_events();
+        let manifest = GraphManifest::from_trace(&events);
+        eprintln!("Graph trace summary: {:?}", summary);
+        eprintln!("Graph manifest: {:?}", manifest.summary());
+        let unknown = manifest
+            .last_use
+            .values()
+            .filter(|last| last.status == LastUseStatus::Unknown)
+            .count();
+        eprintln!(
+            "Graph last-use: graph_order={} unknown={} intra_decode_safe={}",
+            manifest.last_use.len().saturating_sub(unknown),
+            unknown,
+            manifest.intra_decode_safe
+        );
+        if graph_trace_detail {
+            for event in &events {
+                eprintln!(
+                    "  trace exec={} seq={} phase={:?} completion={:?} name={:?} op={:?} bytes={} deps={:?}",
+                    event.execution_id,
+                    event.sequence,
+                    event.phase,
+                    event.completion,
+                    event.node_name,
+                    event.op_name,
+                    event.bytes,
+                    event.dependencies
+                );
+            }
+        }
+    }
     drop(session);
 
     let mut post_operation_plan = None;
@@ -1432,6 +1557,42 @@ fn output_support() {
     println!("Inspection/planning are generic GGUF operations and do not imply execution support.");
     println!("Legacy run=yes is architecture-level; tensor-format support is model-specific. Use `inspect` or `plan` for the final legacy-execution verdict.");
     println!("ForgeCore/libllama run=yes means real-model execution has been validated for at least one fixture of that architecture. The backend delegates tensor-type support to the pinned native runtime; it does not use RAMforge's legacy quantization list.");
+    println!();
+    let capabilities = ResidencyCapabilities::current();
+    println!("Residency capabilities (CPU baseline):");
+    println!(
+        "  tensor metadata: {:?}",
+        capabilities.tensor_mapping_metadata
+    );
+    println!(
+        "  file-backed page release: {:?}",
+        capabilities.file_backed_release
+    );
+    println!("  page prefetch: {:?}", capabilities.page_prefetch);
+    println!("  graph trace: {:?}", capabilities.graph_trace);
+    println!(
+        "  graph dependency analysis: {:?}",
+        capabilities.graph_dependency_analysis
+    );
+    println!(
+        "  proven last-use completion: {:?}",
+        capabilities.proven_last_use_completion
+    );
+    println!(
+        "  between-operation residency: {:?}",
+        capabilities.between_operation_residency
+    );
+    println!(
+        "  intra-decode residency: {:?}",
+        capabilities.intra_decode_residency
+    );
+    println!(
+        "  hard cgroup enforcement: {:?}",
+        capabilities.hard_cgroup_enforcement
+    );
+    println!("  CPU execution: {:?}", capabilities.cpu_execution);
+    println!("  GPU execution: {:?}", capabilities.gpu_execution);
+    println!("  Intra-decode residency is unsupported by the pinned native callback contract; between-operation streaming remains the safe mode.");
 }
 
 fn output_generation_profile(

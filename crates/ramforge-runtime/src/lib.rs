@@ -23,6 +23,7 @@ pub(crate) mod compute_dispatch;
 pub mod discovery;
 pub mod execution;
 pub mod forgecore;
+pub mod graph_manifest;
 pub mod inference;
 pub mod kv_cache;
 pub mod layer;

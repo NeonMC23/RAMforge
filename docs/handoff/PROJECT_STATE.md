@@ -7,17 +7,17 @@
 ## Local verification (2026-10-25)
 
 - The workspace builds and tests against the pinned `forge-core` revision
-  `cb39080` with Rust/Cargo 1.98.1 and the workspace native tree at
+  `df6d377` with Rust/Cargo 1.98.1 and the workspace native tree at
   `/home/neon/Documents/CODE LOCAL/forge/native` (llama.cpp/ggml v0.5.0 plus
   the documented mmap-no-prefetch patch).
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **463 tests, 0 failed, 12 ignored**; the ignored
+  environment variables passes **467 tests, 0 failed, 14 ignored**; the ignored
   tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark,
   the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement,
-  and the opt-in observe/active residency checks. Fixture-gated tests report SKIP when their
+  graph trace, bounded prefetch, and the opt-in observe/active residency checks. Fixture-gated tests report SKIP when their
   environment variables are unset.
 - The registry now tracks `legacy_run` and `forgecore_run` separately.
   `gptneox`/`gpt_neox` is `legacy_run=not-yet`, `forgecore_run=yes`; the legacy
@@ -47,9 +47,10 @@
   device facts, and (when active) cgroup limit/peak/events/page faults. Without
   `--enforce-ram` it labels the requested budget diagnostic-only; with the flag
   it labels the cgroup v2 `memory.max` enforcement.
-- The `forge-core` pin moved to `cb39080` to consume
+- The `forge-core` pin moved to `df6d377` to consume
   `ModelOptions::use_extra_bufts`, `ModelLoadMode::MmapNoPrefetch`,
-  `Model::tensor_mappings()`, and `Model::release_tensor_pages()`. The native
+  `Model::tensor_mappings()`, `Model::release_tensor_pages()`, bounded
+  `Model::prefetch_tensor_pages()`, and `ContextOptions::trace`. The native
   llama.cpp upstream HEAD remains v0.5.0; the capabilities are supplied by the
   documented `patches/llama-model-residency.patch`, applied by
   `setup-native.sh`, not a native upgrade. The adapter uses the options to
@@ -315,6 +316,40 @@ telemetry snapshot is sampled, not continuous; cgroup current may not reflect
 madvise page release; multi-shard inventory is supported by native mapping
 indices but real split-model execution was not re-run in this unit.
 
+#### Graph trace and bounded staging (2026-10-25)
+
+forgeCORE now exposes the pinned scheduler eval callback as an opt-in bounded
+trace. When enabled, the scheduler computes observed node groups and calls
+`ggml_backend_synchronize` before the `ask == false` callback; forgeCORE
+records node name/op/source names and transient source IDs, bytes, phase, and
+`BackendSynchronized` completion. Tracing disabled preserves the original
+execution path.
+
+RAMforge `graph_manifest` builds a conservative manifest from retained
+events. It records graph-order last use and completion, but always marks
+`intra_decode_safe=false`: completion of the last consumer in one graph does
+not prove the next graph/token will not reuse the weight.
+
+Qwen2.5-1.5B, 1 GiB, one token:
+
+- 4096 event budget: 958 requested / 958 synchronized completions, 1,916
+  retained, 0 dropped; 958 nodes, 1,050 tensor resources, edges known,
+  completion proven, 1,050 graph-order last uses, 0 unknown; wall 1.108 s;
+  output ` Paris`; `intra_decode_safe=false`.
+- 512 event budget: 1,404 events dropped; manifest covered 256 nodes and 292
+  resources. Overflow is explicit and the manifest is incomplete.
+
+Bounded staging:
+
+- `--residency-prefetch 128M --no-prefetch` selected 95 file-backed tensors,
+  requested 128.00 MiB, skipped 884.48 MiB by the staging cap.
+- Native `MADV_WILLNEED` accepted 127.72 MiB.
+- Mapping RSS before/after was `0 -> 0`; no measured residency change.
+
+Capabilities from `ramforge support`: tensor metadata/release/prefetch/trace
+and between-operation residency supported; graph dependency/last-use proof
+partial; intra-decode residency and GPU unsupported.
+
 #### GPT-NeoX/Pythia execution evidence
 
 Fixture: `mradermacher/pythia-70m-deduped-GGUF`,
@@ -390,7 +425,7 @@ Read-only model hashes from the matrix inventory:
 
 **Current ForgeCore note:** static ForgeCore device discovery, explicit
 selection, and execution metadata are implemented. The pinned ForgeCore
-revision `cb39080` exposes public static model-load/offload options, CPU
+revision `df6d377` exposes public static model-load/offload options, CPU
 weight-repacking control, and `MmapNoPrefetch`, but the RAMforge adapter remains
 deliberately CPU-only in this refresh; GPU facts may be discoverable but
 non-CPU model execution is explicitly unsupported, with no CPU fallback. The
@@ -517,7 +552,7 @@ The following infrastructure is implemented with extensive unit/integration cove
 - CLI/TUI diagnostic collection, profiling, memory visibility, run history, persistence, and error staging.
 - cgroup v2 hard-budget supervision (`--enforce-ram`) with `memory.peak`, limit/OOM events, page-fault counters, timeout kill, and explicit failure reporting; covered by process-level tests.
 - Explicit file-backed mmap loading, `--no-repack` CPU weight-repacking control, opt-in `--no-prefetch` mapping mode, opt-in model-wide and tensor/layer range page release, model-mapping RSS/PSS measurement, and cold-cache priming for enforced runs.
-- Execution-aware residency inventory, deterministic soft-target planner, lifecycle guard, admission control, and structured telemetry; releases occur only at a post-decode safe boundary.
+- Execution-aware residency inventory, deterministic soft-target planner, lifecycle guard, admission control, bounded scheduler graph trace/manifest, bounded page prefetch, and structured telemetry; releases occur only at a post-decode safe boundary. Intra-decode eviction is not implemented.
 - ForgeCore-observed TTFT, prompt-processing, decode-token-rate, and wall-clock profiling.
 
 “Production-oriented” here means that these are concrete implemented subsystems with tests. It is not a blanket production-readiness or model-quality guarantee.

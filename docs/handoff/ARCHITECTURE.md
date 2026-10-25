@@ -202,7 +202,7 @@ The tokenizer has no chat-template application. It encodes the prompt text suppl
 - `inspect MODEL [--json]`;
 - `plan MODEL --ram SIZE [--json]`;
 - `support`;
-- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--ctx N] [--enforce-ram] [--enforce-timeout S] [--no-repack] [--no-prefetch] [--release-mapping-pages] [--inspect-layer N | --release-layer N] [--residency-policy off|observe|active] [--residency-target SIZE] [--residency-reserve SIZE] [--residency-report] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
+- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--ctx N] [--enforce-ram] [--enforce-timeout S] [--no-repack] [--no-prefetch] [--release-mapping-pages] [--inspect-layer N | --release-layer N] [--residency-policy off|observe|active] [--residency-target SIZE] [--residency-reserve SIZE] [--residency-report] [--residency-prefetch SIZE] [--graph-trace] [--graph-trace-events N] [--graph-trace-detail] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
 
 The static Phase-4 device boundary is in `crates/ramforge-runtime/src/execution.rs`.
 `DeviceRegistry::discover()` is a safe ForgeCore snapshot; CPU is selectable,

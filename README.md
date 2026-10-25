@@ -134,6 +134,13 @@ Flags:
 - `--residency-reserve SIZE`: safety reserve subtracted from the soft target.
 - `--residency-report`: print the structured inventory, admission, plans,
   application result, and before/after observations.
+- `--residency-prefetch SIZE`: best-effort bounded tensor-page prefetch
+  (`MADV_WILLNEED` hint). Requested bytes and observed mapping residency are
+  reported separately.
+- `--graph-trace`: opt-in bounded scheduler eval trace. It forces observed node
+  groups to be computed separately and synchronized; expect overhead.
+- `--graph-trace-events N`: retained event bound (default 4096).
+- `--graph-trace-detail`: print individual trace events.
 
 ### Enforced budget matrix
 
@@ -319,6 +326,42 @@ Observe mode selected 31 tensors in its post-operation plan and performed no
 native release; mapping and process residency were unchanged. Admission for
 both target-512M runs was `AdmittedWithWarning`, because current process
 memory plus reserve exceeded the soft target.
+
+### Graph trace, manifest, and bounded staging
+
+`--graph-trace` installs the pinned public scheduler eval callback. For each
+observed node group, the scheduler computes the group and calls
+`ggml_backend_synchronize` before the `ask == false` callback. forgeCORE
+records node name, op name, source names/transient IDs, size, phase, and an
+explicit `BackendSynchronized` completion. Tracing disabled uses the original
+scheduler path.
+
+Qwen2.5-1.5B Q4_0, 1 GiB, one token, `--graph-trace-events 4096`:
+
+- 958 requested and 958 synchronized-completion events; 1,916 retained; 0 dropped.
+- Manifest: 958 nodes, 1,050 tensor resources, `edges_known=true`,
+  `completion_proven=true`.
+- Last-use analysis: 1,050 graph-order relationships, 0 unknown.
+- `intra_decode_safe=false`: graph-order last use does **not** prove the next
+  graph/token will not reuse the weight.
+- Wall 1.108 s; cgroup peak 1 GiB; output ` Paris`.
+
+With `--graph-trace-events 512`, 1,404 events were dropped and only 512
+retained; the manifest covered 256 nodes/292 resources. Bounded tracing is
+explicitly incomplete at overflow.
+
+`--residency-prefetch 128M --no-prefetch` on Qwen:
+
+- Staging plan selected 95 file-backed tensors, 128.00 MiB;
+  884.48 MiB skipped by the staging limit.
+- Native `MADV_WILLNEED` accepted 127.72 MiB.
+- Mapping RSS before/after: `0 -> 0`; no measurable residency change was
+  observed. The request is a hint, not a synchronous read or a guarantee.
+
+`ramforge support` reports residency capabilities: tensor metadata, release,
+prefetch, trace, and between-operation residency are supported; graph
+dependency/last-use proof is partial; intra-decode residency and GPU are
+unsupported.
 
 ### GPT-NeoX-20B under 8 GiB
 
@@ -761,7 +804,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **463 tests, 0 failed, 12 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, and the opt-in observe/active residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **467 tests, 0 failed, 14 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 
