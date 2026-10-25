@@ -108,6 +108,14 @@ enum Commands {
         #[arg(long)]
         release_mapping_pages: bool,
 
+        /// Print tensor-to-mapping ranges for layer N (blk.N.* tensor naming)
+        #[arg(long, value_name = "N", conflicts_with_all = ["release_layer", "release_mapping_pages"])]
+        inspect_layer: Option<u32>,
+
+        /// Release eligible mapping pages for layer N (blk.N.* tensor naming)
+        #[arg(long, value_name = "N", conflicts_with_all = ["inspect_layer", "release_mapping_pages"])]
+        release_layer: Option<u32>,
+
         /// Enforce --ram as a hard cgroup v2 memory.max limit for the run
         #[arg(long)]
         enforce_ram: bool,
@@ -179,6 +187,8 @@ fn main() {
             no_repack,
             no_prefetch,
             release_mapping_pages,
+            inspect_layer,
+            release_layer,
             enforce_ram,
             enforce_timeout,
             max_tokens,
@@ -229,6 +239,8 @@ fn main() {
                 no_repack,
                 no_prefetch,
                 release_mapping_pages,
+                inspect_layer,
+                release_layer,
                 max_tokens,
                 temperature,
                 top_k,
@@ -320,6 +332,8 @@ fn run_inference(
     no_repack: bool,
     no_prefetch: bool,
     release_mapping_pages: bool,
+    inspect_layer: Option<u32>,
+    release_layer: Option<u32>,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -347,6 +361,8 @@ fn run_inference(
             no_repack,
             no_prefetch,
             release_mapping_pages,
+            inspect_layer,
+            release_layer,
             max_tokens,
             temperature,
             top_k,
@@ -380,6 +396,11 @@ fn run_inference(
     if release_mapping_pages {
         return Err(anyhow::anyhow!(
             "--release-mapping-pages is only supported with --backend forgecore"
+        ));
+    }
+    if inspect_layer.is_some() || release_layer.is_some() {
+        return Err(anyhow::anyhow!(
+            "--inspect-layer and --release-layer are only supported with --backend forgecore"
         ));
     }
 
@@ -595,6 +616,8 @@ fn run_forgecore_inference(
     no_repack: bool,
     no_prefetch: bool,
     release_mapping_pages: bool,
+    inspect_layer: Option<u32>,
+    release_layer: Option<u32>,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -667,6 +690,79 @@ fn run_forgecore_inference(
                 .map(|residency| format_bytes(residency.rss_bytes))
                 .unwrap_or_else(|| "unavailable".to_string())
         );
+    }
+    if let Some(layer) = inspect_layer.or(release_layer) {
+        let mappings = model
+            .tensor_mappings()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let selected = layer_tensor_indices(&mappings, layer);
+        if selected.is_empty() {
+            return Err(anyhow::anyhow!(
+                "layer {layer} has no tensors named blk.{layer}.*; layer grouping uses the model's tensor naming"
+            ));
+        }
+        let file_backed = selected
+            .iter()
+            .filter(|index| mappings[**index].file_backed)
+            .count();
+        let before = model_mapping_residency(&primary_path);
+        eprintln!(
+            "Layer {layer} mapping metadata: tensors={} file_backed={} anonymous={}",
+            selected.len(),
+            file_backed,
+            selected.len() - file_backed
+        );
+        for index in &selected {
+            let mapping = &mappings[*index];
+            if mapping.file_backed {
+                eprintln!(
+                    "  [{index}] {}: mapping={} offset={} size={} pages=[{}, {})",
+                    mapping.name,
+                    mapping.mapping_index.unwrap_or(u32::MAX),
+                    format_bytes(mapping.offset),
+                    format_bytes(mapping.size),
+                    format_bytes(mapping.page_start),
+                    format_bytes(mapping.page_end)
+                );
+            } else {
+                eprintln!(
+                    "  [{index}] {}: anonymous (not file-backed; {} bytes)",
+                    mapping.name,
+                    format_bytes(mapping.size)
+                );
+            }
+        }
+        if release_layer.is_some() {
+            let indices: Vec<i32> = selected
+                .iter()
+                .map(|index| {
+                    i32::try_from(*index).map_err(|_| anyhow::anyhow!("tensor index exceeds i32"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let result = model
+                .release_tensor_pages(&indices)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let after = model_mapping_residency(&primary_path);
+            eprintln!(
+                "Layer {layer} release: selected={} file_backed={} anonymous={} released={} skipped_shared={}",
+                selected.len(),
+                result.selected_tensors,
+                result.non_file_backed_tensors,
+                format_bytes(result.released_bytes),
+                format_bytes(result.skipped_shared_bytes)
+            );
+            eprintln!(
+                "Layer {layer} mapping residency: before={} after={}",
+                before
+                    .as_ref()
+                    .map(|residency| format_bytes(residency.rss_bytes))
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                after
+                    .as_ref()
+                    .map(|residency| format_bytes(residency.rss_bytes))
+                    .unwrap_or_else(|| "unavailable".to_string())
+            );
+        }
     }
     let metadata = model.metadata().clone();
 
@@ -1368,6 +1464,18 @@ fn yes_no(value: bool) -> &'static str {
     } else {
         "no"
     }
+}
+
+fn layer_tensor_indices(
+    mappings: &[ramforge_runtime::TensorMappingInfo],
+    layer: u32,
+) -> Vec<usize> {
+    let prefix = format!("blk.{layer}.");
+    mappings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mapping)| mapping.name.starts_with(&prefix).then_some(index))
+        .collect()
 }
 
 fn format_duration(duration: Duration) -> String {

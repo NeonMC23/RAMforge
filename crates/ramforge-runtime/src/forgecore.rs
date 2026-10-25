@@ -11,7 +11,10 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use forge_core::{BatchBuilder, Context, GpuLayers, Model, ModelLoadMode, ModelOptions};
+use forge_core::{
+    BatchBuilder, Context, GpuLayers, Model, ModelLoadMode, ModelOptions, PageReleaseResult,
+    TensorMappingInfo,
+};
 
 use crate::execution::{
     CapabilityState, DeviceInfo, DeviceRegistry, DeviceSelection, DeviceSelectionError,
@@ -288,6 +291,24 @@ impl ForgeCoreModel {
     pub fn release_mapping_pages(&mut self) -> Result<(), ForgeCoreAdapterError> {
         self.model
             .release_mapping_pages()
+            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
+    }
+
+    /// Owned tensor-to-mapping metadata for layer grouping/reporting.
+    pub fn tensor_mappings(&self) -> Result<Vec<TensorMappingInfo>, ForgeCoreAdapterError> {
+        self.model
+            .tensor_mappings()
+            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
+    }
+
+    /// Release pages for selected tensor indices. Shared pages are skipped by
+    /// the native layer; this never unmaps or invalidates tensor pointers.
+    pub fn release_tensor_pages(
+        &mut self,
+        indices: &[i32],
+    ) -> Result<PageReleaseResult, ForgeCoreAdapterError> {
+        self.model
+            .release_tensor_pages(indices)
             .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
     }
 

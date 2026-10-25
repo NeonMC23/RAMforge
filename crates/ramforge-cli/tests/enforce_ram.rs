@@ -22,6 +22,8 @@ fn help_lists_memory_control_flags() {
         "--no-repack",
         "--no-prefetch",
         "--release-mapping-pages",
+        "--inspect-layer",
+        "--release-layer",
     ] {
         assert!(text.contains(flag), "help must list {flag}: {text}");
     }
@@ -91,6 +93,31 @@ fn release_mapping_pages_is_rejected_for_the_legacy_backend() {
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(
         text.contains("--release-mapping-pages is only supported with --backend forgecore"),
+        "unexpected stderr: {text}"
+    );
+}
+
+#[test]
+fn layer_residency_flags_are_rejected_for_the_legacy_backend() {
+    let output = ramforge()
+        .args([
+            "run",
+            "/nonexistent/model.gguf",
+            "--ram",
+            "64M",
+            "--prompt",
+            "hi",
+            "--release-layer",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains(
+            "--inspect-layer and --release-layer are only supported with --backend forgecore"
+        ),
         "unexpected stderr: {text}"
     );
 }
@@ -205,6 +232,45 @@ fn release_mapping_pages_reports_zero_after_advice() {
         stderr.contains("Mapping page release:") && stderr.contains("resident_after=0 bytes"),
         "release report missing: {stderr}"
     );
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn release_layer_reports_selected_tensor_ranges() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--release-layer",
+            "0",
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "run failed: {stderr}");
+    for expected in [
+        "Layer 0 mapping metadata:",
+        "Layer 0 release:",
+        "released=",
+        "skipped_shared=",
+    ] {
+        assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
+    }
 }
 
 #[test]

@@ -7,17 +7,17 @@
 ## Local verification (2026-10-25)
 
 - The workspace builds and tests against the pinned `forge-core` revision
-  `393ac28` with Rust/Cargo 1.98.1 and the workspace native tree at
+  `cb39080` with Rust/Cargo 1.98.1 and the workspace native tree at
   `/home/neon/Documents/CODE LOCAL/forge/native` (llama.cpp/ggml v0.5.0 plus
   the documented mmap-no-prefetch patch).
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **445 tests, 0 failed, 9 ignored**; the ignored
+  environment variables passes **446 tests, 0 failed, 10 ignored**; the ignored
   tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark,
   the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and
-  four CLI enforcement tests. Fixture-gated tests report SKIP when their
+  five CLI enforcement tests. Fixture-gated tests report SKIP when their
   environment variables are unset.
 - The registry now tracks `legacy_run` and `forgecore_run` separately.
   `gptneox`/`gpt_neox` is `legacy_run=not-yet`, `forgecore_run=yes`; the legacy
@@ -47,11 +47,14 @@
   device facts, and (when active) cgroup limit/peak/events/page faults. Without
   `--enforce-ram` it labels the requested budget diagnostic-only; with the flag
   it labels the cgroup v2 `memory.max` enforcement.
-- The `forge-core` pin moved to `393ac28` to consume
-  `ModelOptions::use_extra_bufts` and `ModelLoadMode::MmapNoPrefetch`. The
-  native llama.cpp upstream HEAD remains v0.5.0; the no-prefetch mode is a
-  documented 9-line patch applied by `setup-native.sh`, not a native upgrade.
-  The adapter uses the options to implement `--no-repack` and `--no-prefetch`.
+- The `forge-core` pin moved to `cb39080` to consume
+  `ModelOptions::use_extra_bufts`, `ModelLoadMode::MmapNoPrefetch`,
+  `Model::tensor_mappings()`, and `Model::release_tensor_pages()`. The native
+  llama.cpp upstream HEAD remains v0.5.0; the capabilities are supplied by the
+  documented `patches/llama-model-residency.patch`, applied by
+  `setup-native.sh`, not a native upgrade. The adapter uses the options to
+  implement `--no-repack`, `--no-prefetch`, model-wide release, and
+  layer/range release.
 - See [../../scripts/test.sh](../../scripts/test.sh) for the reproducible test
   invocation.
 
@@ -206,12 +209,36 @@ Model-scoped release (`--release-mapping-pages`) uses the native
   successful decode on A. This confirms only the target model's mapping is
   released and pointers remain valid.
 
+Tensor/layer-scoped release (`--inspect-layer`, `--release-layer`) uses the
+native tensor metadata and skips pages shared with unselected file-backed
+tensors:
+
+- Qwen2.5-1.5B layer 0, `--no-repack`: 12 tensors, 12 file-backed. Release
+  `25.12 MiB`, skipped shared `8.00 KiB`; mapping `936.84 -> 911.72 MiB`;
+  TTFT 351.6 ms; decode 3.55 tok/s; wall 3.16 s; cgroup peak 1 GiB; output
+  unchanged.
+- Qwen2.5-1.5B layer 0 with repacking: 12 tensors, 5 file-backed and 7
+  anonymous repacked tensors. Anonymous tensors are reported, not released.
+- Pythia-70M layer 0 at 192M: released `3.21 MiB`, skipped `8.00 KiB`;
+  mapping `71.48 -> 68.27 MiB`; wall 0.209 s; output ` the`.
+- GPT-NeoX-20B layer 0 at 8G: 12 tensors, all file-backed; `293.93 MiB`
+  submitted, `0` shared pages; mapping `7.92 GiB -> 7.92 GiB`, so no
+  measurable RSS drop because those pages were already nonresident; TTFT
+  9.207 s; wall 15.18 s; cgroup peak exactly 8 GiB; output ` Paris`.
+- `mapping_ranges` fixture test: tiny model selected-tensor release reports
+  `released=0, skipped_shared=4096` (conservative shared-page behavior);
+  Pythia largest tensor reports `released=27,365,376, skipped_shared=4,096`
+  and decode succeeds after repeated release.
+
+`released_bytes` is page bytes submitted to `madvise`, not proof of an RSS
+drop. Layer grouping uses the tested `blk.N.*` tensor naming; it is RAMforge
+policy, not a native layer index. The operation is called between decode
+operations, not during decode.
+
 The cgroup cap does not include shared file pages charged to another cgroup.
 The default loader still prefaults with `MAP_POPULATE`; no-prefetch is opt-in
-and requires the patched native tree. Page release is whole-model mapping
-granularity, not per-layer eviction. `memory.swap.max=0` is written when the
-swap controller exposes it; `Peak swap` is reported. `memory.swap.max=0` is written when the swap controller
-exposes it; `Peak swap` is reported. The enforced timeout path is tested:
+and requires the patched native tree. `memory.swap.max=0` is written when the
+swap controller exposes it; `Peak swap` is reported. The enforced timeout path is tested:
 Qwen2.5-1.5B at 512M with `--enforce-timeout 1` exits 124, reports
 `Result: timeout; cgroup killed`, and leaves no cgroup behind. The 20B model
 was not run at 4G, 1G, or 100M. Qwen2.5-7B, DeepSeek-Coder-V2-Lite, and
@@ -294,7 +321,7 @@ Read-only model hashes from the matrix inventory:
 
 **Current ForgeCore note:** static ForgeCore device discovery, explicit
 selection, and execution metadata are implemented. The pinned ForgeCore
-revision `393ac28` exposes public static model-load/offload options, CPU
+revision `cb39080` exposes public static model-load/offload options, CPU
 weight-repacking control, and `MmapNoPrefetch`, but the RAMforge adapter remains
 deliberately CPU-only in this refresh; GPU facts may be discoverable but
 non-CPU model execution is explicitly unsupported, with no CPU fallback. The
@@ -420,7 +447,7 @@ The following infrastructure is implemented with extensive unit/integration cove
 - Bounded calibration tasks and persisted execution-plan compatibility checks.
 - CLI/TUI diagnostic collection, profiling, memory visibility, run history, persistence, and error staging.
 - cgroup v2 hard-budget supervision (`--enforce-ram`) with `memory.peak`, limit/OOM events, page-fault counters, timeout kill, and explicit failure reporting; covered by process-level tests.
-- Explicit file-backed mmap loading, `--no-repack` CPU weight-repacking control, opt-in `--no-prefetch` mapping mode, opt-in `--release-mapping-pages` model-scoped page release, model-mapping RSS/PSS measurement, and cold-cache priming for enforced runs.
+- Explicit file-backed mmap loading, `--no-repack` CPU weight-repacking control, opt-in `--no-prefetch` mapping mode, opt-in model-wide and tensor/layer range page release, model-mapping RSS/PSS measurement, and cold-cache priming for enforced runs.
 - ForgeCore-observed TTFT, prompt-processing, decode-token-rate, and wall-clock profiling.
 
 “Production-oriented” here means that these are concrete implemented subsystems with tests. It is not a blanket production-readiness or model-quality guarantee.

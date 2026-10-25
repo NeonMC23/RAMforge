@@ -117,6 +117,14 @@ Flags:
   `madvise(MADV_DONTNEED)`; it does not unmap memory or invalidate tensor
   pointers. Unsupported platforms fail explicitly. This is independent of
   `--no-prefetch` and is a no-op when the mapping is already nonresident.
+- `--inspect-layer N`: print exact native mapping metadata for tensors named
+  `blk.N.*`. Shows file-backed versus anonymous tensors, mapping index, offset,
+  size, and page bounds. It does not release pages.
+- `--release-layer N`: request page release for the file-backed tensors in
+  layer `N` after load. Pages shared with unselected file-backed tensors are
+  skipped conservatively. This is tensor/range-scoped, not per-layer execution
+  scheduling, and cannot guarantee a lower load-time peak. It conflicts with
+  `--release-mapping-pages` and `--inspect-layer`.
 
 ### Enforced budget matrix
 
@@ -225,6 +233,38 @@ The native test loads two tiny models and reports `A 8192->0, B 8192->8192`,
 then decodes successfully against A, confirming model scoping and pointer
 validity.
 
+### Layer-scoped mapping release
+
+`--inspect-layer N` and `--release-layer N` use native tensor metadata, not
+pathname matching. RAMforge groups tensors by the tested models' `blk.N.*`
+naming; this is layer policy, not a native layer index. If no tensors match,
+the request fails explicitly.
+
+Qwen2.5-1.5B layer 0:
+
+- `--no-repack`: 12 tensors, 12 file-backed, 0 anonymous.
+- Repacking enabled: 12 tensors, 5 file-backed, 7 anonymous. Anonymous
+  repacked tensors are reported, not misclassified.
+- `--release-layer 0` at 1G: released 25.12 MiB, skipped 8.00 KiB shared;
+  mapping residency `936.84 -> 911.72 MiB`; TTFT 351.6 ms; decode 3.55 tok/s;
+  wall 3.16 s; cgroup peak 1 GiB; output unchanged. No-release at the same
+  settings was TTFT 345.1 ms, 3.63 tok/s, 3.07 s, so layer release was close
+  to neutral here.
+
+Pythia-70M layer 0 at 192M: released 3.21 MiB, skipped 8.00 KiB; mapping
+`71.48 -> 68.27 MiB`; wall 0.209 s; output ` the`; exit 0.
+
+GPT-NeoX-20B layer 0 at 8G/300 s: 12 tensors, all file-backed; 293.93 MiB
+submitted to release, 0 shared pages skipped; mapping residency was
+`7.92 GiB -> 7.92 GiB`, so **no measurable RSS drop** was observed because
+those pages were already nonresident under the 8G cap. TTFT 9.207 s; wall
+15.18 s; cgroup peak exactly 8 GiB; 56,479 `max` events; output ` Paris`.
+`released_bytes` reports page bytes submitted, not proof of an RSS drop.
+
+This is range-scoped page advice, not execution scheduling. It does not
+release pages during decode, does not implement per-layer eviction, and does
+not guarantee a lower load-time peak.
+
 ### GPT-NeoX-20B under 8 GiB
 
 The 20B GGUF is 13,135,032,320 B on disk and 13,133,230,080 tensor bytes,
@@ -271,9 +311,11 @@ swap configuration was changed.
   is bounded. `--no-prefetch` avoids the initial whole-file fault and moves the
   cost to prompt/decode demand faults; it does not reduce total I/O when the
   model is fully exercised.
-- There is no RAMforge-managed per-layer eviction or staging queue on the
-  forgeCORE path. `--release-mapping-pages` operates at whole-model mapping
-  granularity; the kernel's demand paging remains the per-page mechanism.
+- There is no per-layer execution scheduler or staging queue on the forgeCORE
+  path. `--release-layer` operates on exact tensor ranges and is called
+  between operations, not during decode; layer grouping uses the tested
+  `blk.N.*` naming convention. The kernel's demand paging remains the per-page
+  mechanism.
 - `--enforce-ram` requires cgroup v2 memory delegation. If unavailable, the
   command fails with an actionable error and does not silently fall back to
   diagnostic-only mode. cgroup v1 is unsupported.
@@ -664,7 +706,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **445 tests, 0 failed, 9 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and four CLI enforcement tests. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **446 tests, 0 failed, 10 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and five CLI enforcement tests. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 
