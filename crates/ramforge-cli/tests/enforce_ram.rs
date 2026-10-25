@@ -28,6 +28,7 @@ fn help_lists_memory_control_flags() {
         "--residency-target",
         "--residency-reserve",
         "--residency-report",
+        "--residency-report-json",
         "--residency-prefetch",
         "--graph-trace",
         "--graph-trace-events",
@@ -171,7 +172,7 @@ fn residency_target_requires_policy_or_report() {
     assert!(!output.status.success());
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(
-        text.contains("require --residency-policy observe|active or --residency-report"),
+        text.contains("require --residency-policy"),
         "unexpected stderr: {text}"
     );
 }
@@ -499,6 +500,104 @@ fn observe_policy_reports_without_applying() {
     assert!(
         stderr.contains("Application: none"),
         "observe applied: {stderr}"
+    );
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn json_report_is_versioned_and_keeps_measurements_distinct() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let path = std::env::temp_dir().join(format!(
+        "ramforge-residency-report-{}.json",
+        std::process::id()
+    ));
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--residency-policy",
+            "observe",
+            "--residency-target",
+            "64M",
+            "--residency-report-json",
+            path.to_str().unwrap(),
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "run failed: {stderr}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("json report must exist"))
+            .expect("valid json");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["kind"], "ramforge.residency.operation_report");
+    assert!(report["ledger"]["entries"].is_array());
+    assert!(report["reconciliation"]["mapped_virtual_bytes"].is_u64());
+    assert!(report["measurements"]["before"]["process_rss_bytes"].is_u64());
+    assert_eq!(report["application"], serde_json::Value::Null);
+    assert!(report["timing"]["ttft_ns"].is_u64());
+    assert!(report["timing"]["output_fingerprint"].is_string());
+    assert!(report["ledger"]["unknown_components"]
+        .as_array()
+        .is_some_and(|components| !components.is_empty()));
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn reuse_aware_reports_profile_without_intra_decode_claims() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--graph-trace",
+            "--residency-policy",
+            "reuse-aware",
+            "--residency-target",
+            "64M",
+            "--residency-report",
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "run failed: {stderr}");
+    assert!(
+        stderr.contains("Execution profile:"),
+        "missing profile: {stderr}"
+    );
+    assert!(stderr.contains("profile_used=true") || stderr.contains("Execution profile:"));
+    assert!(
+        stderr.contains("intra_decode_safe=false"),
+        "unsafe claim: {stderr}"
     );
 }
 

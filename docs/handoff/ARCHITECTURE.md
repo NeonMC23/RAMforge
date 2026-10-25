@@ -1,6 +1,6 @@
 # Current architecture
 
-This document describes the code that exists now. The legacy RAMforge path remains the primary historical execution description; Phase 2 additionally adds the current `forgecore` adapter module and explicit CLI backend selection. The later ForgeCore boundaries described at the end remain future work.
+This document describes the code that exists now. The legacy RAMforge executor remains the historical in-process CPU path. The explicit `forgecore` backend delegates model execution to the pinned llama.cpp/ggml tree through forgeCORE, and RAMforge owns the surrounding policy, accounting, admission, lifecycle, reporting, and CLI behavior. GPU execution and intra-decode page eviction remain unimplemented.
 
 ## System flow
 
@@ -202,7 +202,7 @@ The tokenizer has no chat-template application. It encodes the prompt text suppl
 - `inspect MODEL [--json]`;
 - `plan MODEL --ram SIZE [--json]`;
 - `support`;
-- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--ctx N] [--enforce-ram] [--enforce-timeout S] [--no-repack] [--no-prefetch] [--release-mapping-pages] [--inspect-layer N | --release-layer N] [--residency-policy off|observe|active] [--residency-target SIZE] [--residency-reserve SIZE] [--residency-report] [--residency-prefetch SIZE] [--graph-trace] [--graph-trace-events N] [--graph-trace-detail] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
+- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--ctx N] [--enforce-ram] [--enforce-timeout S] [--no-repack] [--no-prefetch] [--release-mapping-pages] [--inspect-layer N | --release-layer N] [--residency-policy off|observe|conservative|memory-bound|reuse-aware|active] [--residency-target SIZE] [--residency-reserve SIZE] [--residency-report] [--residency-report-json PATH] [--residency-prefetch SIZE] [--graph-trace] [--graph-trace-events N] [--graph-trace-detail] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
 
 The static Phase-4 device boundary is in `crates/ramforge-runtime/src/execution.rs`.
 `DeviceRegistry::discover()` is a safe ForgeCore snapshot; CPU is selectable,
@@ -219,6 +219,41 @@ ForgeCore reports them safely. See
 
 `crates/ramforge-runtime/src/plan_persistence.rs` serializes bounded planner decisions, fingerprints, reservations, costs, calibration provenance, and reasons. It deliberately excludes model paths as payloads, model weights, runtime allocations, caches, and inference state. Compatibility re-materializes a candidate plan and invokes the normal compiler boundary.
 
+## Graph-aware residency layer
+
+The forgeCORE backend has a RAMforge-owned residency layer:
+
+- `residency_engine.rs` builds a model-scoped `ResourceInventory` from native
+  tensor mappings, classifies file-backed/anonymous/unknown resources, computes
+  page ranges and conservative shared-page bytes, validates policy, plans
+  releases, controls bounded staging, enforces the lifecycle state machine,
+  applies releases through a caller-supplied forgeCORE closure, and records
+  estimated/native/observed results separately.
+- `memory_ledger.rs` keeps logical model bytes, anonymous weights, mapping
+  resident/PSS, process RSS/peak, cgroup current/peak, staging requests, and
+  unknown KV/scratch/runtime components distinct. It never sums incompatible
+  measurements into a process-memory total.
+- `graph_manifest.rs` turns bounded scheduler trace events into a conservative
+  node/tensor manifest. Native node ids are transient; graph-order last use is
+  not a resource-lifetime guarantee, and `intra_decode_safe` is always false.
+- `execution_profile.rs` summarizes complete observations by stable tensor name
+  and inventory generation. Multi-execution captures are split by execution id.
+  Profiles are in-memory only and are rejected when model/generation do not
+  match.
+- `forgecore.rs` owns the adapter and the release/prefetch/trace calls. RAMforge
+  never calls llama.cpp/ggml FFI and does not depend on `forge-sys`.
+
+The safe mutation boundary is after decode completion and session teardown.
+Planning and admission occur before decode; post-operation planning may use a
+valid profile. Release and staging never occur while an active graph can read
+the pages. Staging is a bounded `MADV_WILLNEED` hint; requested bytes,
+native-accepted bytes, and observed mapping changes are separate fields.
+
+Reports are available in human-readable form and as versioned JSON
+(`schema_version: 1`) from the CLI. See
+[MEMORY_ACCOUNTING.md](MEMORY_ACCOUNTING.md),
+[GRAPH_SAFETY.md](GRAPH_SAFETY.md), and [BENCHMARKS.md](BENCHMARKS.md).
+
 ## Boundaries to preserve during ForgeCore work
 
 These are the current seams that should remain stable unless there is a demonstrated reason to change them:
@@ -229,5 +264,8 @@ These are the current seams that should remain stable unless there is a demonstr
 4. **Resource infrastructure:** `LayerDescriptor`, `LayerReadPlan`, `LayerCache`, persistent-weight policy, `ResidencyStats`, and profile counters.
 5. **Planning contracts:** `ModelProfile`, `MachineProfile`, `StorageProfile`, `CapabilitySet`, `ExecutionPlan`, `PlanCompiler`, `RuntimeConfig`, and persistence schema/compatibility.
 6. **Operator-facing diagnostics:** CLI/TUI commands, profile fields, memory-report distinction, run-history records, and the historical Qwen2.5 diagnostic evidence.
+7. **Residency policy/accounting:** `ResourceInventory`, `MemoryLedger`,
+   `ExecutionProfile`, the lifecycle state machine, staging plans, release
+   application, and report schemas.
 
 The numerical boundary is the part to reconsider: `TensorData` semantics, reference/optimized quantized paths, `ModelExecutor`, `ops.rs`, attention/GQA/RoPE/RMSNorm/SwiGLU conventions, output projection, KV integration, and generation should be treated as ForgeCore candidates until independently revalidated.

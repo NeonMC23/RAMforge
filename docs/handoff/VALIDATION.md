@@ -254,3 +254,45 @@ extension, record:
 
 Every missing value must remain UNKNOWN. A passing build or a discovered GPU
 cannot fill an absent native execution or residency artifact.
+
+## Current residency validation — 2026-10-25
+
+Environment:
+
+```text
+FORGE_LLAMA_DIR=/home/neon/Documents/CODE LOCAL/forge/native
+LD_LIBRARY_PATH=$FORGE_LLAMA_DIR/build/bin
+FORGE_TEST_MODEL=/home/neon/Documents/CODE LOCAL/forge/models/SmolLM2-135M-Instruct-Q4_K_M/SmolLM2-135M-Instruct-Q4_K_M.gguf
+```
+
+Passed:
+
+```text
+cargo check --workspace
+cargo test --workspace                  # 481 passed, 0 failed, 16 ignored
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p ramforge-cli --test enforce_ram \
+  json_report_is_versioned_and_keeps_measurements_distinct -- --ignored --exact
+cargo test -p ramforge-cli --test enforce_ram \
+  reuse_aware_reports_profile_without_intra_decode_claims -- --ignored --exact
+sh -n scripts/residency-bench.sh
+```
+
+The real-model CLI checks required `--enforce-ram`; the host supplied cgroup v2
+delegation. The JSON report was parsed back as schema version 1 and checked for
+ledger/reconciliation/timing fields. The reuse-aware check observed a complete
+profile, `intra_decode_safe=false`, and no intra-decode release claim.
+
+The benchmark harness ran all six policies with prefetch off/on, two repeats,
+SmolLM2-135M Q4_K_M, context 256, target 128 MiB, four greedy tokens, without
+cgroup enforcement: 24/24 runs exited 0. Results and caveats are recorded in
+[BENCHMARKS.md](BENCHMARKS.md). The reuse-aware result required a 16,384-event
+trace; at 4,096 events the four-token capture was truncated and the profile was
+correctly rejected as incomplete.
+
+Not run or not claimed:
+
+- intra-decode eviction (blocked by the native lifetime contract);
+- GPU execution or residency;
+- reproducible cross-machine performance;
+- exact KV-cache or graph-scratch byte accounting.

@@ -7,12 +7,15 @@ This directory is the transfer package for a new developer or agent arriving wit
 1. [PROJECT_STATE.md](PROJECT_STATE.md) — what exists, what is supported, and the current conclusion.
 2. [ARCHITECTURE.md](ARCHITECTURE.md) — the actual source-tree architecture and its boundaries.
 3. [CURRENT_INFERENCE_ENGINE.md](CURRENT_INFERENCE_ENGINE.md) — the current numerical and streaming implementation.
-4. [QWEN25_CORRECTNESS_INVESTIGATION.md](QWEN25_CORRECTNESS_INVESTIGATION.md) — the numerical-divergence evidence and its limits.
-5. [REBUILD_PLAN.md](REBUILD_PLAN.md) — the proposed ForgeCore replacement plan.
-6. [VALIDATION.md](VALIDATION.md) — commands, results, diagnostic entry points, and unavailable evidence.
-7. [PHASE_2_ENGINEERING_REPORT.md](PHASE_2_ENGINEERING_REPORT.md) — the implemented pinned ForgeCore adapter and historical validation record.
-8. [PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md) — static device discovery, explicit selection, adapter integration, and current validation status.
-9. [REPOSITORY_TRANSFER.md](REPOSITORY_TRANSFER.md) — how to start a new repository/session without losing the useful infrastructure or historical evidence.
+4. [MEMORY_ACCOUNTING.md](MEMORY_ACCOUNTING.md) — ledger categories, provenance, reconciliation, policy profiles, and report semantics.
+5. [GRAPH_SAFETY.md](GRAPH_SAFETY.md) — trace/manifest/profile guarantees and the intra-decode safety blocker.
+6. [BENCHMARKS.md](BENCHMARKS.md) — reproducible residency benchmark commands, columns, baseline, and caveats.
+7. [QWEN25_CORRECTNESS_INVESTIGATION.md](QWEN25_CORRECTNESS_INVESTIGATION.md) — the numerical-divergence evidence and its limits.
+8. [REBUILD_PLAN.md](REBUILD_PLAN.md) — the proposed ForgeCore replacement plan.
+9. [VALIDATION.md](VALIDATION.md) — commands, results, diagnostic entry points, and unavailable evidence.
+10. [PHASE_2_ENGINEERING_REPORT.md](PHASE_2_ENGINEERING_REPORT.md) — the implemented pinned ForgeCore adapter and historical validation record.
+11. [PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md) — static device discovery, explicit selection, adapter integration, and current validation status.
+12. [REPOSITORY_TRANSFER.md](REPOSITORY_TRANSFER.md) — how to start a new repository/session without losing the useful infrastructure or historical evidence.
 
 ## Evidence labels
 
@@ -24,8 +27,10 @@ This directory is the transfer package for a new developer or agent arriving wit
 
 ## Current conclusion
 
-The current RAMforge inference engine is **not considered numerically trustworthy for Qwen2.5-1.5B** based on the collected evidence. The infrastructure around it remains valuable. The next project should rebuild the numerical core as **ForgeCore** while preserving the validated infrastructure where appropriate.
+The legacy RAMforge numerical engine is **not considered numerically trustworthy for Qwen2.5-1.5B** based on the collected evidence. The infrastructure around it remains valuable. The explicit `--backend forgecore` path delegates numerical execution to the pinned llama.cpp/ggml implementation through forgeCORE; it is the current validated execution path, while the legacy path remains available for comparison. GPU execution and intra-decode page eviction remain unimplemented.
 
-Phase 2 has a real RAMforge adapter in `crates/ramforge-runtime/src/forgecore.rs` and now pins the external ForgeCore `forge-core` package to verified commit `8d67cb466dba1ee013efc13ee152391602752473`. Phase 4 adds safe ForgeCore device discovery, explicit static selection, capability/accounting metadata, and `run --device`; CPU remains selectable while this RAMforge adapter deliberately rejects non-CPU model binding without fallback. The pinned ForgeCore exposes public static offload options and CPU weight-repacking control, but this refresh does not enable GPU execution, placement policy, or scheduling. The separate `--enforce-ram` cgroup v2 supervisor provides a hard host-memory cap; it is not a claim of native per-layer residency control. The adapter owns the safe `Model → Context → Batch → decode → Logits` boundary; the legacy `InferenceEngine` and its numerical modules remain available as the default comparison path.
+Phase 2 has a real RAMforge adapter in `crates/ramforge-runtime/src/forgecore.rs`; the current ForgeCore pin is `df6d3777b91cd241f3928deae17b63e6620a8091`. Phase 4 adds safe ForgeCore device discovery, explicit static selection, capability/accounting metadata, and `run --device`; CPU remains selectable while this RAMforge adapter deliberately rejects non-CPU model binding without fallback. The pinned native llama.cpp/ggml source remains `7fe450e19305b828c199d602c23a8337aaa1f03b`, with residency behavior supplied by the tracked patch rather than a native upgrade. The adapter owns the safe `Model → Context → Batch → decode → Logits` boundary; the legacy `InferenceEngine` and its numerical modules remain available as the default comparison path.
+
+The current graph-aware milestone adds a unified memory ledger, in-memory execution profiles, conservative/memory-bound/reuse-aware policy profiles, deduplicated bounded staging, versioned JSON operation reports, and a reproducible benchmark harness. Page release is still restricted to the post-operation safe boundary; intra-decode eviction remains unsupported because the pinned callback does not prove resource lifetime.
 
 The real-model Qwen2.5 diagnostic is intentionally ignored and was not run during the current documentation handoff. Exact external llama.cpp statistics that are not present in the repository are marked **UNKNOWN** rather than reconstructed or fabricated.

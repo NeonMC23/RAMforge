@@ -2,6 +2,8 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
+> **Graph-aware residency (2026-10-25):** RAMforge now builds a unified model-scoped memory ledger, in-memory execution profiles from bounded graph traces, deduplicated bounded staging plans, and deterministic `conservative`/`memory-bound`/`reuse-aware` policy profiles in addition to `off`/`observe`/`active`. Operation reports include explicit provenance, reconciliation, requested versus native-accepted versus observed bytes, timing, and an output fingerprint; `--residency-report-json PATH` emits schema version 1. Release mutations remain restricted to the post-operation safe boundary. Intra-decode eviction is still unsupported because the pinned callback does not prove resource lifetime. See [MEMORY_ACCOUNTING.md](docs/handoff/MEMORY_ACCOUNTING.md), [GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md), and [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
+>
 > **GPT-NeoX/Pythia execution and enforced budgets (2026-10-25):** `gptneox` GGUFs are executable through the explicit `--backend forgecore` path, which delegates to the pinned llama.cpp/ggml implementation. The legacy RAMforge executor still rejects the architecture before reading weights, with an actionable error naming the required backend; it never falls back or approximates GPT-NeoX math. Real Pythia-70M Q8_0 runs match the native tokenization and greedy continuation, and an independent NumPy forward pass confirms the final-token logits (top-1 exact, cosine similarity 1.000000046). The 20B GPT-NeoX GGUF (13.13 GB tensor bytes) now executes under an 8 GiB hard cgroup v2 cap with `--enforce-ram --no-repack --no-prefetch`: 7.64 GiB of the model mapping resident at the end-of-run sample, 7,979 limit events, no OOM kill, and one greedy token ` Paris` in 7.72 s. The same 8 GiB run with prefetching took 16.94 s. This is out-of-core execution under a kernel-enforced cap, not a throughput or quality guarantee. See [Enforced host-memory budgets](#enforced-host-memory-budgets-cgroup-v2).
 >
 > **Usable Out-of-Core Inference:** `ramforge run` now streams decoded assistant text to stdout with UTF-8 byte-token accumulation. Optional `--profile` reports measured GGUF I/O, layer load/compute/release, quantized/F32 matvec, allocation, sampling, token latency, bytes read, and peak managed memory. `--memory-report` separates RAMforge-managed memory, process RSS, and system memory. `ramforge support` exposes the architecture/quantization registry; qwen35 remains inspectable/plannable but intentionally not executable.
@@ -125,18 +127,25 @@ Flags:
   skipped conservatively. This is tensor/range-scoped, not per-layer execution
   scheduling, and cannot guarantee a lower load-time peak. It conflicts with
   `--release-mapping-pages` and `--inspect-layer`.
-- `--residency-policy off|observe|active`: execution-aware residency policy.
-  `off` is the default. `observe` builds inventory/plans and reports without
-  mutation. `active` applies eligible tensor releases at a safe post-operation
-  boundary. It cannot release during decode.
+- `--residency-policy off|observe|conservative|memory-bound|reuse-aware|active`:
+  execution-aware residency policy. `off` is the default. `observe` builds
+  inventory/plans and reports without mutation. `conservative` releases only
+  tensors with no shared page bytes. `memory-bound` targets the configured
+  soft budget. `reuse-aware` uses a valid in-memory graph profile to order cold
+  resources first. `active` is the compatibility alias for memory-bound
+  behavior. All mutation happens at a safe post-operation boundary; none occurs
+  during decode.
 - `--residency-target SIZE`: soft process residency target. Defaults to
-  `--ram` for observe/active. This is not a hard limit.
+  `--ram` for mutating policies. This is not a hard limit.
 - `--residency-reserve SIZE`: safety reserve subtracted from the soft target.
-- `--residency-report`: print the structured inventory, admission, plans,
-  application result, and before/after observations.
+- `--residency-report`: print the structured ledger, reconciliation, admission,
+  plans, staging/application results, timing, and before/after observations.
+- `--residency-report-json PATH`: write the same operation as a versioned JSON
+  document (`schema_version: 1`). A write failure is a command error.
 - `--residency-prefetch SIZE`: best-effort bounded tensor-page prefetch
-  (`MADV_WILLNEED` hint). Requested bytes and observed mapping residency are
-  reported separately.
+  (`MADV_WILLNEED` hint). The plan deduplicates overlapping page ranges;
+  requested, native-accepted, and observed mapping changes are reported
+  separately.
 - `--graph-trace`: opt-in bounded scheduler eval trace. It forces observed node
   groups to be computed separately and synchronized; expect overhead.
 - `--graph-trace-events N`: retained event bound (default 4096).
@@ -361,7 +370,59 @@ explicitly incomplete at overflow.
 `ramforge support` reports residency capabilities: tensor metadata, release,
 prefetch, trace, and between-operation residency are supported; graph
 dependency/last-use proof is partial; intra-decode residency and GPU are
-unsupported.
+unsupported. It also lists the policy profiles, the ledger/reconciliation
+surface, JSON report schema, and the fact that execution profiles are in-memory
+diagnostic inputs rather than persisted state.
+
+### Unified ledger, profiles, and policy profiles
+
+The runtime now has a model-scoped memory ledger
+(`ramforge-runtime/src/memory_ledger.rs`) with explicit categories and
+provenance. It keeps file-backed logical bytes, anonymous weights, mapping
+resident bytes, mapping PSS, process RSS/peak, cgroup current/peak, staging
+requested/accepted bytes, and unknown KV/scratch/runtime components distinct.
+Unknown components remain `None` with a reason; they are not silently added as
+zero. Reconciliation reports `RSS - mapping resident` and
+`cgroup current - RSS` as signed differences, not as a single “overhead”
+number. See [MEMORY_ACCOUNTING.md](docs/handoff/MEMORY_ACCOUNTING.md).
+
+Graph manifests now feed an in-memory execution profile
+(`ramforge-runtime/src/execution_profile.rs`). A capture containing multiple
+graph executions is split by execution id before analysis, so transient native
+node ids are never merged across graphs. Profiles store stable tensor names,
+graph-order access ranges, observation counts, completeness, and invalidation
+state. They are validated against model identity and inventory generation
+before `reuse-aware` planning. No profile persistence is implemented. See
+[GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md).
+
+SmolLM2-135M Q4_K_M, 272 file-backed tensors, context 256, 4 greedy tokens,
+target 128 MiB, no cgroup enforcement, median of two runs unless noted:
+
+| Policy | Selected | Mapping RSS delta | Process RSS before/after | Cgroup current delta | TTFT |
+|---|---:|---:|---|---:|---:|
+| off | 0 | 0 B | 163.73 / 163.73 MiB | ~0 B | 24.7 ms |
+| observe | 12 | 0 B | 163.64 / 163.64 MiB | ~0 B | 24.8 ms |
+| conservative | 0 | 0 B | 163.61 / 163.61 MiB | ~0 B | 24.6 ms |
+| memory-bound | 12 | -38,027,264 B | 163.76 / 127.50 MiB | ~0 B | 25.1 ms |
+| active | 12 | -38,027,264 B | 163.78 / 127.52 MiB | ~0 B | 24.7 ms |
+| reuse-aware (valid profile) | 133 | -46,702,592 B | 171.80 / 127.26 MiB | ~0 B | 26.6 ms |
+
+The reuse-aware result required a complete 16,384-event profile; with the
+default 4,096-event cap a four-token capture was truncated, the profile was
+rejected as incomplete, and the plan reported `profile_used=false`. That is
+intentional. `conservative` selected nothing because this model’s aligned
+tensor ranges all share pages; the policy refuses to claim those pages as
+uniquely reclaimable. The native release call still protected shared pages in
+the other mutating policies. A 64 MiB bounded staging plan selected 227 tensors
+and requested 63.98 MiB of deduplicated page ranges; the native accepted
+63.98 MiB and mapping RSS stayed at 98.87 MiB, an honest zero-change hint.
+
+The report now includes prompt tokens, generated tokens, TTFT, decode/total
+wall time, stop reason, and an output token fingerprint. It remains diagnostic:
+the soft target is not a hard limit, release submission is not physical
+reclamation, and cgroup usage can stay flat while mapping/process RSS falls.
+A reproducible harness is documented in
+[BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
 
 ### GPT-NeoX-20B under 8 GiB
 
@@ -804,7 +865,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **467 tests, 0 failed, 14 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **481 tests, 0 failed, 16 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

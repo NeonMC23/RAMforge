@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use forge_core::{PageReleaseResult, TensorMappingInfo};
 
 use crate::cgroup::{self, CgroupEvents, CgroupStats};
+use crate::execution_profile::ExecutionProfile;
+use crate::memory_ledger::MemoryLedger;
 use crate::memory_report::{process_rss, process_rss_peak};
 use crate::page_residency::model_mapping_residency;
 
@@ -461,7 +463,13 @@ pub enum ResidencyPolicyMode {
     Off,
     /// Build/print plans and decisions but never mutate residency.
     Observe,
-    /// Apply eligible release decisions at a safe boundary.
+    /// Release only high-confidence, uniquely reclaimable pages.
+    Conservative,
+    /// Prioritize the soft target while respecting eligibility and reserve.
+    MemoryBound,
+    /// Prefer retaining resources with evidence of recent access.
+    ReuseAware,
+    /// Compatibility mode: memory-bound release at a safe boundary.
     Active,
 }
 
@@ -514,7 +522,11 @@ impl ResidencyPolicy {
                 });
             }
         }
-        if self.mode == ResidencyPolicyMode::Active && self.target_bytes.is_none() {
+        if matches!(
+            self.mode,
+            ResidencyPolicyMode::Active | ResidencyPolicyMode::MemoryBound
+        ) && self.target_bytes.is_none()
+        {
             return Err(PolicyError::ActiveWithoutTarget);
         }
         Ok(self)
@@ -542,6 +554,7 @@ pub enum DecisionReason {
     EmptyPageRange,
     AlreadyAttempted,
     AllPagesShared,
+    SharedPageConservative,
     BudgetAlreadyMet,
     SelectedEligible,
     EligibleButNotNeeded,
@@ -576,6 +589,7 @@ pub struct ResidencyPlan {
     pub measurement_source: MeasurementSource,
     pub decisions: Vec<ResourceDecision>,
     pub selected: Vec<ResourceKey>,
+    pub profile_used: bool,
     pub estimated_reclaim_bytes: u64,
     pub estimated_after_bytes: Option<u64>,
     pub estimated_budget_met: bool,
@@ -606,6 +620,16 @@ impl<'a> Planner<'a> {
         policy: ResidencyPolicy,
         observed_bytes: Option<u64>,
         context: &OperationContext,
+    ) -> ResidencyPlan {
+        self.plan_with_profile(policy, observed_bytes, context, None)
+    }
+
+    pub fn plan_with_profile(
+        &self,
+        policy: ResidencyPolicy,
+        observed_bytes: Option<u64>,
+        context: &OperationContext,
+        profile: Option<&ExecutionProfile>,
     ) -> ResidencyPlan {
         let target = policy.target_bytes;
         let reserve = policy.safety_reserve_bytes;
@@ -685,6 +709,13 @@ impl<'a> Planner<'a> {
                 });
                 continue;
             }
+            if policy.mode == ResidencyPolicyMode::Conservative && resource.shared_page_bytes > 0 {
+                decisions.push(ResourceDecision {
+                    reason: DecisionReason::SharedPageConservative,
+                    ..base
+                });
+                continue;
+            }
             if need == 0 {
                 decisions.push(ResourceDecision {
                     reason: DecisionReason::BudgetAlreadyMet,
@@ -695,11 +726,25 @@ impl<'a> Planner<'a> {
             candidates.push(base);
         }
 
+        let profile_used = policy.mode == ResidencyPolicyMode::ReuseAware && profile.is_some();
         candidates.sort_by(|a, b| {
             let a_shared = a.shared_page_bytes > 0;
             let b_shared = b.shared_page_bytes > 0;
+            let a_reuse = profile
+                .and_then(|profile| profile.last_order(&a.name))
+                .unwrap_or(0);
+            let b_reuse = profile
+                .and_then(|profile| profile.last_order(&b.name))
+                .unwrap_or(0);
             a_shared
                 .cmp(&b_shared)
+                .then_with(|| {
+                    if profile_used {
+                        a_reuse.cmp(&b_reuse)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
                 .then_with(|| b.estimated_reclaim_bytes.cmp(&a.estimated_reclaim_bytes))
                 .then_with(|| a.layer.sort_key().cmp(&b.layer.sort_key()))
                 .then_with(|| a.key.tensor_index.cmp(&b.key.tensor_index))
@@ -734,6 +779,12 @@ impl<'a> Planner<'a> {
         if policy.mode == ResidencyPolicyMode::Off {
             notes.push("residency policy is off".to_string());
         }
+        if policy.mode == ResidencyPolicyMode::ReuseAware && !profile_used {
+            notes.push(
+                "reuse-aware policy has no valid profile; using deterministic memory-bound ordering"
+                    .to_string(),
+            );
+        }
         if source == MeasurementSource::EstimatedFromMapping {
             notes.push("current residency is estimated from mapped tensor pages".to_string());
         }
@@ -751,6 +802,7 @@ impl<'a> Planner<'a> {
             measurement_source: source,
             decisions,
             selected,
+            profile_used,
             estimated_reclaim_bytes: reclaim,
             estimated_after_bytes: estimated_after,
             estimated_budget_met,
@@ -794,23 +846,47 @@ pub fn admit(
         "allocator/runtime overhead".to_string(),
     ];
     let outcome = if let Some(current) = current_bytes {
-        let current_with_reserve = current.saturating_add(safety_reserve_bytes);
-        if let Some(hard) = hard_limit_bytes {
-            if current_with_reserve > hard
-                || known_tensor_bytes.saturating_add(safety_reserve_bytes) > hard
-            {
+        let current_with_reserve = current.checked_add(safety_reserve_bytes);
+        let known_with_reserve = known_tensor_bytes.checked_add(safety_reserve_bytes);
+        if current_with_reserve.is_none() || known_with_reserve.is_none() {
+            reasons
+                .push("memory accounting overflowed while adding the safety reserve".to_string());
+            AdmissionOutcome::Rejected
+        } else if let Some(hard) = hard_limit_bytes {
+            let current_with_reserve = current_with_reserve.unwrap_or(u64::MAX);
+            let known_with_reserve = known_with_reserve.unwrap_or(u64::MAX);
+            if current_with_reserve > hard || known_with_reserve > hard {
                 reasons.push(
                     "current/known memory plus reserve exceeds the hard cgroup limit".to_string(),
+                );
+                reasons.push(
+                    "page release is not a substitute for hard cgroup enforcement".to_string(),
                 );
                 AdmissionOutcome::Rejected
             } else if soft_target_bytes.is_some_and(|target| current_with_reserve > target) {
                 reasons.push("current memory plus reserve exceeds the soft target".to_string());
+                reasons.push(
+                    "soft target is policy guidance; requested page release is not an observed RSS or cgroup reduction".to_string(),
+                );
+                reasons.push(
+                    "KV cache, scratch, and runtime memory are unknown and may dominate the excess"
+                        .to_string(),
+                );
                 AdmissionOutcome::AdmittedWithWarning
             } else {
                 AdmissionOutcome::Admitted
             }
-        } else if soft_target_bytes.is_some_and(|target| current_with_reserve > target) {
+        } else if soft_target_bytes
+            .is_some_and(|target| current_with_reserve.unwrap_or(u64::MAX) > target)
+        {
             reasons.push("current memory plus reserve exceeds the soft target".to_string());
+            reasons.push(
+                "soft target is policy guidance; requested page release is not an observed RSS or cgroup reduction".to_string(),
+            );
+            reasons.push(
+                "KV cache, scratch, and runtime memory are unknown and may dominate the excess"
+                    .to_string(),
+            );
             AdmissionOutcome::AdmittedWithWarning
         } else {
             AdmissionOutcome::Admitted
@@ -943,8 +1019,11 @@ impl ResidencyLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagingPlan {
     pub selected: Vec<ResourceKey>,
+    /// Union of selected page ranges, not the sum of tensor sizes.
     pub selected_bytes: u64,
     pub skipped_bytes: u64,
+    /// Page bytes already represented by an earlier selected range.
+    pub overlap_bytes_avoided: u64,
     pub notes: Vec<String>,
 }
 
@@ -952,6 +1031,18 @@ impl StagingPlan {
     pub fn is_empty(&self) -> bool {
         self.selected.is_empty()
     }
+}
+
+/// Result of submitting a staging plan to the native prefetch hint. The
+/// observed mapping delta is not proof that the hint loaded all requested
+/// pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingResult {
+    pub requested_keys: Vec<ResourceKey>,
+    pub native_requested_bytes: u64,
+    pub mapping_before_bytes: Option<u64>,
+    pub mapping_after_bytes: Option<u64>,
+    pub error: Option<String>,
 }
 
 /// One measured/estimated residency snapshot.
@@ -1036,18 +1127,37 @@ pub struct ApplicationReport {
     pub elapsed: Duration,
 }
 
+/// Observed wall-clock operation facts. These are not native kernel counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationTiming {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub first_token_elapsed: Option<Duration>,
+    pub prompt_elapsed: Option<Duration>,
+    pub decode_elapsed: Option<Duration>,
+    pub total_elapsed: Option<Duration>,
+    pub stop_reason: String,
+    pub output_fingerprint: String,
+}
+
 /// Structured per-operation residency report. Estimates and observations are
 /// separate fields; a native release result is not an RSS measurement.
 #[derive(Debug, Clone)]
 pub struct ResidencyReport {
     pub model_id: ModelId,
+    pub generation: ModelGeneration,
     pub inventory: InventorySummary,
     pub admission: AdmissionDecision,
     pub pre_plan: Option<ResidencyPlan>,
     pub post_plan: Option<ResidencyPlan>,
     pub application: Option<ApplicationReport>,
+    pub staging: Option<StagingPlan>,
+    pub staging_result: Option<StagingResult>,
+    pub profile: Option<ExecutionProfile>,
+    pub ledger: MemoryLedger,
     pub before: ResidencySnapshot,
     pub after: ResidencySnapshot,
+    pub timing: OperationTiming,
     pub elapsed: Duration,
 }
 
@@ -1144,6 +1254,16 @@ impl ResidencyManager {
     /// Deterministic bounded staging plan. This is a prefetch hint only; it
     /// does not reserve memory or guarantee residency.
     pub fn staging_plan(&self, max_bytes: u64) -> StagingPlan {
+        self.staging_plan_with_profile(max_bytes, None)
+    }
+
+    /// Deterministic bounded staging plan. Page ranges are deduplicated per
+    /// mapping so shared or overlapping tensors are requested once.
+    pub fn staging_plan_with_profile(
+        &self,
+        max_bytes: u64,
+        profile: Option<&ExecutionProfile>,
+    ) -> StagingPlan {
         let mut candidates: Vec<&TensorResource> = self
             .inventory
             .resources
@@ -1151,21 +1271,48 @@ impl ResidencyManager {
             .filter(|resource| resource.file_backed && resource.page_bytes > 0)
             .collect();
         candidates.sort_by(|a, b| {
-            a.layer
-                .sort_key()
-                .cmp(&b.layer.sort_key())
+            let a_recent = profile
+                .and_then(|profile| profile.last_order(&a.name))
+                .unwrap_or(0);
+            let b_recent = profile
+                .and_then(|profile| profile.last_order(&b.name))
+                .unwrap_or(0);
+            b_recent
+                .cmp(&a_recent)
+                .then_with(|| a.layer.sort_key().cmp(&b.layer.sort_key()))
                 .then_with(|| a.key.tensor_index.cmp(&b.key.tensor_index))
         });
         let mut selected = Vec::new();
         let mut selected_bytes = 0u64;
         let mut skipped = 0u64;
+        let mut overlap_avoided = 0u64;
+        let mut requested_ranges: BTreeMap<u32, Vec<(u64, u64)>> = BTreeMap::new();
+        let mut budget_overflow = false;
         for resource in candidates {
-            if max_bytes == 0 || selected_bytes.saturating_add(resource.page_bytes) > max_bytes {
+            let Some(mapping_index) = resource.mapping_index else {
                 skipped = skipped.saturating_add(resource.page_bytes);
                 continue;
+            };
+            let ranges = requested_ranges.entry(mapping_index).or_default();
+            let overlap = covered_bytes(ranges, resource.page_start, resource.page_end);
+            let new_bytes = resource.page_bytes.saturating_sub(overlap);
+            overlap_avoided = overlap_avoided.saturating_add(overlap);
+            if max_bytes == 0 || new_bytes == 0 {
+                skipped = skipped.saturating_add(new_bytes);
+                continue;
             }
+            let Some(next_total) = selected_bytes.checked_add(new_bytes) else {
+                budget_overflow = true;
+                skipped = skipped.saturating_add(new_bytes);
+                continue;
+            };
+            if next_total > max_bytes {
+                skipped = skipped.saturating_add(new_bytes);
+                continue;
+            }
+            insert_interval(ranges, resource.page_start, resource.page_end);
             selected.push(resource.key);
-            selected_bytes += resource.page_bytes;
+            selected_bytes = next_total;
         }
         let mut notes = vec![
             "prefetch is a MADV_WILLNEED hint, not a synchronous load or residency guarantee"
@@ -1174,10 +1321,17 @@ impl ResidencyManager {
         if skipped > 0 {
             notes.push("some eligible pages exceeded the staging limit".to_string());
         }
+        if overlap_avoided > 0 {
+            notes.push("overlapping/shared page ranges were requested once".to_string());
+        }
+        if budget_overflow {
+            notes.push("staging byte arithmetic overflowed".to_string());
+        }
         StagingPlan {
             selected,
             selected_bytes,
             skipped_bytes: skipped,
+            overlap_bytes_avoided: overlap_avoided,
             notes,
         }
     }
@@ -1221,13 +1375,25 @@ impl ResidencyManager {
         observed_bytes: Option<u64>,
         context: &OperationContext,
     ) -> Result<ResidencyPlan, ManagerError> {
+        self.plan_with_profile(observed_bytes, context, None)
+    }
+
+    pub fn plan_with_profile(
+        &mut self,
+        observed_bytes: Option<u64>,
+        context: &OperationContext,
+        profile: Option<&ExecutionProfile>,
+    ) -> Result<ResidencyPlan, ManagerError> {
         self.lifecycle
             .transition(ResidencyState::Planning)
             .map_err(ManagerError::Lifecycle)?;
-        let plan = Planner::new(&self.inventory, &self.attempted).plan(
+        let profile = profile
+            .filter(|profile| profile.is_valid_for(&self.model_id, self.inventory.generation));
+        let plan = Planner::new(&self.inventory, &self.attempted).plan_with_profile(
             self.policy,
             observed_bytes,
             context,
+            profile,
         );
         self.lifecycle
             .transition(ResidencyState::SafeBoundary)
@@ -1349,6 +1515,41 @@ impl ResidencyManager {
     }
 }
 
+fn covered_bytes(ranges: &[(u64, u64)], start: u64, end: u64) -> u64 {
+    if start >= end {
+        return 0;
+    }
+    let mut covered = 0u64;
+    for &(range_start, range_end) in ranges {
+        let first = start.max(range_start);
+        let last = end.min(range_end);
+        if first < last {
+            covered = covered.saturating_add(last - first);
+        }
+    }
+    covered
+}
+
+fn insert_interval(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    let mut merged = Vec::with_capacity(ranges.len() + 1);
+    let mut pending = (start, end);
+    for &(range_start, range_end) in ranges.iter() {
+        if range_end < pending.0 {
+            merged.push((range_start, range_end));
+        } else if pending.1 < range_start {
+            merged.push(pending);
+            pending = (range_start, range_end);
+        } else {
+            pending = (pending.0.min(range_start), pending.1.max(range_end));
+        }
+    }
+    merged.push(pending);
+    *ranges = merged;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1404,6 +1605,62 @@ mod tests {
         );
     }
 
+    fn staging_manager(inventory: ResourceInventory) -> ResidencyManager {
+        ResidencyManager::new(
+            inventory.model_id.clone(),
+            inventory,
+            ResidencyPolicy {
+                mode: ResidencyPolicyMode::Observe,
+                target_bytes: None,
+                safety_reserve_bytes: 0,
+            },
+            None,
+        )
+        .expect("manager")
+    }
+
+    #[test]
+    fn staging_respects_zero_and_exact_budgets() {
+        let manager = staging_manager(inventory());
+        let zero = manager
+            .inventory()
+            .resources
+            .iter()
+            .filter(|resource| resource.file_backed)
+            .map(|resource| resource.page_bytes)
+            .min()
+            .expect("page bytes");
+        assert!(manager.staging_plan(0).is_empty());
+        let below = manager.staging_plan(zero.saturating_sub(1));
+        assert!(below.is_empty());
+        let exact = manager.staging_plan(zero);
+        assert_eq!(exact.selected_bytes, zero);
+        assert_eq!(exact.selected.len(), 1);
+    }
+
+    #[test]
+    fn staging_deduplicates_overlapping_page_ranges() {
+        let inventory = ResourceInventory::from_tensor_mappings(
+            ModelId("staging".to_string()),
+            ModelGeneration(1),
+            &[
+                mapping("blk.0.a", true, 0, 0, 4096),
+                mapping("blk.0.b", true, 0, 2048, 4096),
+            ],
+        )
+        .expect("inventory");
+        let manager = staging_manager(inventory);
+        let plan = manager.staging_plan(8192);
+        assert_eq!(plan.selected.len(), 2);
+        assert_eq!(plan.selected_bytes, 8192);
+        assert_eq!(plan.overlap_bytes_avoided, 4096);
+        assert_eq!(plan.skipped_bytes, 0);
+        let constrained = manager.staging_plan(4096);
+        assert_eq!(constrained.selected.len(), 1);
+        assert_eq!(constrained.selected_bytes, 4096);
+        assert!(constrained.skipped_bytes > 0);
+    }
+
     #[test]
     fn shared_page_accounting_is_conservative() {
         let inventory = ResourceInventory::from_tensor_mappings(
@@ -1418,6 +1675,104 @@ mod tests {
         assert!(inventory.resources[0].shared_page_bytes > 0);
         assert!(inventory.resources[1].shared_page_bytes > 0);
         assert_eq!(inventory.resources[0].unique_reclaimable_bytes(), 0);
+    }
+
+    #[test]
+    fn conservative_policy_skips_partially_shared_resources() {
+        let inventory = ResourceInventory::from_tensor_mappings(
+            ModelId("conservative".to_string()),
+            ModelGeneration(1),
+            &[
+                mapping("blk.0.shared_a", true, 0, 0, 8192),
+                mapping("blk.0.shared_b", true, 0, 6144, 4096),
+                mapping("blk.0.unique", true, 0, 16384, 4096),
+            ],
+        )
+        .expect("inventory");
+        let policy = ResidencyPolicy {
+            mode: ResidencyPolicyMode::Conservative,
+            target_bytes: Some(4096),
+            safety_reserve_bytes: 0,
+        };
+        let plan = Planner::new(&inventory, &BTreeSet::new()).plan(
+            policy,
+            Some(inventory.summary.page_bytes),
+            &OperationContext::default(),
+        );
+        assert_eq!(plan.selected.len(), 1);
+        let selected = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.action == DecisionAction::Release)
+            .expect("release");
+        assert_eq!(selected.name, "blk.0.unique");
+        assert!(plan
+            .decisions
+            .iter()
+            .any(|decision| decision.reason == DecisionReason::SharedPageConservative));
+    }
+
+    #[test]
+    fn reuse_aware_policy_retains_recently_used_resource_when_budget_is_tight() {
+        let inventory = ResourceInventory::from_tensor_mappings(
+            ModelId("reuse".to_string()),
+            ModelGeneration(1),
+            &[
+                mapping("blk.0.cold", true, 0, 0, 4096),
+                mapping("blk.0.hot", true, 0, 4096, 4096),
+            ],
+        )
+        .expect("inventory");
+        let mut profile = ExecutionProfile::new(ModelId("reuse".to_string()), ModelGeneration(1));
+        profile.complete_observations = 1;
+        profile.access.insert(
+            "blk.0.cold".to_string(),
+            crate::execution_profile::AccessPattern {
+                first_order: 0,
+                last_order: 1,
+                observed_consumers: 1,
+            },
+        );
+        profile.access.insert(
+            "blk.0.hot".to_string(),
+            crate::execution_profile::AccessPattern {
+                first_order: 0,
+                last_order: 20,
+                observed_consumers: 1,
+            },
+        );
+        let policy = ResidencyPolicy {
+            mode: ResidencyPolicyMode::ReuseAware,
+            target_bytes: Some(4096),
+            safety_reserve_bytes: 0,
+        };
+        let plan = Planner::new(&inventory, &BTreeSet::new()).plan_with_profile(
+            policy,
+            Some(8192),
+            &OperationContext::default(),
+            Some(&profile),
+        );
+        assert!(plan.profile_used);
+        assert_eq!(plan.selected.len(), 1);
+        let selected = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.action == DecisionAction::Release)
+            .expect("release");
+        assert_eq!(selected.name, "blk.0.cold");
+    }
+
+    #[test]
+    fn memory_bound_requires_a_target() {
+        assert_eq!(
+            ResidencyPolicy {
+                mode: ResidencyPolicyMode::MemoryBound,
+                target_bytes: None,
+                safety_reserve_bytes: 0,
+            }
+            .validate(),
+            Err(PolicyError::ActiveWithoutTarget)
+        );
     }
 
     #[test]
@@ -1556,6 +1911,37 @@ mod tests {
     }
 
     #[test]
+    fn manager_rejects_profile_from_another_model() {
+        let inventory = inventory();
+        let policy = ResidencyPolicy {
+            mode: ResidencyPolicyMode::ReuseAware,
+            target_bytes: Some(1),
+            safety_reserve_bytes: 0,
+        };
+        let model_id = inventory.model_id.clone();
+        let mut manager =
+            ResidencyManager::new(model_id, inventory, policy, None).expect("manager");
+        let mut profile = ExecutionProfile::new(ModelId("other".to_string()), ModelGeneration(1));
+        profile.complete_observations = 1;
+        profile.access.insert(
+            "blk.0.attn.weight".to_string(),
+            crate::execution_profile::AccessPattern {
+                first_order: 0,
+                last_order: 100,
+                observed_consumers: 1,
+            },
+        );
+        let plan = manager
+            .plan_with_profile(Some(8192), &OperationContext::default(), Some(&profile))
+            .expect("plan");
+        assert!(!plan.profile_used);
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("no valid profile")));
+    }
+
+    #[test]
     fn two_managers_apply_their_own_indices() {
         let make = |id: &str| {
             ResourceInventory::from_tensor_mappings(
@@ -1606,6 +1992,12 @@ mod tests {
         assert_eq!(hard.outcome, AdmissionOutcome::Rejected);
         let unknown = admit(Some(1024), None, 0, None, 1024);
         assert_eq!(unknown.outcome, AdmissionOutcome::Unknown);
+        let overflow = admit(Some(1024), None, u64::MAX, Some(1), 0);
+        assert_eq!(overflow.outcome, AdmissionOutcome::Rejected);
+        assert!(overflow
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("overflowed")));
     }
 
     #[test]

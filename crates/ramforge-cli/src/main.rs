@@ -3,13 +3,15 @@ use ramforge_core::{
     discover_model_set, parse_memory_size, ChatMessage, ChatTemplate, GgufModel, GgufModelSet,
     Tokenizer,
 };
+use ramforge_runtime::execution_profile::ExecutionProfile;
 use ramforge_runtime::graph_manifest::{GraphManifest, LastUseStatus};
+use ramforge_runtime::memory_ledger::MemoryLedger;
 use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::page_residency::{evict_file_cache, model_mapping_residency};
 use ramforge_runtime::residency_engine::{
-    AdmissionDecision, DecisionAction, ModelGeneration, ModelId, OperationContext,
+    AdmissionDecision, DecisionAction, ModelGeneration, ModelId, OperationContext, OperationTiming,
     ResidencyCapabilities, ResidencyManager, ResidencyPlan, ResidencyPolicy, ResidencyPolicyMode,
-    ResidencyReport, ResidencySnapshot, ResourceInventory,
+    ResidencyReport, ResidencySnapshot, ResourceInventory, StagingPlan, StagingResult,
 };
 use ramforge_runtime::{
     DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
@@ -43,6 +45,9 @@ enum InferenceBackend {
 enum ResidencyPolicyArg {
     Off,
     Observe,
+    Conservative,
+    MemoryBound,
+    ReuseAware,
     Active,
 }
 
@@ -51,8 +56,18 @@ impl ResidencyPolicyArg {
         match self {
             Self::Off => ResidencyPolicyMode::Off,
             Self::Observe => ResidencyPolicyMode::Observe,
+            Self::Conservative => ResidencyPolicyMode::Conservative,
+            Self::MemoryBound => ResidencyPolicyMode::MemoryBound,
+            Self::ReuseAware => ResidencyPolicyMode::ReuseAware,
             Self::Active => ResidencyPolicyMode::Active,
         }
+    }
+
+    fn applies(self) -> bool {
+        matches!(
+            self,
+            Self::Conservative | Self::MemoryBound | Self::ReuseAware | Self::Active
+        )
     }
 }
 
@@ -140,7 +155,7 @@ enum Commands {
         #[arg(long, value_name = "N", conflicts_with_all = ["inspect_layer", "release_mapping_pages"])]
         release_layer: Option<u32>,
 
-        /// Residency policy: off, observe (plan only), or active (release at safe boundaries)
+        /// Residency policy: off, observe, conservative, memory-bound, reuse-aware, or active (compatibility)
         #[arg(long, value_enum, default_value_t = ResidencyPolicyArg::Off)]
         residency_policy: ResidencyPolicyArg,
 
@@ -155,6 +170,10 @@ enum Commands {
         /// Print the structured residency inventory/plan/application report
         #[arg(long)]
         residency_report: bool,
+
+        /// Write a versioned JSON residency report to PATH
+        #[arg(long, value_name = "PATH")]
+        residency_report_json: Option<PathBuf>,
 
         /// Best-effort bounded page prefetch budget (MADV_WILLNEED hint)
         #[arg(long, value_name = "SIZE")]
@@ -249,6 +268,7 @@ fn main() {
             residency_target,
             residency_reserve,
             residency_report,
+            residency_report_json,
             residency_prefetch,
             graph_trace,
             graph_trace_events,
@@ -309,6 +329,7 @@ fn main() {
                 residency_target,
                 residency_reserve,
                 residency_report,
+                residency_report_json,
                 residency_prefetch,
                 graph_trace,
                 graph_trace_events,
@@ -410,6 +431,7 @@ fn run_inference(
     residency_target: Option<String>,
     residency_reserve: Option<String>,
     residency_report: bool,
+    residency_report_json: Option<PathBuf>,
     residency_prefetch: Option<String>,
     graph_trace: bool,
     graph_trace_events: usize,
@@ -461,10 +483,11 @@ fn run_inference(
     }
     if residency_policy == ResidencyPolicyArg::Off
         && !residency_report
+        && residency_report_json.is_none()
         && (residency_target_bytes.is_some() || residency_reserve_bytes != 0)
     {
         return Err(anyhow::anyhow!(
-            "--residency-target/--residency-reserve require --residency-policy observe|active or --residency-report"
+            "--residency-target/--residency-reserve require --residency-policy observe|conservative|memory-bound|reuse-aware|active or --residency-report/--residency-report-json"
         ));
     }
     if graph_trace && graph_trace_events == 0 {
@@ -480,6 +503,7 @@ fn run_inference(
         || residency_target_bytes.is_some()
         || residency_reserve_bytes != 0
         || residency_report
+        || residency_report_json.is_some()
         || residency_prefetch_bytes.is_some();
     if residency_requested
         && (release_mapping_pages || inspect_layer.is_some() || release_layer.is_some())
@@ -512,6 +536,7 @@ fn run_inference(
             residency_target_bytes,
             residency_reserve_bytes,
             residency_report,
+            residency_report_json.clone(),
             residency_prefetch_bytes,
             graph_trace,
             graph_trace_events,
@@ -560,6 +585,7 @@ fn run_inference(
         || residency_target_bytes.is_some()
         || residency_reserve_bytes != 0
         || residency_report
+        || residency_report_json.is_some()
         || residency_prefetch_bytes.is_some();
     if residency_requested {
         return Err(anyhow::anyhow!(
@@ -828,6 +854,7 @@ fn run_forgecore_inference(
     residency_target: Option<u64>,
     residency_reserve: u64,
     residency_report: bool,
+    residency_report_json: Option<PathBuf>,
     residency_prefetch_bytes: Option<u64>,
     graph_trace: bool,
     graph_trace_events: usize,
@@ -986,6 +1013,7 @@ fn run_forgecore_inference(
     let residency_started = Instant::now();
     let mut residency_manager = if residency_policy != ResidencyPolicyArg::Off
         || residency_report
+        || residency_report_json.is_some()
         || residency_target.is_some()
         || residency_reserve != 0
         || residency_prefetch_bytes.is_some()
@@ -1023,9 +1051,12 @@ fn run_forgecore_inference(
     };
     let mut residency_admission: Option<AdmissionDecision> = None;
     let mut pre_operation_plan: Option<ResidencyPlan> = None;
+    let mut residency_staging: Option<StagingPlan> = None;
+    let mut residency_staging_result: Option<StagingResult> = None;
     if let Some(manager) = residency_manager.as_mut() {
         if let Some(limit) = residency_prefetch_bytes {
             let plan = manager.staging_plan(limit);
+            residency_staging = Some(plan.clone());
             eprintln!(
                 "Residency staging plan: selected={} requested_pages={} skipped={}",
                 plan.selected.len(),
@@ -1052,6 +1083,13 @@ fn run_forgecore_inference(
                         .map(|delta| format!("{delta:+} bytes"))
                         .unwrap_or_else(|| "unavailable".to_string())
                 );
+                residency_staging_result = Some(StagingResult {
+                    requested_keys: plan.selected.clone(),
+                    native_requested_bytes: requested,
+                    mapping_before_bytes: before.mapping_rss_bytes,
+                    mapping_after_bytes: after.mapping_rss_bytes,
+                    error: None,
+                });
             }
         }
         let current = process_rss()
@@ -1377,12 +1415,31 @@ fn run_forgecore_inference(
             format_duration(load_elapsed)
         );
     }
+    let mut execution_profile = None;
     if graph_trace {
         let summary = session.trace_summary();
         let events = session.trace_events();
         let manifest = GraphManifest::from_trace(&events);
         eprintln!("Graph trace summary: {:?}", summary);
         eprintln!("Graph manifest: {:?}", manifest.summary());
+        if let Some(manager) = residency_manager.as_ref() {
+            let mut profile =
+                ExecutionProfile::new(manager.model_id().clone(), manager.inventory().generation);
+            let trace_complete = summary
+                .as_ref()
+                .is_some_and(|summary| summary.dropped_events == 0);
+            profile.update_from_trace(&events, trace_complete);
+            eprintln!(
+                "Execution profile: version={} complete={} observations={} incomplete={} tensors={} valid={}",
+                profile.version,
+                profile.is_complete(),
+                profile.complete_observations,
+                profile.incomplete_observations,
+                profile.access.len(),
+                profile.is_valid_for(&manager.model_id().clone(), manager.inventory().generation)
+            );
+            execution_profile = Some(profile);
+        }
         let unknown = manifest
             .last_use
             .values()
@@ -1423,16 +1480,18 @@ fn run_forgecore_inference(
             .or(before.mapping_rss_bytes)
             .or(Some(manager.inventory().summary.page_bytes));
         let plan = manager
-            .plan(current, &OperationContext::default())
+            .plan_with_profile(
+                current,
+                &OperationContext::default(),
+                execution_profile.as_ref(),
+            )
             .map_err(|error| anyhow::anyhow!(error))?;
         if !residency_report && residency_policy != ResidencyPolicyArg::Off {
             print_residency_plan("post-operation", &plan);
         }
         post_operation_plan = Some(plan);
         residency_before = Some(before);
-        if residency_policy == ResidencyPolicyArg::Active
-            && manager.last_plan().is_some_and(|plan| !plan.is_noop())
-        {
+        if residency_policy.applies() && manager.last_plan().is_some_and(|plan| !plan.is_noop()) {
             let application = manager
                 .apply_last_plan(|indices| {
                     model
@@ -1445,7 +1504,7 @@ fn run_forgecore_inference(
         residency_after = Some(ResidencySnapshot::capture_paths(&shard_paths));
     }
 
-    if residency_report {
+    if residency_report || residency_report_json.is_some() {
         if let (Some(manager), Some(admission), Some(before), Some(after)) = (
             residency_manager.as_ref(),
             residency_admission.clone(),
@@ -1454,16 +1513,49 @@ fn run_forgecore_inference(
         ) {
             let report = ResidencyReport {
                 model_id: manager.model_id().clone(),
+                generation: manager.inventory().generation,
                 inventory: manager.inventory().summary,
                 admission,
                 pre_plan: pre_operation_plan.clone(),
                 post_plan: post_operation_plan.clone(),
                 application: residency_application.clone(),
+                staging: residency_staging.clone(),
+                staging_result: residency_staging_result.clone(),
+                profile: execution_profile.clone(),
+                ledger: MemoryLedger::from_inventory(
+                    manager.model_id().clone(),
+                    manager.inventory().generation,
+                    &manager.inventory().summary,
+                    &before,
+                    residency_staging.as_ref(),
+                    residency_staging_result.as_ref(),
+                ),
                 before,
                 after,
+                timing: OperationTiming {
+                    prompt_tokens: prompt_tokens.len(),
+                    generated_tokens: generated_token_ids.len(),
+                    first_token_elapsed,
+                    prompt_elapsed: Some(prompt_elapsed),
+                    decode_elapsed,
+                    total_elapsed: Some(total_generation_elapsed),
+                    stop_reason: stop_reason.to_string(),
+                    output_fingerprint: token_fingerprint(&generated_token_ids),
+                },
                 elapsed: residency_started.elapsed(),
             };
-            print_residency_report(&report);
+            if residency_report {
+                print_residency_report(&report);
+            }
+            if let Some(path) = residency_report_json.as_ref() {
+                let value = residency_report_json_value(&report);
+                let encoded = serde_json::to_vec_pretty(&value)
+                    .map_err(|error| anyhow::anyhow!("serialize residency report: {error}"))?;
+                std::fs::write(path, encoded).map_err(|error| {
+                    anyhow::anyhow!("write residency JSON report '{}': {error}", path.display())
+                })?;
+                eprintln!("Residency JSON report: {}", path.display());
+            }
         }
     } else if residency_policy != ResidencyPolicyArg::Off {
         let pre_selected = pre_operation_plan
@@ -1569,6 +1661,12 @@ fn output_support() {
         capabilities.file_backed_release
     );
     println!("  page prefetch: {:?}", capabilities.page_prefetch);
+    println!("  policy profiles: off, observe, conservative, memory-bound, reuse-aware, active (compatibility)");
+    println!(
+        "  memory ledger/reconciliation: supported; KV/scratch/runtime remain explicitly unknown"
+    );
+    println!("  operation reports: human-readable and versioned JSON schema 1");
+    println!("  execution profiles: in-memory diagnostic input only; not persisted");
     println!("  graph trace: {:?}", capabilities.graph_trace);
     println!(
         "  graph dependency analysis: {:?}",
@@ -1795,13 +1893,14 @@ fn output_memory_report(report: &ramforge_runtime::memory_report::MemoryReport) 
 
 fn print_residency_plan(label: &str, plan: &ResidencyPlan) {
     eprintln!(
-        "Residency {label} plan: mode={:?} target={} reserve={} current={} ({:?}) selected={} estimated_reclaim={} estimated_after={} estimated_budget_met={}",
+        "Residency {label} plan: mode={:?} target={} reserve={} current={} ({:?}) selected={} profile_used={} estimated_reclaim={} estimated_after={} estimated_budget_met={}",
         plan.mode,
         optional_bytes(plan.target_bytes),
         format_bytes(plan.safety_reserve_bytes),
         optional_bytes(plan.observed_bytes),
         plan.measurement_source,
         plan.selected.len(),
+        plan.profile_used,
         format_bytes(plan.estimated_reclaim_bytes),
         optional_bytes(plan.estimated_after_bytes),
         plan.estimated_budget_met
@@ -1838,10 +1937,233 @@ fn print_residency_plan(label: &str, plan: &ResidencyPlan) {
     }
 }
 
+fn token_fingerprint(tokens: &[u32]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for token in tokens {
+        for byte in token.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
+const RESIDENCY_REPORT_SCHEMA_VERSION: u32 = 1;
+const JSON_SELECTED_LIMIT: usize = 1000;
+
+fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
+    let reconciliation = report.ledger.reconciliation(report.inventory.page_bytes);
+    let decision_counts = {
+        let mut counts = std::collections::BTreeMap::new();
+        if let Some(plan) = report.post_plan.as_ref().or(report.pre_plan.as_ref()) {
+            for decision in &plan.decisions {
+                *counts
+                    .entry(format!("{:?}", decision.reason))
+                    .or_insert(0usize) += 1;
+            }
+        }
+        counts
+    };
+    let release_decisions = report
+        .post_plan
+        .as_ref()
+        .or(report.pre_plan.as_ref())
+        .map(|plan| {
+            plan.decisions
+                .iter()
+                .filter(|decision| decision.action == DecisionAction::Release)
+                .take(200)
+                .map(|decision| {
+                    serde_json::json!({
+                        "tensor_index": decision.key.tensor_index,
+                        "generation": decision.key.generation,
+                        "name": decision.name,
+                        "layer": format!("{:?}", decision.layer),
+                        "reason": format!("{:?}", decision.reason),
+                        "page_bytes": decision.page_bytes,
+                        "shared_page_bytes": decision.shared_page_bytes,
+                        "estimated_reclaim_bytes": decision.estimated_reclaim_bytes,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "schema_version": RESIDENCY_REPORT_SCHEMA_VERSION,
+        "kind": "ramforge.residency.operation_report",
+        "model": {
+            "id": report.model_id.0,
+            "generation": report.generation.0,
+        },
+        "inventory": {
+            "tensors": report.inventory.tensors,
+            "file_backed_tensors": report.inventory.file_backed_tensors,
+            "anonymous_tensors": report.inventory.anonymous_tensors,
+            "mappings": report.inventory.mappings,
+            "logical_file_backed_bytes": report.inventory.logical_file_backed_bytes,
+            "logical_anonymous_bytes": report.inventory.logical_anonymous_bytes,
+            "page_bytes": report.inventory.page_bytes,
+            "shared_page_bytes": report.inventory.shared_page_bytes,
+            "unknown_tensors": report.inventory.unknown_tensors,
+        },
+        "admission": {
+            "outcome": format!("{:?}", report.admission.outcome),
+            "soft_target_bytes": report.admission.soft_target_bytes,
+            "hard_limit_bytes": report.admission.hard_limit_bytes,
+            "safety_reserve_bytes": report.admission.safety_reserve_bytes,
+            "current_bytes": report.admission.current_bytes,
+            "known_tensor_bytes": report.admission.known_tensor_bytes,
+            "reasons": report.admission.reasons,
+            "unknown_components": report.admission.unknown_components,
+        },
+        "ledger": {
+            "entries": report.ledger.entries.iter().map(|entry| serde_json::json!({
+                "category": format!("{:?}", entry.category),
+                "bytes": entry.bytes,
+                "kind": format!("{:?}", entry.kind),
+                "source": entry.source,
+                "note": entry.note,
+            })).collect::<Vec<_>>(),
+            "unknown_components": report.ledger.unknown_components,
+            "warnings": report.ledger.warnings,
+        },
+        "reconciliation": {
+            "mapped_virtual_bytes": reconciliation.mapped_virtual_bytes,
+            "mapped_resident_bytes": reconciliation.mapped_resident_bytes,
+            "process_rss_bytes": reconciliation.process_rss_bytes,
+            "cgroup_current_bytes": reconciliation.cgroup_current_bytes,
+            "cgroup_peak_bytes": reconciliation.cgroup_peak_bytes,
+            "rss_minus_mapping": reconciliation.rss_minus_mapping,
+            "cgroup_minus_rss": reconciliation.cgroup_minus_rss,
+            "unknown_components": reconciliation.unknown_components,
+            "notes": reconciliation.notes,
+        },
+        "pre_plan": report.pre_plan.as_ref().map(plan_json_value),
+        "post_plan": report.post_plan.as_ref().map(plan_json_value),
+        "plan_decision_counts": decision_counts,
+        "release_decisions": release_decisions,
+        "staging_plan": report.staging.as_ref().map(|staging| serde_json::json!({
+            "selected_count": staging.selected.len(),
+            "selected": staging.selected.iter().take(JSON_SELECTED_LIMIT).map(|key| serde_json::json!({
+                "tensor_index": key.tensor_index,
+                "generation": key.generation,
+            })).collect::<Vec<_>>(),
+            "selected_bytes": staging.selected_bytes,
+            "skipped_bytes": staging.skipped_bytes,
+            "overlap_bytes_avoided": staging.overlap_bytes_avoided,
+            "notes": staging.notes,
+        })),
+        "staging_result": report.staging_result.as_ref().map(|result| serde_json::json!({
+            "requested": result.requested_keys.len(),
+            "native_requested_bytes": result.native_requested_bytes,
+            "mapping_before_bytes": result.mapping_before_bytes,
+            "mapping_after_bytes": result.mapping_after_bytes,
+            "mapping_delta_bytes": match (result.mapping_before_bytes, result.mapping_after_bytes) {
+                (Some(before), Some(after)) => Some(after as i128 - before as i128),
+                _ => None,
+            },
+            "error": result.error,
+        })),
+        "application": report.application.as_ref().map(|application| {
+            let native = application.native_result.as_ref();
+            serde_json::json!({
+                "attempted": application.attempted_keys.len(),
+                "native_indices": application.native_indices.len(),
+                "elapsed_ns": application.elapsed.as_nanos(),
+                "native_released_bytes_submitted": native.map(|result| result.released_bytes),
+                "native_skipped_shared_bytes": native.map(|result| result.skipped_shared_bytes),
+                "native_non_file_backed_tensors": native.map(|result| result.non_file_backed_tensors),
+                "native_selected_tensors": native.map(|result| result.selected_tensors),
+                "error": application.error,
+            })
+        }),
+        "profile": report.profile.as_ref().map(|profile| serde_json::json!({
+            "version": profile.version,
+            "complete_observations": profile.complete_observations,
+            "incomplete_observations": profile.incomplete_observations,
+            "last_node_count": profile.last_node_count,
+            "last_tensor_count": profile.last_tensor_count,
+            "invalidated_reason": profile.invalidated_reason,
+            "access": profile.access.iter().take(200).map(|(name, pattern)| serde_json::json!({
+                "tensor": name,
+                "first_order": pattern.first_order,
+                "last_order": pattern.last_order,
+                "observed_consumers": pattern.observed_consumers,
+            })).collect::<Vec<_>>(),
+        })),
+        "timing": {
+            "prompt_tokens": report.timing.prompt_tokens,
+            "generated_tokens": report.timing.generated_tokens,
+            "ttft_ns": report.timing.first_token_elapsed.map(|value| value.as_nanos()),
+            "prompt_ns": report.timing.prompt_elapsed.map(|value| value.as_nanos()),
+            "decode_ns": report.timing.decode_elapsed.map(|value| value.as_nanos()),
+            "total_ns": report.timing.total_elapsed.map(|value| value.as_nanos()),
+            "stop_reason": report.timing.stop_reason,
+            "output_fingerprint": report.timing.output_fingerprint,
+        },
+        "measurements": {
+            "before": snapshot_json_value(&report.before),
+            "after": snapshot_json_value(&report.after),
+        },
+        "estimated_vs_observed": {
+            "estimated_reclaim_bytes": report.post_plan.as_ref().or(report.pre_plan.as_ref()).map(|plan| plan.estimated_reclaim_bytes),
+            "observed_mapping_delta_bytes": report.before.mapping_delta(&report.after),
+        },
+        "elapsed_ns": report.elapsed.as_nanos(),
+        "warnings": [
+            "released_bytes is page bytes submitted to madvise, not confirmed physical reclamation",
+            "mapped bytes, resident bytes, process RSS, and cgroup usage are distinct measurements",
+            "prefetch is a hint, not a residency guarantee"
+        ],
+    })
+}
+
+fn plan_json_value(plan: &ResidencyPlan) -> serde_json::Value {
+    serde_json::json!({
+        "mode": format!("{:?}", plan.mode),
+        "target_bytes": plan.target_bytes,
+        "safety_reserve_bytes": plan.safety_reserve_bytes,
+        "observed_bytes": plan.observed_bytes,
+        "measurement_source": format!("{:?}", plan.measurement_source),
+        "selected_count": plan.selected.len(),
+        "selected": plan.selected.iter().take(JSON_SELECTED_LIMIT).map(|key| serde_json::json!({
+            "tensor_index": key.tensor_index,
+            "generation": key.generation,
+        })).collect::<Vec<_>>(),
+        "profile_used": plan.profile_used,
+        "estimated_reclaim_bytes": plan.estimated_reclaim_bytes,
+        "estimated_after_bytes": plan.estimated_after_bytes,
+        "estimated_budget_met": plan.estimated_budget_met,
+        "notes": plan.notes,
+    })
+}
+
+fn snapshot_json_value(snapshot: &ResidencySnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "process_rss_bytes": snapshot.process_rss_bytes,
+        "process_rss_peak_bytes": snapshot.process_rss_peak_bytes,
+        "mapping_rss_bytes": snapshot.mapping_rss_bytes,
+        "mapping_pss_bytes": snapshot.mapping_pss_bytes,
+        "cgroup_current_bytes": snapshot.cgroup_current_bytes,
+        "cgroup_peak_bytes": snapshot.cgroup_peak_bytes,
+        "cgroup_events": snapshot.cgroup_events.as_ref().map(|events| serde_json::json!({
+            "low": events.low,
+            "high": events.high,
+            "max": events.max,
+            "oom": events.oom,
+            "oom_kill": events.oom_kill,
+            "oom_group_kill": events.oom_group_kill,
+        })),
+    })
+}
+
 fn print_residency_report(report: &ResidencyReport) {
     eprintln!();
     eprintln!("Residency report:");
-    eprintln!("  Model: {}", report.model_id.0);
+    eprintln!(
+        "  Model: {} generation={}",
+        report.model_id.0, report.generation.0
+    );
     eprintln!(
         "  Inventory: tensors={} file_backed={} anonymous={} mappings={} file_bytes={} anonymous_bytes={} page_bytes={} shared_page_bytes={}",
         report.inventory.tensors,
@@ -1853,6 +2175,67 @@ fn print_residency_report(report: &ResidencyReport) {
         format_bytes(report.inventory.page_bytes),
         format_bytes(report.inventory.shared_page_bytes)
     );
+    eprintln!("  Ledger (categories are not interchangeable totals):");
+    for entry in &report.ledger.entries {
+        eprintln!(
+            "    {:?}: {} [{:?}] source={} note={}",
+            entry.category,
+            optional_bytes(entry.bytes),
+            entry.kind,
+            entry.source,
+            entry.note
+        );
+    }
+    let reconciliation = report.ledger.reconciliation(report.inventory.page_bytes);
+    eprintln!(
+        "  Reconciliation: mapped_virtual={} mapped_resident={} process_rss={} cgroup_current={} cgroup_peak={} rss_minus_mapping={} cgroup_minus_rss={}",
+        format_bytes(reconciliation.mapped_virtual_bytes),
+        optional_bytes(reconciliation.mapped_resident_bytes),
+        optional_bytes(reconciliation.process_rss_bytes),
+        optional_bytes(reconciliation.cgroup_current_bytes),
+        optional_bytes(reconciliation.cgroup_peak_bytes),
+        optional_signed_bytes(reconciliation.rss_minus_mapping),
+        optional_signed_bytes(reconciliation.cgroup_minus_rss)
+    );
+    for unknown in &reconciliation.unknown_components {
+        eprintln!("    unknown component: {unknown}");
+    }
+    if let Some(staging) = &report.staging {
+        eprintln!(
+            "  Staging plan: selected={} requested_pages={} skipped={} overlap_avoided={}",
+            staging.selected.len(),
+            format_bytes(staging.selected_bytes),
+            format_bytes(staging.skipped_bytes),
+            format_bytes(staging.overlap_bytes_avoided)
+        );
+        for note in &staging.notes {
+            eprintln!("    staging note: {note}");
+        }
+    }
+    if let Some(result) = &report.staging_result {
+        eprintln!(
+            "  Staging result: requested={} native_accepted={} mapping_before={} mapping_after={} delta={}",
+            result.requested_keys.len(),
+            format_bytes(result.native_requested_bytes),
+            optional_bytes(result.mapping_before_bytes),
+            optional_bytes(result.mapping_after_bytes),
+            match (result.mapping_before_bytes, result.mapping_after_bytes) {
+                (Some(before), Some(after)) => optional_signed_bytes(Some(after as i128 - before as i128)),
+                _ => "unavailable".to_string(),
+            }
+        );
+    }
+    if let Some(profile) = &report.profile {
+        eprintln!(
+            "  Execution profile: version={} complete_observations={} incomplete_observations={} tensors={} nodes={} invalidated={:?}",
+            profile.version,
+            profile.complete_observations,
+            profile.incomplete_observations,
+            profile.access.len(),
+            profile.last_node_count,
+            profile.invalidated_reason
+        );
+    }
     eprintln!(
         "  Admission: {:?}; current={} soft_target={} hard_limit={} reserve={} known_tensor_bytes={}",
         report.admission.outcome,
@@ -1919,6 +2302,28 @@ fn print_residency_report(report: &ResidencyReport) {
         optional_bytes(report.after.cgroup_current_bytes),
         optional_bytes(report.after.cgroup_peak_bytes),
         report.after.cgroup_events
+    );
+    eprintln!(
+        "  Timing: prompt_tokens={} generated_tokens={} ttft={} decode={} total={} stop={} output_fingerprint={}",
+        report.timing.prompt_tokens,
+        report.timing.generated_tokens,
+        report
+            .timing
+            .first_token_elapsed
+            .map(format_duration)
+            .unwrap_or_else(|| "unavailable".to_string()),
+        report
+            .timing
+            .decode_elapsed
+            .map(format_duration)
+            .unwrap_or_else(|| "unavailable".to_string()),
+        report
+            .timing
+            .total_elapsed
+            .map(format_duration)
+            .unwrap_or_else(|| "unavailable".to_string()),
+        report.timing.stop_reason,
+        report.timing.output_fingerprint
     );
     eprintln!("  Residency elapsed: {}", format_duration(report.elapsed));
     eprintln!(

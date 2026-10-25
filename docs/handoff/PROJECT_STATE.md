@@ -1,6 +1,6 @@
 # Project state
 
-**As-of date:** 2026-10-02; local verification refreshed 2026-10-25.<br>
+**As-of date:** 2026-10-25.<br>
 **Repository:** RAMforge workspace at the handoff source checkout.<br>
 **Status labels:** see [README.md](README.md).
 
@@ -14,11 +14,11 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **467 tests, 0 failed, 14 ignored**; the ignored
-  tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark,
-  the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement,
-  graph trace, bounded prefetch, and the opt-in observe/active residency checks. Fixture-gated tests report SKIP when their
-  environment variables are unset.
+  environment variables passes **481 tests, 0 failed, 16 ignored**. The ignored
+  tests are the real-model diagnostics, quantized microbenchmark, opt-in
+  GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
+  checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
+  their environment variables are unset.
 - The registry now tracks `legacy_run` and `forgecore_run` separately.
   `gptneox`/`gpt_neox` is `legacy_run=not-yet`, `forgecore_run=yes`; the legacy
   preflight error names `--backend forgecore` and never switches implicitly.
@@ -40,6 +40,9 @@
   `size_bytes()`, measured RSS, and explicit budget non-enforcement against the
   real native model.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check` remains not clean because of pre-existing
+  formatting debt outside this change; touched files were formatted with
+  `rustfmt`.
 - `cargo fmt --all -- --check`: **not clean**; the repository has pre-existing
   formatting differences in several files. They are not mass-reformatted here.
 - The ForgeCore CLI `--memory-report` path reports separate logical GGUF,
@@ -58,6 +61,60 @@
   layer/range release.
 - See [../../scripts/test.sh](../../scripts/test.sh) for the reproducible test
   invocation.
+
+## Graph-aware residency milestone (2026-10-25)
+
+Implemented in RAMforge:
+
+- `memory_ledger.rs` — model-scoped categories with provenance
+  (`ExactMeasured`, `NativeLogical`, `Estimated`, `Unknown`, `Requested`,
+  `NativeAccepted`), checked category totals, explicit unknown KV/scratch/
+  runtime components, and signed reconciliation against mapping/RSS/cgroup
+  measurements.
+- `execution_profile.rs` — in-memory profiles from complete trace captures,
+  split per execution id, keyed by stable tensor names, validated against model
+  identity and inventory generation. Multi-execution captures are never merged
+  by transient native node id.
+- `residency_engine.rs` — new `conservative`, `memory-bound`, and `reuse-aware`
+  modes alongside the compatible `active` mode; profile-aware planning and
+  post-operation ordering; deduplicated bounded staging page ranges; staging
+  results; model generation in reports; checked admission reserve arithmetic;
+  observed timing/output fingerprint fields.
+- CLI — policy profiles, `--residency-report-json PATH` (schema 1), ledger/
+  reconciliation/timing/profile output, and capability reporting updates.
+- `scripts/residency-bench.sh` — opt-in reproducible comparison harness using
+  versioned JSON reports and bounded TSV rows.
+- Documentation — `MEMORY_ACCOUNTING.md`, `GRAPH_SAFETY.md`, and
+  `BENCHMARKS.md`.
+
+Measured SmolLM2-135M Q4_K_M (98.87 MiB tensor payload, context 256, 4 greedy
+tokens, target 128 MiB, no cgroup enforcement; medians of two matrix runs
+unless noted):
+
+| Policy | Selected | Mapping RSS delta | Process RSS before/after | Cgroup delta | TTFT |
+|---|---:|---:|---|---:|---:|
+| off | 0 | 0 B | 163.73 / 163.73 MiB | ~0 B | 24.7 ms |
+| observe | 12 | 0 B | 163.64 / 163.64 MiB | ~0 B | 24.8 ms |
+| conservative | 0 | 0 B | 163.61 / 163.61 MiB | ~0 B | 24.6 ms |
+| memory-bound | 12 | -38,027,264 B | 163.76 / 127.50 MiB | ~0 B | 25.1 ms |
+| active | 12 | -38,027,264 B | 163.78 / 127.52 MiB | ~0 B | 24.7 ms |
+| reuse-aware (valid profile) | 133 | -46,702,592 B | 171.80 / 127.26 MiB | ~0 B | 26.6 ms |
+
+The reuse-aware row used a complete 16,384-event capture. With the default
+4,096-event cap on a four-token run, the capture was truncated, the profile was
+rejected as incomplete, and `profile_used=false`; this is the intended
+conservative behavior. Conservative selected nothing because every aligned
+tensor range had non-zero shared page bytes. Bounded staging (64 MiB) selected
+227 tensors, requested 63.98 MiB of deduplicated page ranges, native-accepted
+63.98 MiB, and observed zero mapping-RSS change.
+
+Remaining blockers are unchanged: exact KV/scratch bytes are unavailable;
+intra-decode release lacks a proven native lifetime contract; cgroup attribution
+may not move after page advice; prefetch may not change mapping residency; GPU
+is unvalidated. There is no persisted execution-profile path, so no
+cross-process profile application exists. See
+[MEMORY_ACCOUNTING.md](MEMORY_ACCOUNTING.md) and
+[GRAPH_SAFETY.md](GRAPH_SAFETY.md).
 
 ### Real-model smoke evidence (2026-10-25)
 
@@ -285,10 +342,11 @@ applies releases only after the session/context is dropped. There is no
 intra-decode layer callback, no concurrent release during decode, and no
 per-layer execution scheduler.
 
-CLI: `--residency-policy off|observe|active`, `--residency-target`,
-`--residency-reserve`, `--residency-report`. Default is off. Manual
-release/inspection controls are rejected in combination with policy controls;
-legacy rejects all residency controls.
+CLI: `--residency-policy off|observe|conservative|memory-bound|reuse-aware|active`,
+`--residency-target`, `--residency-reserve`, `--residency-report`,
+`--residency-report-json PATH`, `--residency-prefetch SIZE`, `--graph-trace`.
+Default is off. Manual release/inspection controls are rejected in combination
+with policy controls; legacy rejects all residency controls.
 
 Qwen2.5-1.5B Q4_0, 1 GiB enforced, no repack, 8 tokens:
 
