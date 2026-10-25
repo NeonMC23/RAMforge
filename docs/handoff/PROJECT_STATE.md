@@ -14,10 +14,10 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **446 tests, 0 failed, 10 ignored**; the ignored
+  environment variables passes **463 tests, 0 failed, 12 ignored**; the ignored
   tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark,
-  the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and
-  five CLI enforcement tests. Fixture-gated tests report SKIP when their
+  the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement,
+  and the opt-in observe/active residency checks. Fixture-gated tests report SKIP when their
   environment variables are unset.
 - The registry now tracks `legacy_run` and `forgecore_run` separately.
   `gptneox`/`gpt_neox` is `legacy_run=not-yet`, `forgecore_run=yes`; the legacy
@@ -246,6 +246,75 @@ Qwen2.5-Coder-32B were not run; DeepSeek's `deepseek2` architecture is
 inspect/plan-only in the validated registry. See the README for commands and
 caveats.
 
+#### Execution-aware residency engine (2026-10-25)
+
+`ramforge-runtime/src/residency_engine.rs` connects native tensor metadata to a
+RAMforge-owned inventory, deterministic planner, lifecycle guard, admission
+control, and telemetry report. It is CPU-only and does not call native FFI;
+release application goes through `ForgeCoreModel::release_tensor_pages()`.
+
+Inventory records:
+
+- native tensor index/name and exact file-backed/anonymous classification;
+- mapping index, offset, logical size, page size, and page bounds;
+- layer identity inferred only from `blk.N.*`; unknown otherwise;
+- conservative shared-page bytes per resource;
+- eligibility and ineligibility reason;
+- native versus inferred versus unknown confidence.
+
+Planning:
+
+- soft target and safety reserve, distinct from the hard cgroup limit;
+- required/pinned/attempted exclusions;
+- deterministic ranking by shared-page status, estimated reclaimable bytes,
+  layer, and tensor index;
+- explicit retain/release reasons and `estimated_after` /
+  `estimated_budget_met`, never an observed-RSS guarantee.
+
+Lifecycle:
+
+```text
+ModelReady -> PreparingOperation -> Executing -> Synchronizing
+           -> SafeBoundary -> Planning -> Applying -> SafeBoundary
+```
+
+`decode_tokens` reads logits through the synchronizing native getter, and the
+adapter calls `synchronize()` explicitly before `SafeBoundary`. The engine
+applies releases only after the session/context is dropped. There is no
+intra-decode layer callback, no concurrent release during decode, and no
+per-layer execution scheduler.
+
+CLI: `--residency-policy off|observe|active`, `--residency-target`,
+`--residency-reserve`, `--residency-report`. Default is off. Manual
+release/inspection controls are rejected in combination with policy controls;
+legacy rejects all residency controls.
+
+Qwen2.5-1.5B Q4_0, 1 GiB enforced, no repack, 8 tokens:
+
+| Policy | TTFT | Decode | Wall | Mapping before/after | Process RSS before/after | Cgroup peak |
+|---|---:|---:|---:|---|---|---:|
+| off | 360.3 ms | 3.46 tok/s | 3.21 s | 856.64 / 856.64 MiB | 1.00 / 1.00 GiB | 1 GiB |
+| observe 512M | 364.0 ms | 3.20 tok/s | 3.41 s | 862.54 / 862.54 MiB | 1.00 / 1.00 GiB | 1 GiB |
+| active 512M | 353.1 ms | 3.41 tok/s | 3.31 s | 855.68 / 476.57 MiB | 1021.21 / 642.10 MiB | 1 GiB |
+
+Active post-operation: 30 tensors, 514.44 MiB submitted, 84.00 KiB shared
+skipped; mapping delta `-397,520,896 B`; process RSS delta `-397,525,760 B`;
+cgroup current unchanged; no OOM. `estimated_after=506.84 MiB` and
+`estimated_budget_met=true`, but observed process RSS stayed at 642.10 MiB,
+above the 512 MiB soft target. This is the requested-versus-observed
+distinction: the target is policy, not a guarantee; anon/KV/scratch and
+unsubmitted/shared pages remain. The cgroup remains the hard enforcement
+mechanism.
+
+Observe mode selected 31 tensors in its post plan and performed no mutation;
+mapping and process RSS were unchanged. Admission for both 512M runs was
+`AdmittedWithWarning`.
+
+Known limits: no intra-decode eviction; layer identity is inferred from names;
+telemetry snapshot is sampled, not continuous; cgroup current may not reflect
+madvise page release; multi-shard inventory is supported by native mapping
+indices but real split-model execution was not re-run in this unit.
+
 #### GPT-NeoX/Pythia execution evidence
 
 Fixture: `mradermacher/pythia-70m-deduped-GGUF`,
@@ -448,6 +517,7 @@ The following infrastructure is implemented with extensive unit/integration cove
 - CLI/TUI diagnostic collection, profiling, memory visibility, run history, persistence, and error staging.
 - cgroup v2 hard-budget supervision (`--enforce-ram`) with `memory.peak`, limit/OOM events, page-fault counters, timeout kill, and explicit failure reporting; covered by process-level tests.
 - Explicit file-backed mmap loading, `--no-repack` CPU weight-repacking control, opt-in `--no-prefetch` mapping mode, opt-in model-wide and tensor/layer range page release, model-mapping RSS/PSS measurement, and cold-cache priming for enforced runs.
+- Execution-aware residency inventory, deterministic soft-target planner, lifecycle guard, admission control, and structured telemetry; releases occur only at a post-decode safe boundary.
 - ForgeCore-observed TTFT, prompt-processing, decode-token-rate, and wall-clock profiling.
 
 “Production-oriented” here means that these are concrete implemented subsystems with tests. It is not a blanket production-readiness or model-quality guarantee.

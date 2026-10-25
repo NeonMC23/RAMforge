@@ -451,6 +451,13 @@ impl ForgeCoreSession {
         self.context.n_ctx()
     }
 
+    /// Wait for native work to complete. `decode_tokens` already reads
+    /// logits through a synchronizing native getter; this is an explicit
+    /// lifecycle boundary for residency code.
+    pub fn synchronize(&mut self) {
+        self.context.synchronize();
+    }
+
     pub fn vocab_size(&self) -> u32 {
         self.context.n_vocab()
     }

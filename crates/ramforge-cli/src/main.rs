@@ -5,9 +5,14 @@ use ramforge_core::{
 };
 use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::page_residency::{evict_file_cache, model_mapping_residency};
+use ramforge_runtime::residency_engine::{
+    AdmissionDecision, DecisionAction, ModelGeneration, ModelId, OperationContext,
+    ResidencyManager, ResidencyPlan, ResidencyPolicy, ResidencyPolicyMode, ResidencyReport,
+    ResidencySnapshot, ResourceInventory,
+};
 use ramforge_runtime::{
-    DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreModel,
-    ForgeCoreModelOptions,
+    DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
+    ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -31,6 +36,23 @@ enum InferenceBackend {
     /// ForgeCore/libllama model/context/batch/decode/logits path (CPU in the current RAMforge adapter).
     #[value(name = "forgecore", alias = "forge-core")]
     ForgeCore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ResidencyPolicyArg {
+    Off,
+    Observe,
+    Active,
+}
+
+impl ResidencyPolicyArg {
+    fn mode(self) -> ResidencyPolicyMode {
+        match self {
+            Self::Off => ResidencyPolicyMode::Off,
+            Self::Observe => ResidencyPolicyMode::Observe,
+            Self::Active => ResidencyPolicyMode::Active,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -116,6 +138,22 @@ enum Commands {
         #[arg(long, value_name = "N", conflicts_with_all = ["inspect_layer", "release_mapping_pages"])]
         release_layer: Option<u32>,
 
+        /// Residency policy: off, observe (plan only), or active (release at safe boundaries)
+        #[arg(long, value_enum, default_value_t = ResidencyPolicyArg::Off)]
+        residency_policy: ResidencyPolicyArg,
+
+        /// Soft residency target (default: --ram). Not a hard limit.
+        #[arg(long, value_name = "SIZE")]
+        residency_target: Option<String>,
+
+        /// Safety reserve subtracted from the soft target
+        #[arg(long, value_name = "SIZE")]
+        residency_reserve: Option<String>,
+
+        /// Print the structured residency inventory/plan/application report
+        #[arg(long)]
+        residency_report: bool,
+
         /// Enforce --ram as a hard cgroup v2 memory.max limit for the run
         #[arg(long)]
         enforce_ram: bool,
@@ -189,6 +227,10 @@ fn main() {
             release_mapping_pages,
             inspect_layer,
             release_layer,
+            residency_policy,
+            residency_target,
+            residency_reserve,
+            residency_report,
             enforce_ram,
             enforce_timeout,
             max_tokens,
@@ -241,6 +283,10 @@ fn main() {
                 release_mapping_pages,
                 inspect_layer,
                 release_layer,
+                residency_policy,
+                residency_target,
+                residency_reserve,
+                residency_report,
                 max_tokens,
                 temperature,
                 top_k,
@@ -334,6 +380,10 @@ fn run_inference(
     release_mapping_pages: bool,
     inspect_layer: Option<u32>,
     release_layer: Option<u32>,
+    residency_policy: ResidencyPolicyArg,
+    residency_target: Option<String>,
+    residency_reserve: Option<String>,
+    residency_report: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -344,10 +394,54 @@ fn run_inference(
 ) -> anyhow::Result<()> {
     let ram_bytes = parse_memory_size(&ram_str)
         .map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
+    let residency_target_bytes = residency_target
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --residency-target: {error}"))?;
+    let residency_reserve_bytes = residency_reserve
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --residency-reserve: {error}"))?
+        .unwrap_or(0);
+    if residency_target_bytes == Some(0) {
+        return Err(anyhow::anyhow!(
+            "--residency-target must be greater than zero"
+        ));
+    }
+    if let Some(target) = residency_target_bytes {
+        if residency_reserve_bytes > target {
+            return Err(anyhow::anyhow!(
+                "--residency-reserve {} exceeds --residency-target {}",
+                format_bytes(residency_reserve_bytes),
+                format_bytes(target)
+            ));
+        }
+    }
+    if residency_policy == ResidencyPolicyArg::Off
+        && !residency_report
+        && (residency_target_bytes.is_some() || residency_reserve_bytes != 0)
+    {
+        return Err(anyhow::anyhow!(
+            "--residency-target/--residency-reserve require --residency-policy observe|active or --residency-report"
+        ));
+    }
     let device_selection = device
         .parse::<DeviceSelection>()
         .map_err(|error| anyhow::anyhow!(error))?;
 
+    let residency_requested = residency_policy != ResidencyPolicyArg::Off
+        || residency_target_bytes.is_some()
+        || residency_reserve_bytes != 0
+        || residency_report;
+    if residency_requested
+        && (release_mapping_pages || inspect_layer.is_some() || release_layer.is_some())
+    {
+        return Err(anyhow::anyhow!(
+            "manual mapping release/inspection cannot be combined with residency policy controls"
+        ));
+    }
     if matches!(backend, InferenceBackend::ForgeCore) {
         return run_forgecore_inference(
             model_path,
@@ -363,6 +457,10 @@ fn run_inference(
             release_mapping_pages,
             inspect_layer,
             release_layer,
+            residency_policy,
+            residency_target_bytes,
+            residency_reserve_bytes,
+            residency_report,
             max_tokens,
             temperature,
             top_k,
@@ -401,6 +499,22 @@ fn run_inference(
     if inspect_layer.is_some() || release_layer.is_some() {
         return Err(anyhow::anyhow!(
             "--inspect-layer and --release-layer are only supported with --backend forgecore"
+        ));
+    }
+    let residency_requested = residency_policy != ResidencyPolicyArg::Off
+        || residency_target_bytes.is_some()
+        || residency_reserve_bytes != 0
+        || residency_report;
+    if residency_requested {
+        return Err(anyhow::anyhow!(
+            "residency policy, target, reserve, and report controls are only supported with --backend forgecore"
+        ));
+    }
+    if residency_requested
+        && (release_mapping_pages || inspect_layer.is_some() || release_layer.is_some())
+    {
+        return Err(anyhow::anyhow!(
+            "manual mapping release/inspection cannot be combined with residency policy controls"
         ));
     }
 
@@ -603,6 +717,42 @@ fn run_inference(
     Ok(())
 }
 
+fn decode_with_residency(
+    session: &mut ForgeCoreSession,
+    tokens: &[u32],
+    position: u32,
+    mut residency: Option<&mut ResidencyManager>,
+) -> anyhow::Result<ForgeCoreLogits> {
+    if let Some(manager) = residency.as_mut() {
+        manager
+            .begin_decode()
+            .map_err(|error| anyhow::anyhow!(error))?;
+    }
+    let decoded = session
+        .decode_tokens(tokens, position)
+        .map_err(|error| anyhow::anyhow!(error));
+    let logits = match decoded {
+        Ok(logits) => {
+            // decode_tokens reads logits through a synchronizing native getter;
+            // make the lifecycle boundary explicit before any residency mutation.
+            session.synchronize();
+            if let Some(manager) = residency.as_mut() {
+                manager
+                    .finish_decode()
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            logits
+        }
+        Err(error) => {
+            if let Some(manager) = residency.as_mut() {
+                manager.fail();
+            }
+            return Err(error);
+        }
+    };
+    Ok(logits)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_forgecore_inference(
     model_path: PathBuf,
@@ -618,6 +768,10 @@ fn run_forgecore_inference(
     release_mapping_pages: bool,
     inspect_layer: Option<u32>,
     release_layer: Option<u32>,
+    residency_policy: ResidencyPolicyArg,
+    residency_target: Option<u64>,
+    residency_reserve: u64,
+    residency_report: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -639,6 +793,11 @@ fn run_forgecore_inference(
         ExecutionConfig::new(device, 1, None, false).map_err(|error| anyhow::anyhow!(error))?;
     let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
     let primary_path = model_set.primary_path().to_path_buf();
+    let shard_paths: Vec<PathBuf> = model_set
+        .shards
+        .iter()
+        .map(|shard| shard.path.clone())
+        .collect();
     if ramforge_cli::supervisor::enforced_budget_bytes().is_some() {
         let mut evicted = 0usize;
         for shard in &model_set.shards {
@@ -764,6 +923,80 @@ fn run_forgecore_inference(
             );
         }
     }
+    let residency_started = Instant::now();
+    let mut residency_manager = if residency_policy != ResidencyPolicyArg::Off
+        || residency_report
+        || residency_target.is_some()
+        || residency_reserve != 0
+    {
+        let model_id = ModelId(model.path().display().to_string());
+        let mappings = model
+            .tensor_mappings()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let inventory = ResourceInventory::from_tensor_mappings(
+            model_id.clone(),
+            ModelGeneration(1),
+            &mappings,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        let soft_target = residency_target
+            .or_else(|| (residency_policy != ResidencyPolicyArg::Off).then_some(ram_bytes));
+        let policy = ResidencyPolicy {
+            mode: residency_policy.mode(),
+            target_bytes: soft_target,
+            safety_reserve_bytes: residency_reserve,
+        }
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))?;
+        Some(
+            ResidencyManager::new(
+                model_id,
+                inventory,
+                policy,
+                ramforge_cli::supervisor::enforced_budget_bytes(),
+            )
+            .map_err(|error| anyhow::anyhow!(error))?,
+        )
+    } else {
+        None
+    };
+    let mut residency_admission: Option<AdmissionDecision> = None;
+    let mut pre_operation_plan: Option<ResidencyPlan> = None;
+    if let Some(manager) = residency_manager.as_mut() {
+        let current = process_rss()
+            .or_else(|| ResidencySnapshot::capture_paths(&shard_paths).mapping_rss_bytes)
+            .or(Some(manager.inventory().summary.page_bytes));
+        let admission = manager.admission(current);
+        if !residency_report && residency_policy != ResidencyPolicyArg::Off {
+            eprintln!(
+                "Residency admission: {:?}; current={} soft_target={} hard_limit={} reserve={}",
+                admission.outcome,
+                optional_bytes(admission.current_bytes),
+                optional_bytes(admission.soft_target_bytes),
+                optional_bytes(admission.hard_limit_bytes),
+                format_bytes(admission.safety_reserve_bytes)
+            );
+            for reason in &admission.reasons {
+                eprintln!("  admission: {reason}");
+            }
+        }
+        let context = OperationContext {
+            required: manager.inventory().file_backed_keys(),
+            pinned: Default::default(),
+        };
+        let plan = manager
+            .plan(current, &context)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if !residency_report && residency_policy != ResidencyPolicyArg::Off {
+            print_residency_plan("pre-operation", &plan);
+        }
+        residency_admission = Some(admission);
+        pre_operation_plan = Some(plan);
+        manager
+            .begin_operation()
+            .map_err(|error| anyhow::anyhow!(error))?;
+    }
+
     let metadata = model.metadata().clone();
 
     let gguf = model_set.merged_model();
@@ -810,9 +1043,8 @@ fn run_forgecore_inference(
 
     let load_elapsed = model_load_started.elapsed();
     let prompt_started = Instant::now();
-    let mut logits = session
-        .decode_tokens(&prompt_tokens, 0)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let mut logits =
+        decode_with_residency(&mut session, &prompt_tokens, 0, residency_manager.as_mut())?;
     let prompt_elapsed = prompt_started.elapsed();
     let sampler = ramforge_runtime::sampling::Sampler::new(temperature, top_k, top_p);
     let eos_id = tokenizer.eos_id;
@@ -980,9 +1212,12 @@ fn run_forgecore_inference(
             .ok_or_else(|| anyhow::anyhow!("next token position overflow"))?;
         let next_position = u32::try_from(next_position)
             .map_err(|_| anyhow::anyhow!("next token position exceeds ForgeCore's u32 limit"))?;
-        logits = session
-            .decode_token(next_token, next_position)
-            .map_err(|error| anyhow::anyhow!(error))?;
+        logits = decode_with_residency(
+            &mut session,
+            &[next_token],
+            next_position,
+            residency_manager.as_mut(),
+        )?;
     }
 
     let rss_after_decode = process_rss();
@@ -1048,6 +1283,84 @@ fn run_forgecore_inference(
         eprintln!(
             "  Model load plus tokenization: {}",
             format_duration(load_elapsed)
+        );
+    }
+    drop(session);
+
+    let mut post_operation_plan = None;
+    let mut residency_application = None;
+    let mut residency_before = None;
+    let mut residency_after = None;
+    if let Some(manager) = residency_manager.as_mut() {
+        let before = ResidencySnapshot::capture_paths(&shard_paths);
+        let current = before
+            .process_rss_bytes
+            .or(before.mapping_rss_bytes)
+            .or(Some(manager.inventory().summary.page_bytes));
+        let plan = manager
+            .plan(current, &OperationContext::default())
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if !residency_report && residency_policy != ResidencyPolicyArg::Off {
+            print_residency_plan("post-operation", &plan);
+        }
+        post_operation_plan = Some(plan);
+        residency_before = Some(before);
+        if residency_policy == ResidencyPolicyArg::Active
+            && manager.last_plan().is_some_and(|plan| !plan.is_noop())
+        {
+            let application = manager
+                .apply_last_plan(|indices| {
+                    model
+                        .release_tensor_pages(indices)
+                        .map_err(|error| error.to_string())
+                })
+                .map_err(|error| anyhow::anyhow!(error))?;
+            residency_application = Some(application);
+        }
+        residency_after = Some(ResidencySnapshot::capture_paths(&shard_paths));
+    }
+
+    if residency_report {
+        if let (Some(manager), Some(admission), Some(before), Some(after)) = (
+            residency_manager.as_ref(),
+            residency_admission.clone(),
+            residency_before.clone(),
+            residency_after.clone(),
+        ) {
+            let report = ResidencyReport {
+                model_id: manager.model_id().clone(),
+                inventory: manager.inventory().summary,
+                admission,
+                pre_plan: pre_operation_plan.clone(),
+                post_plan: post_operation_plan.clone(),
+                application: residency_application.clone(),
+                before,
+                after,
+                elapsed: residency_started.elapsed(),
+            };
+            print_residency_report(&report);
+        }
+    } else if residency_policy != ResidencyPolicyArg::Off {
+        let pre_selected = pre_operation_plan
+            .as_ref()
+            .map(|plan| plan.selected.len())
+            .unwrap_or(0);
+        let post_selected = post_operation_plan
+            .as_ref()
+            .map(|plan| plan.selected.len())
+            .unwrap_or(0);
+        let released = residency_application
+            .as_ref()
+            .and_then(|application| application.native_result.as_ref())
+            .map(|result| result.released_bytes)
+            .unwrap_or(0);
+        eprintln!(
+            "Residency: policy={:?} pre_selected={} post_selected={} applied={} released={}",
+            residency_policy,
+            pre_selected,
+            post_selected,
+            residency_application.is_some(),
+            format_bytes(released)
         );
     }
     if memory_report {
@@ -1317,6 +1630,139 @@ fn output_memory_report(report: &ramforge_runtime::memory_report::MemoryReport) 
             .unwrap_or_else(|| "unavailable".to_string())
     );
     eprintln!("  Note: RAMforge MemoryBudget does not control Linux page cache or total RSS.");
+}
+
+fn print_residency_plan(label: &str, plan: &ResidencyPlan) {
+    eprintln!(
+        "Residency {label} plan: mode={:?} target={} reserve={} current={} ({:?}) selected={} estimated_reclaim={} estimated_after={} estimated_budget_met={}",
+        plan.mode,
+        optional_bytes(plan.target_bytes),
+        format_bytes(plan.safety_reserve_bytes),
+        optional_bytes(plan.observed_bytes),
+        plan.measurement_source,
+        plan.selected.len(),
+        format_bytes(plan.estimated_reclaim_bytes),
+        optional_bytes(plan.estimated_after_bytes),
+        plan.estimated_budget_met
+    );
+    let mut reason_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for decision in &plan.decisions {
+        *reason_counts
+            .entry(format!("{:?}", decision.reason))
+            .or_default() += 1;
+    }
+    eprintln!("  decisions: {reason_counts:?}");
+    for (shown, decision) in plan
+        .decisions
+        .iter()
+        .filter(|decision| decision.action == DecisionAction::Release)
+        .enumerate()
+    {
+        if shown >= 20 {
+            eprintln!("  ... additional release decisions omitted");
+            break;
+        }
+        eprintln!(
+            "  release {} (layer={:?}) pages={} shared={} estimated_reclaim={}",
+            decision.name,
+            decision.layer,
+            format_bytes(decision.page_bytes),
+            format_bytes(decision.shared_page_bytes),
+            format_bytes(decision.estimated_reclaim_bytes)
+        );
+    }
+    for note in &plan.notes {
+        eprintln!("  note: {note}");
+    }
+}
+
+fn print_residency_report(report: &ResidencyReport) {
+    eprintln!();
+    eprintln!("Residency report:");
+    eprintln!("  Model: {}", report.model_id.0);
+    eprintln!(
+        "  Inventory: tensors={} file_backed={} anonymous={} mappings={} file_bytes={} anonymous_bytes={} page_bytes={} shared_page_bytes={}",
+        report.inventory.tensors,
+        report.inventory.file_backed_tensors,
+        report.inventory.anonymous_tensors,
+        report.inventory.mappings,
+        format_bytes(report.inventory.logical_file_backed_bytes),
+        format_bytes(report.inventory.logical_anonymous_bytes),
+        format_bytes(report.inventory.page_bytes),
+        format_bytes(report.inventory.shared_page_bytes)
+    );
+    eprintln!(
+        "  Admission: {:?}; current={} soft_target={} hard_limit={} reserve={} known_tensor_bytes={}",
+        report.admission.outcome,
+        optional_bytes(report.admission.current_bytes),
+        optional_bytes(report.admission.soft_target_bytes),
+        optional_bytes(report.admission.hard_limit_bytes),
+        format_bytes(report.admission.safety_reserve_bytes),
+        format_bytes(report.admission.known_tensor_bytes)
+    );
+    for reason in &report.admission.reasons {
+        eprintln!("    reason: {reason}");
+    }
+    eprintln!(
+        "  Admission unknown components: {}",
+        report.admission.unknown_components.join(", ")
+    );
+    if let Some(plan) = &report.pre_plan {
+        print_residency_plan("pre-operation", plan);
+    }
+    if let Some(plan) = &report.post_plan {
+        print_residency_plan("post-operation", plan);
+    }
+    if let Some(application) = &report.application {
+        eprintln!(
+            "  Application: attempted={} native_indices={} elapsed={}",
+            application.attempted_keys.len(),
+            application.native_indices.len(),
+            format_duration(application.elapsed)
+        );
+        if let Some(result) = &application.native_result {
+            eprintln!(
+                "    native: released={} skipped_shared={} non_file_backed={} selected={}",
+                format_bytes(result.released_bytes),
+                format_bytes(result.skipped_shared_bytes),
+                result.non_file_backed_tensors,
+                result.selected_tensors
+            );
+        }
+        if let Some(error) = &application.error {
+            eprintln!("    error: {error}");
+        }
+    } else {
+        eprintln!("  Application: none");
+    }
+    eprintln!(
+        "  Mapping residency: before={} after={} delta={}",
+        optional_bytes(report.before.mapping_rss_bytes),
+        optional_bytes(report.after.mapping_rss_bytes),
+        report
+            .before
+            .mapping_delta(&report.after)
+            .map(|delta| format!("{delta:+} bytes"))
+            .unwrap_or_else(|| "unavailable".to_string())
+    );
+    eprintln!(
+        "  Process RSS: before={} after={} peak={}",
+        optional_bytes(report.before.process_rss_bytes),
+        optional_bytes(report.after.process_rss_bytes),
+        optional_bytes(report.after.process_rss_peak_bytes)
+    );
+    eprintln!(
+        "  Cgroup: before_current={} after_current={} peak={} events={:?}",
+        optional_bytes(report.before.cgroup_current_bytes),
+        optional_bytes(report.after.cgroup_current_bytes),
+        optional_bytes(report.after.cgroup_peak_bytes),
+        report.after.cgroup_events
+    );
+    eprintln!("  Residency elapsed: {}", format_duration(report.elapsed));
+    eprintln!(
+        "  Note: released bytes are page bytes submitted to madvise, not proof of RSS reduction; layer grouping uses tensor-name convention."
+    );
 }
 
 fn output_forgecore_memory_report(report: &ForgeCoreMemoryReport) {

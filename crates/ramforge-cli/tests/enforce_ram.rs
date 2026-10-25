@@ -24,6 +24,10 @@ fn help_lists_memory_control_flags() {
         "--release-mapping-pages",
         "--inspect-layer",
         "--release-layer",
+        "--residency-policy",
+        "--residency-target",
+        "--residency-reserve",
+        "--residency-report",
     ] {
         assert!(text.contains(flag), "help must list {flag}: {text}");
     }
@@ -118,6 +122,79 @@ fn layer_residency_flags_are_rejected_for_the_legacy_backend() {
         text.contains(
             "--inspect-layer and --release-layer are only supported with --backend forgecore"
         ),
+        "unexpected stderr: {text}"
+    );
+}
+
+#[test]
+fn residency_policy_is_rejected_for_the_legacy_backend() {
+    let output = ramforge()
+        .args([
+            "run",
+            "/nonexistent/model.gguf",
+            "--ram",
+            "64M",
+            "--prompt",
+            "hi",
+            "--residency-policy",
+            "observe",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("residency policy, target, reserve, and report controls are only supported with --backend forgecore"),
+        "unexpected stderr: {text}"
+    );
+}
+
+#[test]
+fn residency_target_requires_policy_or_report() {
+    let output = ramforge()
+        .args([
+            "run",
+            "/nonexistent/model.gguf",
+            "--ram",
+            "64M",
+            "--prompt",
+            "hi",
+            "--residency-target",
+            "32M",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("require --residency-policy observe|active or --residency-report"),
+        "unexpected stderr: {text}"
+    );
+}
+
+#[test]
+fn residency_reserve_cannot_exceed_target() {
+    let output = ramforge()
+        .args([
+            "run",
+            "/nonexistent/model.gguf",
+            "--ram",
+            "64M",
+            "--prompt",
+            "hi",
+            "--residency-policy",
+            "observe",
+            "--residency-target",
+            "32M",
+            "--residency-reserve",
+            "64M",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        text.contains("exceeds --residency-target"),
         "unexpected stderr: {text}"
     );
 }
@@ -271,6 +348,94 @@ fn release_layer_reports_selected_tensor_ranges() {
     ] {
         assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
     }
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn observe_policy_reports_without_applying() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--residency-policy",
+            "observe",
+            "--residency-target",
+            "64M",
+            "--residency-report",
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "run failed: {stderr}");
+    assert!(
+        stderr.contains("Residency report:"),
+        "missing report: {stderr}"
+    );
+    assert!(
+        stderr.contains("Application: none"),
+        "observe applied: {stderr}"
+    );
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn active_policy_applies_release_at_post_operation_boundary() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--residency-policy",
+            "active",
+            "--residency-target",
+            "32M",
+            "--residency-report",
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "run failed: {stderr}");
+    assert!(
+        stderr.contains("Residency report:"),
+        "missing report: {stderr}"
+    );
+    assert!(
+        stderr.contains("Application:"),
+        "missing application: {stderr}"
+    );
+    assert!(
+        stderr.contains("native: released="),
+        "no native release: {stderr}"
+    );
 }
 
 #[test]

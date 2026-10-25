@@ -125,6 +125,15 @@ Flags:
   skipped conservatively. This is tensor/range-scoped, not per-layer execution
   scheduling, and cannot guarantee a lower load-time peak. It conflicts with
   `--release-mapping-pages` and `--inspect-layer`.
+- `--residency-policy off|observe|active`: execution-aware residency policy.
+  `off` is the default. `observe` builds inventory/plans and reports without
+  mutation. `active` applies eligible tensor releases at a safe post-operation
+  boundary. It cannot release during decode.
+- `--residency-target SIZE`: soft process residency target. Defaults to
+  `--ram` for observe/active. This is not a hard limit.
+- `--residency-reserve SIZE`: safety reserve subtracted from the soft target.
+- `--residency-report`: print the structured inventory, admission, plans,
+  application result, and before/after observations.
 
 ### Enforced budget matrix
 
@@ -264,6 +273,52 @@ those pages were already nonresident under the 8G cap. TTFT 9.207 s; wall
 This is range-scoped page advice, not execution scheduling. It does not
 release pages during decode, does not implement per-layer eviction, and does
 not guarantee a lower load-time peak.
+
+### Execution-aware residency engine
+
+The runtime now has a RAMforge-owned residency engine
+(`ramforge-runtime/src/residency_engine.rs`) connected to the real forgeCORE
+decode path:
+
+1. Build a model-scoped `ResourceInventory` from native tensor metadata.
+2. Classify file-backed, anonymous/repacked, and unknown resources.
+3. Infer layer identity only from the tested `blk.N.*` naming convention; an
+   unrecognized name remains unknown.
+4. Compute page ranges and conservative shared-page bytes.
+5. Apply a deterministic policy with soft target, safety reserve,
+   required/pinned exclusions, and estimated reclaimable capacity.
+6. Enforce lifecycle transitions around decode:
+   `ModelReady -> PreparingOperation -> Executing -> Synchronizing -> SafeBoundary -> Planning -> Applying -> SafeBoundary`.
+7. Apply releases only after the context is dropped at a safe boundary.
+8. Report estimates, native results, and before/after observations separately.
+
+`decode_tokens` copies logits through `llama_get_logits_ith`, which synchronizes
+native work; the adapter also calls `synchronize()` explicitly before the
+lifecycle enters `SafeBoundary`. No release is attempted while a decode is
+active. There is no intra-decode layer callback or layer eviction scheduler.
+
+Qwen2.5-1.5B Q4_0, 1 GiB enforced, `--no-repack`, prompt
+`The capital of France is`, 8 greedy tokens, `--ctx 256`:
+
+| Policy | TTFT | Decode | Wall | Mapping before/after | Process RSS before/after | Peak cgroup |
+|---|---:|---:|---:|---|---|---:|
+| off | 360.3 ms | 3.46 tok/s | 3.21 s | 856.64 MiB / 856.64 MiB | 1.00 GiB / 1.00 GiB | 1 GiB |
+| observe, target 512M | 364.0 ms | 3.20 tok/s | 3.41 s | 862.54 / 862.54 MiB | 1.00 / 1.00 GiB | 1 GiB |
+| active, target 512M | 353.1 ms | 3.41 tok/s | 3.31 s | 855.68 / 476.57 MiB | 1021.21 / 642.10 MiB | 1 GiB |
+
+Active post-operation result: 30 selected tensors, 514.44 MiB submitted,
+84.00 KiB shared pages skipped; mapping delta `-397,520,896` bytes; process RSS
+delta `-397,525,760` bytes; cgroup current unchanged at 1022.50 MiB; peak
+1 GiB; no OOM. The plan's `estimated_after` was 506.84 MiB and
+`estimated_budget_met=true`, but the observed process RSS remained 642.10 MiB
+above the 512 MiB target. The estimate is not a guarantee: anon/KV/scratch
+memory and unsubmitted/shared pages remain. The cgroup remains the enforcement
+mechanism; the soft target is policy only.
+
+Observe mode selected 31 tensors in its post-operation plan and performed no
+native release; mapping and process residency were unchanged. Admission for
+both target-512M runs was `AdmittedWithWarning`, because current process
+memory plus reserve exceeded the soft target.
 
 ### GPT-NeoX-20B under 8 GiB
 
@@ -706,7 +761,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **446 tests, 0 failed, 10 ignored**. The ignored tests are the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, two real cgroup enforcement tests, and five CLI enforcement tests. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **463 tests, 0 failed, 12 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, and the opt-in observe/active residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 
