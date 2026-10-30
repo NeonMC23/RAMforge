@@ -16,7 +16,7 @@ use crate::execution_profile::{ExecutionProfile, ProfileIdentity};
 use crate::memory_ledger::MemoryLedger;
 use crate::memory_report::{process_rss, process_rss_peak};
 use crate::page_residency::model_mapping_residency;
-use crate::prediction::{PredictionHistorySummary, PredictionSet};
+use crate::prediction::{PredictionHistorySummary, PredictionMetrics, PredictionSet};
 use crate::prediction_planner::{PredictionPlan, StagingExecution};
 use crate::resource_lifetime::{LifetimeEvent, ResourceLifetime as ResourceLifetimeTracker};
 
@@ -1164,6 +1164,19 @@ pub struct StagingResult {
 }
 
 /// One measured/estimated residency snapshot.
+pub fn process_faults() -> (Option<u64>, Option<u64>) {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return (None, None);
+    };
+    let Some((_, tail)) = stat.rsplit_once(')') else {
+        return (None, None);
+    };
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    let minor = fields.get(7).and_then(|value| value.parse().ok());
+    let major = fields.get(9).and_then(|value| value.parse().ok());
+    (minor, major)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResidencySnapshot {
     pub process_rss_bytes: Option<u64>,
@@ -1173,6 +1186,8 @@ pub struct ResidencySnapshot {
     pub cgroup_current_bytes: Option<u64>,
     pub cgroup_peak_bytes: Option<u64>,
     pub cgroup_events: Option<CgroupEvents>,
+    pub process_minor_faults: Option<u64>,
+    pub process_major_faults: Option<u64>,
 }
 
 impl ResidencySnapshot {
@@ -1217,6 +1232,7 @@ impl ResidencySnapshot {
         mapping_pss_bytes: Option<u64>,
         cgroup: Option<CgroupStats>,
     ) -> Self {
+        let (process_minor_faults, process_major_faults) = process_faults();
         Self {
             process_rss_bytes,
             process_rss_peak_bytes,
@@ -1225,6 +1241,8 @@ impl ResidencySnapshot {
             cgroup_current_bytes: cgroup.as_ref().and_then(|value| value.current_bytes),
             cgroup_peak_bytes: cgroup.as_ref().and_then(|value| value.peak_bytes),
             cgroup_events: cgroup.and_then(|value| value.events),
+            process_minor_faults,
+            process_major_faults,
         }
     }
 
@@ -1279,10 +1297,13 @@ pub struct ResidencyReport {
     pub native_quiescent: bool,
     pub native_context_id: Option<u64>,
     pub native_execution_generation: Option<u64>,
+    pub minor_faults_before_load: Option<u64>,
+    pub major_faults_before_load: Option<u64>,
     pub lifetime_counts: BTreeMap<String, usize>,
     pub prediction_set: Option<PredictionSet>,
     pub prediction_plan: Option<PredictionPlan>,
     pub prediction_staging: Option<StagingExecution>,
+    pub prediction_metrics: Option<PredictionMetrics>,
     pub prediction_history: Option<PredictionHistorySummary>,
     pub ledger: MemoryLedger,
     pub before: ResidencySnapshot,

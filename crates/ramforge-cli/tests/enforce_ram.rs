@@ -667,6 +667,7 @@ fn json_report_is_versioned_and_keeps_measurements_distinct() {
     assert_eq!(report["native_lifetime"]["quiescent"], true);
     assert!(report["native_lifetime"]["context_id"].is_u64());
     assert!(report["resource_lifetime_states"].is_object());
+    assert!(report["process_faults"]["after_minor"].is_u64());
     assert!(report["admission"]["eligible_reclaimable_bytes"].is_u64());
     assert_eq!(report["admission"]["native_contract_version"], 1);
     assert!(report["profile_source"].is_string());

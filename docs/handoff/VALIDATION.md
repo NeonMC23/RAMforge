@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 509 passed, 0 failed, 18 ignored.
+- `cargo test --workspace`: 511 passed, 0 failed, 18 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -309,6 +309,18 @@ Not run or not claimed:
 - Prediction JSON report and profile/history identity validation: passed.
 - Prediction never sets `release_authorized=true`; `FinalUseProven` remains
   unreachable for model weights.
+- `scripts/prediction-bench.py` five-arm/four-workload matrix:
+  - 100/100 no-pressure runs succeeded, 5 repetitions;
+  - 100/100 256 MiB cgroup runs succeeded, 5 repetitions;
+  - cache state uncontrolled (`cache_controlled=false`);
+  - mapping delta 0 B in all arms; no RSS reduction;
+  - 256 MiB predictive medians: major faults 4 vs baseline 5 (alternate),
+    2 vs 3 (short workloads), and TTFT lower on alternate/short workloads;
+  - long-workload prediction was neutral/slightly worse. This is an
+    association, not a proven causal speedup.
+- Metric calibration: 64 predicted, 64 matched observed, 63 within horizon,
+  precision 100%, recall 23.5%, 57 prefetch-followed, 57 benefit-unknown,
+  7 duplicate/overlap avoided. Correct prediction is not useful prefetch.
 
 ## Native lifetime validation — 2026-10-30
 
@@ -331,7 +343,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          509 passed, 0 failed, 18 ignored
+cargo test --workspace                          511 passed, 0 failed, 18 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

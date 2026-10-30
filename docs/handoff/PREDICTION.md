@@ -24,12 +24,13 @@ Confidence is expressed in basis points and is explainable:
 
 ```text
 base = 5500 + 1000 * min(complete_observations, 4)
-confidence = base                              (no history samples)
-confidence = (base * 2 + historical_accuracy) / 3   (history samples)
+confidence = base                              (no usable history)
+confidence = (base * 2 + historical_accuracy) / 3   (usable history)
 ```
 
-`historical_accuracy` is `hits / (hits + misses) * 10000` from the validated
-prediction history. Classes are:
+`historical_accuracy` uses at least 3 samples for a tensor; if unavailable, it
+falls back to global history only after at least 10 samples. A single hit does
+not turn a cold profile into 100% confidence. Classes are:
 
 - high: `>= 7500`
 - medium: `>= 5000`
@@ -41,6 +42,39 @@ this classification. The predictor is deterministic for identical inputs.
 Predicted order comes from the profile's stable tensor `last_order`. The
 expected distance is `last_order - first_order` where observed. Predictions are
 ranked by confidence, predicted order, size, and stable tensor index.
+
+## Metric definitions
+
+The report separates the following; they are not interchangeable:
+
+- **Prediction generated** — an advisory resource prediction.
+- **Prediction matched observed** — the stable tensor appeared in the later
+  observed execution. This is prediction accuracy, not prefetch usefulness.
+- **Prediction matched within horizon** — the tensor appeared within the first
+  `horizon` observed model resources. The current evaluation horizon is the
+  configured lookahead (64).
+- **Prefetch requested** — resources selected by the planner.
+- **Prefetch accepted** — native prefetch returned success. Per-resource
+  acceptance is only reported when the aggregate accepted bytes equal the
+  requested bytes; partial acceptance is marked unknown.
+- **Prefetch followed by observed access** — a selected resource was later
+  observed. This is a usefulness proxy, not proof of fault avoidance.
+- **Prefetch with observed residency** — currently unknown per resource; the
+  pinned API returns aggregate accepted bytes, not per-resource residency.
+- **Prefetch not followed within evaluation** — selected resources not observed.
+- **Prefetch benefit unknown** — accepted resources for which no page-fault or
+  I/O attribution is available.
+- **Duplicate/overlap avoided** — planner decisions that deduplicated a request.
+- **Rejected/deferred** — explicit planner outcomes.
+- **Staging bytes requested/accepted/observed** — three separate quantities.
+- **Physical residency benefit** — not inferred from `madvise` success or RSS.
+- **Performance benefit** — only from repeated measured timing; not implied by
+  prediction accuracy.
+
+Precision = matched predictions / generated predictions. Recall uses only
+observed **inventory resources**, not all transient graph tensor names. False
+positive rate = unmatched predictions / generated predictions. All counters are
+deterministic for fixed inputs and avoid overlapping-page double counting.
 
 ## Planner
 
@@ -77,12 +111,10 @@ staging request is not presented as accepted or resident.
 ## Prediction feedback
 
 After a complete current trace, predictions are compared with observed stable
-tensor accesses:
-
-- hit/miss counts;
-- staged request count and bytes;
-- staged bytes whose tensor was not observed (wasted speculative staging);
-- rolling accuracy in basis points.
+inventory resources. The history separates prediction accuracy, within-horizon
+matches, prefetch accepted/followed/not-followed, unknown benefit, duplicate
+avoidance, and calibration buckets. Legacy v1 histories migrate by filling
+new fields with zero; v2 is written on save.
 
 The feedback history is separate from the execution profile, versioned, bounded
 to 16 MiB and 100,000 records, atomically written, and identity-validated.
@@ -113,6 +145,22 @@ The report's `prediction` section contains the source, confidence counts,
 predictions, planner decisions, requested/accepted staging bytes, observed
 mapping delta, and feedback counters. JSON and human output use the same data.
 
+## Calibration findings
+
+On the SmolLM2 test profile, 64 predicted model resources all matched the next
+execution (precision 100%) but only 63 fell within the 64-resource horizon and
+only 23.5% of the 272 observed inventory resources were covered by the
+lookahead. All 57 accepted prefetch resources were later observed, but their
+per-resource residency and fault benefit are unknown. This is the key
+distinction: a 100% prediction-match rate is **not** evidence of useful
+physical prefetch or performance gain.
+
+Cold-start predictions were medium confidence; a warm feedback history raised
+them to high confidence. The real-model benchmark did not find a universal
+speedup. Under a 256 MiB cgroup, predictive arms showed fewer major faults and
+lower TTFT on some workloads, but long-workload results were mixed and this was
+not a controlled cold-cache experiment.
+
 ## Deterministic simulation
 
 ```sh
@@ -122,7 +170,10 @@ ramforge simulate --budget 12K --window 8K --wrong-history
 
 The simulator compares a baseline against predictive staging with a synthetic
 five-resource model. It reports hits/misses, reread bytes, staged/wasted bytes,
-peak resident bytes, budget violations, and release authorization. It is
+prediction precision/recall and within-horizon matches, peak resident bytes,
+budget violations, and release authorization. For the standard 12K/8K scenario,
+prediction matches 2 of 5 test accesses (precision 100%, recall 40%); the
+wrong-history scenario matches 0 (precision 0%) and wastes 8,192 bytes. It is
 simulation evidence only, not hardware performance evidence.
 
 Tests cover correct/wrong history, zero budget, unknown size, bounded staging,

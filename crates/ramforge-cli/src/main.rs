@@ -14,11 +14,12 @@ use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::page_residency::{evict_file_cache, model_mapping_residency};
 use ramforge_runtime::prediction::{
     load_prediction_history, predict_from_profile, PredictionConfig, PredictionHistory,
-    PredictionSet,
+    PredictionMetrics, PredictionSet,
 };
 use ramforge_runtime::prediction_planner::{
-    execute_staging, plan_predictions, PredictionPlan, StagingExecution,
+    evaluate_predictions, execute_staging, plan_predictions, PredictionPlan, StagingExecution,
 };
+use ramforge_runtime::residency_engine::process_faults;
 use ramforge_runtime::residency_engine::{
     AdmissionDecision, AdmissionOutcome, DecisionAction, ManagerError, ModelGeneration, ModelId,
     OperationContext, OperationTiming, ResidencyCapabilities, ResidencyManager, ResidencyPlan,
@@ -1062,6 +1063,7 @@ fn run_forgecore_inference(
 ) -> anyhow::Result<()> {
     let model_load_started = Instant::now();
     let rss_before_load = process_rss();
+    let (minor_faults_before_load, major_faults_before_load) = process_faults();
 
     // The explicit ForgeCore backend is the only owner of model execution in
     // this branch. RAMforge still owns device selection, prompt tokenization,
@@ -1253,6 +1255,7 @@ fn run_forgecore_inference(
     let mut prediction_set: Option<PredictionSet> = None;
     let mut prediction_plan: Option<PredictionPlan> = None;
     let mut prediction_staging: Option<StagingExecution> = None;
+    let mut prediction_metrics: Option<PredictionMetrics> = None;
     let residency_started = Instant::now();
     let mut residency_manager = if residency_policy != ResidencyPolicyArg::Off
         || residency_report
@@ -1796,18 +1799,43 @@ fn run_forgecore_inference(
                     if let (Some(set), Some(plan)) =
                         (prediction_set.as_ref(), prediction_plan.as_ref())
                     {
+                        let metrics = evaluate_predictions(
+                            set,
+                            &profile,
+                            manager.inventory(),
+                            plan,
+                            prediction_staging.as_ref(),
+                            prediction_config.lookahead,
+                        );
                         if let Some(history) = prediction_history.as_mut() {
                             history.record_feedback(set, &profile, &plan.staged_bytes_by_name);
+                            history.record_evaluation(&metrics);
                             let summary = history.summary();
                             eprintln!(
-                                "Prediction feedback: hits={} misses={} staged_requests={} wasted_bytes={} accuracy_bps={:?}",
+                                "Prediction evaluation: matched={} within_horizon={} precision_bps={:?} recall_bps={:?} fpr_bps={:?} accepted_resources={:?} followed_by_access={:?} not_followed={:?} observed_residency={:?}",
+                                metrics.matched_observed,
+                                metrics.matched_within_horizon,
+                                metrics.precision_bps,
+                                metrics.recall_bps,
+                                metrics.false_positive_rate_bps,
+                                metrics.prefetch_accepted_resources,
+                                metrics.prefetch_followed_by_observed_access,
+                                metrics.prefetch_not_followed_by_observed_access,
+                                metrics.prefetch_observed_residency_resources
+                            );
+                            eprintln!(
+                                "Prediction history: hits={} misses={} within_horizon={} staged_requests={} accepted_bytes={} followed_by_access={} wasted_bytes={} accuracy_bps={:?}",
                                 summary.hits,
                                 summary.misses,
+                                summary.matched_within_horizon,
                                 summary.staged_requests,
+                                summary.prefetch_accepted_bytes,
+                                summary.prefetch_followed_by_access,
                                 summary.wasted_bytes,
                                 summary.accuracy_bps
                             );
                         }
+                        prediction_metrics = Some(metrics);
                     }
                 }
                 if let Some(path) = prediction_history_save.as_ref() {
@@ -1965,10 +1993,13 @@ fn run_forgecore_inference(
                 native_quiescent: manager.native_quiescent(),
                 native_context_id,
                 native_execution_generation,
+                minor_faults_before_load,
+                major_faults_before_load,
                 lifetime_counts: manager.lifetime_counts(),
                 prediction_set: prediction_set.clone(),
                 prediction_plan: prediction_plan.clone(),
                 prediction_staging: prediction_staging.clone(),
+                prediction_metrics: prediction_metrics.clone(),
                 prediction_history: prediction_history.as_ref().map(|history| history.summary()),
                 ledger: MemoryLedger::from_inventory(
                     manager.model_id().clone(),
@@ -2147,6 +2178,7 @@ fn run_simulation(
         staging_window_bytes: window.min(budget),
         speculative_budget_bytes: window.saturating_div(2).min(budget),
         min_confidence_bps: 5_000,
+        prediction_horizon: 4,
         resources: names
             .iter()
             .map(|name| SimResource {
@@ -2183,6 +2215,11 @@ fn run_simulation(
                     "reread_bytes": result.predictive.reread_bytes,
                     "staged_bytes": result.predictive.staged_bytes,
                     "wasted_staged_bytes": result.predictive.wasted_staged_bytes,
+                    "predicted_resources": result.predictive.predicted_resources,
+                    "matched_resources": result.predictive.matched_resources,
+                    "within_horizon_matches": result.predictive.within_horizon_matches,
+                    "prediction_precision_bps": result.predictive.prediction_precision_bps,
+                    "prediction_recall_bps": result.predictive.prediction_recall_bps,
                     "peak_resident_bytes": result.predictive.peak_resident_bytes,
                     "budget_violations": result.predictive.budget_violations,
                     "release_authorized": result.predictive.release_authorized,
@@ -2749,6 +2786,32 @@ fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
                     "known_size": prediction.known_size,
                     "reason": prediction.reason,
                 })).collect::<Vec<_>>(),
+                "metrics": report.prediction_metrics.as_ref().map(|metrics| serde_json::json!({
+                    "horizon": metrics.horizon,
+                    "predictions": metrics.predictions_generated,
+                    "matched_observed": metrics.matched_observed,
+                    "matched_within_horizon": metrics.matched_within_horizon,
+                    "missed_predictions": metrics.missed_observed,
+                    "observed_distinct": metrics.observed_distinct,
+                    "precision_bps": metrics.precision_bps,
+                    "recall_bps": metrics.recall_bps,
+                    "false_positive_rate_bps": metrics.false_positive_rate_bps,
+                    "prefetch_requested_resources": metrics.prefetch_requested_resources,
+                    "prefetch_requested_bytes": metrics.prefetch_requested_bytes,
+                    "prefetch_accepted_bytes": metrics.prefetch_accepted_bytes,
+                    "prefetch_accepted_resources": metrics.prefetch_accepted_resources,
+                    "prefetch_followed_by_observed_access": metrics.prefetch_followed_by_observed_access,
+                    "prefetch_not_followed_by_observed_access": metrics.prefetch_not_followed_by_observed_access,
+                    "prefetch_observed_residency_resources": metrics.prefetch_observed_residency_resources,
+                    "prefetch_benefit_unknown_resources": metrics.prefetch_benefit_unknown_resources,
+                    "duplicate_or_overlap_avoided": metrics.duplicate_or_overlap_avoided,
+                    "rejected": metrics.rejected,
+                    "deferred": metrics.deferred,
+                    "observed_mapping_delta_bytes": metrics.observed_mapping_delta_bytes,
+                    "bucket_high": {"predictions": metrics.bucket_high.predictions, "hits": metrics.bucket_high.hits, "within_horizon": metrics.bucket_high.within_horizon, "precision_bps": metrics.bucket_high.precision_bps()},
+                    "bucket_medium": {"predictions": metrics.bucket_medium.predictions, "hits": metrics.bucket_medium.hits, "within_horizon": metrics.bucket_medium.within_horizon, "precision_bps": metrics.bucket_medium.precision_bps()},
+                    "bucket_low": {"predictions": metrics.bucket_low.predictions, "hits": metrics.bucket_low.hits, "within_horizon": metrics.bucket_low.within_horizon, "precision_bps": metrics.bucket_low.precision_bps()},
+                })),
                 "plan": plan.map(|plan| serde_json::json!({
                     "stage_count": plan.stage_keys.len(),
                     "prefetch_count": plan.prefetch_keys.len(),
@@ -2781,6 +2844,19 @@ fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
                     "total_predictions": history.total_predictions,
                     "hits": history.hits,
                     "misses": history.misses,
+                    "matched_within_horizon": history.matched_within_horizon,
+                    "prefetch_requested": history.prefetch_requested,
+                    "prefetch_accepted_bytes": history.prefetch_accepted_bytes,
+                    "prefetch_accepted_resources": history.prefetch_accepted_resources,
+                    "prefetch_followed_by_access": history.prefetch_followed_by_access,
+                    "prefetch_not_followed_by_access": history.prefetch_not_followed_by_access,
+                    "prefetch_benefit_unknown": history.prefetch_benefit_unknown,
+                    "duplicate_or_overlap_avoided": history.duplicate_or_overlap_avoided,
+                    "rejected": history.rejected,
+                    "deferred": history.deferred,
+                    "bucket_high_precision_bps": history.bucket_high_precision_bps,
+                    "bucket_medium_precision_bps": history.bucket_medium_precision_bps,
+                    "bucket_low_precision_bps": history.bucket_low_precision_bps,
                     "staged_requests": history.staged_requests,
                     "staged_bytes": history.staged_bytes,
                     "wasted_bytes": history.wasted_bytes,
@@ -2820,6 +2896,12 @@ fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
             "total_ns": report.timing.total_elapsed.map(|value| value.as_nanos()),
             "stop_reason": report.timing.stop_reason,
             "output_fingerprint": report.timing.output_fingerprint,
+        },
+        "process_faults": {
+            "before_load_minor": report.minor_faults_before_load,
+            "before_load_major": report.major_faults_before_load,
+            "after_minor": report.after.process_minor_faults,
+            "after_major": report.after.process_major_faults,
         },
         "measurements": {
             "before": snapshot_json_value(&report.before),
@@ -2866,6 +2948,8 @@ fn snapshot_json_value(snapshot: &ResidencySnapshot) -> serde_json::Value {
         "mapping_pss_bytes": snapshot.mapping_pss_bytes,
         "cgroup_current_bytes": snapshot.cgroup_current_bytes,
         "cgroup_peak_bytes": snapshot.cgroup_peak_bytes,
+        "process_minor_faults": snapshot.process_minor_faults,
+        "process_major_faults": snapshot.process_major_faults,
         "cgroup_events": snapshot.cgroup_events.as_ref().map(|events| serde_json::json!({
             "low": events.low,
             "high": events.high,
@@ -3031,6 +3115,13 @@ fn print_residency_report(report: &ResidencyReport) {
         optional_bytes(report.before.process_rss_bytes),
         optional_bytes(report.after.process_rss_bytes),
         optional_bytes(report.after.process_rss_peak_bytes)
+    );
+    eprintln!(
+        "  Page faults (process-wide, not attributable to prefetch): before_load_minor={:?} after_minor={:?} before_load_major={:?} after_major={:?}",
+        report.minor_faults_before_load,
+        report.after.process_minor_faults,
+        report.major_faults_before_load,
+        report.after.process_major_faults
     );
     eprintln!(
         "  Cgroup: before_current={} after_current={} peak={} events={:?}",

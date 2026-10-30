@@ -145,20 +145,73 @@ successful reclamation.
 
 ## Predictive measurements
 
-SmolLM2-135M Q4_K_M, one token, loaded profile, `PREDICTION=1`:
+The dedicated harness is `scripts/prediction-bench.py`. It rotates five arms
+across four workloads, runs five repetitions per arm/workload by default, and
+writes per-run JSON, `results.tsv`, and `summary.json`. Cache state was not
+controlled: **no run is labeled cold**. The script records
+`cache_controlled=false`.
 
-- 64 medium-confidence predictions;
-- 56 selected for speculative prefetch; 8 deferred by page-range deduplication/window;
-- requested **16,650,240 B**, native-accepted **16,650,240 B**;
-- observed mapping RSS delta **0 B**;
-- feedback: 64 hits, 0 misses, 0 wasted staged bytes for that trace.
+```sh
+python3 scripts/prediction-bench.py \
+  --model MODEL.gguf --profile profile.json --history history.json \
+  --out /tmp/pred-bench --repeats 5 --target 192M
+# constrained:
+python3 scripts/prediction-bench.py \
+  --model MODEL.gguf --profile profile.json --history history.json \
+  --out /tmp/pred-press --repeats 5 --target 256M --enforce
+```
 
-With a warm feedback history, confidence classified all 64 as high:
-**17,375,232 B** requested/accepted, mapping delta still **0 B**. A same-model
-one-token A/B (baseline `off`/`observe` vs prediction, two repeats, no
-enforcement) showed mapping delta **0 B** and essentially unchanged process RSS
-in both arms. These are hint/accounting measurements; this workload did not
-demonstrate a throughput or RSS improvement.
+Arms: baseline (no prediction/no prefetch), reactive (existing bounded
+prefetch), predictive, predictive conservative, predictive aggressive. Run
+order is rotated by workload/repetition. Cache state was not controlled or
+verified, so no result is labeled cold; the summary records
+`cache_controlled=false`.
+
+SmolLM2-135M Q4_K_M, five repetitions, no cgroup enforcement, 192 MiB target:
+
+| Workload | Baseline TTFT | Predictive TTFT | Mapping delta | Major-fault delta |
+|---|---:|---:|---:|---:|
+| alternate | 44.45 ms | 44.84 ms | 0 B | 0 / 0 |
+| short-long | 30.55 ms | 30.38 ms | 0 B | 0 / 0 |
+| short-short | 30.81 ms | 30.91 ms | 0 B | 0 / 0 |
+| long-short | 659.14 ms | 706.49 ms | 0 B | 0 / 0 |
+
+Under a 256 MiB cgroup, five repetitions:
+
+| Workload | Baseline TTFT | Predictive TTFT | Conservative TTFT | Major faults baseline/predictive |
+|---|---:|---:|---:|---:|
+| alternate | 86.42 ms | 81.13 ms | 77.93 ms | 5 / 4 |
+| short-long | 70.29 ms | 65.11 ms | 66.63 ms | 3 / 2 |
+| short-short | 73.74 ms | 65.74 ms | 64.65 ms | 3 / 2 |
+| long-short | 689.54 ms | 695.68 ms | 714.56 ms | 5 / 4 |
+
+Page faults are process-wide `/proc/self/stat` counters sampled before model
+load and after decode. They include loader, tokenizer, trace, and harness
+activity; the harness reports deltas but cannot attribute them exclusively to
+prefetch. Process RSS and cgroup usage are also process/group measurements, not
+per-resource proof.
+
+RSS remained around 168–184 MiB; mapping delta was **0 B** in all arms, so no
+physical mapping residency benefit was observed. Prediction metrics for the
+warm history were stable across workloads: 64 generated, 64 matched overall,
+63 within the 64-resource horizon, precision 100% (prediction accuracy), recall
+23.5% of 272 observed inventory resources, 57 native-accepted resources
+followed by observed access, 57 with unknown physical benefit, 0 not-followed,
+and 7 duplicate/overlap requests avoided. The 100% precision reflects that all
+predicted model tensors are touched by a transformer execution; it does not
+mean 64 useful prefetches.
+
+Interpretation:
+
+- 100% prediction match is not 100% useful prefetch; all model weights are
+  observed in a run, and per-resource residency/fault benefit is unknown.
+- Under the 256 MiB cgroup, medians show lower TTFT and fewer major faults for
+  three workloads, but the long-short workload was neutral/slightly worse.
+  This is an association under uncontrolled cache/order variance, not a proven
+  causal speedup.
+- No-pressure runs were neutral or slightly slower with prediction. No RSS or
+  mapping reduction was observed.
+- The results do not justify claiming a general performance improvement.
 
 ## Caveats
 

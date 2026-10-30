@@ -338,6 +338,8 @@ mod tests {
             cgroup_current_bytes: Some(500),
             cgroup_peak_bytes: Some(600),
             cgroup_events: None,
+            process_minor_faults: None,
+            process_major_faults: None,
         }
     }
 

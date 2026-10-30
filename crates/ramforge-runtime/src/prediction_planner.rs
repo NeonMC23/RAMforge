@@ -6,7 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::prediction::{PredictedAccess, PredictionConfidence, PredictionConfig, PredictionSet};
+use crate::prediction::{
+    CalibrationCounters, PredictedAccess, PredictionConfidence, PredictionConfig,
+    PredictionMetrics, PredictionSet,
+};
 use crate::residency_engine::{ResourceInventory, ResourceKey};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,6 +405,142 @@ where
     execution
 }
 
+/// Evaluate predictions against a later observed execution. A prediction hit
+/// means only "the stable tensor was observed"; it is not proof that prefetch
+/// helped, that pages became resident, or that performance improved.
+pub fn evaluate_predictions(
+    predictions: &PredictionSet,
+    observed: &crate::execution_profile::ExecutionProfile,
+    inventory: &ResourceInventory,
+    plan: &PredictionPlan,
+    staging: Option<&StagingExecution>,
+    horizon: usize,
+) -> PredictionMetrics {
+    let known_names: std::collections::BTreeSet<&str> = inventory
+        .resources
+        .iter()
+        .map(|resource| resource.name.as_str())
+        .collect();
+    let mut ordered: Vec<(&str, usize)> = observed
+        .access
+        .iter()
+        .filter(|(name, _)| known_names.contains(name.as_str()))
+        .map(|(name, access)| (name.as_str(), access.first_order))
+        .collect();
+    ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+    let observed_rank: BTreeMap<&str, usize> = ordered
+        .iter()
+        .enumerate()
+        .map(|(rank, (name, _))| (*name, rank))
+        .collect();
+    let observed_names: std::collections::BTreeSet<&str> =
+        ordered.iter().map(|(name, _)| *name).collect();
+
+    let mut metrics = PredictionMetrics {
+        horizon,
+        predictions_generated: predictions.predictions.len(),
+        observed_distinct: observed_names.len(),
+        prefetch_requested_resources: plan.stage_keys.len() + plan.prefetch_keys.len(),
+        prefetch_requested_bytes: plan.requested_bytes(),
+        duplicate_or_overlap_avoided: plan
+            .decisions
+            .iter()
+            .filter(|decision| {
+                matches!(
+                    decision.reason,
+                    PredictiveReason::DuplicateRequest | PredictiveReason::SharedPageDeduplicated
+                )
+            })
+            .count(),
+        rejected: plan.rejected,
+        deferred: plan.deferred,
+        ..PredictionMetrics::default()
+    };
+    let mut bucket_high = CalibrationCounters::default();
+    let mut bucket_medium = CalibrationCounters::default();
+    let mut bucket_low = CalibrationCounters::default();
+    for prediction in &predictions.predictions {
+        let hit = observed_names.contains(prediction.name.as_str());
+        let within = observed_rank
+            .get(prediction.name.as_str())
+            .is_some_and(|rank| *rank < horizon);
+        if hit {
+            metrics.matched_observed += 1;
+        }
+        if within {
+            metrics.matched_within_horizon += 1;
+        }
+        let bucket = match prediction.confidence {
+            PredictionConfidence::High => &mut bucket_high,
+            PredictionConfidence::Medium => &mut bucket_medium,
+            PredictionConfidence::Low => &mut bucket_low,
+        };
+        bucket.predictions += 1;
+        if hit {
+            bucket.hits += 1;
+        }
+        if within {
+            bucket.within_horizon += 1;
+        }
+    }
+    metrics.missed_observed = metrics
+        .predictions_generated
+        .saturating_sub(metrics.matched_observed);
+    metrics.precision_bps = (metrics.predictions_generated > 0).then(|| {
+        ((metrics.matched_observed.saturating_mul(10_000)) / metrics.predictions_generated) as u16
+    });
+    metrics.recall_bps = (metrics.observed_distinct > 0).then(|| {
+        ((metrics.matched_observed.saturating_mul(10_000)) / metrics.observed_distinct) as u16
+    });
+    metrics.false_positive_rate_bps = (metrics.predictions_generated > 0).then(|| {
+        ((metrics.missed_observed.saturating_mul(10_000)) / metrics.predictions_generated) as u16
+    });
+    metrics.bucket_high = bucket_high;
+    metrics.bucket_medium = bucket_medium;
+    metrics.bucket_low = bucket_low;
+
+    if let Some(staging) = staging {
+        metrics.prefetch_accepted_bytes = staging.native_accepted_bytes;
+        metrics.observed_mapping_delta_bytes = staging.observed_mapping_delta();
+        let requested = metrics.prefetch_requested_resources;
+        if staging.error.is_some() || requested == 0 {
+            metrics.prefetch_accepted_resources = Some(0);
+            metrics.prefetch_followed_by_observed_access = Some(0);
+            metrics.prefetch_not_followed_by_observed_access = Some(0);
+            metrics.prefetch_benefit_unknown_resources = Some(0);
+        } else if staging.native_accepted_bytes >= metrics.prefetch_requested_bytes {
+            metrics.prefetch_accepted_resources = Some(requested);
+            let selected_names: std::collections::BTreeSet<&str> = plan
+                .decisions
+                .iter()
+                .filter(|decision| {
+                    matches!(
+                        decision.action,
+                        PredictiveAction::StageNow | PredictiveAction::Prefetch
+                    )
+                })
+                .map(|decision| decision.name.as_str())
+                .collect();
+            let followed = selected_names
+                .iter()
+                .filter(|name| observed_names.contains(**name))
+                .count();
+            metrics.prefetch_followed_by_observed_access = Some(followed);
+            metrics.prefetch_not_followed_by_observed_access =
+                Some(requested.saturating_sub(followed));
+            metrics.prefetch_benefit_unknown_resources = Some(requested);
+        } else {
+            // Native acceptance is aggregate; per-resource acceptance is not
+            // observable from the pinned API. Report acceptance as unknown.
+            metrics.prefetch_accepted_resources = None;
+            metrics.prefetch_followed_by_observed_access = None;
+            metrics.prefetch_not_followed_by_observed_access = None;
+            metrics.prefetch_benefit_unknown_resources = Some(requested);
+        }
+    }
+    metrics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +635,55 @@ mod tests {
         });
         assert_eq!(execution.requested_bytes, execution.native_accepted_bytes);
         assert_eq!(execution.operations, 1);
+    }
+
+    #[test]
+    fn evaluation_separates_prediction_hits_from_prefetch_usefulness() {
+        let config = PredictionConfig {
+            enabled: true,
+            staging_window_bytes: 16384,
+            speculative_budget_bytes: 0,
+            min_confidence_bps: 5_000,
+            ..Default::default()
+        };
+        let predictions = predict_from_profile(&config, Some(&profile()), &inventory(), None);
+        let plan = plan_predictions(&config, &predictions, &inventory(), None, None, 0, false);
+        let execution = execute_staging(&config, &plan, |_| Ok(plan.requested_bytes()));
+        let metrics = evaluate_predictions(
+            &predictions,
+            &profile(),
+            &inventory(),
+            &plan,
+            Some(&execution),
+            4,
+        );
+        assert_eq!(metrics.predictions_generated, 2);
+        assert_eq!(metrics.matched_observed, 2);
+        assert_eq!(metrics.precision_bps, Some(10_000));
+        assert_eq!(metrics.prefetch_accepted_resources, Some(2));
+        assert_eq!(metrics.prefetch_followed_by_observed_access, Some(2));
+        assert_eq!(metrics.prefetch_observed_residency_resources, None);
+        assert!(metrics.prefetch_benefit_unknown_resources == Some(2));
+
+        let mut empty = crate::execution_profile::ExecutionProfile::new(
+            ModelId("m".to_string()),
+            ModelGeneration(1),
+        );
+        empty.complete_observations = 1;
+        let empty_metrics = evaluate_predictions(
+            &predictions,
+            &empty,
+            &inventory(),
+            &plan,
+            Some(&execution),
+            4,
+        );
+        assert_eq!(empty_metrics.matched_observed, 0);
+        assert_eq!(empty_metrics.prefetch_followed_by_observed_access, Some(0));
+        assert_eq!(
+            empty_metrics.prefetch_not_followed_by_observed_access,
+            Some(2)
+        );
     }
 
     #[test]

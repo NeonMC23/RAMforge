@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **509 tests, 0 failed, 18 ignored**. The ignored
+  environment variables passes **511 tests, 0 failed, 18 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -72,19 +72,30 @@
   admission-rejected resources are rejected or deferred; page ranges are
   deduplicated; `release_authorized=false`.
 - `prediction_sim.rs` — deterministic simulator comparing baseline and
-  predictive staging with budget/adversarial tests.
+  predictive staging with budget/adversarial tests, plus prediction
+  precision/recall/horizon fields.
 - Prediction feedback history is versioned, bounded, atomically written, and
   contains hit/miss/staging/waste counters. It never contains transient native
   IDs.
 - CLI: `--prediction*`, `--prediction-history-*`, and `ramforge simulate`.
 - Reports include confidence counts, predictions, planner decisions,
-  requested/accepted staging bytes, observed mapping delta, and feedback.
+  requested/accepted staging bytes, observed mapping delta, and separate
+  prediction/prefetch/residency metrics.
+- `scripts/prediction-bench.py` provides rotated five-arm, four-workload
+  experiments with per-run JSON and machine-readable summaries.
 
-Measured SmolLM2-135M Q4_K_M, one token, loaded profile: 64 predictions,
-requested/accepted 16,650,240 B, observed mapping delta 0 B on the first run;
-with warm feedback, 64 high-confidence predictions and 17,375,232 B
-requested/accepted, still 0 B mapping delta. These are hint/accounting
-measurements, not throughput claims.
+Measured SmolLM2-135M Q4_K_M with the dedicated five-arm/four-workload harness
+(five repetitions, rotated order, uncontrolled cache): mapping delta was 0 B in
+all arms and RSS was essentially unchanged. At a 256 MiB cgroup, predictive
+medians had fewer major faults and lower TTFT on short/alternate workloads,
+while the long-workload result was neutral/slightly worse. This is an
+association, not a controlled causal speedup.
+
+Prediction metrics are now separated: 64 generated, 64 matched an observed
+inventory tensor, 63 within the 64-resource horizon, precision 100%, recall
+23.5%, 57 native-accepted prefetches followed by an observed access, 57 with
+unknown physical benefit, 0 not-followed, and 7 duplicate/overlap requests
+avoided. Prediction accuracy is not prefetch benefit.
 
 The simulator (`ramforge simulate --budget 12K --window 8K --json`) compares
 baseline and predictive staging with zero simulated budget violations; it is

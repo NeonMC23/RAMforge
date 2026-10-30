@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::execution_profile::{ExecutionProfile, ProfileIdentity};
 use crate::residency_engine::{ModelGeneration, ModelId, ResourceInventory, TensorResource};
 
-pub const PREDICTION_HISTORY_SCHEMA_VERSION: u32 = 1;
+pub const PREDICTION_HISTORY_SCHEMA_VERSION: u32 = 2;
 pub const PREDICTION_HISTORY_KIND: &str = "ramforge.prediction_history";
 pub const MAX_PREDICTION_HISTORY_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_PREDICTION_HISTORY_RECORDS: usize = 100_000;
@@ -179,13 +179,57 @@ impl PredictionSet {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CalibrationCounters {
+    pub predictions: u64,
+    pub hits: u64,
+    pub within_horizon: u64,
+}
+
+impl CalibrationCounters {
+    pub fn precision_bps(&self) -> Option<u16> {
+        (self.predictions > 0)
+            .then(|| ((self.hits.saturating_mul(10_000)) / self.predictions) as u16)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct PredictionFeedbackRecord {
     pub predictions: u64,
     pub hits: u64,
     pub misses: u64,
+    pub within_horizon: u64,
     pub staged_requests: u64,
     pub staged_bytes: u64,
     pub wasted_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PredictionMetrics {
+    pub horizon: usize,
+    pub predictions_generated: usize,
+    pub matched_observed: usize,
+    pub matched_within_horizon: usize,
+    pub missed_observed: usize,
+    pub observed_distinct: usize,
+    pub precision_bps: Option<u16>,
+    pub recall_bps: Option<u16>,
+    pub false_positive_rate_bps: Option<u16>,
+    pub prefetch_requested_resources: usize,
+    pub prefetch_requested_bytes: u64,
+    pub prefetch_accepted_bytes: u64,
+    pub prefetch_accepted_resources: Option<usize>,
+    pub prefetch_followed_by_observed_access: Option<usize>,
+    pub prefetch_not_followed_by_observed_access: Option<usize>,
+    pub prefetch_observed_residency_resources: Option<usize>,
+    pub prefetch_benefit_unknown_resources: Option<usize>,
+    pub duplicate_or_overlap_avoided: usize,
+    pub rejected: usize,
+    pub deferred: usize,
+    pub observed_mapping_delta_bytes: Option<i128>,
+    pub bucket_high: CalibrationCounters,
+    pub bucket_medium: CalibrationCounters,
+    pub bucket_low: CalibrationCounters,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +242,19 @@ pub struct PredictionHistorySummary {
     pub staged_bytes: u64,
     pub wasted_bytes: u64,
     pub accuracy_bps: Option<u16>,
+    pub matched_within_horizon: u64,
+    pub prefetch_requested: u64,
+    pub prefetch_accepted_bytes: u64,
+    pub prefetch_accepted_resources: u64,
+    pub prefetch_followed_by_access: u64,
+    pub prefetch_not_followed_by_access: u64,
+    pub prefetch_benefit_unknown: u64,
+    pub duplicate_or_overlap_avoided: u64,
+    pub rejected: u64,
+    pub deferred: u64,
+    pub bucket_high_precision_bps: Option<u16>,
+    pub bucket_medium_precision_bps: Option<u16>,
+    pub bucket_low_precision_bps: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +269,32 @@ pub struct PredictionHistory {
     pub staged_requests: u64,
     pub staged_bytes: u64,
     pub wasted_bytes: u64,
+    #[serde(default)]
+    pub matched_within_horizon: u64,
+    #[serde(default)]
+    pub prefetch_requested: u64,
+    #[serde(default)]
+    pub prefetch_accepted_bytes: u64,
+    #[serde(default)]
+    pub prefetch_accepted_resources: u64,
+    #[serde(default)]
+    pub prefetch_followed_by_access: u64,
+    #[serde(default)]
+    pub prefetch_not_followed_by_access: u64,
+    #[serde(default)]
+    pub prefetch_benefit_unknown: u64,
+    #[serde(default)]
+    pub duplicate_or_overlap_avoided: u64,
+    #[serde(default)]
+    pub rejected: u64,
+    #[serde(default)]
+    pub deferred: u64,
+    #[serde(default)]
+    pub bucket_high: CalibrationCounters,
+    #[serde(default)]
+    pub bucket_medium: CalibrationCounters,
+    #[serde(default)]
+    pub bucket_low: CalibrationCounters,
 }
 
 impl PredictionHistory {
@@ -227,16 +310,43 @@ impl PredictionHistory {
             staged_requests: 0,
             staged_bytes: 0,
             wasted_bytes: 0,
+            matched_within_horizon: 0,
+            prefetch_requested: 0,
+            prefetch_accepted_bytes: 0,
+            prefetch_accepted_resources: 0,
+            prefetch_followed_by_access: 0,
+            prefetch_not_followed_by_access: 0,
+            prefetch_benefit_unknown: 0,
+            duplicate_or_overlap_avoided: 0,
+            rejected: 0,
+            deferred: 0,
+            bucket_high: CalibrationCounters::default(),
+            bucket_medium: CalibrationCounters::default(),
+            bucket_low: CalibrationCounters::default(),
         }
     }
 
     pub fn accuracy_bps(&self, tensor: &str) -> Option<u16> {
+        self.tensor_accuracy_bps(tensor, 1)
+    }
+
+    /// Use per-tensor history only after enough independent samples. A single
+    /// hit must not turn a cold profile into 100% confidence.
+    pub fn tensor_accuracy_bps(&self, tensor: &str, min_samples: u64) -> Option<u16> {
         let record = self.records.get(tensor)?;
         let samples = record.hits + record.misses;
-        if samples == 0 {
+        if samples < min_samples.max(1) {
             return None;
         }
         Some(((record.hits.saturating_mul(10_000)) / samples) as u16)
+    }
+
+    pub fn global_accuracy_bps(&self) -> Option<u16> {
+        let samples = self.hits + self.misses;
+        if samples < 10 {
+            return None;
+        }
+        Some(((self.hits.saturating_mul(10_000)) / samples) as u16)
     }
 
     pub fn summary(&self) -> PredictionHistorySummary {
@@ -250,7 +360,20 @@ impl PredictionHistory {
             staged_bytes: self.staged_bytes,
             wasted_bytes: self.wasted_bytes,
             accuracy_bps: (samples > 0)
-                .then_some(((self.hits.saturating_mul(10_000)) / samples) as u16),
+                .then(|| ((self.hits.saturating_mul(10_000)) / samples) as u16),
+            matched_within_horizon: self.matched_within_horizon,
+            prefetch_requested: self.prefetch_requested,
+            prefetch_accepted_bytes: self.prefetch_accepted_bytes,
+            prefetch_accepted_resources: self.prefetch_accepted_resources,
+            prefetch_followed_by_access: self.prefetch_followed_by_access,
+            prefetch_not_followed_by_access: self.prefetch_not_followed_by_access,
+            prefetch_benefit_unknown: self.prefetch_benefit_unknown,
+            duplicate_or_overlap_avoided: self.duplicate_or_overlap_avoided,
+            rejected: self.rejected,
+            deferred: self.deferred,
+            bucket_high_precision_bps: self.bucket_high.precision_bps(),
+            bucket_medium_precision_bps: self.bucket_medium.precision_bps(),
+            bucket_low_precision_bps: self.bucket_low.precision_bps(),
         }
     }
 
@@ -262,6 +385,19 @@ impl PredictionHistory {
         self.staged_requests = 0;
         self.staged_bytes = 0;
         self.wasted_bytes = 0;
+        self.matched_within_horizon = 0;
+        self.prefetch_requested = 0;
+        self.prefetch_accepted_bytes = 0;
+        self.prefetch_accepted_resources = 0;
+        self.prefetch_followed_by_access = 0;
+        self.prefetch_not_followed_by_access = 0;
+        self.prefetch_benefit_unknown = 0;
+        self.duplicate_or_overlap_avoided = 0;
+        self.rejected = 0;
+        self.deferred = 0;
+        self.bucket_high = CalibrationCounters::default();
+        self.bucket_medium = CalibrationCounters::default();
+        self.bucket_low = CalibrationCounters::default();
     }
 
     pub fn record_predictions(&mut self, predictions: &PredictionSet) {
@@ -270,6 +406,73 @@ impl PredictionHistory {
             let record = self.records.entry(prediction.name.clone()).or_default();
             record.predictions = record.predictions.saturating_add(1);
         }
+    }
+
+    /// Record the detailed, non-double-counting evaluation counters. This is
+    /// intentionally separate from per-tensor hit/miss feedback so a caller
+    /// can update both without counting the same event twice.
+    pub fn record_evaluation(&mut self, metrics: &PredictionMetrics) {
+        self.matched_within_horizon = self
+            .matched_within_horizon
+            .saturating_add(metrics.matched_within_horizon as u64);
+        self.prefetch_requested = self
+            .prefetch_requested
+            .saturating_add(metrics.prefetch_requested_resources as u64);
+        self.prefetch_accepted_bytes = self
+            .prefetch_accepted_bytes
+            .saturating_add(metrics.prefetch_accepted_bytes);
+        self.prefetch_accepted_resources = self
+            .prefetch_accepted_resources
+            .saturating_add(metrics.prefetch_accepted_resources.unwrap_or(0) as u64);
+        self.prefetch_followed_by_access = self
+            .prefetch_followed_by_access
+            .saturating_add(metrics.prefetch_followed_by_observed_access.unwrap_or(0) as u64);
+        self.prefetch_not_followed_by_access = self.prefetch_not_followed_by_access.saturating_add(
+            metrics
+                .prefetch_not_followed_by_observed_access
+                .unwrap_or(0) as u64,
+        );
+        self.prefetch_benefit_unknown = self
+            .prefetch_benefit_unknown
+            .saturating_add(metrics.prefetch_benefit_unknown_resources.unwrap_or(0) as u64);
+        self.duplicate_or_overlap_avoided = self
+            .duplicate_or_overlap_avoided
+            .saturating_add(metrics.duplicate_or_overlap_avoided as u64);
+        self.rejected = self.rejected.saturating_add(metrics.rejected as u64);
+        self.deferred = self.deferred.saturating_add(metrics.deferred as u64);
+        self.bucket_high.predictions = self
+            .bucket_high
+            .predictions
+            .saturating_add(metrics.bucket_high.predictions);
+        self.bucket_high.hits = self
+            .bucket_high
+            .hits
+            .saturating_add(metrics.bucket_high.hits);
+        self.bucket_high.within_horizon = self
+            .bucket_high
+            .within_horizon
+            .saturating_add(metrics.bucket_high.within_horizon);
+        self.bucket_medium.predictions = self
+            .bucket_medium
+            .predictions
+            .saturating_add(metrics.bucket_medium.predictions);
+        self.bucket_medium.hits = self
+            .bucket_medium
+            .hits
+            .saturating_add(metrics.bucket_medium.hits);
+        self.bucket_medium.within_horizon = self
+            .bucket_medium
+            .within_horizon
+            .saturating_add(metrics.bucket_medium.within_horizon);
+        self.bucket_low.predictions = self
+            .bucket_low
+            .predictions
+            .saturating_add(metrics.bucket_low.predictions);
+        self.bucket_low.hits = self.bucket_low.hits.saturating_add(metrics.bucket_low.hits);
+        self.bucket_low.within_horizon = self
+            .bucket_low
+            .within_horizon
+            .saturating_add(metrics.bucket_low.within_horizon);
     }
 
     pub fn record_feedback(
@@ -338,7 +541,7 @@ impl PredictionHistory {
     }
 
     pub fn validate(&self, expected: &ProfileIdentity) -> Result<(), PredictionError> {
-        if self.schema_version != PREDICTION_HISTORY_SCHEMA_VERSION {
+        if self.schema_version != 1 && self.schema_version != PREDICTION_HISTORY_SCHEMA_VERSION {
             return Err(PredictionError::Schema(self.schema_version));
         }
         if self.kind != PREDICTION_HISTORY_KIND {
@@ -370,8 +573,11 @@ pub fn load_prediction_history(
     }
     let bytes =
         std::fs::read(path).map_err(|error| PredictionError::Io(format!("read: {error}")))?;
-    let history: PredictionHistory =
+    let mut history: PredictionHistory =
         serde_json::from_slice(&bytes).map_err(|error| PredictionError::Json(error.to_string()))?;
+    if history.schema_version == 1 {
+        history.schema_version = PREDICTION_HISTORY_SCHEMA_VERSION;
+    }
     history.validate(expected)?;
     Ok(history)
 }
@@ -452,9 +658,11 @@ pub fn predict_from_profile(
             continue;
         }
         let resource = resources[0];
-        let history_confidence = history
-            .filter(|_| set.history_valid)
-            .and_then(|history| history.accuracy_bps(name));
+        let history_confidence = history.filter(|_| set.history_valid).and_then(|history| {
+            history
+                .tensor_accuracy_bps(name, 3)
+                .or_else(|| history.global_accuracy_bps())
+        });
         let confidence_bps = match history_confidence {
             Some(accuracy) => ((observation_confidence as u32 * 2 + accuracy as u32) / 3) as u16,
             None => observation_confidence,
@@ -644,6 +852,11 @@ mod tests {
             load_prediction_history(&output, &wrong),
             Err(PredictionError::Identity(_))
         ));
+        let mut old = history.clone();
+        old.schema_version = 1;
+        old.save(&output).expect("save v1");
+        let migrated = load_prediction_history(&output, &identity).expect("migrate v1");
+        assert_eq!(migrated.schema_version, PREDICTION_HISTORY_SCHEMA_VERSION);
         let mut schema = history.clone();
         schema.schema_version = 999;
         schema.save(&output).expect("save schema");
@@ -655,6 +868,48 @@ mod tests {
         assert!(history.records.is_empty());
         assert_eq!(history.hits, 0);
         let _ = std::fs::remove_file(&output);
+    }
+
+    #[test]
+    fn detailed_evaluation_counters_do_not_double_count_hits() {
+        let identity = ProfileIdentity {
+            model_path: "m".to_string(),
+            model_size_bytes: 1,
+            model_modified_unix_ns: None,
+            inventory_generation: 1,
+            native_contract_version: 1,
+        };
+        let mut history = PredictionHistory::new(identity);
+        let mut metrics = PredictionMetrics {
+            predictions_generated: 4,
+            matched_observed: 3,
+            matched_within_horizon: 2,
+            prefetch_requested_resources: 2,
+            prefetch_requested_bytes: 8192,
+            prefetch_accepted_bytes: 8192,
+            prefetch_accepted_resources: Some(2),
+            prefetch_followed_by_observed_access: Some(1),
+            prefetch_not_followed_by_observed_access: Some(1),
+            prefetch_benefit_unknown_resources: Some(2),
+            duplicate_or_overlap_avoided: 1,
+            rejected: 1,
+            deferred: 1,
+            ..PredictionMetrics::default()
+        };
+        metrics.bucket_high = CalibrationCounters {
+            predictions: 4,
+            hits: 3,
+            within_horizon: 2,
+        };
+        history.record_evaluation(&metrics);
+        assert_eq!(history.hits, 0);
+        assert_eq!(history.matched_within_horizon, 2);
+        assert_eq!(history.prefetch_accepted_resources, 2);
+        assert_eq!(history.prefetch_followed_by_access, 1);
+        assert_eq!(history.prefetch_not_followed_by_access, 1);
+        assert_eq!(history.prefetch_benefit_unknown, 2);
+        assert_eq!(history.duplicate_or_overlap_avoided, 1);
+        assert_eq!(history.bucket_high.precision_bps(), Some(7500));
     }
 
     #[test]

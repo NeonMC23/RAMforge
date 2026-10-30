@@ -27,6 +27,7 @@ pub struct SimScenario {
     pub staging_window_bytes: u64,
     pub speculative_budget_bytes: u64,
     pub min_confidence_bps: u16,
+    pub prediction_horizon: usize,
     pub resources: Vec<SimResource>,
     pub training_sequence: Vec<String>,
     pub test_sequence: Vec<String>,
@@ -44,6 +45,11 @@ pub struct SimResult {
     pub peak_resident_bytes: u64,
     pub budget_violations: u64,
     pub staged_resources: usize,
+    pub predicted_resources: usize,
+    pub matched_resources: usize,
+    pub within_horizon_matches: usize,
+    pub prediction_precision_bps: Option<u16>,
+    pub prediction_recall_bps: Option<u16>,
     pub deferred: usize,
     pub rejected: usize,
     pub release_authorized: bool,
@@ -115,8 +121,35 @@ pub fn simulate(scenario: &SimScenario) -> Result<SimComparison, String> {
     predictive.deferred = plan.deferred;
     predictive.rejected = plan.rejected;
     predictive.release_authorized = plan.release_authorized;
-    let mut wasted = 0u64;
+    let predicted_names: BTreeSet<&str> = staged
+        .iter()
+        .filter_map(|key| {
+            inventory
+                .resources
+                .iter()
+                .find(|resource| resource.key.tensor_index == *key)
+                .map(|resource| resource.name.as_str())
+        })
+        .collect();
     let accessed: BTreeSet<&str> = scenario.test_sequence.iter().map(String::as_str).collect();
+    let matched_names: BTreeSet<&str> = predicted_names
+        .iter()
+        .filter(|name| accessed.contains(**name))
+        .copied()
+        .collect();
+    predictive.predicted_resources = predicted_names.len();
+    predictive.matched_resources = matched_names.len();
+    predictive.within_horizon_matches = scenario
+        .test_sequence
+        .iter()
+        .take(scenario.prediction_horizon)
+        .filter(|name| matched_names.contains(name.as_str()))
+        .count();
+    predictive.prediction_precision_bps = (!predicted_names.is_empty())
+        .then(|| ((matched_names.len() * 10_000) / predicted_names.len()) as u16);
+    predictive.prediction_recall_bps =
+        (!accessed.is_empty()).then(|| ((matched_names.len() * 10_000) / accessed.len()) as u16);
+    let mut wasted = 0u64;
     for key in &staged {
         if let Some(resource) = inventory
             .resources
@@ -219,6 +252,11 @@ fn run_strategy(
         peak_resident_bytes: peak,
         budget_violations: violations,
         staged_resources: 0,
+        predicted_resources: 0,
+        matched_resources: 0,
+        within_horizon_matches: 0,
+        prediction_precision_bps: None,
+        prediction_recall_bps: None,
         deferred: 0,
         rejected: 0,
         release_authorized: false,
@@ -289,6 +327,7 @@ mod tests {
             staging_window_bytes: 8 * 1024,
             speculative_budget_bytes: 8 * 1024,
             min_confidence_bps: 5_000,
+            prediction_horizon: 4,
             resources: names
                 .iter()
                 .map(|name| SimResource {
@@ -311,6 +350,10 @@ mod tests {
     fn predictive_staging_reduces_simulated_rereads() {
         let result = simulate(&scenario(false)).expect("simulation");
         assert!(result.predictive.hits > result.baseline.hits);
+        assert!(result.predictive.predicted_resources > 0);
+        assert!(result.predictive.matched_resources > 0);
+        assert_eq!(result.predictive.prediction_precision_bps, Some(10_000));
+        assert!(result.predictive.prediction_recall_bps.is_some());
         assert!(result.miss_reduction() > 0);
         assert!(result.reread_byte_reduction() > 0);
         assert_eq!(result.predictive.budget_violations, 0);
@@ -323,6 +366,8 @@ mod tests {
         let result = simulate(&scenario(true)).expect("simulation");
         assert_eq!(result.predictive.budget_violations, 0);
         assert!(result.predictive.wasted_staged_bytes > 0);
+        assert_eq!(result.predictive.matched_resources, 0);
+        assert_eq!(result.predictive.prediction_precision_bps, Some(0));
         assert!(!result.predictive.release_authorized);
     }
 
