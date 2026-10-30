@@ -446,12 +446,12 @@ target 128 MiB, no cgroup enforcement, median of two runs unless noted:
 
 | Policy | Selected | Mapping RSS delta | Process RSS before/after | Cgroup current delta | TTFT |
 |---|---:|---:|---|---:|---:|
-| off | 0 | 0 B | 164.16 / 164.20 MiB | ~0 B | 26.4 ms |
-| observe | 12 | 0 B | 164.04 / 164.10 MiB | ~0 B | 27.5 ms |
-| conservative | 0 | 0 B | 164.04 / 164.07 MiB | ~0 B | 27.7 ms |
-| memory-bound | 12–13 | -38,387,712 B | 164.20 / 127.65 MiB | ~0 B | 26.5 ms |
-| active | 12 | -38,027,264 B | 164.20 / 127.98 MiB | ~0 B | 26.0 ms |
-| reuse-aware (valid profile) | 134–135 | -46,983,168 B | 172.36 / 127.57 MiB | ~0 B | 28.7 ms |
+| off | 0 | 0 B | 164.30 / 164.30 MiB | ~0 B | 28.2 ms |
+| observe | 12–13 | 0 B | 164.25 / 164.25 MiB | ~0 B | 28.4 ms |
+| conservative | 0 | 0 B | 164.21 / 164.21 MiB | ~0 B | 25.5 ms |
+| memory-bound | 12–13 | -38,387,712 B | 164.23 / 127.63 MiB | ~0 B | 27.0 ms |
+| active | 13 | -38,748,160 B | 164.30 / 127.37 MiB | ~0 B | 27.5 ms |
+| reuse-aware (valid profile) | 134 | -46,923,776 B | 172.23 / 127.48 MiB | ~0 B | 26.7 ms |
 
 The reuse-aware result required a complete 16,384-event profile; with the
 default 4,096-event cap a four-token capture was truncated, the profile was

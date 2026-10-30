@@ -88,12 +88,12 @@ tokens, CPU, no cgroup enforcement, two repeats for the matrix rows. Medians:
 
 | Policy | Prefetch | Selected | Mapping delta | Process RSS before/after | Cgroup delta | TTFT |
 |---|---|---:|---:|---|---:|---:|
-| off | off | 0 | 0 B | 164.16 / 164.20 MiB | ~0 B | 26.4 ms |
-| observe | off | 12 | 0 B | 164.04 / 164.10 MiB | ~0 B | 27.5 ms |
-| conservative | off | 0 | 0 B | 164.04 / 164.07 MiB | ~0 B | 27.7 ms |
-| memory-bound | off | 12–13 | -38,387,712 B | 164.20 / 127.65 MiB | ~0 B | 26.5 ms |
-| active | off | 12 | -38,027,264 B | 164.20 / 127.98 MiB | ~0 B | 26.0 ms |
-| reuse-aware (valid profile) | off | 134–135 | -46,983,168 B | 172.36 / 127.57 MiB | ~0 B | 28.7 ms |
+| off | off | 0 | 0 B | 164.30 / 164.30 MiB | ~0 B | 28.2 ms |
+| observe | off | 12–13 | 0 B | 164.25 / 164.25 MiB | ~0 B | 28.4 ms |
+| conservative | off | 0 | 0 B | 164.21 / 164.21 MiB | ~0 B | 25.5 ms |
+| memory-bound | off | 12–13 | -38,387,712 B | 164.23 / 127.63 MiB | ~0 B | 27.0 ms |
+| active | off | 13 | -38,748,160 B | 164.30 / 127.37 MiB | ~0 B | 27.5 ms |
+| reuse-aware (valid profile) | off | 134 | -46,923,776 B | 172.23 / 127.48 MiB | ~0 B | 26.7 ms |
 
 The harness enables graph tracing for reuse-aware runs and defaults to a
 16,384 event cap. With the CLI's 4,096 default, a four-token capture was
