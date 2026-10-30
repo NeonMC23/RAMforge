@@ -44,6 +44,9 @@ fn help_lists_memory_control_flags() {
         "--graph-trace",
         "--graph-trace-events",
         "--graph-trace-detail",
+        "--node-dispatch-observe",
+        "--node-dispatch-events",
+        "--node-dispatch-detail",
     ] {
         assert!(text.contains(flag), "help must list {flag}: {text}");
     }
@@ -1070,5 +1073,65 @@ fn enforced_oom_is_a_failure_not_a_success() {
     assert!(
         stderr.contains("cgroup OOM kill") || stderr.contains("oom_kill="),
         "OOM must be reported: {stderr}"
+    );
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and the native CPU observer build"]
+fn node_dispatch_observer_reports_diagnostic_events() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let path = std::env::temp_dir().join(format!(
+        "ramforge-node-dispatch-{}.json",
+        std::process::id()
+    ));
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--no-prefetch",
+            "--backend",
+            "forgecore",
+            "--node-dispatch-observe",
+            "--node-dispatch-events",
+            "4096",
+            "--residency-report-json",
+            path.to_str().unwrap(),
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).unwrap_or_else(|_| panic!("missing report: {stderr}")),
+    )
+    .expect("node dispatch report");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        output.status.success(),
+        "node dispatch run failed: {stderr}"
+    );
+    let dispatch = &report["node_dispatch"];
+    assert_eq!(dispatch["summary"]["dropped_events"], 0);
+    assert!(dispatch["summary"]["events"].as_u64().unwrap() > 0);
+    assert!(!dispatch["events"].as_array().unwrap().is_empty());
+    assert!(dispatch["attributed_events"].as_u64().unwrap() > 0);
+    assert!(dispatch["unattributed_events"].as_u64().unwrap() > 0);
+    assert!(dispatch["matched_resources"].as_u64().unwrap() > 0);
+    assert_eq!(dispatch["identity_mismatches"], 0);
+    assert_eq!(dispatch["events"][0]["backend"], "cpu");
+    assert!(dispatch["events"][0]["node_count"].as_u64().unwrap() > 0);
+    assert_eq!(
+        dispatch["semantics"],
+        "CPU node dispatch start; not a tensor read or residency proof"
     );
 }

@@ -230,6 +230,22 @@ states remain separate and are recorded in `summary.json` and `results.tsv`.
 This verifies file-page-cache state at process start; it is not proof of
 physical reclamation, PSS, or model-mapping residency after loading.
 
+## CPU node-dispatch observation
+
+An opt-in CPU observer records one event per non-empty, compute-enabled graph
+node before workers enter that node kernel. Events carry model/context/
+execution identity, node and op names, declared source names, and bounded
+sequence numbers. They are dispatch-start evidence only: not a physical read,
+page fault, I/O, completion, or residency proof. `dropped_events` makes an
+incomplete capture explicit. The observer adds no callback or observer-only
+barrier when disabled.
+
+RAMforge correlates source names only by exact unique inventory names. Unknown
+or truncated source identities stay unattributed. No pre-dispatch residency
+sampling is performed because the CPU callback does not expose a validated
+file-backed mapping identity safely; a raw tensor pointer is not a durable
+resource key. Dispatch events never authorize release or eviction.
+
 ## Execution timing
 
 `ExecutionTiming` separates model load, profile load, history load, prediction,

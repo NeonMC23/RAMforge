@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 531 passed, 0 failed, 18 ignored.
+- `cargo test --workspace`: 531 passed, 0 failed, 19 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -368,6 +368,29 @@ Not run or not claimed:
   three workloads and slower on short-long, with wide variability; this is not
   a general speedup. Mapping delta was 0 B.')
 
+## CPU node-dispatch validation — 2026-10-31
+
+- forgeCORE `cargo test --workspace`: **388 passed, 0 failed, 4 ignored**.
+  New `node_dispatch` tests cover disabled-by-default behavior, installation
+  and removal, event drain, overflow, multiple contexts, four-worker
+  exactly-once publication, identity fields, and bounded options.
+- RAMforge `cargo test --workspace`: **531 passed, 0 failed, 19 ignored**.
+  The ignored real-model CLI test verifies `--node-dispatch-observe` JSON with
+  attributed and unattributed events, zero identity mismatches, CPU backend,
+  and bounded serialization.
+- Native CPU hook: the callback is invoked by worker 0 immediately before
+  `ggml_compute_forward` for each non-empty, compute-enabled node. An
+  observer-only barrier follows publication while active; the disabled path
+  adds neither callback nor barrier. Four-worker test observed one event per
+  active node and strictly increasing event sequence.
+- Observer overhead smoke (SmolLM2, five measured decodes per setting):
+  one thread off 22.20 ms vs on 20.39–21.22 ms; four threads off 9.76 ms vs
+  on 10.51–10.96 ms. The spread is noisy; no speedup is claimed. Events were
+  bounded, with no drops in the measured settings.
+- No pre-dispatch residency sampling was added. Source-name correlation is
+  exact-unique only; unknown names remain unattributed. Dispatch events never
+  authorize release or eviction.
+
 ## Native lifetime validation — 2026-10-30
 
 ForgeCORE pin: `457c4f75193b004ed01c1cc0c8e620a4a7683196`.
@@ -389,7 +412,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          531 passed, 0 failed, 18 ignored
+cargo test --workspace                          531 passed, 0 failed, 19 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

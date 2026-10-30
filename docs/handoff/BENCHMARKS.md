@@ -395,6 +395,30 @@ Interpretation:
   remain unknown.
 - The results do not justify claiming a general performance improvement.
 
+## CPU node-dispatch observer overhead (2026-10-31)
+
+Manual smoke test: SmolLM2-135M Q4_K_M, tiny decode, five measured repetitions
+per setting after warmup. The observer records one event per non-empty,
+compute-enabled node and drains after each repetition.
+
+| Workers | Observer | Median decode | Events | Dropped |
+|---|---:|---:|---:|---:|
+| 1 | off | 22.20 ms | 0 | 0 |
+| 1 | on, drained | 20.39 ms | 2,575 | 0 |
+| 1 | on, not drained | 21.22 ms | 3,090 | 0 |
+| 4 | off | 9.76 ms | 0 | 0 |
+| 4 | on, drained | 10.51 ms | 2,575 | 0 |
+| 4 | on, not drained | 10.96 ms | 3,090 | 0 |
+
+These medians come from one five-decode smoke run and are visibly noisy; the
+four-worker enabled results are about 8–12% slower in this run, while earlier
+runs were within noise. They are not evidence of a speedup or a reliable
+overhead estimate. The observer path includes worker-0 publication and an
+observer-only barrier before each node kernel; the disabled path has neither.
+Event storage was fixed at 4,096 entries for drained runs and 65,536 for the
+not-drained run. This is a diagnostic smoke measurement on one machine, not a
+statistically powered benchmark.
+
 ## Caveats
 
 - These are wall-clock observations on one machine, not a throughput guarantee.

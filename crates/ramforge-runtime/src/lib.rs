@@ -67,7 +67,10 @@ pub use crate::forgecore::{
     ForgeCoreAdapterError, ForgeCoreContextOptions, ForgeCoreLogits, ForgeCoreModel,
     ForgeCoreModelMetadata, ForgeCoreModelOptions, ForgeCoreSession,
 };
-pub use forge_core::{PageReleaseResult, TensorMappingInfo};
+pub use forge_core::{
+    NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSummary,
+    PageReleaseResult, TensorMappingInfo, MAX_NODE_DISPATCH_EVENTS,
+};
 pub use orchestration::{
     OrchestratedRuntime, OrchestrationError, OrchestrationRequest, PlanningSession,
     RuntimeOrchestrator,

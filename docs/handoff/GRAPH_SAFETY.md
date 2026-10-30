@@ -28,6 +28,47 @@ The callback is bounded and copies only:
 It retains no native pointers. Trace buffer overflow increments dropped events
 and does not silently present a truncated capture as complete.
 
+
+## CPU node-dispatch observer
+
+`--node-dispatch-observe` installs a separate, opt-in observer in the patched
+CPU execution path. It is not the scheduler trace described above.
+
+The native loop dispatches each non-empty, compute-enabled node from worker 0.
+Immediately before kernel dispatch, worker 0 publishes one
+`NodeDispatchStarted`-semantics event and then enters an observer-only barrier.
+Other workers cannot enter that node's kernel until the barrier completes. With
+the observer disabled, neither the callback nor the barrier is present.
+
+Each event reports the model instance id, context id, execution sequence,
+event sequence, node index/count, CPU worker count, op name, node name, and
+declared source names. Source names and names over the fixed field capacities
+are marked truncated. Raw pointers are never retained. The execution sequence
+is per `Context::decode`; node indices reset for each internal graph, so an
+event sequence plus node index identifies order but does not synthesize a
+separate graph id.
+
+The event proves only that the node was dispatched, was not a NOP/skipped node,
+and was dispatched before the workers entered that node's kernel. It does not
+prove that its sources were physically read, that any page fault or I/O
+occurred, that the kernel completed, that the source is not used again, or that
+release is safe. It is never a release authorization.
+
+Event storage is bounded per context. When full, the oldest event is dropped
+and `dropped_events` is incremented. Consumers must treat a nonzero drop count
+as an incomplete capture. The observer's fixed-capacity ring uses no dynamic
+allocation in the native callback.
+
+RAMforge correlates a source name only when it exactly matches a unique
+inventory resource name. Events with no such match remain unattributed. The
+report preserves `unattributed_events`, source/name truncation counts, and
+explicit limitations. A dispatch event is not a residency observation and is
+not used to authorize eviction or `FinalUseProven`.
+
+No pre-dispatch page-residency sample is implemented: the CPU callback has no
+validated file-backed mapping path or safe stable pointer-to-resource contract,
+and a raw tensor pointer is not a durable resource identity.
+
 ## What a completed node-group event proves
 
 It proves that the observed node group’s backend work was synchronized at the

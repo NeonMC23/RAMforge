@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **531 tests, 0 failed, 18 ignored**. The ignored
+  environment variables passes **531 tests, 0 failed, 19 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -61,6 +61,35 @@
   layer/range release.
 - See [../../scripts/test.sh](../../scripts/test.sh) for the reproducible test
   invocation.
+
+## CPU node-dispatch observability (2026-10-31)
+
+- forgeCORE now exposes an opt-in CPU-only node-dispatch observer through
+  `Context::set_dispatch_observer`; the native hook is in the CPU compute
+  thread immediately before kernel dispatch. One event is published by worker
+  0, followed by an observer-only barrier while active. Disabled execution has
+  no callback or barrier.
+- Events carry model instance, context, execution/event sequence, node
+  index/count, worker count, op/node names, and declared source names. They are
+  dispatch-start observations only: not a tensor read, page fault, I/O,
+  completion, final use, or release proof.
+- Event storage is fixed-capacity and preallocated; overflow drops oldest events
+  and reports `dropped_events`. No dynamic allocation occurs in the native
+  callback.
+- RAMforge exposes `--node-dispatch-observe`, `--node-dispatch-events`, and
+  `--node-dispatch-detail`. Correlation uses only exact unique inventory names;
+  unmatched events remain unattributed. No dispatch event authorizes release.
+- The observer is not combined with page residency sampling. The native CPU
+  callback has no validated file-backed mapping identity, so a pre-dispatch
+  residency sample is intentionally omitted.
+- Five-decode overhead smoke (SmolLM2, tiny-batch decode): one thread
+  observer off 22.20 ms vs on 20.39–21.22 ms; four threads off 9.76 ms vs on
+  10.51–10.96 ms. The spread is noisy; no speedup is claimed. Events were
+  bounded and no drops occurred in these settings.
+- forgeCORE tests: 388 passed, 4 ignored. RAMforge tests: 531 passed, 19
+  ignored. New tests cover opt-in/default disabled, exact one event per active
+  node with four workers, ordered events, overflow, multiple contexts,
+  removal, bounded options, and CLI JSON attribution.
 
 ## Residency observability and end-to-end accounting (2026-10-30)
 

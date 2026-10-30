@@ -26,13 +26,13 @@ use ramforge_runtime::prediction_planner::{
 use ramforge_runtime::residency_engine::process_faults;
 use ramforge_runtime::residency_engine::{
     AdmissionDecision, AdmissionOutcome, DecisionAction, ExecutionTiming, ManagerError,
-    ModelGeneration, ModelId, OperationContext, OperationTiming, ResidencyCapabilities,
-    ResidencyManager, ResidencyPlan, ResidencyPolicy, ResidencyPolicyMode, ResidencyReport,
-    ResidencySnapshot, ResourceInventory, StagingPlan, StagingResult,
+    ModelGeneration, ModelId, NodeDispatchObservation, OperationContext, OperationTiming,
+    ResidencyCapabilities, ResidencyManager, ResidencyPlan, ResidencyPolicy, ResidencyPolicyMode,
+    ResidencyReport, ResidencySnapshot, ResourceInventory, StagingPlan, StagingResult,
 };
 use ramforge_runtime::{
     DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
-    ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession,
+    ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, NodeDispatchOptions,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -297,6 +297,18 @@ enum Commands {
         #[arg(long, requires = "graph_trace")]
         graph_trace_detail: bool,
 
+        /// Observe CPU graph-node dispatch starts (diagnostic; not memory access)
+        #[arg(long)]
+        node_dispatch_observe: bool,
+
+        /// Maximum retained CPU node-dispatch events
+        #[arg(long, default_value_t = 4096, requires = "node_dispatch_observe")]
+        node_dispatch_events: usize,
+
+        /// Print individual CPU node-dispatch events
+        #[arg(long, requires = "node_dispatch_observe")]
+        node_dispatch_detail: bool,
+
         /// Enforce --ram as a hard cgroup v2 memory.max limit for the run
         #[arg(long)]
         enforce_ram: bool,
@@ -415,6 +427,9 @@ fn main() {
             graph_trace,
             graph_trace_events,
             graph_trace_detail,
+            node_dispatch_observe,
+            node_dispatch_events,
+            node_dispatch_detail,
             enforce_ram,
             enforce_timeout,
             max_tokens,
@@ -487,6 +502,9 @@ fn main() {
                 graph_trace,
                 graph_trace_events,
                 graph_trace_detail,
+                node_dispatch_observe,
+                node_dispatch_events,
+                node_dispatch_detail,
                 max_tokens,
                 temperature,
                 top_k,
@@ -600,6 +618,9 @@ fn run_inference(
     graph_trace: bool,
     graph_trace_events: usize,
     graph_trace_detail: bool,
+    node_dispatch_observe: bool,
+    node_dispatch_events: usize,
+    node_dispatch_detail: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -696,6 +717,11 @@ fn run_inference(
             "--graph-trace-events must be greater than zero"
         ));
     }
+    if node_dispatch_observe && node_dispatch_events == 0 {
+        return Err(anyhow::anyhow!(
+            "--node-dispatch-events must be greater than zero"
+        ));
+    }
     let device_selection = device
         .parse::<DeviceSelection>()
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -711,7 +737,8 @@ fn run_inference(
         || residency_observe
         || prediction
         || prediction_history_load.is_some()
-        || prediction_history_save.is_some();
+        || prediction_history_save.is_some()
+        || node_dispatch_observe;
     if residency_requested
         && (release_mapping_pages || inspect_layer.is_some() || release_layer.is_some())
     {
@@ -722,6 +749,11 @@ fn run_inference(
     if graph_trace && !matches!(backend, InferenceBackend::ForgeCore) {
         return Err(anyhow::anyhow!(
             "--graph-trace is only supported with --backend forgecore"
+        ));
+    }
+    if node_dispatch_observe && !matches!(backend, InferenceBackend::ForgeCore) {
+        return Err(anyhow::anyhow!(
+            "--node-dispatch-observe is only supported with --backend forgecore"
         ));
     }
     if matches!(backend, InferenceBackend::ForgeCore) {
@@ -756,6 +788,9 @@ fn run_inference(
             graph_trace,
             graph_trace_events,
             graph_trace_detail,
+            node_dispatch_observe,
+            node_dispatch_events,
+            node_dispatch_detail,
             max_tokens,
             temperature,
             top_k,
@@ -1088,6 +1123,9 @@ fn run_forgecore_inference(
     graph_trace: bool,
     graph_trace_events: usize,
     graph_trace_detail: bool,
+    node_dispatch_observe: bool,
+    node_dispatch_events: usize,
+    node_dispatch_detail: bool,
     max_tokens: usize,
     temperature: f32,
     top_k: Option<usize>,
@@ -1319,6 +1357,7 @@ fn run_forgecore_inference(
         || residency_target.is_some()
         || residency_reserve != 0
         || residency_prefetch_bytes.is_some()
+        || node_dispatch_observe
     {
         let model_id = ModelId(
             std::fs::canonicalize(model.path())
@@ -1620,6 +1659,17 @@ fn run_forgecore_inference(
             trace_max_events: graph_trace.then_some(graph_trace_events),
         })
         .map_err(|error| anyhow::anyhow!(error))?;
+    if node_dispatch_observe {
+        session
+            .set_node_dispatch_observer(Some(NodeDispatchOptions {
+                max_events: node_dispatch_events,
+            }))
+            .map_err(|error| anyhow::anyhow!(error))?;
+        eprintln!(
+            "CPU node-dispatch observer: enabled max_events={} (dispatch only; not a memory read)",
+            node_dispatch_events
+        );
+    }
     let context_length = session.context_length() as usize;
     if prompt_tokens.len() > context_length {
         return Err(anyhow::anyhow!(
@@ -2005,6 +2055,114 @@ fn run_forgecore_inference(
             }
         }
     }
+    let mut node_dispatch_observation: Option<NodeDispatchObservation> = None;
+    if node_dispatch_observe {
+        let summary = session.node_dispatch_summary();
+        let events = session.take_node_dispatch_events();
+        if let Some(summary) = summary {
+            let names: std::collections::BTreeMap<String, usize> = residency_manager
+                .as_ref()
+                .map(|manager| {
+                    let mut counts = std::collections::BTreeMap::new();
+                    for resource in &manager.inventory().resources {
+                        *counts.entry(resource.name.clone()).or_insert(0) += 1;
+                    }
+                    counts
+                })
+                .unwrap_or_default();
+            let unique_names: std::collections::BTreeSet<String> = names
+                .iter()
+                .filter(|(_, count)| **count == 1)
+                .map(|(name, _)| name.clone())
+                .collect();
+            let expected_model = residency_manager
+                .as_ref()
+                .and_then(|manager| manager.native_model_instance());
+            let expected_context = session.lifetime_state().ok().map(|state| state.context_id);
+            let mut matched = std::collections::BTreeSet::new();
+            let mut attributed_events = 0usize;
+            let mut unattributed_events = 0usize;
+            let mut source_truncated_events = 0usize;
+            let mut node_name_truncated_events = 0usize;
+            let mut identity_mismatches = 0usize;
+            for event in &events {
+                if expected_model.is_some_and(|id| id != event.model_instance_id)
+                    || expected_context.is_some_and(|id| id != event.context_id)
+                {
+                    identity_mismatches += 1;
+                }
+                let event_matched = event
+                    .source_names
+                    .iter()
+                    .filter(|name| unique_names.contains(*name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if event_matched.is_empty()
+                    && event
+                        .node_name
+                        .as_ref()
+                        .is_some_and(|name| unique_names.contains(name))
+                {
+                    if let Some(name) = &event.node_name {
+                        matched.insert(name.clone());
+                    }
+                    attributed_events += 1;
+                } else if event_matched.is_empty() {
+                    unattributed_events += 1;
+                } else {
+                    attributed_events += 1;
+                    matched.extend(event_matched);
+                }
+                source_truncated_events += usize::from(event.sources_truncated);
+                node_name_truncated_events += usize::from(event.node_name_truncated);
+            }
+            let mut notes = vec![
+                "dispatch-start events; not proof of tensor reads, page faults, I/O, completion, or release safety".to_string(),
+                "source-name attribution requires an exact unique match to the model inventory".to_string(),
+            ];
+            if identity_mismatches > 0 {
+                notes.push(format!(
+                    "{identity_mismatches} events did not match the active model/context identity"
+                ));
+            }
+            if node_dispatch_detail {
+                for event in &events {
+                    eprintln!(
+                        "  dispatch exec={} seq={} node={}/{} threads={} name={:?} op={:?} sources={:?}",
+                        event.execution_sequence,
+                        event.event_sequence,
+                        event.node_index,
+                        event.node_count,
+                        event.n_threads,
+                        event.node_name,
+                        event.op_name,
+                        event.source_names
+                    );
+                }
+            }
+            eprintln!(
+                "CPU node-dispatch: events={} dropped={} retained={} attributed_events={} unattributed_events={} matched_resources={} max_events={}",
+                summary.events,
+                summary.dropped_events,
+                summary.retained_events,
+                attributed_events,
+                unattributed_events,
+                matched.len(),
+                summary.max_events
+            );
+            node_dispatch_observation = Some(NodeDispatchObservation {
+                summary,
+                events,
+                attributed_events,
+                unattributed_events,
+                matched_resources: matched.len(),
+                source_truncated_events,
+                node_name_truncated_events,
+                identity_mismatches,
+                notes,
+            });
+        }
+    }
     if let Ok(lifetime) = session.lifetime_state() {
         native_context_id = Some(lifetime.context_id);
         native_execution_generation = Some(lifetime.execution_generation);
@@ -2175,6 +2333,7 @@ fn run_forgecore_inference(
                 page_after_staging: page_after_staging.clone(),
                 page_after: page_after.clone(),
                 prefetch_correlation: prefetch_correlation.clone(),
+                node_dispatch: node_dispatch_observation.clone(),
                 execution_timing: ExecutionTiming {
                     model_load_ns: Some(native_model_load_ns),
                     profile_load_ns,
@@ -3009,6 +3168,7 @@ fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
             "after": report.page_after.as_ref().map(page_snapshot_json),
             "prefetch_correlation": report.prefetch_correlation.as_ref().map(prefetch_correlation_json),
         },
+        "node_dispatch": report.node_dispatch.as_ref().map(node_dispatch_json),
         "prediction": report.prediction_set.as_ref().map(|set| {
             let plan = report.prediction_plan.as_ref();
             serde_json::json!({
@@ -3204,6 +3364,46 @@ fn plan_json_value(plan: &ResidencyPlan) -> serde_json::Value {
         "estimated_after_bytes": plan.estimated_after_bytes,
         "estimated_budget_met": plan.estimated_budget_met,
         "notes": plan.notes,
+    })
+}
+
+fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "ramforge.node_dispatch.observation",
+        "semantics": "CPU node dispatch start; not a tensor read or residency proof",
+        "summary": {
+            "executions": observation.summary.executions,
+            "events": observation.summary.events,
+            "dropped_events": observation.summary.dropped_events,
+            "retained_events": observation.summary.retained_events,
+            "max_events": observation.summary.max_events,
+        },
+        "attributed_events": observation.attributed_events,
+        "unattributed_events": observation.unattributed_events,
+        "matched_resources": observation.matched_resources,
+        "source_truncated_events": observation.source_truncated_events,
+        "node_name_truncated_events": observation.node_name_truncated_events,
+        "identity_mismatches": observation.identity_mismatches,
+        "notes": observation.notes,
+        "events_serialized": observation.events.len().min(512),
+        "events_omitted": observation.events.len().saturating_sub(512),
+        "events": observation.events.iter().take(512).map(|event| serde_json::json!({
+            "model_instance_id": event.model_instance_id,
+            "context_id": event.context_id,
+            "execution_sequence": event.execution_sequence,
+            "event_sequence": event.event_sequence,
+            "node_index": event.node_index,
+            "node_count": event.node_count,
+            "n_threads": event.n_threads,
+            "backend": "cpu",
+            "node_name": event.node_name,
+            "node_name_truncated": event.node_name_truncated,
+            "op_name": event.op_name,
+            "op_name_truncated": event.op_name_truncated,
+            "source_names": event.source_names,
+            "sources_truncated": event.sources_truncated,
+        })).collect::<Vec<_>>(),
     })
 }
 

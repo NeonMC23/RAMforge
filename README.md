@@ -2,6 +2,8 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
+> **CPU node-dispatch observation (2026-10-31):** RAMforge now exposes an opt-in CPU dispatch observer through forgeCORE. It publishes one event from worker 0 before each non-empty, compute-enabled node enters its kernel, with model/context/execution identity, node/op names, declared source names, bounded event storage, and explicit overflow accounting. This is dispatch-start evidence only—not proof of a physical tensor read, page fault, I/O, kernel completion, residency, or release safety. Source-name correlation is exact-and-unique; unmatched events remain unattributed. See [GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md).
+
 > **Targeted residency observation and controlled cache validation (2026-10-30):** RAMforge now samples selected prefetch resources first within a bounded `mincore()` page budget, reports selected versus general coverage separately, deduplicates overlapping pages, and preserves partial/unknown coverage. A safe benchmark mode creates an isolated model copy, uses `POSIX_FADV_DONTNEED` only on that copy, verifies page-cache state with `mincore`, and labels controlled, warm, partial, unknown, and failed preparation distinctly. Before-access residency remains unavailable without a native access callback, so eviction-before-use and causal benefit stay unknown. See [PREDICTION.md](docs/handoff/PREDICTION.md), [MEMORY_ACCOUNTING.md](docs/handoff/MEMORY_ACCOUNTING.md), and [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
 >
 > **Predictive residency (2026-10-30):** RAMforge now has a deterministic predictive staging layer over validated profiles: bounded confidence-ranked predictions, high-confidence staging and medium-confidence speculative prefetch, explicit budget/admission decisions, feedback history, and a deterministic simulator. Prediction is advisory only; `release_authorized` is always false and release still requires the native quiescence gate. See [PREDICTION.md](docs/handoff/PREDICTION.md).
@@ -178,6 +180,13 @@ Flags:
   groups to be computed separately and synchronized; expect overhead.
 - `--graph-trace-events N`: retained event bound (default 4096).
 - `--graph-trace-detail`: print individual trace events.
+- `--node-dispatch-observe`: opt-in CPU node-dispatch observer. It emits one
+  event per non-empty, compute-enabled node before workers enter that node's
+  kernel. It is dispatch-start evidence, not a tensor read, page-fault, I/O,
+  completion, or release-safety proof.
+- `--node-dispatch-events N`: retained event bound (default 4096); overflow
+  drops oldest events and reports `dropped_events`.
+- `--node-dispatch-detail`: print individual dispatch events.
 
 ### Enforced budget matrix
 
@@ -1051,7 +1060,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **531 tests, 0 failed, 18 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **531 tests, 0 failed, 19 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

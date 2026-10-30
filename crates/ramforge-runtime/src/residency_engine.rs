@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use forge_core::{PageReleaseResult, TensorMappingInfo};
+use forge_core::{NodeDispatchEvent, NodeDispatchSummary, PageReleaseResult, TensorMappingInfo};
 
 use crate::cgroup::{self, CgroupEvents, CgroupStats};
 use crate::execution_profile::{ExecutionProfile, ProfileIdentity};
@@ -1316,6 +1316,21 @@ pub struct ExecutionTiming {
     pub end_to_end_ns: u128,
 }
 
+/// Diagnostic CPU node-dispatch observations correlated against the model
+/// inventory. Dispatch is not a physical tensor read or residency proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeDispatchObservation {
+    pub summary: NodeDispatchSummary,
+    pub events: Vec<NodeDispatchEvent>,
+    pub attributed_events: usize,
+    pub unattributed_events: usize,
+    pub matched_resources: usize,
+    pub source_truncated_events: usize,
+    pub node_name_truncated_events: usize,
+    pub identity_mismatches: usize,
+    pub notes: Vec<String>,
+}
+
 /// Structured per-operation residency report. Estimates and observations are
 /// separate fields; a native release result is not an RSS measurement.
 #[derive(Debug, Clone)]
@@ -1349,6 +1364,7 @@ pub struct ResidencyReport {
     pub page_after_staging: Option<PageResidencySnapshot>,
     pub page_after: Option<PageResidencySnapshot>,
     pub prefetch_correlation: Option<PrefetchCorrelationReport>,
+    pub node_dispatch: Option<NodeDispatchObservation>,
     pub execution_timing: ExecutionTiming,
     pub ledger: MemoryLedger,
     pub before: ResidencySnapshot,

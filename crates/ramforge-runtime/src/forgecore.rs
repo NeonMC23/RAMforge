@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 
 use forge_core::{
     BatchBuilder, Context, ContextLifetimeState, ContextTraceOptions, GpuLayers, Model,
-    ModelLifetimeState, ModelLoadMode, ModelOptions, PageReleaseResult, ResidencyError,
-    TensorMappingInfo, TraceEvent, TraceSummary,
+    ModelLifetimeState, ModelLoadMode, ModelOptions, NodeDispatchEvent, NodeDispatchOptions,
+    NodeDispatchSummary, PageReleaseResult, ResidencyError, TensorMappingInfo, TraceEvent,
+    TraceSummary,
 };
 
 use crate::execution::{
@@ -507,6 +508,31 @@ impl ForgeCoreSession {
     /// lifecycle boundary for residency code.
     pub fn synchronize(&mut self) {
         self.context.synchronize();
+    }
+
+    pub fn set_node_dispatch_observer(
+        &mut self,
+        options: Option<NodeDispatchOptions>,
+    ) -> Result<(), ForgeCoreAdapterError> {
+        self.context
+            .set_dispatch_observer(options)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn node_dispatch_summary(&self) -> Option<NodeDispatchSummary> {
+        self.context.dispatch_summary()
+    }
+
+    pub fn node_dispatch_events(&self) -> Vec<NodeDispatchEvent> {
+        self.context.dispatch_events()
+    }
+
+    pub fn take_node_dispatch_events(&self) -> Vec<NodeDispatchEvent> {
+        self.context.take_dispatch_events()
+    }
+
+    pub fn clear_node_dispatch_events(&self) {
+        self.context.clear_dispatch_events();
     }
 
     pub fn trace_summary(&self) -> Option<TraceSummary> {
