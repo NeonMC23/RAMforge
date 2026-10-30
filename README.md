@@ -532,9 +532,9 @@ benefit. Before-access residency is not observed, so eviction before use and
 avoided-load causality remain unknown. Targeted sampling uses the same bounded
 observation and remains diagnostic-only; it is off by default and must not be
 enabled for normal throughput measurements. Full observation previously cost
-about **54 ms per snapshot**, or **158 ms** for three snapshots; a 64-page
-targeted snapshot still cost about **37 ms**, so metadata-population overhead
-is visible.
+about **54 ms per snapshot**, or **158 ms** for three. Interval population
+accounting keeps a 64-page targeted sample at about **1–2 ms per snapshot** in
+the final matrix; observation overhead no longer dominates that sample.
 
 The five-arm benchmark supports separate warm and controlled-nonresident runs
 via `--cache-condition warm|isolated-nonresident`. The controlled mode copies
