@@ -45,6 +45,7 @@ pub mod planner;
 pub mod profile;
 pub mod residency;
 pub mod residency_engine;
+pub mod resource_lifetime;
 pub mod runtime_config;
 pub mod sampling;
 pub mod simd;

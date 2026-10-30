@@ -39,6 +39,8 @@ REPEATS=${REPEATS:-1}
 ENFORCE=${ENFORCE:-0}
 ENFORCE_TIMEOUT=${ENFORCE_TIMEOUT:-120}
 GRAPH_TRACE_EVENTS=${GRAPH_TRACE_EVENTS:-16384}
+PROFILE_SAVE=${PROFILE_SAVE:-}
+PROFILE_LOAD=${PROFILE_LOAD:-}
 OUT=${RAMFORGE_BENCH_OUT:-bench-out}
 BACKEND=${BACKEND:-forgecore}
 POLICIES=${POLICIES:-"off observe conservative memory-bound reuse-aware active"}
@@ -47,7 +49,7 @@ mkdir -p "$OUT"
 RESULTS="$OUT/results.tsv"
 
 if [ ! -f "$RESULTS" ]; then
-  printf 'timestamp\tpolicy\tprefetch\trepeat\tstatus\twall_ns\tmodel\tgeneration\tselected\tprofile_used\testimated_reclaim_bytes\tobserved_mapping_delta_bytes\trss_before\trss_after\tcgroup_before\tcgroup_after\tstaging_requested_bytes\tstaging_native_requested_bytes\tnative_released_bytes\ttrace_complete\tttft_ns\tdecode_ns\ttotal_ns\toutput_fingerprint\tstderr_sha256\n' > "$RESULTS"
+  printf 'timestamp\tpolicy\tprefetch\trepeat\tstatus\twall_ns\tmodel\tgeneration\tselected\tprofile_used\tprofile_source\tnative_contract\tnative_quiescent\tlifetime_states\testimated_reclaim_bytes\tobserved_mapping_delta_bytes\trss_before\trss_after\tcgroup_before\tcgroup_after\tstaging_requested_bytes\tstaging_native_requested_bytes\tnative_released_bytes\ttrace_complete\tttft_ns\tdecode_ns\ttotal_ns\toutput_fingerprint\tstderr_sha256\n' > "$RESULTS"
 fi
 
 for policy in $POLICIES; do
@@ -73,6 +75,12 @@ for policy in $POLICIES; do
       fi
       if [ "$policy" = "reuse-aware" ]; then
         set -- "$@" --graph-trace --graph-trace-events "$GRAPH_TRACE_EVENTS"
+        if [ -n "$PROFILE_SAVE" ]; then
+          set -- "$@" --residency-profile-save "$PROFILE_SAVE"
+        fi
+        if [ -n "$PROFILE_LOAD" ]; then
+          set -- "$@" --residency-profile-load "$PROFILE_LOAD"
+        fi
       fi
       if [ "$ENFORCE" = "1" ]; then
         set -- "$@" --enforce-ram --enforce-timeout "$ENFORCE_TIMEOUT"
@@ -93,12 +101,16 @@ staging = report.get("staging_result") or {}
 app = report.get("application") or {}
 profile = report.get("profile") or {}
 timing = report.get("timing") or {}
+native = report.get("native_lifetime") or {}
+lifetimes = report.get("resource_lifetime_states") or {}
 before = (report.get("measurements") or {}).get("before") or {}
 after = (report.get("measurements") or {}).get("after") or {}
 row = [
     stamp, policy, prefetch, repeat, status, wall,
     report["model"]["id"], report["model"]["generation"],
     plan.get("selected_count", len(plan.get("selected") or [])), plan.get("profile_used"),
+    report.get("profile_source"), native.get("contract_version"), native.get("quiescent"),
+    json.dumps(lifetimes, sort_keys=True),
     (report.get("estimated_vs_observed") or {}).get("estimated_reclaim_bytes"),
     (report.get("estimated_vs_observed") or {}).get("observed_mapping_delta_bytes"),
     before.get("process_rss_bytes"), after.get("process_rss_bytes"),

@@ -12,8 +12,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use forge_core::{
-    BatchBuilder, Context, ContextTraceOptions, GpuLayers, Model, ModelLoadMode, ModelOptions,
-    PageReleaseResult, TensorMappingInfo, TraceEvent, TraceSummary,
+    BatchBuilder, Context, ContextLifetimeState, ContextTraceOptions, GpuLayers, Model,
+    ModelLifetimeState, ModelLoadMode, ModelOptions, PageReleaseResult, ResidencyError,
+    TensorMappingInfo, TraceEvent, TraceSummary,
 };
 
 use crate::execution::{
@@ -36,6 +37,7 @@ pub enum ForgeCoreAdapterError {
     Batch(String),
     Decode(String),
     Logits(String),
+    Residency(String),
 }
 
 impl fmt::Display for ForgeCoreAdapterError {
@@ -53,11 +55,16 @@ impl fmt::Display for ForgeCoreAdapterError {
             Self::Batch(message) => write!(formatter, "ForgeCore batch: {message}"),
             Self::Decode(message) => write!(formatter, "ForgeCore decode: {message}"),
             Self::Logits(message) => write!(formatter, "ForgeCore logits: {message}"),
+            Self::Residency(message) => write!(formatter, "ForgeCore residency: {message}"),
         }
     }
 }
 
 impl std::error::Error for ForgeCoreAdapterError {}
+
+fn map_residency_error(error: ResidencyError) -> ForgeCoreAdapterError {
+    ForgeCoreAdapterError::Residency(error.to_string())
+}
 
 /// CPU model-loading options exposed by the RAMforge adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,7 +298,7 @@ impl ForgeCoreModel {
     pub fn release_mapping_pages(&mut self) -> Result<(), ForgeCoreAdapterError> {
         self.model
             .release_mapping_pages()
-            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
+            .map_err(map_residency_error)
     }
 
     /// Owned tensor-to-mapping metadata for layer grouping/reporting.
@@ -309,7 +316,7 @@ impl ForgeCoreModel {
     ) -> Result<PageReleaseResult, ForgeCoreAdapterError> {
         self.model
             .release_tensor_pages(indices)
-            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
+            .map_err(map_residency_error)
     }
 
     /// Best-effort page prefetch for selected tensor indices.
@@ -325,6 +332,20 @@ impl ForgeCoreModel {
 
     pub fn execution_config(&self) -> &ExecutionConfig {
         &self.execution
+    }
+
+    pub fn native_contract_version() -> u32 {
+        Model::residency_contract_version()
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.model.instance_id()
+    }
+
+    pub fn lifetime_state(&self) -> Result<ModelLifetimeState, ForgeCoreAdapterError> {
+        self.model
+            .lifetime_state()
+            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
     }
 
     /// Open a context using the selected execution configuration.
@@ -469,6 +490,16 @@ impl ForgeCoreSession {
 
     pub fn context_length(&self) -> u32 {
         self.context.n_ctx()
+    }
+
+    pub fn lifetime_state(&self) -> Result<ContextLifetimeState, ForgeCoreAdapterError> {
+        self.context
+            .lifetime_state()
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn model_lifetime_state(&self) -> Result<ModelLifetimeState, ForgeCoreAdapterError> {
+        self.model.lifetime_state()
     }
 
     /// Wait for native work to complete. `decode_tokens` already reads

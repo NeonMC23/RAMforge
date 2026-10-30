@@ -7,14 +7,14 @@
 ## Local verification (2026-10-25)
 
 - The workspace builds and tests against the pinned `forge-core` revision
-  `df6d377` with Rust/Cargo 1.98.1 and the workspace native tree at
+  `457c4f7` with Rust/Cargo 1.98.1 and the workspace native tree at
   `/home/neon/Documents/CODE LOCAL/forge/native` (llama.cpp/ggml v0.5.0 plus
   the documented mmap-no-prefetch patch).
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **482 tests, 0 failed, 16 ignored**. The ignored
+  environment variables passes **493 tests, 0 failed, 17 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -50,7 +50,7 @@
   device facts, and (when active) cgroup limit/peak/events/page faults. Without
   `--enforce-ram` it labels the requested budget diagnostic-only; with the flag
   it labels the cgroup v2 `memory.max` enforcement.
-- The `forge-core` pin moved to `df6d377` to consume
+- The `forge-core` pin moved to `457c4f7` to consume
   `ModelOptions::use_extra_bufts`, `ModelLoadMode::MmapNoPrefetch`,
   `Model::tensor_mappings()`, `Model::release_tensor_pages()`, bounded
   `Model::prefetch_tensor_pages()`, and `ContextOptions::trace`. The native
@@ -61,6 +61,36 @@
   layer/range release.
 - See [../../scripts/test.sh](../../scripts/test.sh) for the reproducible test
   invocation.
+
+## Native lifetime and safe residency milestone (2026-10-30)
+
+- forgeCORE pin moved to `457c4f75193b004ed01c1cc0c8e620a4a7683196`.
+- Native pin remains `7fe450e19305b828c199d602c23a8337aaa1f03b`; the tracked
+  patch now adds an execution gate and lifetime diagnostics.
+- `Model::lifetime_state`, `Context::lifetime_state`, contract version 1, and
+  `ResidencyError` are available through forgeCORE. Release returns `Busy`
+  while any context has asynchronous graph work in flight.
+- RAMforge binds managers to the native model instance, observes quiescence
+  after session drop, refuses release planning without a matching contract and
+  quiescent observation, and records native context/execution facts in reports.
+- `resource_lifetime.rs` encodes the transition invariant that graph completion
+  alone cannot authorize release.
+- Versioned execution profiles can be saved/loaded atomically and inspected
+  with `ramforge profile`. Validation covers model path/size/mtime, inventory
+  generation, native contract, schema, completeness, and invalidation.
+- Admission reports an eligible-reclaimable estimate only when the native
+  contract is present, matching, and quiescent.
+
+Measured SmolLM2-135M Q4_K_M with a 128 MiB target and one greedy token:
+memory-bound selected 12 tensors, submitted 38,027,264 B, observed mapping RSS
+`98.87 -> 62.60 MiB`, process RSS `163.65 -> 127.39 MiB`, and cgroup current
+unchanged. Native lifetime reported contract 1, one context, execution
+generation 1, and quiescent=true after drop. Resource states were 260 `Owned`
+and 12 `Reconciled`.
+
+Intra-decode eviction remains unsupported. Context-owned KV/scratch resources
+have no independent native release API. A synchronized context does not prove
+future-token reuse.
 
 ## Graph-aware residency milestone (2026-10-25)
 
@@ -93,12 +123,12 @@ unless noted):
 
 | Policy | Selected | Mapping RSS delta | Process RSS before/after | Cgroup delta | TTFT |
 |---|---:|---:|---|---:|---:|
-| off | 0 | 0 B | 163.73 / 163.73 MiB | ~0 B | 24.7 ms |
-| observe | 12 | 0 B | 163.64 / 163.64 MiB | ~0 B | 24.8 ms |
-| conservative | 0 | 0 B | 163.61 / 163.61 MiB | ~0 B | 24.6 ms |
-| memory-bound | 12 | -38,027,264 B | 163.76 / 127.50 MiB | ~0 B | 25.1 ms |
-| active | 12 | -38,027,264 B | 163.78 / 127.52 MiB | ~0 B | 24.7 ms |
-| reuse-aware (valid profile) | 133 | -46,702,592 B | 171.80 / 127.26 MiB | ~0 B | 26.6 ms |
+| off | 0 | 0 B | 164.16 / 164.20 MiB | ~0 B | 26.4 ms |
+| observe | 12 | 0 B | 164.04 / 164.10 MiB | ~0 B | 27.5 ms |
+| conservative | 0 | 0 B | 164.04 / 164.07 MiB | ~0 B | 27.7 ms |
+| memory-bound | 12–13 | -38,387,712 B | 164.20 / 127.65 MiB | ~0 B | 26.5 ms |
+| active | 12 | -38,027,264 B | 164.20 / 127.98 MiB | ~0 B | 26.0 ms |
+| reuse-aware (valid profile) | 134–135 | -46,983,168 B | 172.36 / 127.57 MiB | ~0 B | 28.7 ms |
 
 The reuse-aware row used a complete 16,384-event capture. With the default
 4,096-event cap on a four-token run, the capture was truncated, the profile was
@@ -111,8 +141,8 @@ tensor range had non-zero shared page bytes. Bounded staging (64 MiB) selected
 Remaining blockers are unchanged: exact KV/scratch bytes are unavailable;
 intra-decode release lacks a proven native lifetime contract; cgroup attribution
 may not move after page advice; prefetch may not change mapping residency; GPU
-is unvalidated. There is no persisted execution-profile path, so no
-cross-process profile application exists. See
+is unvalidated. Persisted execution profiles are validated and bounded, but a
+loaded profile remains a heuristic and not future-reuse proof. See
 [MEMORY_ACCOUNTING.md](MEMORY_ACCOUNTING.md) and
 [GRAPH_SAFETY.md](GRAPH_SAFETY.md).
 
@@ -483,7 +513,7 @@ Read-only model hashes from the matrix inventory:
 
 **Current ForgeCore note:** static ForgeCore device discovery, explicit
 selection, and execution metadata are implemented. The pinned ForgeCore
-revision `df6d377` exposes public static model-load/offload options, CPU
+revision `457c4f7` exposes public static model-load/offload options, CPU
 weight-repacking control, and `MmapNoPrefetch`, but the RAMforge adapter remains
 deliberately CPU-only in this refresh; GPU facts may be discoverable but
 non-CPU model execution is explicitly unsupported, with no CPU fallback. The

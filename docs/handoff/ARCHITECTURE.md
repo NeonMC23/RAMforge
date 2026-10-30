@@ -202,7 +202,7 @@ The tokenizer has no chat-template application. It encodes the prompt text suppl
 - `inspect MODEL [--json]`;
 - `plan MODEL --ram SIZE [--json]`;
 - `support`;
-- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--ctx N] [--enforce-ram] [--enforce-timeout S] [--no-repack] [--no-prefetch] [--release-mapping-pages] [--inspect-layer N | --release-layer N] [--residency-policy off|observe|conservative|memory-bound|reuse-aware|active] [--residency-target SIZE] [--residency-reserve SIZE] [--residency-report] [--residency-report-json PATH] [--residency-prefetch SIZE] [--graph-trace] [--graph-trace-events N] [--graph-trace-detail] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
+- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--ctx N] [--enforce-ram] [--enforce-timeout S] [--no-repack] [--no-prefetch] [--release-mapping-pages] [--inspect-layer N | --release-layer N] [--residency-policy off|observe|conservative|memory-bound|reuse-aware|active] [--residency-target SIZE] [--residency-reserve SIZE] [--residency-report] [--residency-report-json PATH] [--residency-profile-load PATH] [--residency-profile-save PATH] [--residency-prefetch SIZE] [--graph-trace] [--graph-trace-events N] [--graph-trace-detail] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
 
 The static Phase-4 device boundary is in `crates/ramforge-runtime/src/execution.rs`.
 `DeviceRegistry::discover()` is a safe ForgeCore snapshot; CPU is selectable,
@@ -238,10 +238,22 @@ The forgeCORE backend has a RAMforge-owned residency layer:
   not a resource-lifetime guarantee, and `intra_decode_safe` is always false.
 - `execution_profile.rs` summarizes complete observations by stable tensor name
   and inventory generation. Multi-execution captures are split by execution id.
-  Profiles are in-memory only and are rejected when model/generation do not
-  match.
+  Profiles can be persisted in a bounded/versioned file with model identity,
+  size/mtime, inventory generation, and native contract validation; transient
+  native IDs are never serialized.
+- `resource_lifetime.rs` is the explicit resource state machine. Graph-node
+  completion cannot promote a resource directly to release eligibility; only
+  a synchronized operation boundary with native quiescence can do that.
+  `FinalUseProven` remains reserved for a future contract.
 - `forgecore.rs` owns the adapter and the release/prefetch/trace calls. RAMforge
-  never calls llama.cpp/ggml FFI and does not depend on `forge-sys`.
+  never calls llama.cpp/ggml FFI and does not depend on `forge-sys`. It exposes
+  model instance/lifetime state, context execution generations, typed residency
+  errors (`Busy`, `Unsupported`, `Invalid`, `Native`), and the native contract
+  version.
+- The native patch adds a model-scoped execution gate: contexts hold a shared
+  lease until synchronization/destruction; page release uses a non-blocking
+  exclusive attempt and returns `EBUSY` if any context is in flight. This is an
+  operation-boundary guarantee, not intra-decode reuse proof.
 
 The safe mutation boundary is after decode completion and session teardown.
 Planning and admission occur before decode; post-operation planning may use a

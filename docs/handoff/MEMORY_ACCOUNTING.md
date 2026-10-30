@@ -137,6 +137,58 @@ The bounded staging controller plans per tensor/mapping page range:
 Prefetch remains a hint. `MADV_WILLNEED` can return success without loading all
 pages, and a zero mapping delta after a successful hint is a valid observation.
 
+## Native lifetime gate
+
+The pinned native patch adds a model-scoped execution gate. A context holds a
+shared lease from asynchronous graph submission until `llama_synchronize` (or
+context destruction) observes completion. Page release takes the exclusive side
+with `try_to_lock`:
+
+- no in-flight context: release may advise pages away;
+- any in-flight context: release returns `EBUSY` without blocking and without
+  changing residency;
+- a synchronized context still logically owns model weights for future tokens.
+
+`Model::instance_id`, `Model::lifetime_state`, `Context::lifetime_state`, and
+the contract version 1 are exposed through forgeCORE. RAMforge binds its
+manager to the loaded model instance and records a quiescent observation after
+session drop. For planner mutation, RAMforge requires the native quiescent flag,
+zero in-flight contexts, and zero active contexts; the lower-level native call
+can release pages with an idle context because pointers remain valid, but
+RAMforge's policy is stricter. A bound manager refuses to select resources
+while the native contract is missing, mismatched, or not quiescent. The actual native call is
+the final enforcement point; RAMforge does not infer safety from a graph node
+callback.
+
+## Resource-lifetime state machine
+
+`ramforge-runtime/src/resource_lifetime.rs` rejects illegal transitions. The
+important invariant is that `ExecutionCompleted` cannot transition directly to
+`ReleaseEligible`:
+
+```text
+Discovered -> Owned -> Referenced -> ExecutionSubmitted -> ExecutionCompleted
+                                                              |
+                                          OperationBoundarySynchronized
+                                                              v
+                                                        ReleaseEligible
+                                                              |
+                                                     ReleaseSelected
+                                                              v
+                                                    ReleaseRequested
+                                                       /          \
+                                              NativeAccepted   NativeFailure
+                                                    v             v
+                                             Reconciled     ReleaseFailed
+```
+
+`FinalUseProven` is reserved for a future contract that proves no future graph
+can reuse the resource. It is not reached from graph completion in the current
+implementation. `Invalidated`, `SharedOrReused`, and `Unknown` represent
+explicit non-release outcomes. A failed native release is recorded as
+`ReleaseFailed` and the application report retains the error; it is never
+reported as a complete release.
+
 ## Policy profiles
 
 The existing `off` / `observe` / `active` CLI values remain compatible. New
@@ -148,7 +200,7 @@ profiles are explicit:
 | `observe` | Yes | No | Deterministic memory-bound plan for inspection |
 | `conservative` | Yes | Yes, after safe boundary | Only tensors with **zero** shared page bytes |
 | `memory-bound` | Yes | Yes, after safe boundary | Cold/large candidates until target or eligibility exhausted |
-| `reuse-aware` | Yes | Yes, after safe boundary | Valid profile orders cold resources first; profile must match model generation |
+| `reuse-aware` | Yes | Yes, after safe boundary | Valid profile (in-memory or persisted) orders cold resources first; profile must match model generation |
 | `active` | Yes | Yes, after safe boundary | Compatibility alias for memory-bound behavior |
 
 A target is required for `memory-bound` and `active`. The soft target is reduced
@@ -156,7 +208,7 @@ by the safety reserve. `conservative` intentionally may release nothing on
 models whose tensor payloads share aligned pages; that is safer than pretending
 the shared bytes are uniquely reclaimable.
 
-`reuse-aware` uses an in-memory execution profile derived from a complete
+`reuse-aware` uses an execution profile derived from a complete
 bounded trace. Profiles contain stable tensor names and graph-order access
 information only; transient native node IDs are never persisted. A profile
 from another model or inventory generation is ignored. If no valid profile is
@@ -172,7 +224,11 @@ Admission is separate from planning:
 - unknown memory components are listed explicitly;
 - if the excess is likely anonymous, KV, scratch, or runtime memory, the report
   says page release may not be able to address it;
-- a request that cannot be measured is `Unknown`, not silently admitted.
+- a request that cannot be measured is `Unknown`, not silently admitted;
+- the report includes the native contract/instance/quiescence facts and an
+  eligible-reclaimable estimate only when the contract matches and the model
+  was observed quiescent;
+- an ineligible or unknown lifetime component is not counted as reclaimable.
 
 The cgroup remains the hard enforcement mechanism. No policy claims that a
 release request lowers cgroup usage by the requested amount.
@@ -188,7 +244,9 @@ release request lowers cgroup usage by the requested amount.
 - ledger entries and reconciliation;
 - staging plan/result;
 - application request/result;
-- profile completeness and bounded access names;
+- native contract/instance/quiescence and context execution generation;
+- resource lifetime state counts;
+- profile source/identity, completeness, and bounded access names;
 - bounded selected-resource lists plus explicit selected counts;
 - before/after RSS, mapping RSS/PSS, cgroup current/peak/events;
 - estimated versus observed mapping delta;
@@ -205,6 +263,8 @@ silently discard the report.
 - cgroup current may not move after page advice even when mapping/process RSS
   falls.
 - Prefetch may produce no measurable residency change.
+- Context-owned KV/scratch buffers have no independent native release API.
+- A synchronized context does not prove that model weights will not be reused.
 - Intra-decode release is unsupported; the safe boundary is after decode and
   context teardown.
 - GPU residency and execution are not validated.

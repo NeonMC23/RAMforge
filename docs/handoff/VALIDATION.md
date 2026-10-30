@@ -269,7 +269,7 @@ Passed:
 
 ```text
 cargo check --workspace
-cargo test --workspace                  # 482 passed, 0 failed, 16 ignored
+cargo test --workspace                  # 493 passed, 0 failed, 17 ignored
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p ramforge-cli --test enforce_ram \
   json_report_is_versioned_and_keeps_measurements_distinct -- --ignored --exact
@@ -296,3 +296,43 @@ Not run or not claimed:
 - GPU execution or residency;
 - reproducible cross-machine performance;
 - exact KV-cache or graph-scratch byte accounting.
+
+## Native lifetime validation — 2026-10-30
+
+ForgeCORE pin: `457c4f75193b004ed01c1cc0c8e620a4a7683196`.
+
+Native tests executed with the pinned tree and `FORGE_TEST_MODEL` pointing at
+SmolLM2-135M Q4_K_M:
+
+- `release_is_busy_until_native_synchronization_then_safe`
+- `two_contexts_must_both_be_synchronized_before_release`
+- `context_drop_synchronizes_and_releases_native_count`
+- `model_instance_identity_is_process_local_and_distinct`
+
+They prove the current contract: release is rejected with `ResidencyError::Busy`
+until all contexts synchronize or drop; a context drop synchronizes; model
+instance IDs are distinct; page release after synchronization leaves inference
+valid.
+
+RAMforge checks:
+
+```text
+cargo check --workspace                         passed
+cargo test --workspace                          493 passed, 0 failed, 17 ignored
+cargo clippy --workspace --all-targets -D warnings  passed
+```
+
+Real-model checks passed individually:
+
+- versioned JSON report with native lifetime fields;
+- profile save then `ramforge profile --model` identity validation;
+- reuse-aware inference with a loaded persisted profile;
+- memory-bound post-operation release with native quiescence and state-machine
+  reconciliation.
+
+Not validated/claimed:
+
+- intra-decode release;
+- context-owned KV/scratch page release;
+- GPU execution/residency;
+- cross-machine performance or cgroup attribution.

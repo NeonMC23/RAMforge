@@ -3,15 +3,18 @@ use ramforge_core::{
     discover_model_set, parse_memory_size, ChatMessage, ChatTemplate, GgufModel, GgufModelSet,
     Tokenizer,
 };
-use ramforge_runtime::execution_profile::ExecutionProfile;
+use ramforge_runtime::execution_profile::{
+    inspect_profile, load_profile, ExecutionProfile, ProfileIdentity,
+};
 use ramforge_runtime::graph_manifest::{GraphManifest, LastUseStatus};
 use ramforge_runtime::memory_ledger::MemoryLedger;
 use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::page_residency::{evict_file_cache, model_mapping_residency};
 use ramforge_runtime::residency_engine::{
-    AdmissionDecision, DecisionAction, ModelGeneration, ModelId, OperationContext, OperationTiming,
-    ResidencyCapabilities, ResidencyManager, ResidencyPlan, ResidencyPolicy, ResidencyPolicyMode,
-    ResidencyReport, ResidencySnapshot, ResourceInventory, StagingPlan, StagingResult,
+    AdmissionDecision, DecisionAction, ManagerError, ModelGeneration, ModelId, OperationContext,
+    OperationTiming, ResidencyCapabilities, ResidencyManager, ResidencyPlan, ResidencyPolicy,
+    ResidencyPolicyMode, ResidencyReport, ResidencySnapshot, ResourceInventory, StagingPlan,
+    StagingResult,
 };
 use ramforge_runtime::{
     DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
@@ -102,6 +105,23 @@ enum Commands {
     },
     /// Show explicit architecture, tokenizer, and quantization capabilities
     Support,
+    /// Inspect/validate a persisted execution profile
+    Profile {
+        /// Profile JSON path
+        path: PathBuf,
+
+        /// Model path used to validate model identity
+        #[arg(long, value_name = "MODEL")]
+        model: Option<PathBuf>,
+
+        /// Inventory generation expected by the profile
+        #[arg(long, default_value_t = 1)]
+        inventory_generation: u64,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
     /// Run real inference; select legacy or explicit ForgeCore execution
     Run {
         /// Path to the GGUF model file
@@ -174,6 +194,14 @@ enum Commands {
         /// Write a versioned JSON residency report to PATH
         #[arg(long, value_name = "PATH")]
         residency_report_json: Option<PathBuf>,
+
+        /// Load a validated execution profile from PATH (reuse-aware/staging input)
+        #[arg(long, value_name = "PATH")]
+        residency_profile_load: Option<PathBuf>,
+
+        /// Save the current complete trace profile atomically to PATH
+        #[arg(long, value_name = "PATH", requires = "graph_trace")]
+        residency_profile_save: Option<PathBuf>,
 
         /// Best-effort bounded page prefetch budget (MADV_WILLNEED hint)
         #[arg(long, value_name = "SIZE")]
@@ -250,6 +278,19 @@ fn main() {
             }
         }
         Commands::Support => output_support(),
+        Commands::Profile {
+            path,
+            model,
+            inventory_generation,
+            json,
+        } => {
+            if let Err(error) =
+                run_profile_inspect(&path, model.as_deref(), inventory_generation, json)
+            {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Run {
             model,
             ram,
@@ -269,6 +310,8 @@ fn main() {
             residency_reserve,
             residency_report,
             residency_report_json,
+            residency_profile_load,
+            residency_profile_save,
             residency_prefetch,
             graph_trace,
             graph_trace_events,
@@ -330,6 +373,8 @@ fn main() {
                 residency_reserve,
                 residency_report,
                 residency_report_json,
+                residency_profile_load,
+                residency_profile_save,
                 residency_prefetch,
                 graph_trace,
                 graph_trace_events,
@@ -432,6 +477,8 @@ fn run_inference(
     residency_reserve: Option<String>,
     residency_report: bool,
     residency_report_json: Option<PathBuf>,
+    residency_profile_load: Option<PathBuf>,
+    residency_profile_save: Option<PathBuf>,
     residency_prefetch: Option<String>,
     graph_trace: bool,
     graph_trace_events: usize,
@@ -504,6 +551,8 @@ fn run_inference(
         || residency_reserve_bytes != 0
         || residency_report
         || residency_report_json.is_some()
+        || residency_profile_load.is_some()
+        || residency_profile_save.is_some()
         || residency_prefetch_bytes.is_some();
     if residency_requested
         && (release_mapping_pages || inspect_layer.is_some() || release_layer.is_some())
@@ -537,6 +586,8 @@ fn run_inference(
             residency_reserve_bytes,
             residency_report,
             residency_report_json.clone(),
+            residency_profile_load.clone(),
+            residency_profile_save.clone(),
             residency_prefetch_bytes,
             graph_trace,
             graph_trace_events,
@@ -586,6 +637,8 @@ fn run_inference(
         || residency_reserve_bytes != 0
         || residency_report
         || residency_report_json.is_some()
+        || residency_profile_load.is_some()
+        || residency_profile_save.is_some()
         || residency_prefetch_bytes.is_some();
     if residency_requested {
         return Err(anyhow::anyhow!(
@@ -855,6 +908,8 @@ fn run_forgecore_inference(
     residency_reserve: u64,
     residency_report: bool,
     residency_report_json: Option<PathBuf>,
+    residency_profile_load: Option<PathBuf>,
+    residency_profile_save: Option<PathBuf>,
     residency_prefetch_bytes: Option<u64>,
     graph_trace: bool,
     graph_trace_events: usize,
@@ -1010,15 +1065,50 @@ fn run_forgecore_inference(
             );
         }
     }
+    let profile_identity =
+        if graph_trace || residency_profile_load.is_some() || residency_profile_save.is_some() {
+            let model_file_bytes = model_set.total_file_bytes();
+            Some(
+                ProfileIdentity::from_model_path(
+                    model.path(),
+                    model_file_bytes,
+                    1,
+                    ForgeCoreModel::native_contract_version(),
+                )
+                .map_err(|error| anyhow::anyhow!(error))?,
+            )
+        } else {
+            None
+        };
+    let mut loaded_profile: Option<ExecutionProfile> = None;
+    if let (Some(path), Some(identity)) =
+        (residency_profile_load.as_ref(), profile_identity.as_ref())
+    {
+        let profile = load_profile(path, identity).map_err(|error| anyhow::anyhow!(error))?;
+        eprintln!(
+            "Residency profile loaded: path={} entries={} complete_observations={}",
+            path.display(),
+            profile.access.len(),
+            profile.complete_observations
+        );
+        loaded_profile = Some(profile);
+    }
     let residency_started = Instant::now();
     let mut residency_manager = if residency_policy != ResidencyPolicyArg::Off
         || residency_report
         || residency_report_json.is_some()
+        || residency_profile_load.is_some()
+        || residency_profile_save.is_some()
         || residency_target.is_some()
         || residency_reserve != 0
         || residency_prefetch_bytes.is_some()
     {
-        let model_id = ModelId(model.path().display().to_string());
+        let model_id = ModelId(
+            std::fs::canonicalize(model.path())
+                .unwrap_or_else(|_| model.path().to_path_buf())
+                .display()
+                .to_string(),
+        );
         let mappings = model
             .tensor_mappings()
             .map_err(|error| anyhow::anyhow!(error))?;
@@ -1037,15 +1127,29 @@ fn run_forgecore_inference(
         }
         .validate()
         .map_err(|error| anyhow::anyhow!(error))?;
-        Some(
-            ResidencyManager::new(
-                model_id,
-                inventory,
-                policy,
-                ramforge_cli::supervisor::enforced_budget_bytes(),
-            )
-            .map_err(|error| anyhow::anyhow!(error))?,
+        let mut manager = ResidencyManager::new(
+            model_id,
+            inventory,
+            policy,
+            ramforge_cli::supervisor::enforced_budget_bytes(),
         )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        manager
+            .bind_native_model(
+                model.instance_id(),
+                ForgeCoreModel::native_contract_version(),
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let lifetime = model
+            .lifetime_state()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        manager.observe_native_lifetime(
+            lifetime.quiescent,
+            lifetime.active_contexts,
+            lifetime.inflight_contexts,
+            None,
+        );
+        Some(manager)
     } else {
         None
     };
@@ -1055,7 +1159,11 @@ fn run_forgecore_inference(
     let mut residency_staging_result: Option<StagingResult> = None;
     if let Some(manager) = residency_manager.as_mut() {
         if let Some(limit) = residency_prefetch_bytes {
-            let plan = manager.staging_plan(limit);
+            let plan = if loaded_profile.is_some() {
+                manager.staging_plan_with_profile(limit, loaded_profile.as_ref())
+            } else {
+                manager.staging_plan(limit)
+            };
             residency_staging = Some(plan.clone());
             eprintln!(
                 "Residency staging plan: selected={} requested_pages={} skipped={}",
@@ -1114,7 +1222,7 @@ fn run_forgecore_inference(
             pinned: Default::default(),
         };
         let plan = manager
-            .plan(current, &context)
+            .plan_with_profile(current, &context, loaded_profile.as_ref())
             .map_err(|error| anyhow::anyhow!(error))?;
         if !residency_report && residency_policy != ResidencyPolicyArg::Off {
             print_residency_plan("pre-operation", &plan);
@@ -1416,6 +1524,8 @@ fn run_forgecore_inference(
         );
     }
     let mut execution_profile = None;
+    let mut native_context_id: Option<u64> = None;
+    let mut native_execution_generation: Option<u64> = None;
     if graph_trace {
         let summary = session.trace_summary();
         let events = session.trace_events();
@@ -1446,6 +1556,19 @@ fn run_forgecore_inference(
                 profile.access.len(),
                 profile.is_valid_for(&manager.model_id().clone(), manager.inventory().generation)
             );
+            if let Some(path) = residency_profile_save.as_ref() {
+                let identity = profile_identity
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("profile save requires a model identity"))?;
+                profile
+                    .save_json_file(identity, path)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                eprintln!(
+                    "Residency profile saved: path={} entries={}",
+                    path.display(),
+                    profile.access.len()
+                );
+            }
             execution_profile = Some(profile);
         }
         let unknown = manifest
@@ -1475,6 +1598,10 @@ fn run_forgecore_inference(
             }
         }
     }
+    if let Ok(lifetime) = session.lifetime_state() {
+        native_context_id = Some(lifetime.context_id);
+        native_execution_generation = Some(lifetime.execution_generation);
+    }
     drop(session);
 
     let mut post_operation_plan = None;
@@ -1482,6 +1609,23 @@ fn run_forgecore_inference(
     let mut residency_before = None;
     let mut residency_after = None;
     if let Some(manager) = residency_manager.as_mut() {
+        let native_lifetime = model
+            .lifetime_state()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        manager.observe_native_lifetime(
+            native_lifetime.quiescent,
+            native_lifetime.active_contexts,
+            native_lifetime.inflight_contexts,
+            native_execution_generation,
+        );
+        if !native_lifetime.quiescent || native_lifetime.active_contexts != 0 {
+            eprintln!(
+                "Residency native guard: quiescent={} active_contexts={} inflight_contexts={}",
+                native_lifetime.quiescent,
+                native_lifetime.active_contexts,
+                native_lifetime.inflight_contexts
+            );
+        }
         let before = ResidencySnapshot::capture_paths(&shard_paths);
         let current = before
             .process_rss_bytes
@@ -1491,7 +1635,15 @@ fn run_forgecore_inference(
             .plan_with_profile(
                 current,
                 &OperationContext::default(),
-                execution_profile.as_ref(),
+                execution_profile
+                    .as_ref()
+                    .filter(|profile| {
+                        profile.is_valid_for(
+                            &manager.model_id().clone(),
+                            manager.inventory().generation,
+                        )
+                    })
+                    .or(loaded_profile.as_ref()),
             )
             .map_err(|error| anyhow::anyhow!(error))?;
         if !residency_report && residency_policy != ResidencyPolicyArg::Off {
@@ -1500,14 +1652,18 @@ fn run_forgecore_inference(
         post_operation_plan = Some(plan);
         residency_before = Some(before);
         if residency_policy.applies() && manager.last_plan().is_some_and(|plan| !plan.is_noop()) {
-            let application = manager
-                .apply_last_plan(|indices| {
-                    model
-                        .release_tensor_pages(indices)
-                        .map_err(|error| error.to_string())
-                })
-                .map_err(|error| anyhow::anyhow!(error))?;
-            residency_application = Some(application);
+            match manager.apply_last_plan(|indices| {
+                model
+                    .release_tensor_pages(indices)
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(application) => residency_application = Some(application),
+                Err(ManagerError::Release(message)) => {
+                    residency_application = manager.application().cloned();
+                    eprintln!("Residency application incomplete: {message}");
+                }
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            }
         }
         residency_after = Some(ResidencySnapshot::capture_paths(&shard_paths));
     }
@@ -1529,7 +1685,34 @@ fn run_forgecore_inference(
                 application: residency_application.clone(),
                 staging: residency_staging.clone(),
                 staging_result: residency_staging_result.clone(),
-                profile: execution_profile.clone(),
+                profile: execution_profile
+                    .clone()
+                    .filter(|profile| {
+                        profile.is_valid_for(
+                            &manager.model_id().clone(),
+                            manager.inventory().generation,
+                        )
+                    })
+                    .or_else(|| loaded_profile.clone()),
+                profile_source: if execution_profile.as_ref().is_some_and(|profile| {
+                    profile
+                        .is_valid_for(&manager.model_id().clone(), manager.inventory().generation)
+                }) {
+                    "current_trace".to_string()
+                } else if loaded_profile.is_some() {
+                    "loaded_file".to_string()
+                } else if execution_profile.is_some() {
+                    "invalid_trace".to_string()
+                } else {
+                    "none".to_string()
+                },
+                profile_identity: profile_identity.clone(),
+                native_model_instance: manager.native_model_instance(),
+                native_contract_version: manager.native_contract_version(),
+                native_quiescent: manager.native_quiescent(),
+                native_context_id,
+                native_execution_generation,
+                lifetime_counts: manager.lifetime_counts(),
                 ledger: MemoryLedger::from_inventory(
                     manager.model_id().clone(),
                     manager.inventory().generation,
@@ -1612,6 +1795,83 @@ fn run_forgecore_inference(
     Ok(())
 }
 
+fn run_profile_inspect(
+    path: &std::path::Path,
+    model: Option<&std::path::Path>,
+    inventory_generation: u64,
+    json: bool,
+) -> anyhow::Result<()> {
+    let inspection = inspect_profile(path).map_err(|error| anyhow::anyhow!(error))?;
+    let valid = true;
+    if let Some(model_path) = model {
+        let model_set = discover_model_set(model_path)
+            .map_err(|error| anyhow::anyhow!("discover model set: {error}"))?;
+        let model_bytes = model_set.total_file_bytes();
+        let identity = ProfileIdentity::from_model_path(
+            model_path,
+            model_bytes,
+            inventory_generation,
+            ForgeCoreModel::native_contract_version(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        if let Err(error) = load_profile(path, &identity) {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "valid": false,
+                        "error": error.to_string(),
+                        "inspection": format!("{inspection:?}"),
+                    })
+                );
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!(error));
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "valid": valid,
+                "schema_version": inspection.schema_version,
+                "kind": inspection.kind,
+                "profile_version": inspection.profile_version,
+                "entries": inspection.entries,
+                "complete_observations": inspection.complete_observations,
+                "incomplete_observations": inspection.incomplete_observations,
+                "invalidated": inspection.invalidated,
+                "identity": inspection.identity,
+                "model_identity_validated": model.is_some(),
+            })
+        );
+    } else {
+        println!("Profile: {}", path.display());
+        println!(
+            "  schema={} kind={} profile_version={} valid={}",
+            inspection.schema_version, inspection.kind, inspection.profile_version, valid
+        );
+        println!(
+            "  entries={} complete_observations={} incomplete_observations={} invalidated={}",
+            inspection.entries,
+            inspection.complete_observations,
+            inspection.incomplete_observations,
+            inspection.invalidated
+        );
+        println!("  model={}", inspection.identity.model_path);
+        println!(
+            "  model_size_bytes={} model_modified_unix_ns={:?}",
+            inspection.identity.model_size_bytes, inspection.identity.model_modified_unix_ns
+        );
+        println!(
+            "  inventory_generation={} native_contract={}",
+            inspection.identity.inventory_generation, inspection.identity.native_contract_version
+        );
+        println!("  model_identity_validated={}", model.is_some());
+    }
+    Ok(())
+}
+
 fn output_support() {
     use ramforge_runtime::support::{
         execution_architectures, forgecore_execution_architectures, ARCHITECTURES, QUANTIZATIONS,
@@ -1674,7 +1934,9 @@ fn output_support() {
         "  memory ledger/reconciliation: supported; KV/scratch/runtime remain explicitly unknown"
     );
     println!("  operation reports: human-readable and versioned JSON schema 1");
-    println!("  execution profiles: in-memory diagnostic input only; not persisted");
+    println!(
+        "  execution profiles: bounded/versioned; optional validated persistence via --residency-profile-load/save"
+    );
     println!("  graph trace: {:?}", capabilities.graph_trace);
     println!(
         "  graph dependency analysis: {:?}",
@@ -1683,6 +1945,14 @@ fn output_support() {
     println!(
         "  proven last-use completion: {:?}",
         capabilities.proven_last_use_completion
+    );
+    println!(
+        "  native lifetime contract: {:?}",
+        capabilities.native_lifetime_contract
+    );
+    println!(
+        "  context-owned resource release: {:?}",
+        capabilities.context_owned_release
     );
     println!(
         "  between-operation residency: {:?}",
@@ -2016,6 +2286,10 @@ fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
         },
         "admission": {
             "outcome": format!("{:?}", report.admission.outcome),
+            "native_model_instance": report.admission.native_model_instance,
+            "native_contract_version": report.admission.native_contract_version,
+            "native_quiescent": report.admission.native_quiescent,
+            "eligible_reclaimable_bytes": report.admission.eligible_reclaimable_bytes,
             "soft_target_bytes": report.admission.soft_target_bytes,
             "hard_limit_bytes": report.admission.hard_limit_bytes,
             "safety_reserve_bytes": report.admission.safety_reserve_bytes,
@@ -2085,6 +2359,16 @@ fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
                 "error": application.error,
             })
         }),
+        "resource_lifetime_states": report.lifetime_counts,
+        "native_lifetime": {
+            "contract_version": report.native_contract_version,
+            "model_instance_id": report.native_model_instance,
+            "quiescent": report.native_quiescent,
+            "context_id": report.native_context_id,
+            "execution_generation": report.native_execution_generation,
+        },
+        "profile_source": report.profile_source,
+        "profile_identity": report.profile_identity,
         "profile": report.profile.as_ref().map(|profile| serde_json::json!({
             "version": profile.version,
             "complete_observations": profile.complete_observations,
@@ -2233,6 +2517,15 @@ fn print_residency_report(report: &ResidencyReport) {
             }
         );
     }
+    eprintln!("  Resource lifetime states: {:?}", report.lifetime_counts);
+    eprintln!(
+        "  Native lifetime: contract={:?} instance={:?} quiescent={} context_id={:?} execution_generation={:?}",
+        report.native_contract_version,
+        report.native_model_instance,
+        report.native_quiescent,
+        report.native_context_id,
+        report.native_execution_generation
+    );
     if let Some(profile) = &report.profile {
         eprintln!(
             "  Execution profile: version={} complete_observations={} incomplete_observations={} tensors={} nodes={} invalidated={:?}",
@@ -2245,13 +2538,20 @@ fn print_residency_report(report: &ResidencyReport) {
         );
     }
     eprintln!(
-        "  Admission: {:?}; current={} soft_target={} hard_limit={} reserve={} known_tensor_bytes={}",
+        "  Execution profile source: {} identity={:?}",
+        report.profile_source, report.profile_identity
+    );
+    eprintln!(
+        "  Admission: {:?}; current={} soft_target={} hard_limit={} reserve={} known_tensor_bytes={} eligible_reclaimable={} native_quiescent={} contract={:?}",
         report.admission.outcome,
         optional_bytes(report.admission.current_bytes),
         optional_bytes(report.admission.soft_target_bytes),
         optional_bytes(report.admission.hard_limit_bytes),
         format_bytes(report.admission.safety_reserve_bytes),
-        format_bytes(report.admission.known_tensor_bytes)
+        format_bytes(report.admission.known_tensor_bytes),
+        format_bytes(report.admission.eligible_reclaimable_bytes),
+        report.admission.native_quiescent,
+        report.admission.native_contract_version
     );
     for reason in &report.admission.reasons {
         eprintln!("    reason: {reason}");

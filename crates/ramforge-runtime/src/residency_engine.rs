@@ -12,18 +12,33 @@ use std::time::{Duration, Instant};
 use forge_core::{PageReleaseResult, TensorMappingInfo};
 
 use crate::cgroup::{self, CgroupEvents, CgroupStats};
-use crate::execution_profile::ExecutionProfile;
+use crate::execution_profile::{ExecutionProfile, ProfileIdentity};
 use crate::memory_ledger::MemoryLedger;
 use crate::memory_report::{process_rss, process_rss_peak};
 use crate::page_residency::model_mapping_residency;
+use crate::resource_lifetime::{LifetimeEvent, ResourceLifetime as ResourceLifetimeTracker};
 
 /// Stable identity for one loaded model within a runtime session.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ModelId(pub String);
 
 /// Monotonic generation for one model handle. Refreshing/reloading invalidates
 /// resource keys from older generations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ModelGeneration(pub u64);
 
 /// Resource key scoped to one model generation.
@@ -84,6 +99,27 @@ pub enum IneligibilityReason {
     InvalidMappingMetadata,
 }
 
+/// Who owns a resource's logical storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceOwner {
+    ModelFileMapping,
+    ModelAnonymousBuffer,
+    ContextOwned,
+    Unknown,
+}
+
+/// What the native contract proves about releasing this resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceLifetime {
+    /// File-backed model pages whose physical pages may be advised away at a
+    /// synchronized between-operation boundary. Logical ownership continues.
+    PageReleaseSafeAfterOperation,
+    /// Context-owned/anonymous memory with no independent native release API.
+    Unsupported,
+    /// Evidence is insufficient to classify the resource.
+    Unknown,
+}
+
 /// One model tensor resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorResource {
@@ -101,6 +137,8 @@ pub struct TensorResource {
     pub page_bytes: u64,
     /// Union of pages shared with other file-backed tensors in this model.
     pub shared_page_bytes: u64,
+    pub owner: ResourceOwner,
+    pub lifetime: ResourceLifetime,
     pub eligibility: Result<(), IneligibilityReason>,
     pub metadata_confidence: MetadataConfidence,
 }
@@ -132,6 +170,9 @@ pub struct InventorySummary {
 pub struct ResourceInventory {
     pub model_id: ModelId,
     pub generation: ModelGeneration,
+    /// Bound only after the caller validates the native model identity.
+    pub native_model_instance: Option<u64>,
+    pub native_contract_version: Option<u32>,
     pub resources: Vec<TensorResource>,
     pub by_index: BTreeMap<i32, usize>,
     pub summary: InventorySummary,
@@ -272,6 +313,20 @@ impl ResourceInventory {
                 page_end,
                 page_bytes: page_end.saturating_sub(page_start),
                 shared_page_bytes: 0,
+                owner: if file_backed {
+                    ResourceOwner::ModelFileMapping
+                } else if mapping.mapping_index.is_none() {
+                    ResourceOwner::ModelAnonymousBuffer
+                } else {
+                    ResourceOwner::Unknown
+                },
+                lifetime: if file_backed {
+                    ResourceLifetime::PageReleaseSafeAfterOperation
+                } else if mapping.mapping_index.is_none() {
+                    ResourceLifetime::Unsupported
+                } else {
+                    ResourceLifetime::Unknown
+                },
                 eligibility,
                 metadata_confidence: confidence,
             };
@@ -318,6 +373,8 @@ impl ResourceInventory {
         Ok(Self {
             model_id,
             generation,
+            native_model_instance: None,
+            native_contract_version: None,
             resources,
             by_index,
             summary,
@@ -411,6 +468,8 @@ pub struct ResidencyCapabilities {
     pub graph_trace: CapabilityState,
     pub graph_dependency_analysis: CapabilityState,
     pub proven_last_use_completion: CapabilityState,
+    pub native_lifetime_contract: CapabilityState,
+    pub context_owned_release: CapabilityState,
     pub between_operation_residency: CapabilityState,
     pub intra_decode_residency: CapabilityState,
     pub hard_cgroup_enforcement: CapabilityState,
@@ -442,6 +501,8 @@ impl ResidencyCapabilities {
             // The callback proves observed node completion, not that the next
             // graph/token cannot reuse a weight.
             proven_last_use_completion: CapabilityState::PartiallySupported,
+            native_lifetime_contract: CapabilityState::Supported,
+            context_owned_release: CapabilityState::Unsupported,
             between_operation_residency: CapabilityState::Supported,
             intra_decode_residency: CapabilityState::Unsupported,
             hard_cgroup_enforcement: if cgroup {
@@ -555,6 +616,9 @@ pub enum DecisionReason {
     AlreadyAttempted,
     AllPagesShared,
     SharedPageConservative,
+    LifetimeUnsupported,
+    LifetimeUnknown,
+    SynchronizationMissing,
     BudgetAlreadyMet,
     SelectedEligible,
     EligibleButNotNeeded,
@@ -605,6 +669,9 @@ impl ResidencyPlan {
 pub struct Planner<'a> {
     inventory: &'a ResourceInventory,
     attempted: &'a BTreeSet<ResourceKey>,
+    native_contract_version: Option<u32>,
+    native_quiescent: bool,
+    require_native_guard: bool,
 }
 
 impl<'a> Planner<'a> {
@@ -612,7 +679,17 @@ impl<'a> Planner<'a> {
         Self {
             inventory,
             attempted,
+            native_contract_version: None,
+            native_quiescent: false,
+            require_native_guard: false,
         }
+    }
+
+    pub fn with_native_guard(mut self, contract_version: Option<u32>, quiescent: bool) -> Self {
+        self.native_contract_version = contract_version;
+        self.native_quiescent = quiescent;
+        self.require_native_guard = true;
+        self
     }
 
     pub fn plan(
@@ -684,6 +761,33 @@ impl<'a> Planner<'a> {
             if !resource.file_backed {
                 decisions.push(ResourceDecision {
                     reason: DecisionReason::AnonymousOrRepacked,
+                    ..base
+                });
+                continue;
+            }
+            if resource.lifetime == ResourceLifetime::Unsupported {
+                decisions.push(ResourceDecision {
+                    reason: DecisionReason::LifetimeUnsupported,
+                    ..base
+                });
+                continue;
+            }
+            if resource.lifetime == ResourceLifetime::Unknown {
+                decisions.push(ResourceDecision {
+                    reason: DecisionReason::LifetimeUnknown,
+                    ..base
+                });
+                continue;
+            }
+            if self.require_native_guard
+                && (self.native_contract_version != Some(1) || !self.native_quiescent)
+            {
+                decisions.push(ResourceDecision {
+                    reason: if self.native_contract_version != Some(1) {
+                        DecisionReason::LifetimeUnknown
+                    } else {
+                        DecisionReason::SynchronizationMissing
+                    },
                     ..base
                 });
                 continue;
@@ -823,6 +927,10 @@ pub enum AdmissionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionDecision {
     pub outcome: AdmissionOutcome,
+    pub native_model_instance: Option<u64>,
+    pub native_contract_version: Option<u32>,
+    pub native_quiescent: bool,
+    pub eligible_reclaimable_bytes: u64,
     pub soft_target_bytes: Option<u64>,
     pub hard_limit_bytes: Option<u64>,
     pub safety_reserve_bytes: u64,
@@ -900,6 +1008,10 @@ pub fn admit(
     };
     AdmissionDecision {
         outcome,
+        native_model_instance: None,
+        native_contract_version: None,
+        native_quiescent: false,
+        eligible_reclaimable_bytes: 0,
         soft_target_bytes,
         hard_limit_bytes,
         safety_reserve_bytes,
@@ -1154,6 +1266,14 @@ pub struct ResidencyReport {
     pub staging: Option<StagingPlan>,
     pub staging_result: Option<StagingResult>,
     pub profile: Option<ExecutionProfile>,
+    pub profile_source: String,
+    pub profile_identity: Option<ProfileIdentity>,
+    pub native_model_instance: Option<u64>,
+    pub native_contract_version: Option<u32>,
+    pub native_quiescent: bool,
+    pub native_context_id: Option<u64>,
+    pub native_execution_generation: Option<u64>,
+    pub lifetime_counts: BTreeMap<String, usize>,
     pub ledger: MemoryLedger,
     pub before: ResidencySnapshot,
     pub after: ResidencySnapshot,
@@ -1174,6 +1294,11 @@ pub struct ResidencyManager {
     attempted: BTreeSet<ResourceKey>,
     last_plan: Option<ResidencyPlan>,
     application: Option<ApplicationReport>,
+    native_model_instance: Option<u64>,
+    native_contract_version: Option<u32>,
+    native_quiescent: bool,
+    last_native_generation: Option<u64>,
+    lifetimes: BTreeMap<ResourceKey, ResourceLifetimeTracker>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1184,6 +1309,8 @@ pub enum ManagerError {
     StalePlan,
     NoPlan,
     ObserveOnly,
+    SynchronizationMissing,
+    NativeContract(String),
     Release(String),
 }
 
@@ -1196,6 +1323,10 @@ impl std::fmt::Display for ManagerError {
             Self::StalePlan => write!(f, "residency plan is stale for this model generation"),
             Self::NoPlan => write!(f, "no residency plan is available"),
             Self::ObserveOnly => write!(f, "observation-only policy cannot apply releases"),
+            Self::SynchronizationMissing => {
+                write!(f, "native execution is not quiescent; release is unsafe")
+            }
+            Self::NativeContract(error) => write!(f, "native residency contract: {error}"),
             Self::Release(error) => write!(f, "residency release failed: {error}"),
         }
     }
@@ -1211,6 +1342,11 @@ impl ResidencyManager {
         hard_limit_bytes: Option<u64>,
     ) -> Result<Self, ManagerError> {
         let policy = policy.validate().map_err(ManagerError::Policy)?;
+        let lifetimes = inventory
+            .resources
+            .iter()
+            .map(|resource| (resource.key, ResourceLifetimeTracker::default()))
+            .collect();
         Ok(Self {
             model_id,
             inventory,
@@ -1220,6 +1356,11 @@ impl ResidencyManager {
             attempted: BTreeSet::new(),
             last_plan: None,
             application: None,
+            native_model_instance: None,
+            native_contract_version: None,
+            native_quiescent: false,
+            last_native_generation: None,
+            lifetimes,
         })
     }
 
@@ -1237,6 +1378,76 @@ impl ResidencyManager {
 
     pub fn hard_limit_bytes(&self) -> Option<u64> {
         self.hard_limit_bytes
+    }
+
+    /// Bind this manager to the loaded native model instance and contract.
+    /// The binding is one-way: a different instance is a stale manager.
+    pub fn bind_native_model(
+        &mut self,
+        instance_id: u64,
+        contract_version: u32,
+    ) -> Result<(), ManagerError> {
+        if instance_id == 0 {
+            return Err(ManagerError::NativeContract(
+                "native model instance id is zero".to_string(),
+            ));
+        }
+        if contract_version != 1 {
+            return Err(ManagerError::NativeContract(format!(
+                "unsupported contract version {contract_version}; expected 1"
+            )));
+        }
+        if self
+            .native_model_instance
+            .is_some_and(|bound| bound != instance_id)
+        {
+            return Err(ManagerError::StalePlan);
+        }
+        self.native_model_instance = Some(instance_id);
+        self.native_contract_version = Some(contract_version);
+        self.inventory.native_model_instance = Some(instance_id);
+        self.inventory.native_contract_version = Some(contract_version);
+        for lifetime in self.lifetimes.values_mut() {
+            let _ = lifetime.apply(LifetimeEvent::ModelBound, "native model bound");
+        }
+        Ok(())
+    }
+
+    /// Record a point-in-time native model/context observation. Only an
+    /// explicitly quiescent observation enables native-guarded planning.
+    pub fn observe_native_lifetime(
+        &mut self,
+        quiescent: bool,
+        active_contexts: u64,
+        inflight_contexts: u64,
+        execution_generation: Option<u64>,
+    ) {
+        self.native_quiescent = quiescent && inflight_contexts == 0 && active_contexts == 0;
+        if self.native_quiescent && active_contexts == 0 {
+            self.last_native_generation = execution_generation.or(self.last_native_generation);
+        }
+    }
+
+    pub fn native_model_instance(&self) -> Option<u64> {
+        self.native_model_instance
+    }
+
+    pub fn native_contract_version(&self) -> Option<u32> {
+        self.native_contract_version
+    }
+
+    pub fn native_quiescent(&self) -> bool {
+        self.native_quiescent
+    }
+
+    pub fn lifetime_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for lifetime in self.lifetimes.values() {
+            *counts
+                .entry(format!("{:?}", lifetime.state()))
+                .or_insert(0usize) += 1;
+        }
+        counts
     }
 
     pub fn state(&self) -> ResidencyState {
@@ -1337,7 +1548,7 @@ impl ResidencyManager {
     }
 
     pub fn admission(&self, current_bytes: Option<u64>) -> AdmissionDecision {
-        admit(
+        let mut decision = admit(
             self.policy.target_bytes,
             self.hard_limit_bytes,
             self.policy.safety_reserve_bytes,
@@ -1346,7 +1557,28 @@ impl ResidencyManager {
                 .summary
                 .logical_file_backed_bytes
                 .saturating_add(self.inventory.summary.logical_anonymous_bytes),
-        )
+        );
+        decision.native_model_instance = self.native_model_instance;
+        decision.native_contract_version = self.native_contract_version;
+        decision.native_quiescent = self.native_quiescent;
+        decision.eligible_reclaimable_bytes = if self.native_model_instance.is_some()
+            && self.native_contract_version == Some(1)
+            && self.native_quiescent
+        {
+            self.inventory
+                .resources
+                .iter()
+                .filter(|resource| {
+                    resource.lifetime == ResourceLifetime::PageReleaseSafeAfterOperation
+                        && !self.attempted.contains(&resource.key)
+                })
+                .fold(0u64, |total, resource| {
+                    total.saturating_add(resource.unique_reclaimable_bytes())
+                })
+        } else {
+            0
+        };
+        decision
     }
 
     pub fn begin_operation(&mut self) -> Result<(), ManagerError> {
@@ -1389,12 +1621,31 @@ impl ResidencyManager {
             .map_err(ManagerError::Lifecycle)?;
         let profile = profile
             .filter(|profile| profile.is_valid_for(&self.model_id, self.inventory.generation));
-        let plan = Planner::new(&self.inventory, &self.attempted).plan_with_profile(
-            self.policy,
-            observed_bytes,
-            context,
-            profile,
-        );
+        let mut planner = Planner::new(&self.inventory, &self.attempted);
+        if self.native_model_instance.is_some() {
+            planner =
+                planner.with_native_guard(self.native_contract_version, self.native_quiescent);
+        }
+        let plan = planner.plan_with_profile(self.policy, observed_bytes, context, profile);
+        if self.native_model_instance.is_some() && self.native_quiescent {
+            for key in &plan.selected {
+                if let Some(lifetime) = self.lifetimes.get_mut(key) {
+                    let _ = lifetime.apply(
+                        LifetimeEvent::OperationBoundarySynchronized,
+                        "operation boundary observed quiescent",
+                    );
+                    if matches!(
+                        self.policy.mode,
+                        ResidencyPolicyMode::Conservative
+                            | ResidencyPolicyMode::MemoryBound
+                            | ResidencyPolicyMode::ReuseAware
+                            | ResidencyPolicyMode::Active
+                    ) {
+                        let _ = lifetime.apply(LifetimeEvent::ReleaseSelected, "selected by plan");
+                    }
+                }
+            }
+        }
         self.lifecycle
             .transition(ResidencyState::SafeBoundary)
             .map_err(ManagerError::Lifecycle)?;
@@ -1411,6 +1662,11 @@ impl ResidencyManager {
         }
         if self.policy.mode == ResidencyPolicyMode::Off {
             return Err(ManagerError::NoPlan);
+        }
+        if self.native_model_instance.is_some()
+            && (self.native_contract_version != Some(1) || !self.native_quiescent)
+        {
+            return Err(ManagerError::SynchronizationMissing);
         }
         let plan = self.last_plan.clone().ok_or(ManagerError::NoPlan)?;
         if plan.selected.is_empty() {
@@ -1453,6 +1709,12 @@ impl ResidencyManager {
             Ok(native_result) => {
                 for key in &plan.selected {
                     self.attempted.insert(*key);
+                    if let Some(lifetime) = self.lifetimes.get_mut(key) {
+                        let _ = lifetime.apply(LifetimeEvent::ReleaseSubmitted, "native call");
+                        let _ = lifetime.apply(LifetimeEvent::NativeAccepted, "native result");
+                        let _ = lifetime
+                            .apply(LifetimeEvent::ReconciliationComplete, "report captured");
+                    }
                 }
                 self.lifecycle
                     .transition(ResidencyState::SafeBoundary)
@@ -1466,6 +1728,12 @@ impl ResidencyManager {
                 }
             }
             Err(error) => {
+                for key in &plan.selected {
+                    if let Some(lifetime) = self.lifetimes.get_mut(key) {
+                        let _ =
+                            lifetime.apply(LifetimeEvent::NativeFailure, "native release error");
+                    }
+                }
                 self.lifecycle.fail();
                 ApplicationReport {
                     attempted_keys: plan.selected.clone(),
@@ -1506,6 +1774,16 @@ impl ResidencyManager {
                 from: self.state(),
                 to: ResidencyState::Planning,
             }));
+        }
+        self.lifetimes = inventory
+            .resources
+            .iter()
+            .map(|resource| (resource.key, ResourceLifetimeTracker::default()))
+            .collect();
+        if self.native_model_instance.is_some() {
+            for lifetime in self.lifetimes.values_mut() {
+                let _ = lifetime.apply(LifetimeEvent::ModelBound, "native model rebound");
+            }
         }
         self.inventory = inventory;
         self.attempted.clear();
@@ -1939,6 +2217,131 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("no valid profile")));
+    }
+
+    #[test]
+    fn native_guard_requires_quiescence_and_matching_contract() {
+        let inventory = inventory();
+        let policy = ResidencyPolicy {
+            mode: ResidencyPolicyMode::MemoryBound,
+            target_bytes: Some(1),
+            safety_reserve_bytes: 0,
+        };
+        let mut manager =
+            ResidencyManager::new(inventory.model_id.clone(), inventory, policy, None)
+                .expect("manager");
+        assert!(manager.bind_native_model(1, 1).is_ok());
+        manager.observe_native_lifetime(false, 1, 1, Some(1));
+        assert_eq!(manager.admission(Some(8192)).eligible_reclaimable_bytes, 0);
+        let blocked = manager
+            .plan(Some(8192), &OperationContext::default())
+            .expect("blocked plan");
+        assert_eq!(blocked.selected.len(), 0);
+        assert!(blocked
+            .decisions
+            .iter()
+            .any(|decision| decision.reason == DecisionReason::SynchronizationMissing));
+
+        manager.observe_native_lifetime(true, 0, 0, Some(1));
+        assert!(manager.admission(Some(8192)).eligible_reclaimable_bytes > 0);
+        let allowed = manager
+            .plan(Some(8192), &OperationContext::default())
+            .expect("allowed plan");
+        assert!(!allowed.selected.is_empty());
+
+        manager.observe_native_lifetime(false, 1, 1, Some(2));
+        assert_eq!(
+            manager.apply_last_plan(|_| Ok(PageReleaseResult::default())),
+            Err(ManagerError::SynchronizationMissing)
+        );
+    }
+
+    #[test]
+    fn native_rejection_is_recorded_as_partial_failure() {
+        let inventory = inventory();
+        let mut manager = ResidencyManager::new(
+            inventory.model_id.clone(),
+            inventory,
+            ResidencyPolicy {
+                mode: ResidencyPolicyMode::MemoryBound,
+                target_bytes: Some(1),
+                safety_reserve_bytes: 0,
+            },
+            None,
+        )
+        .expect("manager");
+        manager.bind_native_model(1, 1).expect("bind");
+        manager.observe_native_lifetime(true, 0, 0, Some(1));
+        manager
+            .plan(Some(8192), &OperationContext::default())
+            .expect("plan");
+        let error = manager
+            .apply_last_plan(|_| Err("native resource still in use".to_string()))
+            .expect_err("release must fail");
+        assert!(matches!(error, ManagerError::Release(_)));
+        let application = manager.application().expect("application report");
+        assert_eq!(
+            application.error.as_deref(),
+            Some("native resource still in use")
+        );
+        assert_eq!(
+            manager.lifetime_counts().get("ReleaseFailed"),
+            Some(&application.native_indices.len())
+        );
+    }
+
+    #[test]
+    fn native_binding_rejects_unknown_contract_and_stale_instance() {
+        let inventory = inventory();
+        let mut manager = ResidencyManager::new(
+            inventory.model_id.clone(),
+            inventory,
+            ResidencyPolicy {
+                mode: ResidencyPolicyMode::Observe,
+                target_bytes: None,
+                safety_reserve_bytes: 0,
+            },
+            None,
+        )
+        .expect("manager");
+        assert!(matches!(
+            manager.bind_native_model(0, 1),
+            Err(ManagerError::NativeContract(_))
+        ));
+        assert!(matches!(
+            manager.bind_native_model(1, 2),
+            Err(ManagerError::NativeContract(_))
+        ));
+        manager.bind_native_model(1, 1).expect("bind");
+        assert_eq!(
+            manager.bind_native_model(2, 1),
+            Err(ManagerError::StalePlan)
+        );
+    }
+
+    #[test]
+    fn anonymous_resources_are_lifetime_unsupported() {
+        let inventory = inventory();
+        let anonymous = inventory
+            .resources
+            .iter()
+            .find(|resource| !resource.file_backed)
+            .expect("anonymous resource");
+        assert_eq!(anonymous.owner, ResourceOwner::ModelAnonymousBuffer);
+        assert_eq!(anonymous.lifetime, ResourceLifetime::Unsupported);
+        let plan = Planner::new(&inventory, &BTreeSet::new()).plan(
+            ResidencyPolicy {
+                mode: ResidencyPolicyMode::MemoryBound,
+                target_bytes: Some(1),
+                safety_reserve_bytes: 0,
+            },
+            Some(8192),
+            &OperationContext::default(),
+        );
+        assert!(plan.decisions.iter().any(|decision| {
+            decision.name == anonymous.name
+                && decision.reason == DecisionReason::AnonymousOrRepacked
+        }));
     }
 
     #[test]

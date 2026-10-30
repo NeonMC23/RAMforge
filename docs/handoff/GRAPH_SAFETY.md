@@ -87,10 +87,17 @@ A profile is valid only when:
 - at least one complete observation exists;
 - the profile has not been invalidated.
 
-Profiles are currently in-memory only. There is no persisted profile file, so
-there is no cross-process load path that could apply a profile to the wrong
-model. If persistence is added later, it must be versioned, bounded, and
-validated against both model identity and inventory generation before use.
+Profiles may be persisted with `--residency-profile-save` and loaded with
+`--residency-profile-load`. Files are schema/profile versioned, bounded to
+16 MiB/100,000 entries, atomically written, and contain only stable tensor
+names and graph-order access. Native node IDs are never serialized. Loading
+validates canonical model path, total model file size, primary-file mtime,
+inventory generation, native contract version, completeness, and invalidation.
+For sharded models, a same-size edit to a non-primary shard would not change
+the primary mtime; rotate/invalidate the profile explicitly in that case. `ramforge profile` inspects a
+file and can validate it against a model. A loaded profile is a heuristic for a
+later operation, not a promise that the next prompt accesses the same
+tensors.
 
 ## Reuse-aware planning
 
@@ -104,6 +111,22 @@ reuse awareness.
 The profile is evidence about one observed execution. It is a heuristic for a
 later operation, not a promise that the next prompt or token will access the
 same tensors.
+
+## Operation boundary and native gate
+
+The native patch adds a model-scoped shared/exclusive execution gate. A context
+holds a shared lease from asynchronous graph submission until `synchronize`
+(or destruction) observes completion. Page release attempts the exclusive side
+without blocking and returns `EBUSY` if any context is in flight. This makes
+the between-operation boundary enforceable and prevents a release call from
+racing an active graph.
+
+The gate is deliberately **not** an intra-decode lifetime proof. It proves
+that no observed asynchronous execution is in flight at the release instant;
+it does not prove that a future token/graph will not reuse a weight. RAMforge
+therefore marks resources `ReleaseEligible` only after the native model reports
+zero contexts/in-flight work following session drop, and keeps
+`FinalUseProven` unreachable for model weights.
 
 ## Why intra-decode release is unsupported
 

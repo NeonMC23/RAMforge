@@ -43,6 +43,11 @@ Useful environment variables:
 | `GRAPH_TRACE_EVENTS` | `16384` | trace cap for reuse-aware |
 | `RAMFORGE_BENCH_OUT` | `bench-out` | output directory |
 
+The harness passes `--residency-policy reuse-aware` with `--graph-trace` and
+`GRAPH_TRACE_EVENTS` (default 16384). A 4096-event cap on a multi-token capture
+is expected to be incomplete; the profile is then rejected and the plan reports
+`profile_used=false`.
+
 The script writes:
 
 - `results.tsv` — one row per run;
@@ -62,6 +67,9 @@ Important columns:
   whole cgroup and may be much larger than this process;
 - `staging_requested_bytes` — deduplicated page-range budget from RAMforge;
 - `staging_native_requested_bytes` — bytes accepted by the native prefetch;
+- `profile_source` — `current_trace`, `loaded_file`, or `none`;
+- `native_contract`, `native_quiescent`, `lifetime_states` — native contract
+  version, point-in-time quiescence, and resource state counts;
 - `native_released_bytes` — bytes submitted to `madvise`, not confirmed
   reclamation;
 - `ttft_ns`, `decode_ns`, `total_ns` — observed wall-clock from the CLI;
@@ -80,12 +88,12 @@ tokens, CPU, no cgroup enforcement, two repeats for the matrix rows. Medians:
 
 | Policy | Prefetch | Selected | Mapping delta | Process RSS before/after | Cgroup delta | TTFT |
 |---|---|---:|---:|---|---:|---:|
-| off | off | 0 | 0 B | 163.73 / 163.73 MiB | ~0 B | 24.7 ms |
-| observe | off | 12 | 0 B | 163.64 / 163.64 MiB | ~0 B | 24.8 ms |
-| conservative | off | 0 | 0 B | 163.61 / 163.61 MiB | ~0 B | 24.6 ms |
-| memory-bound | off | 12 | -38,027,264 B | 163.76 / 127.50 MiB | ~0 B | 25.1 ms |
-| active | off | 12 | -38,027,264 B | 163.78 / 127.52 MiB | ~0 B | 24.7 ms |
-| reuse-aware (valid profile) | off | 133 | -46,702,592 B | 171.80 / 127.26 MiB | ~0 B | 26.6 ms |
+| off | off | 0 | 0 B | 164.16 / 164.20 MiB | ~0 B | 26.4 ms |
+| observe | off | 12 | 0 B | 164.04 / 164.10 MiB | ~0 B | 27.5 ms |
+| conservative | off | 0 | 0 B | 164.04 / 164.07 MiB | ~0 B | 27.7 ms |
+| memory-bound | off | 12–13 | -38,387,712 B | 164.20 / 127.65 MiB | ~0 B | 26.5 ms |
+| active | off | 12 | -38,027,264 B | 164.20 / 127.98 MiB | ~0 B | 26.0 ms |
+| reuse-aware (valid profile) | off | 134–135 | -46,983,168 B | 172.36 / 127.57 MiB | ~0 B | 28.7 ms |
 
 The harness enables graph tracing for reuse-aware runs and defaults to a
 16,384 event cap. With the CLI's 4,096 default, a four-token capture was
@@ -107,9 +115,35 @@ those pages as unique. `memory-bound` and `active` released tensors while the
 native callback protected shared pages, and the measured mapping RSS fell by
 the submitted byte count for the selected ranges.
 
+## Native lifetime and profile scenarios
+
+For a profile run, save a complete profile in one process and validate it before
+loading it in another:
+
+```sh
+ramforge run MODEL --backend forgecore --ram 192M --ctx 256 \
+  --graph-trace --graph-trace-events 16384 --residency-policy reuse-aware \
+  --residency-target 128M --residency-profile-save /tmp/model.profile.json \
+  --prompt "The capital of France is" --max-tokens 1
+ramforge profile /tmp/model.profile.json --model MODEL --json
+ramforge run MODEL --backend forgecore --ram 192M --ctx 256 \
+  --residency-policy reuse-aware --residency-target 128M \
+  --residency-profile-load /tmp/model.profile.json --residency-report \
+  --prompt "The capital of France is" --max-tokens 1
+```
+
+Record `native_lifetime.contract_version`, `model_instance_id`, `quiescent`,
+`context_id`, `execution_generation`, `resource_lifetime_states`, and
+`profile_source`. A `Busy` release is a failure/partial result, not a
+successful reclamation.
+
 ## Caveats
 
 - These are wall-clock observations on one machine, not a throughput guarantee.
+- The native gate proves no in-flight asynchronous work at release time. It
+  does not prove future-token reuse safety.
+- Profile files are bounded and validated; a loaded profile is a heuristic,
+  not a promise that the next prompt accesses the same tensors.
 - cgroup current was dominated by other activity in the shared cgroup and did
   not move. That does not contradict the mapping/process RSS drops; the
   categories are different.

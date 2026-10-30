@@ -2,7 +2,9 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **Graph-aware residency (2026-10-25):** RAMforge now builds a unified model-scoped memory ledger, in-memory execution profiles from bounded graph traces, deduplicated bounded staging plans, and deterministic `conservative`/`memory-bound`/`reuse-aware` policy profiles in addition to `off`/`observe`/`active`. Operation reports include explicit provenance, reconciliation, requested versus native-accepted versus observed bytes, timing, and an output fingerprint; `--residency-report-json PATH` emits schema version 1. Release mutations remain restricted to the post-operation safe boundary. Intra-decode eviction is still unsupported because the pinned callback does not prove resource lifetime. See [MEMORY_ACCOUNTING.md](docs/handoff/MEMORY_ACCOUNTING.md), [GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md), and [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
+> **Native lifetime contract (2026-10-30):** forgeCORE now exposes the pinned native execution-quiescence/ownership contract: model/context instance identities, execution generations, active/in-flight contexts, a point-in-time quiescence observation, and a non-blocking release gate that returns `EBUSY` while any context has asynchronous compute in flight. RAMforge binds that contract into its planner and lifetime state machine, persists validated execution profiles, and reports the contract facts. Intra-decode eviction remains unsupported because synchronized completion is still not proof of future reuse. See [GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md).
+>
+> **Graph-aware residency (2026-10-25):** RAMforge now builds a unified model-scoped memory ledger, execution profiles from bounded graph traces (with validated optional persistence), deduplicated bounded staging plans, and deterministic `conservative`/`memory-bound`/`reuse-aware` policy profiles in addition to `off`/`observe`/`active`. Operation reports include explicit provenance, reconciliation, requested versus native-accepted versus observed bytes, timing, and an output fingerprint; `--residency-report-json PATH` emits schema version 1. Release mutations remain restricted to the post-operation safe boundary. Intra-decode eviction is still unsupported because the pinned callback does not prove resource lifetime. See [MEMORY_ACCOUNTING.md](docs/handoff/MEMORY_ACCOUNTING.md), [GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md), and [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
 >
 > **GPT-NeoX/Pythia execution and enforced budgets (2026-10-25):** `gptneox` GGUFs are executable through the explicit `--backend forgecore` path, which delegates to the pinned llama.cpp/ggml implementation. The legacy RAMforge executor still rejects the architecture before reading weights, with an actionable error naming the required backend; it never falls back or approximates GPT-NeoX math. Real Pythia-70M Q8_0 runs match the native tokenization and greedy continuation, and an independent NumPy forward pass confirms the final-token logits (top-1 exact, cosine similarity 1.000000046). The 20B GPT-NeoX GGUF (13.13 GB tensor bytes) now executes under an 8 GiB hard cgroup v2 cap with `--enforce-ram --no-repack --no-prefetch`: 7.64 GiB of the model mapping resident at the end-of-run sample, 7,979 limit events, no OOM kill, and one greedy token ` Paris` in 7.72 s. The same 8 GiB run with prefetching took 16.94 s. This is out-of-core execution under a kernel-enforced cap, not a throughput or quality guarantee. See [Enforced host-memory budgets](#enforced-host-memory-budgets-cgroup-v2).
 >
@@ -142,6 +144,13 @@ Flags:
   plans, staging/application results, timing, and before/after observations.
 - `--residency-report-json PATH`: write the same operation as a versioned JSON
   document (`schema_version: 1`). A write failure is a command error.
+- `--residency-profile-load PATH`: load a validated execution profile for
+  reuse-aware planning and staging order. Model identity, model size/mtime,
+  inventory generation, schema, and native contract must match.
+- `--residency-profile-save PATH`: atomically save the current complete trace
+  profile (requires `--graph-trace`). Incomplete captures are rejected.
+- `ramforge profile PATH [--model MODEL] [--json]`: inspect a persisted profile
+  and, when `--model` is supplied, validate model identity.
 - `--residency-prefetch SIZE`: best-effort bounded tensor-page prefetch
   (`MADV_WILLNEED` hint). The plan deduplicates overlapping page ranges;
   requested, native-accepted, and observed mapping changes are reported
@@ -371,8 +380,9 @@ explicitly incomplete at overflow.
 prefetch, trace, and between-operation residency are supported; graph
 dependency/last-use proof is partial; intra-decode residency and GPU are
 unsupported. It also lists the policy profiles, the ledger/reconciliation
-surface, JSON report schema, and the fact that execution profiles are in-memory
-diagnostic inputs rather than persisted state.
+surface, JSON report schema, the native lifetime contract, and the fact that
+execution profiles are bounded diagnostic inputs. Profiles may be persisted
+with explicit validation, but they are never execution guarantees.
 
 ### Unified ledger, profiles, and policy profiles
 
@@ -386,28 +396,62 @@ zero. Reconciliation reports `RSS - mapping resident` and
 `cgroup current - RSS` as signed differences, not as a single “overhead”
 number. See [MEMORY_ACCOUNTING.md](docs/handoff/MEMORY_ACCOUNTING.md).
 
-Graph manifests now feed an in-memory execution profile
+Graph manifests now feed an execution profile
 (`ramforge-runtime/src/execution_profile.rs`). A capture containing multiple
 graph executions is split by execution id before analysis, so transient native
 node ids are never merged across graphs. Profiles store stable tensor names,
 graph-order access ranges, observation counts, completeness, and invalidation
 state. Incomplete, cyclic, or ambiguous captures are rejected as profile
 evidence. Profiles are validated against model identity and inventory
-generation before `reuse-aware` planning. No profile persistence is
-implemented. See
+generation before `reuse-aware` planning.
+
+Profiles can now be persisted with `--residency-profile-save` and loaded with
+`--residency-profile-load`. The file is versioned, bounded to 16 MiB and
+100,000 tensor entries, written atomically, and contains only stable tensor
+names/order. It does not contain transient native node IDs. Validation checks
+schema, profile version, model path, model size/mtime, inventory generation,
+native contract version, completeness, and invalidation. `ramforge profile`
+inspects the file; adding `--model` validates model identity. A loaded profile
+is used for staging order and post-operation reuse-aware planning, but it is
+not proof that the next prompt will access the same tensors. See
 [GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md).
+
+### Native execution-quiescence contract
+
+ForgeCore now exposes the native contract added by the tracked patch:
+
+- a model instance id and residency contract version;
+- model active/in-flight context counts and a point-in-time quiescent flag;
+- context id, execution generation, in-flight/synchronized state;
+- `ResidencyError::{Busy, Unsupported, Invalid, Native}`.
+
+A context holds a native shared lease from asynchronous graph submission until
+`llama_synchronize` (or destruction) observes completion. Page release takes
+the exclusive side with a non-blocking attempt and returns `EBUSY` if any
+context is in flight. RAMforge binds the manager to the model instance,
+observes quiescence after session drop, and marks resources
+`ReleaseEligible` only at that operation boundary. Graph-node completion alone
+cannot reach `ReleaseEligible`; `FinalUseProven` remains unreachable for model
+weights. The tests exercise two simultaneous contexts, stale/mismatched
+contracts, release rejection, context-drop synchronization, and inference
+after page release.
+
+This is a safe **between-operation physical page** contract. It is not
+intra-decode eviction: a synchronized context still owns model weights for
+future tokens. Context-owned KV/scratch buffers have no independent native
+release API and remain unsupported.
 
 SmolLM2-135M Q4_K_M, 272 file-backed tensors, context 256, 4 greedy tokens,
 target 128 MiB, no cgroup enforcement, median of two runs unless noted:
 
 | Policy | Selected | Mapping RSS delta | Process RSS before/after | Cgroup current delta | TTFT |
 |---|---:|---:|---|---:|---:|
-| off | 0 | 0 B | 163.73 / 163.73 MiB | ~0 B | 24.7 ms |
-| observe | 12 | 0 B | 163.64 / 163.64 MiB | ~0 B | 24.8 ms |
-| conservative | 0 | 0 B | 163.61 / 163.61 MiB | ~0 B | 24.6 ms |
-| memory-bound | 12 | -38,027,264 B | 163.76 / 127.50 MiB | ~0 B | 25.1 ms |
-| active | 12 | -38,027,264 B | 163.78 / 127.52 MiB | ~0 B | 24.7 ms |
-| reuse-aware (valid profile) | 133 | -46,702,592 B | 171.80 / 127.26 MiB | ~0 B | 26.6 ms |
+| off | 0 | 0 B | 164.16 / 164.20 MiB | ~0 B | 26.4 ms |
+| observe | 12 | 0 B | 164.04 / 164.10 MiB | ~0 B | 27.5 ms |
+| conservative | 0 | 0 B | 164.04 / 164.07 MiB | ~0 B | 27.7 ms |
+| memory-bound | 12–13 | -38,387,712 B | 164.20 / 127.65 MiB | ~0 B | 26.5 ms |
+| active | 12 | -38,027,264 B | 164.20 / 127.98 MiB | ~0 B | 26.0 ms |
+| reuse-aware (valid profile) | 134–135 | -46,983,168 B | 172.36 / 127.57 MiB | ~0 B | 28.7 ms |
 
 The reuse-aware result required a complete 16,384-event profile; with the
 default 4,096-event cap a four-token capture was truncated, the profile was
@@ -423,6 +467,17 @@ The report now includes prompt tokens, generated tokens, TTFT, decode/total
 wall time, stop reason, and an output token fingerprint. It remains diagnostic:
 the soft target is not a hard limit, release submission is not physical
 reclamation, and cgroup usage can stay flat while mapping/process RSS falls.
+Persisted profile example:
+
+```sh
+ramforge run model.gguf --backend forgecore --ram 192M --ctx 256 \
+  --graph-trace --graph-trace-events 16384 --residency-policy reuse-aware \
+  --residency-target 128M --residency-profile-save profile.json \
+  --prompt "The capital of France is" --max-tokens 1
+
+ramforge profile profile.json --model model.gguf --json
+```
+
 A reproducible harness is documented in
 [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
 
@@ -867,7 +922,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **482 tests, 0 failed, 16 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **493 tests, 0 failed, 17 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

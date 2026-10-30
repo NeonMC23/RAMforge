@@ -29,6 +29,8 @@ fn help_lists_memory_control_flags() {
         "--residency-reserve",
         "--residency-report",
         "--residency-report-json",
+        "--residency-profile-load",
+        "--residency-profile-save",
         "--residency-prefetch",
         "--graph-trace",
         "--graph-trace-events",
@@ -36,6 +38,47 @@ fn help_lists_memory_control_flags() {
     ] {
         assert!(text.contains(flag), "help must list {flag}: {text}");
     }
+}
+
+#[test]
+fn profile_command_inspects_versioned_profile() {
+    let path =
+        std::env::temp_dir().join(format!("ramforge-cli-profile-{}.json", std::process::id()));
+    let profile = serde_json::json!({
+        "schema_version": 1,
+        "kind": "ramforge.execution_profile",
+        "identity": {
+            "model_path": "/tmp/reference.gguf",
+            "model_size_bytes": 123,
+            "model_modified_unix_ns": null,
+            "inventory_generation": 1,
+            "native_contract_version": 1
+        },
+        "profile": {
+            "version": 1,
+            "model_id": "/tmp/reference.gguf",
+            "generation": 1,
+            "complete_observations": 1,
+            "incomplete_observations": 0,
+            "last_node_count": 1,
+            "last_tensor_count": 1,
+            "access": {"blk.0.weight": {"first_order": 0, "last_order": 1, "observed_consumers": 1}},
+            "invalidated_reason": null
+        }
+    });
+    std::fs::write(&path, serde_json::to_vec(&profile).unwrap()).unwrap();
+    let output = ramforge()
+        .args(["profile", path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "profile failed: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("profile JSON");
+    assert_eq!(value["valid"], true);
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["entries"], 1);
+    assert_eq!(value["model_identity_validated"], false);
 }
 
 #[test]
@@ -550,11 +593,80 @@ fn json_report_is_versioned_and_keeps_measurements_distinct() {
     assert!(report["reconciliation"]["mapped_virtual_bytes"].is_u64());
     assert!(report["measurements"]["before"]["process_rss_bytes"].is_u64());
     assert_eq!(report["application"], serde_json::Value::Null);
+    assert_eq!(report["native_lifetime"]["contract_version"], 1);
+    assert!(report["native_lifetime"]["model_instance_id"].is_u64());
+    assert_eq!(report["native_lifetime"]["quiescent"], true);
+    assert!(report["native_lifetime"]["context_id"].is_u64());
+    assert!(report["resource_lifetime_states"].is_object());
+    assert!(report["admission"]["eligible_reclaimable_bytes"].is_u64());
+    assert_eq!(report["admission"]["native_contract_version"], 1);
+    assert!(report["profile_source"].is_string());
     assert!(report["timing"]["ttft_ns"].is_u64());
     assert!(report["timing"]["output_fingerprint"].is_string());
     assert!(report["ledger"]["unknown_components"]
         .as_array()
         .is_some_and(|components| !components.is_empty()));
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn profile_save_then_validate_has_matching_model_identity() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let path =
+        std::env::temp_dir().join(format!("ramforge-profile-save-{}.json", std::process::id()));
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--graph-trace",
+            "--graph-trace-events",
+            "16384",
+            "--residency-policy",
+            "reuse-aware",
+            "--residency-target",
+            "128M",
+            "--residency-profile-save",
+            path.to_str().unwrap(),
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "save run failed: {stderr}");
+    assert!(
+        stderr.contains("Residency profile saved:"),
+        "missing save: {stderr}"
+    );
+
+    let validate = ramforge()
+        .args([
+            "profile",
+            path.to_str().unwrap(),
+            "--model",
+            &model,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let stdout = String::from_utf8_lossy(&validate.stdout);
+    assert!(validate.status.success(), "validate failed: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("validate JSON");
+    assert_eq!(value["valid"], true);
+    assert_eq!(value["model_identity_validated"], true);
 }
 
 #[test]
