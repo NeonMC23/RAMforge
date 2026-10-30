@@ -193,13 +193,42 @@ reported as a complete release.
 
 `PageResidencySnapshot` (`page_residency.rs`) uses Linux `mincore()` over
 bounded page ranges. Virtual addresses are located only through
-`/proc/self/maps`; no pointers are exposed. Observation does not fault pages in
-or evict them. It distinguishes resident, nonresident, and unknown pages; a
-page beyond the inspection budget is unknown, never nonresident. Overlapping
-tensor ranges are reported per resource, with unique-page totals deduplicated.
-Non-Linux, missing mappings, and `mincore` errors are explicit unsupported or
-unknown states. `pagemap` is not used because permissions are commonly
-restricted.
+`/proc/self/maps`; no pointers or physical addresses are exposed. Observation
+does not fault pages in or evict them. It distinguishes resident, nonresident,
+and unknown pages; a page beyond the inspection budget is unknown, never
+nonresident.
+
+`observe_page_residency_targeted` samples resources selected by the current
+prediction plan first, in inventory order, then spends the remaining page
+budget on non-selected resources. Unique pages are keyed by mapping index and
+page index, so overlapping tensor ranges in one mapping do not consume the
+budget twice. Per-resource `inspected_pages`, `unknown_pages`, and `sampled`
+are reported alongside `targeted`, so a partially observed tensor is never
+presented as wholly resident or wholly nonresident.
+
+The snapshot's `targeted` coverage block separates:
+
+- targeted pages available/sampled/unknown;
+- general mapping pages available/sampled/unknown;
+- selected resources fully observed, partially observed, and not observed;
+- configured page budget and coverage basis points for each population.
+
+Targeted and general coverage use different denominators. They are not merged.
+If a selected tensor is larger than the budget, it is explicitly partial.
+Missing mappings and `mincore` errors are unknown/unsupported states.
+`pagemap` is not used because permissions are commonly restricted.
+
+## Cache-condition preparation
+
+The benchmark helper's `isolated-nonresident` mode copies the model to a
+separate file, flushes the copy, calls `posix_fadvise(POSIX_FADV_DONTNEED)` on
+that copy, and verifies page-cache residency with `mmap` + `mincore` before
+starting the model process. The source model is not modified. No global cache
+drop or privileged command is used. A run is labeled controlled only when all
+probed pages are nonresident. Partial, warm, unknown, and failed preparation
+states remain separate and are recorded in `summary.json` and `results.tsv`.
+This verifies file-page-cache state at process start; it is not proof of
+physical reclamation, PSS, or model-mapping residency after loading.
 
 ## Execution timing
 

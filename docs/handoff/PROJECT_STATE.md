@@ -1,6 +1,6 @@
 # Project state
 
-**As-of date:** 2026-10-25.<br>
+**As-of date:** 2026-10-30.<br>
 **Repository:** RAMforge workspace at the handoff source checkout.<br>
 **Status labels:** see [README.md](README.md).
 
@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **522 tests, 0 failed, 18 ignored**. The ignored
+  environment variables passes **531 tests, 0 failed, 18 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -70,26 +70,43 @@
   explicit unsupported/error states. No addresses or physical data are exposed.
 - Prefetch correlation classifies already resident, became resident, remained
   nonresident, unknown; benefit is clearly useful, potentially useful,
-  redundant, wasted, or unknown. `ClearlyUseful` requires measured benefit.
-- Full observation of SmolLM2 (25,581 pages) cost about 54 ms/snapshot (158 ms
-  for three); 2,048-page sampling cost about 3.7 ms but left 23,533 pages
-  unknown. All 57 selected resources were already resident/redundant; no
-  prefetch-induced residency was observed.
+  redundant, ineffective, wasted, evicted-before-use, or unknown.
+  `ClearlyUseful` requires measured benefit. Observation is targeted: selected
+  prefetch resources are sampled first, unique mapping pages are deduplicated,
+  and selected/general coverage is reported separately. Partial resources stay
+  partial and unobserved pages stay unknown.
+- Earlier warm full observation of SmolLM2 (25,581 pages) cost about
+  54 ms/snapshot (158 ms for three) and found the selected resources already
+  resident. Targeted sampling now prioritizes selected resources; a 2,048-page
+  budget sampled 2,048/4,065 selected pages (33 fully observed, 4 partial, 19
+  not). Targeted population accounting uses interval arithmetic rather than a
+  key per page; a 64-page sample costs roughly 1–2 ms per snapshot. Partial and
+  unknown resources are never promoted to resident.
 - `ExecutionTiming` now records model load, profile load, history load,
   prediction, planning, staging, observation, inference, explicit
   synchronization, and end-to-end time. TTFT excludes staging; end-to-end does
   not.
 - Five-repetition matrices show prediction can lower inference/TTFT on some
-  workloads while worsening end-to-end latency; for example, 256 MiB
-  short-short was 285.1 ms baseline vs 295.0 ms predictive end-to-end. No
-  speedup is claimed.
-- `scripts/prediction-bench.py` supports observation (`--observe`), component
-  timing, residency correlation, page faults, and human/JSON summaries.
+  workloads while worsening end-to-end latency. In the final controlled
+  isolated-copy SmolLM2 matrix, predictive end-to-end was 343.3 vs 323.9 ms
+  (short-short), 475.7 vs 491.4 ms (short-long), 922.5 vs 907.7 ms
+  (long-short), and 378.9 vs 363.5 ms (alternate): one improvement, three
+  regressions despite lower TTFT. Qwen was faster on three of four but slower
+  on short-long. No general speedup is claimed.
+- `scripts/prediction-bench.py` supports observation (`--observe`), targeted
+  page budgets, component timing, residency correlation, page faults, and
+  human/JSON summaries. `--cache-condition isolated-nonresident` creates and
+  verifies an isolated model copy; warm, partial, unknown, and preparation
+  failures remain distinct. No global cache drop is used. The five-repetition
+  SmolLM2 matrix completed 100/100 controlled and 100/100 warm runs; mapping
+  delta was 0 B in all arms.
 - The deterministic simulator now runs baseline/reactive/predictive/
   conservative/aggressive over 16 required scenarios, with initial residency,
   staging effects, eviction, unknown states, component costs, end-to-end cost,
-  net benefit, and explicit `benefit_known`. `ramforge simulate --scenario all`
-  exports the bounded versioned report.
+  net benefit, targeted/general observation coverage, partial-resource
+  coverage, before-access availability, cache-condition labels, and explicit
+  `benefit_known`. `ramforge simulate --scenario all` exports the bounded
+  versioned report.
 
 ## Predictive residency milestone (2026-10-30)
 

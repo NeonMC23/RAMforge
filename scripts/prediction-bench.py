@@ -6,10 +6,14 @@ the operator separately controls and records cache state. Simulation is not
 included; use `ramforge simulate` for deterministic simulation.
 """
 import argparse
+import ctypes
 import csv
+import hashlib
 import json
+import mmap
 import os
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
@@ -48,6 +52,265 @@ def git_head(path):
         ).strip()
     except Exception:
         return None
+
+
+def _probe_residency(path):
+    """Verification only. mmap() twice and mincore() do not fault pages in.
+
+    Returns page-cache residency counts for the isolated copy before RAMforge
+    starts. This is not proof of physical reclamation or PSS.
+    """
+    result = {
+        "pages": None,
+        "resident_pages": None,
+        "nonresident_pages": None,
+        "unknown_pages": None,
+        "error": None,
+    }
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError as error:
+        result["error"] = f"open: {error}"
+        return result
+    address = None
+    try:
+        size = os.fstat(fd).st_size
+        if size == 0:
+            result.update(pages=0, resident_pages=0, nonresident_pages=0, unknown_pages=0)
+            return result
+        page = mmap.PAGESIZE
+        pages = (size + page - 1) // page
+        length = pages * page
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_long,
+        ]
+        address = libc.mmap(
+            None, length, mmap.PROT_READ, mmap.MAP_SHARED, fd, 0
+        )
+        if address in (None, 0, ctypes.c_void_p(-1).value):
+            result["error"] = f"mmap: {os.strerror(ctypes.get_errno())}"
+            result["unknown_pages"] = pages
+            address = None
+            return result
+        vector = (ctypes.c_ubyte * pages)()
+        libc.mincore.restype = ctypes.c_int
+        libc.mincore.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_ubyte),
+        ]
+        rc = libc.mincore(ctypes.c_void_p(address), length, vector)
+        if rc != 0:
+            result["error"] = f"mincore: {os.strerror(ctypes.get_errno())}"
+            result["unknown_pages"] = pages
+        else:
+            resident = sum(1 for value in vector if value & 1)
+            result.update(
+                pages=pages,
+                resident_pages=resident,
+                nonresident_pages=pages - resident,
+                unknown_pages=0,
+            )
+    except Exception as error:  # diagnostic helper must not masquerade as evidence
+        result["error"] = str(error)
+    finally:
+        if address is not None:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            libc.munmap(ctypes.c_void_p(address), length)
+        os.close(fd)
+    return result
+
+
+_HASH_CACHE = {}
+
+
+def _sha256(path):
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    if key not in _HASH_CACHE:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                digest.update(chunk)
+        _HASH_CACHE[key] = digest.hexdigest()
+    return _HASH_CACHE[key]
+
+
+def prepare_cache_condition(source, condition, copy_dir):
+    """Prepare and verify an isolated model copy without global cache drops."""
+    source = Path(source).resolve()
+    meta = {
+        "requested": condition,
+        "actual": "uncontrolled",
+        "controlled": False,
+        "preparation_ok": False,
+        "method": "none",
+        "model": str(source),
+        "source_size": None,
+        "source_sha256": None,
+        "copy_identity": None,
+        "probe_before": None,
+        "probe_after": None,
+    }
+    try:
+        meta["source_size"] = source.stat().st_size
+        meta["source_sha256"] = _sha256(source)
+    except OSError as error:
+        meta["error"] = str(error)
+        return source, meta
+    if condition == "uncontrolled":
+        meta.update(
+            actual="uncontrolled",
+            controlled=False,
+            preparation_ok=True,
+            method="none",
+            note="cache state was not controlled or verified before the run",
+        )
+        return source, meta
+    try:
+        copy_dir = Path(copy_dir)
+        copy_dir.mkdir(parents=True, exist_ok=True)
+        source_key = hashlib.sha256(str(source).encode()).hexdigest()[:10]
+        key = f"{source.stem}-{source.stat().st_size}-{source_key}"
+        destination = copy_dir / f"{key}{source.suffix}"
+        if not destination.is_file() or destination.stat().st_size != source.stat().st_size:
+            shutil.copyfile(source, destination)
+        meta["model"] = str(destination)
+        meta["copy_identity"] = (
+            f"{destination}:{destination.stat().st_size}:"
+            f"source-sha256={meta['source_sha256']}"
+        )
+        meta["method"] = (
+            "isolated copy + mincore verification (no cache drop)"
+            if condition == "warm"
+            else "isolated copy + POSIX_FADV_DONTNEED + mincore verification"
+        )
+        if condition == "warm":
+            # Make the isolated copy genuinely warm before verifying it. Do not
+            # assume that copy/writeback or a fresh process left pages resident.
+            with destination.open("rb") as handle:
+                for _ in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                    pass
+        meta["probe_before"] = _probe_residency(destination)
+        if condition == "warm":
+            probe = meta["probe_before"]
+            pages = probe.get("pages") or 0
+            resident = probe.get("resident_pages") or 0
+            if pages > 0 and resident == pages:
+                meta.update(
+                    actual="warm",
+                    controlled=False,
+                    preparation_ok=True,
+                    note="all probed pages were resident; this is a warm run, not cold",
+                )
+            else:
+                meta.update(
+                    actual="warm-or-unknown",
+                    controlled=False,
+                    preparation_ok=True,
+                    note=f"{resident}/{pages} probed pages were resident; no cold claim is made",
+                )
+            return destination, meta
+        fd = os.open(destination, os.O_RDONLY)
+        try:
+            # A freshly copied file may still be dirty. DONTNEED cannot evict
+            # dirty pages, so make the copy clean before the hint.
+            os.fsync(fd)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+        probe = _probe_residency(destination)
+        meta["probe_after"] = probe
+        if probe.get("error"):
+            meta.update(
+                actual="unknown",
+                preparation_ok=False,
+                note=f"residency verification failed: {probe['error']}",
+            )
+            return destination, meta
+        pages = probe.get("pages") or 0
+        resident = probe.get("resident_pages") or 0
+        nonresident = probe.get("nonresident_pages") or 0
+        if pages > 0 and nonresident == pages:
+            meta.update(
+                actual="controlled-nonresident",
+                controlled=True,
+                preparation_ok=True,
+                note="all probed pages were nonresident after isolated-copy preparation",
+            )
+        elif nonresident > 0:
+            meta.update(
+                actual="partially-controlled",
+                controlled=False,
+                preparation_ok=True,
+                note=(
+                    f"{nonresident}/{pages} probed pages nonresident; "
+                    "the rest remained resident"
+                ),
+            )
+        else:
+            meta.update(
+                actual="warm-or-unknown",
+                controlled=False,
+                preparation_ok=True,
+                note=(
+                    f"fadvise returned success but {resident}/{pages} probed pages "
+                    "remained resident; no cold claim is made"
+                ),
+            )
+    except Exception as error:
+        meta.update(
+            actual="cache-preparation-failed",
+            controlled=False,
+            preparation_ok=False,
+            note=str(error),
+        )
+    return Path(meta["model"]), meta
+
+
+def prepare_artifact_identity(path, model, directory, label):
+    """Clone a profile/history for an identical isolated model copy.
+
+    Profile validation intentionally binds to the model path and mtime. An
+    isolated copy has a different path, so the benchmark rewrites only the
+    identity fields. The tensor inventory and access records are unchanged.
+    """
+    if not path:
+        return path
+    source = Path(path)
+    model = Path(model)
+    try:
+        payload = json.loads(source.read_text())
+    except Exception:
+        return path
+    identity = payload.get("identity")
+    if not isinstance(identity, dict):
+        return path
+    stat = model.stat()
+    if (
+        identity.get("model_path") == str(model)
+        and identity.get("model_size_bytes") == stat.st_size
+        and identity.get("model_modified_unix_ns") == stat.st_mtime_ns
+    ):
+        return path
+    identity["model_path"] = str(model)
+    identity["model_size_bytes"] = stat.st_size
+    identity["model_modified_unix_ns"] = stat.st_mtime_ns
+    if isinstance(payload.get("profile"), dict):
+        payload["profile"]["model_id"] = str(model)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"{model.name}.{label}.json"
+    destination.write_text(json.dumps(payload, sort_keys=True))
+    return str(destination)
 
 
 def command_for(
@@ -188,6 +451,13 @@ def parse_report(path, arm, workload, repeat, order, wall_ns, status, stderr):
             "observation_after_staging_ns": page_after_staging.get("elapsed_ns"),
             "observation_inspected_pages": page_before.get("inspected_pages"),
             "observation_sampled": page_before.get("sampled"),
+            "observation_targeted": (page_before.get("targeted") or {}),
+            "observation_targeted_pages_available": (page_before.get("targeted") or {}).get("targeted_pages_available"),
+            "observation_targeted_pages_sampled": (page_before.get("targeted") or {}).get("targeted_pages_sampled"),
+            "observation_general_pages_sampled": (page_before.get("targeted") or {}).get("general_pages_sampled"),
+            "observation_selected_fully": (page_before.get("targeted") or {}).get("selected_resources_fully_observed"),
+            "observation_selected_partial": (page_before.get("targeted") or {}).get("selected_resources_partially_observed"),
+            "observation_selected_not_observed": (page_before.get("targeted") or {}).get("selected_resources_not_observed"),
             "resident_pages_before": page_before.get("resident_pages"),
             "resident_pages_after_staging": page_after_staging.get("resident_pages"),
             "unknown_pages_before": page_before.get("unknown_pages"),
@@ -198,6 +468,9 @@ def parse_report(path, arm, workload, repeat, order, wall_ns, status, stderr):
             "prefetch_redundant": correlation.get("redundant"),
             "prefetch_potentially_useful": correlation.get("potentially_useful"),
             "prefetch_wasted": correlation.get("wasted"),
+            "prefetch_ineffective": correlation.get("ineffective"),
+            "prefetch_evicted_before_use": correlation.get("evicted_before_use"),
+            "prefetch_before_access_observation_available": correlation.get("before_access_observation_available"),
             "prefetch_clearly_useful": correlation.get("clearly_useful"),
             "prefetch_accepted_resources": metrics.get("prefetch_accepted_resources"),
             "prefetch_followed": metrics.get("prefetch_followed_by_observed_access"),
@@ -253,6 +526,20 @@ def main():
     parser.add_argument("--enforce", action="store_true")
     parser.add_argument("--observe", action="store_true", help="enable bounded page residency observation")
     parser.add_argument("--observe-pages", type=int, default=2048)
+    parser.add_argument(
+        "--cache-condition",
+        choices=["uncontrolled", "warm", "isolated-nonresident"],
+        default="uncontrolled",
+        help="safe cache preparation; warm is verified and never assumed",
+    )
+    parser.add_argument(
+        "--model-copy-dir",
+        default=os.environ.get(
+            "RAMFORGE_COPY_DIR",
+            str(Path.home() / ".cache" / "ramforge-cold-models"),
+        ),
+        help="directory for isolated model copies",
+    )
     args = parser.parse_args()
     if not args.model or not args.profile:
         parser.error("--model and --profile are required")
@@ -278,11 +565,26 @@ def main():
                 stem = f"{stamp}-{name}-{arm}-r{repeat}"
                 json_path = out / f"{stem}.json"
                 err_path = out / f"{stem}.stderr"
+                run_model, cache_meta = prepare_cache_condition(
+                    args.model, args.cache_condition, args.model_copy_dir
+                )
+                prepared_profile = prepare_artifact_identity(
+                    args.profile,
+                    run_model,
+                    Path(args.model_copy_dir) / "prepared",
+                    "profile",
+                )
+                prepared_history = prepare_artifact_identity(
+                    args.history,
+                    run_model,
+                    Path(args.model_copy_dir) / "prepared",
+                    "history",
+                )
                 cmd = command_for(
                     args.binary,
-                    args.model,
-                    args.profile,
-                    args.history,
+                    str(run_model),
+                    prepared_profile,
+                    prepared_history,
                     args.target,
                     ctx,
                     prompt,
@@ -298,11 +600,27 @@ def main():
                 with err_path.open("w") as err:
                     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=err)
                 wall = time.time_ns() - start
-                rows.append(
-                    parse_report(
-                        json_path, arm, name, repeat, order, wall, proc.returncode, str(err_path)
-                    )
+                row = parse_report(
+                    json_path, arm, name, repeat, order, wall, proc.returncode, str(err_path)
                 )
+                row.update(
+                    {
+                        "cache_condition_requested": cache_meta["requested"],
+                        "cache_condition_actual": cache_meta["actual"],
+                        "cache_controlled": cache_meta["controlled"],
+                        "cache_preparation_ok": cache_meta["preparation_ok"],
+                        "cache_method": cache_meta["method"],
+                        "cache_note": cache_meta.get("note"),
+                        "model_file": cache_meta["model"],
+                        "model_copy_identity": cache_meta["copy_identity"],
+                        "model_source_sha256": cache_meta["source_sha256"],
+                        "profile_prepared": prepared_profile != args.profile if args.profile else False,
+                        "history_prepared": prepared_history != args.history if args.history else False,
+                        "cache_probe_before": cache_meta.get("probe_before"),
+                        "cache_probe_after": cache_meta.get("probe_after"),
+                    }
+                )
+                rows.append(row)
 
     if rows:
         fields = sorted({key for row in rows for key in row})
@@ -320,8 +638,9 @@ def main():
         "target": args.target,
         "enforce": args.enforce,
         "repeats": args.repeats,
+        "cache_condition_requested": args.cache_condition,
         "cache_controlled": False,
-        "cache_note": "No cache-drop was performed; results are not labeled cold.",
+        "cache_note": "Cache conditions are recorded per run; uncontrolled runs are not labeled cold.",
         "kernel": platform.release(),
         "machine": platform.machine(),
         "python": platform.python_version(),
@@ -332,8 +651,18 @@ def main():
         "arms": list(ARMS),
         "runs": len(rows),
         "failures": sum(1 for row in rows if row.get("status") != 0),
+        "cache_conditions": {},
         "summary": {},
     }
+    for row in rows:
+        condition = row.get("cache_condition_actual") or "unknown"
+        summary["cache_conditions"][condition] = summary["cache_conditions"].get(condition, 0) + 1
+    summary["cache_controlled"] = bool(rows) and all(
+        row.get("cache_controlled") for row in rows if row.get("status") == 0
+    ) and not any(row.get("status") != 0 for row in rows)
+    if args.cache_condition == "warm":
+        summary["cache_note"] = "Warm runs are isolated-copy probes; no cold claim is made."
+
     for workload in summary["workloads"]:
         summary["summary"][workload] = {}
         for arm in ARMS:
@@ -378,6 +707,12 @@ def main():
                 "observation_after_staging_ns": spread(selected, "observation_after_staging_ns"),
                 "observation_inspected_pages": median(selected, "observation_inspected_pages"),
                 "observation_sampled": median(selected, "observation_sampled"),
+                "observation_targeted_pages_available": median(selected, "observation_targeted_pages_available"),
+                "observation_targeted_pages_sampled": median(selected, "observation_targeted_pages_sampled"),
+                "observation_general_pages_sampled": median(selected, "observation_general_pages_sampled"),
+                "observation_selected_fully": median(selected, "observation_selected_fully"),
+                "observation_selected_partial": median(selected, "observation_selected_partial"),
+                "observation_selected_not_observed": median(selected, "observation_selected_not_observed"),
                 "resident_pages_before": median(selected, "resident_pages_before"),
                 "resident_pages_after_staging": median(selected, "resident_pages_after_staging"),
                 "prefetch_already_resident": median(selected, "prefetch_already_resident"),
@@ -387,6 +722,9 @@ def main():
                 "prefetch_redundant": median(selected, "prefetch_redundant"),
                 "prefetch_potentially_useful": median(selected, "prefetch_potentially_useful"),
                 "prefetch_wasted": median(selected, "prefetch_wasted"),
+                "prefetch_ineffective": median(selected, "prefetch_ineffective"),
+                "prefetch_evicted_before_use": median(selected, "prefetch_evicted_before_use"),
+                "prefetch_before_access_observation_available": median(selected, "prefetch_before_access_observation_available"),
                 "prefetch_clearly_useful": median(selected, "prefetch_clearly_useful"),
                 "prefetch_followed": median(selected, "prefetch_followed"),
                 "prefetch_not_followed": median(selected, "prefetch_not_followed"),
@@ -398,7 +736,7 @@ def main():
         f"model={args.model}",
         f"profile={args.profile} history={args.history or 'none'}",
         f"target={args.target} enforce={args.enforce} observe={args.observe} observe_pages={args.observe_pages} repeats={args.repeats}",
-        f"cache_controlled={summary['cache_controlled']} ({summary['cache_note']})",
+        f"cache_controlled={summary['cache_controlled']} conditions={summary['cache_conditions']} ({summary['cache_note']})",
         f"runs={summary['runs']} failures={summary['failures']}",
     ]
     for workload in summary["workloads"]:

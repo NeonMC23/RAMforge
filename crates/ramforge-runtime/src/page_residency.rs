@@ -192,7 +192,7 @@ Pss:               128 kB
 /// Bounded per-page residency observation configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageObservationConfig {
-    /// Maximum pages inspected in one snapshot.
+    /// Maximum unique pages inspected in one snapshot.
     pub max_pages: usize,
     /// Maximum resources included in one snapshot.
     pub max_resources: usize,
@@ -234,7 +234,31 @@ pub struct ResourcePageResidency {
     pub nonresident_pages: u64,
     pub unknown_pages: u64,
     pub sampled: bool,
+    /// True when the resource was selected by the current prediction plan.
+    pub targeted: bool,
     pub error: Option<String>,
+}
+
+/// Coverage of a targeted observation. Targeted and general coverage refer to
+/// different populations and must not be combined into a single misleading
+/// percentage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetedObservationCoverage {
+    pub selected_resources: usize,
+    pub selected_resources_fully_observed: usize,
+    pub selected_resources_partially_observed: usize,
+    pub selected_resources_not_observed: usize,
+    /// Unique pages in selected resources.
+    pub targeted_pages_available: u64,
+    pub targeted_pages_sampled: u64,
+    pub targeted_pages_unknown: u64,
+    /// Unique pages in non-selected resources.
+    pub general_pages_available: u64,
+    pub general_pages_sampled: u64,
+    pub general_pages_unknown: u64,
+    pub targeted_coverage_bps: Option<u16>,
+    pub general_coverage_bps: Option<u16>,
+    pub page_budget: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,7 +266,10 @@ pub struct PageResidencySnapshot {
     pub supported: bool,
     pub source: &'static str,
     pub page_size: Option<u64>,
+    /// Unique pages physically inspected.
     pub inspected_pages: u64,
+    /// Unique pages in the observed population, where metadata permits their
+    /// enumeration.
     pub total_pages: u64,
     pub resident_pages: u64,
     pub nonresident_pages: u64,
@@ -254,6 +281,9 @@ pub struct PageResidencySnapshot {
     pub unique_unknown_pages: Option<u64>,
     pub sampled: bool,
     pub resources: Vec<ResourcePageResidency>,
+    /// Present only for targeted observation. `None` means this was a general
+    /// observation with no selected-prefetch population.
+    pub targeted: Option<TargetedObservationCoverage>,
     pub elapsed_ns: u128,
     pub unsupported_reason: Option<String>,
 }
@@ -274,6 +304,7 @@ impl PageResidencySnapshot {
             unique_unknown_pages: None,
             sampled: false,
             resources: Vec::new(),
+            targeted: None,
             elapsed_ns: 0,
             unsupported_reason: Some(reason.into()),
         }
@@ -282,10 +313,99 @@ impl PageResidencySnapshot {
 
 /// Observe resident pages for bounded resource ranges using Linux `mincore`.
 /// This never faults pages in, never evicts, and never exposes addresses.
-#[cfg(target_os = "linux")]
 pub fn observe_page_residency(
     ranges: &[PageRange],
     config: PageObservationConfig,
+) -> PageResidencySnapshot {
+    observe_page_residency_internal(ranges, &std::collections::BTreeSet::new(), config, false)
+}
+
+/// Observe selected prefetch resources first, then use remaining budget for
+/// broader mapping coverage. The selected population and the general
+/// population are reported separately.
+pub fn observe_page_residency_targeted(
+    ranges: &[PageRange],
+    selected: &std::collections::BTreeSet<String>,
+    config: PageObservationConfig,
+) -> PageResidencySnapshot {
+    observe_page_residency_internal(ranges, selected, config, true)
+}
+
+#[cfg(target_os = "linux")]
+fn page_count(range: &PageRange) -> u64 {
+    if range.page_size == 0 || range.page_end <= range.page_start {
+        0
+    } else {
+        (range.page_end - range.page_start).div_ceil(range.page_size)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn page_interval(range: &PageRange) -> Option<(u64, u64)> {
+    if range.page_size == 0 || range.page_end <= range.page_start || range.mapping_index.is_none() {
+        return None;
+    }
+    let start = range.page_start / range.page_size;
+    let end = range.page_end.div_ceil(range.page_size);
+    (end > start).then_some((start, end))
+}
+
+#[cfg(target_os = "linux")]
+fn add_interval(
+    intervals: &mut std::collections::BTreeMap<u32, Vec<(u64, u64)>>,
+    range: &PageRange,
+) {
+    let (Some(mapping_index), Some((start, end))) = (range.mapping_index, page_interval(range))
+    else {
+        return;
+    };
+    intervals
+        .entry(mapping_index)
+        .or_default()
+        .push((start, end));
+}
+
+#[cfg(target_os = "linux")]
+fn interval_union_count(intervals: &mut std::collections::BTreeMap<u32, Vec<(u64, u64)>>) -> u64 {
+    let mut total = 0u64;
+    for values in intervals.values_mut() {
+        values.sort_unstable();
+        let Some((mut first, mut last)) = values.first().copied() else {
+            continue;
+        };
+        for &(next_first, next_last) in &values[1..] {
+            if next_first > last {
+                total = total.saturating_add(last - first);
+                first = next_first;
+                last = next_last;
+            } else {
+                last = last.max(next_last);
+            }
+        }
+        total = total.saturating_add(last - first);
+    }
+    total
+}
+
+#[cfg(target_os = "linux")]
+fn interval_contains(
+    intervals: &std::collections::BTreeMap<u32, Vec<(u64, u64)>>,
+    mapping_index: u32,
+    page: u64,
+) -> bool {
+    intervals.get(&mapping_index).is_some_and(|values| {
+        values
+            .iter()
+            .any(|&(start, end)| page >= start && page < end)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn observe_page_residency_internal(
+    ranges: &[PageRange],
+    selected: &std::collections::BTreeSet<String>,
+    config: PageObservationConfig,
+    targeted_mode: bool,
 ) -> PageResidencySnapshot {
     use std::collections::BTreeMap;
     use std::time::Instant;
@@ -294,7 +414,7 @@ pub fn observe_page_residency(
     let maps = match std::fs::read_to_string("/proc/self/maps") {
         Ok(maps) => maps,
         Err(error) => {
-            return PageResidencySnapshot::unsupported(format!("/proc/self/maps: {error}"));
+            return PageResidencySnapshot::unsupported(format!("/proc/self/maps: {error}"))
         }
     };
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -316,6 +436,48 @@ pub fn observe_page_residency(
             .or_insert(base);
     }
 
+    // Selected resources are ordered first. Within each group, inventory order
+    // is preserved, making sampling deterministic.
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by_key(|index| {
+        let is_target = selected.contains(&ranges[*index].name);
+        (!is_target, *index)
+    });
+    let processed_count = order.len().min(config.max_resources);
+    let processed = &order[..processed_count];
+    let omitted = &order[processed_count..];
+
+    let total_for = page_count;
+    let available_for = |range: &PageRange| {
+        range.mapping_index.is_some()
+            && range.mapping_path.is_some()
+            && range
+                .mapping_path
+                .as_ref()
+                .is_some_and(|path| bases.contains_key(path))
+    };
+
+    // Interval arithmetic gives the true unique-page population without
+    // allocating one key per page. This matters for multi-hundred-thousand
+    // page Qwen mappings and keeps a small sample small.
+    let mut all_intervals: BTreeMap<u32, Vec<(u64, u64)>> = BTreeMap::new();
+    let mut target_intervals: BTreeMap<u32, Vec<(u64, u64)>> = BTreeMap::new();
+    let mut unavailable_unknown_pages = 0u64;
+    for index in processed.iter().chain(omitted.iter()) {
+        let range = &ranges[*index];
+        let total = total_for(range);
+        if !available_for(range) {
+            unavailable_unknown_pages = unavailable_unknown_pages.saturating_add(total);
+            continue;
+        }
+        add_interval(&mut all_intervals, range);
+        if selected.contains(&range.name) {
+            add_interval(&mut target_intervals, range);
+        }
+    }
+    let all_unique_pages = interval_union_count(&mut all_intervals);
+    let targeted_available = interval_union_count(&mut target_intervals);
+
     let mut snapshot = PageResidencySnapshot {
         supported: true,
         source: "linux mincore(/proc/self/maps)",
@@ -330,169 +492,236 @@ pub fn observe_page_residency(
         unique_unknown_pages: None,
         sampled: false,
         resources: Vec::new(),
+        targeted: None,
         elapsed_ns: 0,
         unsupported_reason: None,
     };
-    let mut unique: BTreeMap<(PathBuf, u64), bool> = BTreeMap::new();
-    for range in ranges.iter().take(config.max_resources) {
-        let total_pages = if range.page_size == 0 || range.page_end <= range.page_start {
-            0
-        } else {
-            (range.page_end - range.page_start).div_ceil(range.page_size)
-        };
-        snapshot.total_pages = snapshot.total_pages.saturating_add(total_pages);
-        let Some(mapping_index) = range.mapping_index else {
-            snapshot.resources.push(ResourcePageResidency {
-                name: range.name.clone(),
-                tensor_index: range.tensor_index,
-                generation: range.generation,
-                mapping_index: None,
-                total_pages,
-                inspected_pages: 0,
-                resident_pages: 0,
-                nonresident_pages: 0,
-                unknown_pages: total_pages,
-                sampled: false,
-                error: Some("resource has no file-backed mapping".to_string()),
-            });
-            snapshot.unknown_pages = snapshot.unknown_pages.saturating_add(total_pages);
-            continue;
-        };
-        let Some(path) = range.mapping_path.as_ref() else {
-            snapshot.resources.push(ResourcePageResidency {
-                name: range.name.clone(),
-                tensor_index: range.tensor_index,
-                generation: range.generation,
-                mapping_index: Some(mapping_index),
-                total_pages,
-                inspected_pages: 0,
-                resident_pages: 0,
-                nonresident_pages: 0,
-                unknown_pages: total_pages,
-                sampled: false,
-                error: Some("mapping shard path unavailable".to_string()),
-            });
-            snapshot.unknown_pages = snapshot.unknown_pages.saturating_add(total_pages);
-            continue;
-        };
-        let Some(base) = bases.get(path) else {
-            snapshot.resources.push(ResourcePageResidency {
-                name: range.name.clone(),
-                tensor_index: range.tensor_index,
-                generation: range.generation,
-                mapping_index: Some(mapping_index),
-                total_pages,
-                inspected_pages: 0,
-                resident_pages: 0,
-                nonresident_pages: 0,
-                unknown_pages: total_pages,
-                sampled: false,
-                error: Some("mapping is not present in /proc/self/maps".to_string()),
-            });
-            snapshot.unknown_pages = snapshot.unknown_pages.saturating_add(total_pages);
-            continue;
-        };
-        let remaining_budget = config
-            .max_pages
-            .saturating_sub(snapshot.inspected_pages as usize);
-        let inspect_pages = (total_pages as usize).min(remaining_budget);
+    let mut observed: BTreeMap<(u32, u64), bool> = BTreeMap::new();
+
+    for index in processed {
+        let range = &ranges[*index];
+        let total_pages = total_for(range);
+        let is_targeted = selected.contains(&range.name);
         let mut resource = ResourcePageResidency {
             name: range.name.clone(),
             tensor_index: range.tensor_index,
             generation: range.generation,
-            mapping_index: Some(mapping_index),
+            mapping_index: range.mapping_index,
             total_pages,
             inspected_pages: 0,
             resident_pages: 0,
             nonresident_pages: 0,
             unknown_pages: 0,
-            sampled: inspect_pages < total_pages as usize,
+            sampled: false,
+            targeted: is_targeted,
             error: None,
         };
-        if inspect_pages == 0 {
-            resource.unknown_pages = total_pages;
-            snapshot.unknown_pages = snapshot.unknown_pages.saturating_add(total_pages);
+        if total_pages == 0 {
             snapshot.resources.push(resource);
-            snapshot.sampled = true;
             continue;
         }
-        let length = (inspect_pages as u64).saturating_mul(page_size);
-        let address = match base.checked_add(range.page_start) {
-            Some(address) => address,
+        let Some(mapping_index) = range.mapping_index else {
+            resource.unknown_pages = total_pages;
+            resource.error = Some("resource has no file-backed mapping".to_string());
+            snapshot.resources.push(resource);
+            continue;
+        };
+        let Some(path) = range.mapping_path.as_ref() else {
+            resource.unknown_pages = total_pages;
+            resource.error = Some("mapping shard path unavailable".to_string());
+            snapshot.resources.push(resource);
+            continue;
+        };
+        let Some(base) = bases.get(path).copied() else {
+            resource.unknown_pages = total_pages;
+            resource.error = Some("mapping is not present in /proc/self/maps".to_string());
+            snapshot.resources.push(resource);
+            continue;
+        };
+        let base = match base.checked_add(range.page_start) {
+            Some(base) => base,
             None => {
                 resource.unknown_pages = total_pages;
                 resource.error = Some("page address overflow".to_string());
-                snapshot.unknown_pages = snapshot.unknown_pages.saturating_add(total_pages);
                 snapshot.resources.push(resource);
                 continue;
             }
         };
-        let mut vector = vec![0u8; inspect_pages];
-        let rc = unsafe {
-            libc::mincore(
-                address as *mut libc::c_void,
-                length as usize,
-                vector.as_mut_ptr(),
-            )
-        };
-        if rc != 0 {
-            let errno = std::io::Error::last_os_error();
-            resource.unknown_pages = total_pages;
-            resource.error = Some(format!("mincore: {errno}"));
-            snapshot.unknown_pages = snapshot.unknown_pages.saturating_add(total_pages);
-            snapshot.resources.push(resource);
-            continue;
-        }
-        resource.inspected_pages = inspect_pages as u64;
-        for (index, status) in vector.iter().enumerate() {
-            if status & 1 != 0 {
-                resource.resident_pages += 1;
-                snapshot.resident_pages += 1;
-                unique.insert(
-                    (path.clone(), range.page_start / page_size + index as u64),
-                    true,
-                );
-            } else {
-                resource.nonresident_pages += 1;
-                snapshot.nonresident_pages += 1;
-                unique.insert(
-                    (path.clone(), range.page_start / page_size + index as u64),
-                    false,
-                );
+        let mut page_index = 0u64;
+        while page_index < total_pages {
+            let page = range.page_start / range.page_size + page_index;
+            let key = (mapping_index, page);
+            if let Some(resident) = observed.get(&key).copied() {
+                resource.inspected_pages += 1;
+                if resident {
+                    resource.resident_pages += 1;
+                } else {
+                    resource.nonresident_pages += 1;
+                }
+                page_index += 1;
+                continue;
             }
+            let budget_left = config.max_pages.saturating_sub(observed.len());
+            if budget_left == 0 {
+                break;
+            }
+            let run_start = page_index;
+            let mut run_len = 0u64;
+            while page_index < total_pages && run_len < budget_left as u64 {
+                let run_page = range.page_start / range.page_size + page_index;
+                if observed.contains_key(&(mapping_index, run_page)) {
+                    break;
+                }
+                page_index += 1;
+                run_len += 1;
+            }
+            if run_len == 0 {
+                break;
+            }
+            let address = match base.checked_add(run_start.saturating_mul(page_size)) {
+                Some(address) => address,
+                None => {
+                    resource.error = Some("page address overflow".to_string());
+                    break;
+                }
+            };
+            let mut vector = vec![0u8; run_len as usize];
+            let rc = unsafe {
+                libc::mincore(
+                    address as *mut libc::c_void,
+                    run_len.saturating_mul(page_size) as usize,
+                    vector.as_mut_ptr(),
+                )
+            };
+            if rc != 0 {
+                resource.error = Some(format!("mincore: {}", std::io::Error::last_os_error()));
+                break;
+            }
+            for (offset, status) in vector.iter().enumerate() {
+                let resident = status & 1 != 0;
+                let page = range.page_start / range.page_size + run_start + offset as u64;
+                observed.insert((mapping_index, page), resident);
+                if resident {
+                    resource.resident_pages += 1;
+                } else {
+                    resource.nonresident_pages += 1;
+                }
+            }
+            resource.inspected_pages += run_len;
         }
-        resource.unknown_pages = total_pages.saturating_sub(inspect_pages as u64);
-        snapshot.inspected_pages = snapshot
-            .inspected_pages
-            .saturating_add(inspect_pages as u64);
-        snapshot.unknown_pages = snapshot
-            .unknown_pages
-            .saturating_add(resource.unknown_pages);
+        resource.unknown_pages = resource
+            .total_pages
+            .saturating_sub(resource.inspected_pages);
+        resource.sampled = resource.inspected_pages < resource.total_pages;
         snapshot.sampled |= resource.sampled;
         snapshot.resources.push(resource);
     }
-    // Resources omitted by max_resources are unknown, never zero.
-    if ranges.len() > config.max_resources {
-        let omitted = ranges.len() - config.max_resources;
-        snapshot.unknown_pages = snapshot
-            .unknown_pages
-            .saturating_add(omitted as u64 * page_size);
-        snapshot.sampled = true;
+
+    for index in omitted {
+        let range = &ranges[*index];
+        let total_pages = total_for(range);
+        snapshot.resources.push(ResourcePageResidency {
+            name: range.name.clone(),
+            tensor_index: range.tensor_index,
+            generation: range.generation,
+            mapping_index: range.mapping_index,
+            total_pages,
+            inspected_pages: 0,
+            resident_pages: 0,
+            nonresident_pages: 0,
+            unknown_pages: total_pages,
+            sampled: total_pages > 0,
+            targeted: selected.contains(&range.name),
+            error: Some("resource omitted by max_resources".to_string()),
+        });
+        snapshot.sampled |= total_pages > 0;
     }
-    for resident in unique.values() {
-        if *resident {
-            snapshot.unique_resident_pages += 1;
-        } else {
-            snapshot.unique_nonresident_pages += 1;
+
+    snapshot.inspected_pages = observed.len() as u64;
+    snapshot.total_pages = all_unique_pages.saturating_add(unavailable_unknown_pages);
+    snapshot.resident_pages = observed.values().filter(|resident| **resident).count() as u64;
+    snapshot.nonresident_pages = observed.values().filter(|resident| !**resident).count() as u64;
+    snapshot.unique_resident_pages = snapshot.resident_pages;
+    snapshot.unique_nonresident_pages = snapshot.nonresident_pages;
+    let unknown_unique = all_unique_pages.saturating_sub(snapshot.inspected_pages);
+    snapshot.unique_unknown_pages = Some(unknown_unique);
+    snapshot.unknown_pages = unknown_unique.saturating_add(unavailable_unknown_pages);
+    snapshot.sampled |= snapshot.inspected_pages < snapshot.total_pages;
+
+    if targeted_mode {
+        let targeted_sampled = observed
+            .keys()
+            .filter(|(mapping, page)| interval_contains(&target_intervals, *mapping, *page))
+            .count() as u64;
+        let general_sampled = snapshot.inspected_pages.saturating_sub(targeted_sampled);
+        let mut selected_totals: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        for resource in &snapshot.resources {
+            if resource.targeted {
+                let entry = selected_totals
+                    .entry(resource.name.clone())
+                    .or_insert((0, 0));
+                entry.0 = entry.0.saturating_add(resource.total_pages);
+                entry.1 = entry.1.saturating_add(resource.unknown_pages);
+            }
         }
+        let fully = selected_totals
+            .values()
+            .filter(|(total, unknown)| *total == 0 || *unknown == 0)
+            .count();
+        let not_observed = selected_totals
+            .values()
+            .filter(|(total, unknown)| *total > 0 && *unknown == *total)
+            .count()
+            + selected.len().saturating_sub(selected_totals.len());
+        let partial = selected_totals
+            .values()
+            .filter(|(total, unknown)| *total > 0 && *unknown > 0 && *unknown < *total)
+            .count();
+        let bps = |sampled: u64, available: u64| {
+            (available > 0).then(|| ((sampled * 10_000) / available) as u16)
+        };
+        snapshot.targeted = Some(TargetedObservationCoverage {
+            selected_resources: selected.len(),
+            selected_resources_fully_observed: fully,
+            selected_resources_partially_observed: partial,
+            selected_resources_not_observed: not_observed,
+            targeted_pages_available: targeted_available,
+            targeted_pages_sampled: targeted_sampled,
+            targeted_pages_unknown: targeted_available.saturating_sub(targeted_sampled),
+            general_pages_available: all_unique_pages.saturating_sub(targeted_available),
+            general_pages_sampled: general_sampled,
+            general_pages_unknown: all_unique_pages
+                .saturating_sub(targeted_available)
+                .saturating_sub(general_sampled),
+            targeted_coverage_bps: bps(targeted_sampled, targeted_available),
+            general_coverage_bps: bps(
+                general_sampled,
+                all_unique_pages.saturating_sub(targeted_available),
+            ),
+            page_budget: config.max_pages,
+        });
     }
+
     snapshot.elapsed_ns = started.elapsed().as_nanos();
     snapshot
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn observe_page_residency(
+fn observe_page_residency_internal(
     _ranges: &[PageRange],
+    _selected: &std::collections::BTreeSet<String>,
+    _config: PageObservationConfig,
+    _targeted_mode: bool,
+) -> PageResidencySnapshot {
+    PageResidencySnapshot::unsupported("mincore observation is Linux-only")
+}
+
+/// Deprecated compatibility helper retained for callers that only need a
+/// general snapshot. It performs no page faults and remains bounded.
+#[cfg(not(target_os = "linux"))]
+pub fn observe_page_residency_targeted(
+    _ranges: &[PageRange],
+    _selected: &std::collections::BTreeSet<String>,
     _config: PageObservationConfig,
 ) -> PageResidencySnapshot {
     PageResidencySnapshot::unsupported("mincore observation is Linux-only")
@@ -526,6 +755,7 @@ fn parse_maps_header(line: &str) -> Option<(u64, u64, &str)> {
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn page_size() -> u64 {
         unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
@@ -574,22 +804,21 @@ mod observation_tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn mincore_is_bounded_and_does_not_invent_unknown_zeroes() {
+    fn mapped_file(label: &str, pages: u64) -> (PathBuf, *mut libc::c_void) {
         use std::os::unix::io::AsRawFd;
         let page = page_size();
         let path = std::env::temp_dir().join(format!(
             "ramforge-pages-{}-{}.bin",
             std::process::id(),
-            "mincore"
+            label
         ));
-        std::fs::write(&path, vec![1u8; (page * 2) as usize]).expect("file");
+        std::fs::write(&path, vec![1u8; (page * pages) as usize]).expect("file");
         let canonical = path.canonicalize().expect("canonical");
         let file = std::fs::File::open(&canonical).expect("open");
         let address = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                (page * 2) as usize,
+                (page * pages) as usize,
                 libc::PROT_READ,
                 libc::MAP_SHARED,
                 file.as_raw_fd(),
@@ -597,26 +826,221 @@ mod observation_tests {
             )
         };
         assert_ne!(address, libc::MAP_FAILED);
-        // Touch the first page through the mapping.
+        (canonical, address)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn range(name: &str, path: &Path, start_page: u64, pages: u64) -> PageRange {
+        PageRange {
+            name: name.to_string(),
+            tensor_index: 0,
+            generation: 1,
+            mapping_index: Some(0),
+            mapping_path: Some(path.to_path_buf()),
+            page_start: start_page * page_size(),
+            page_end: (start_page + pages) * page_size(),
+            page_size: page_size(),
+            mapping_size: pages * page_size(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn targeted_resources_are_sampled_before_general_ranges() {
+        let (path, address) = mapped_file("targeted", 3);
         unsafe { std::ptr::read_volatile(address.cast::<u8>()) };
-        let snapshot = observe_page_residency(
-            &[PageRange {
-                name: "x".to_string(),
-                tensor_index: 0,
-                generation: 1,
-                mapping_index: Some(0),
-                mapping_path: Some(canonical.clone()),
-                page_start: 0,
-                page_end: page * 2,
-                page_size: page,
-                mapping_size: page * 2,
-            }],
+        let ranges = [
+            range("general", &path, 0, 1),
+            range("selected", &path, 1, 1),
+        ];
+        let selected = BTreeSet::from(["selected".to_string()]);
+        let snapshot = observe_page_residency_targeted(
+            &ranges,
+            &selected,
+            PageObservationConfig {
+                max_pages: 1,
+                max_resources: 2,
+            },
+        );
+        unsafe { libc::munmap(address, (page_size() * 3) as usize) };
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(snapshot.resources[0].name, "selected");
+        assert_eq!(snapshot.resources[0].inspected_pages, 1);
+        assert_eq!(snapshot.resources[1].name, "general");
+        assert_eq!(snapshot.resources[1].inspected_pages, 0);
+        assert_eq!(snapshot.resources[1].unknown_pages, 1);
+        let coverage = snapshot.targeted.expect("targeted coverage");
+        assert_eq!(coverage.selected_resources, 1);
+        assert_eq!(coverage.selected_resources_fully_observed, 1);
+        assert_eq!(coverage.targeted_pages_sampled, 1);
+        assert_eq!(coverage.general_pages_sampled, 0);
+        assert_eq!(coverage.page_budget, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_name_without_a_range_is_not_observed() {
+        let (path, address) = mapped_file("missing-selected", 1);
+        let ranges = [range("general", &path, 0, 1)];
+        let selected = BTreeSet::from(["ghost".to_string()]);
+        let snapshot = observe_page_residency_targeted(
+            &ranges,
+            &selected,
             PageObservationConfig {
                 max_pages: 1,
                 max_resources: 1,
             },
         );
-        unsafe { libc::munmap(address, (page * 2) as usize) };
+        unsafe { libc::munmap(address, page_size() as usize) };
+        let _ = std::fs::remove_file(&path);
+        let coverage = snapshot.targeted.expect("coverage");
+        assert_eq!(coverage.selected_resources, 1);
+        assert_eq!(coverage.selected_resources_not_observed, 1);
+        assert_eq!(coverage.selected_resources_fully_observed, 0);
+        assert_eq!(coverage.general_pages_sampled, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn general_sampling_uses_only_remaining_budget() {
+        let (path, address) = mapped_file("remaining", 3);
+        let ranges = [
+            range("b", &path, 1, 1),
+            range("a", &path, 0, 1),
+            range("c", &path, 2, 1),
+        ];
+        let selected = BTreeSet::from(["a".to_string()]);
+        let snapshot = observe_page_residency_targeted(
+            &ranges,
+            &selected,
+            PageObservationConfig {
+                max_pages: 2,
+                max_resources: 3,
+            },
+        );
+        unsafe { libc::munmap(address, (page_size() * 3) as usize) };
+        let _ = std::fs::remove_file(&path);
+        let by_name = |name: &str| {
+            snapshot
+                .resources
+                .iter()
+                .find(|resource| resource.name == name)
+                .expect("resource")
+        };
+        assert_eq!(by_name("a").inspected_pages, 1);
+        assert_eq!(by_name("b").inspected_pages, 1);
+        assert_eq!(by_name("c").inspected_pages, 0);
+        assert_eq!(by_name("c").unknown_pages, 1);
+        let coverage = snapshot.targeted.expect("coverage");
+        assert_eq!(coverage.targeted_pages_sampled, 1);
+        assert_eq!(coverage.general_pages_sampled, 1);
+        assert_eq!(coverage.general_pages_unknown, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlap_does_not_consume_page_budget_twice() {
+        let (path, address) = mapped_file("overlap", 2);
+        unsafe { std::ptr::read_volatile(address.cast::<u8>()) };
+        let ranges = [range("a", &path, 0, 2), range("b", &path, 0, 2)];
+        let selected = BTreeSet::from(["a".to_string(), "b".to_string()]);
+        let snapshot = observe_page_residency_targeted(
+            &ranges,
+            &selected,
+            PageObservationConfig {
+                max_pages: 2,
+                max_resources: 2,
+            },
+        );
+        unsafe { libc::munmap(address, (page_size() * 2) as usize) };
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(snapshot.inspected_pages, 2);
+        assert_eq!(snapshot.total_pages, 2);
+        assert_eq!(
+            snapshot.unique_resident_pages + snapshot.unique_nonresident_pages,
+            2
+        );
+        let coverage = snapshot.targeted.expect("coverage");
+        assert_eq!(coverage.targeted_pages_available, 2);
+        assert_eq!(coverage.targeted_pages_sampled, 2);
+        assert_eq!(coverage.selected_resources_fully_observed, 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_resource_larger_than_budget_is_partial_not_complete() {
+        let (path, address) = mapped_file("partial", 4);
+        unsafe { std::ptr::read_volatile(address.cast::<u8>()) };
+        let ranges = [range("selected", &path, 0, 4)];
+        let selected = BTreeSet::from(["selected".to_string()]);
+        let snapshot = observe_page_residency_targeted(
+            &ranges,
+            &selected,
+            PageObservationConfig {
+                max_pages: 2,
+                max_resources: 1,
+            },
+        );
+        unsafe { libc::munmap(address, (page_size() * 4) as usize) };
+        let _ = std::fs::remove_file(&path);
+        let resource = &snapshot.resources[0];
+        assert_eq!(resource.inspected_pages, 2);
+        assert_eq!(resource.unknown_pages, 2);
+        assert!(resource.sampled);
+        let coverage = snapshot.targeted.expect("coverage");
+        assert_eq!(coverage.selected_resources_partially_observed, 1);
+        assert_eq!(coverage.selected_resources_fully_observed, 0);
+        assert_eq!(coverage.targeted_pages_unknown, 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zero_budget_and_missing_mappings_are_unknown() {
+        let (path, address) = mapped_file("zero", 1);
+        let ranges = [
+            range("selected", &path, 0, 1),
+            PageRange {
+                name: "missing".to_string(),
+                tensor_index: 1,
+                generation: 1,
+                mapping_index: None,
+                mapping_path: None,
+                page_start: 0,
+                page_end: 4096,
+                page_size: 4096,
+                mapping_size: 4096,
+            },
+        ];
+        let selected = BTreeSet::from(["selected".to_string(), "missing".to_string()]);
+        let snapshot = observe_page_residency_targeted(
+            &ranges,
+            &selected,
+            PageObservationConfig {
+                max_pages: 0,
+                max_resources: 2,
+            },
+        );
+        unsafe { libc::munmap(address, page_size() as usize) };
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(snapshot.inspected_pages, 0);
+        assert_eq!(snapshot.unknown_pages, 2);
+        let coverage = snapshot.targeted.expect("coverage");
+        assert_eq!(coverage.selected_resources_not_observed, 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mincore_is_bounded_and_does_not_invent_unknown_zeroes() {
+        let (path, address) = mapped_file("mincore", 2);
+        unsafe { std::ptr::read_volatile(address.cast::<u8>()) };
+        let snapshot = observe_page_residency(
+            &[range("x", &path, 0, 2)],
+            PageObservationConfig {
+                max_pages: 1,
+                max_resources: 1,
+            },
+        );
+        unsafe { libc::munmap(address, (page_size() * 2) as usize) };
         let _ = std::fs::remove_file(&path);
         assert!(snapshot.supported);
         assert_eq!(snapshot.inspected_pages, 1);
@@ -647,9 +1071,15 @@ pub enum PrefetchBenefitClass {
     PotentiallyUseful,
     /// The pages were already resident before the request.
     Redundant,
-    /// The request was accepted/attempted but no useful access/residency
-    /// effect was observed.
+    /// Staging was attempted but the selected pages demonstrably remained
+    /// nonresident.
+    Ineffective,
+    /// The pages became resident but were not accessed within the observation
+    /// window.
     Wasted,
+    /// The pages became resident but a before-access observation showed they
+    /// were nonresident again before the access.
+    EvictedBeforeUse,
     Unknown,
 }
 
@@ -680,8 +1110,12 @@ pub struct PrefetchCorrelationReport {
     pub clearly_useful: usize,
     pub potentially_useful: usize,
     pub redundant: usize,
+    pub ineffective: usize,
     pub wasted: usize,
+    pub evicted_before_use: usize,
     pub benefit_unknown: usize,
+    /// False unless a safe pre-access snapshot was actually captured.
+    pub before_access_observation_available: bool,
     pub notes: Vec<String>,
 }
 
@@ -759,14 +1193,16 @@ pub fn correlate_prefetch_residency(
                 PrefetchBenefitClass::PotentiallyUseful
             }
             (PrefetchResidencyClass::BecameResident, Some(false)) => PrefetchBenefitClass::Wasted,
-            (PrefetchResidencyClass::RemainedNonResident, _) => PrefetchBenefitClass::Wasted,
+            (PrefetchResidencyClass::RemainedNonResident, _) => PrefetchBenefitClass::Ineffective,
             _ => PrefetchBenefitClass::Unknown,
         };
         match benefit {
             PrefetchBenefitClass::ClearlyUseful => report.clearly_useful += 1,
             PrefetchBenefitClass::PotentiallyUseful => report.potentially_useful += 1,
             PrefetchBenefitClass::Redundant => report.redundant += 1,
+            PrefetchBenefitClass::Ineffective => report.ineffective += 1,
             PrefetchBenefitClass::Wasted => report.wasted += 1,
+            PrefetchBenefitClass::EvictedBeforeUse => report.evicted_before_use += 1,
             PrefetchBenefitClass::Unknown => report.benefit_unknown += 1,
         }
         report.resources.push(PrefetchResourceCorrelation {
@@ -793,6 +1229,9 @@ pub fn correlate_prefetch_residency(
             .notes
             .push("page residency observation is unsupported or incomplete".to_string());
     }
+    report.notes.push(
+        "before-access residency was not observed; evicted-before-use remains unknown".to_string(),
+    );
     report
 }
 
@@ -815,6 +1254,7 @@ mod correlation_tests {
             unique_unknown_pages: None,
             sampled,
             resources,
+            targeted: None,
             elapsed_ns: 0,
             unsupported_reason: None,
         }
@@ -832,6 +1272,7 @@ mod correlation_tests {
             nonresident_pages: total.saturating_sub(resident).saturating_sub(unknown),
             unknown_pages: unknown,
             sampled: unknown > 0,
+            targeted: false,
             error: None,
         }
     }
@@ -843,6 +1284,7 @@ mod correlation_tests {
                 resource("a", 2, 2, 0),
                 resource("b", 0, 1, 0),
                 resource("c", 0, 1, 1),
+                resource("d", 0, 1, 0),
             ],
             false,
         );
@@ -851,12 +1293,18 @@ mod correlation_tests {
                 resource("a", 2, 2, 0),
                 resource("b", 1, 1, 0),
                 resource("c", 1, 1, 1),
+                resource("d", 0, 1, 0),
             ],
             false,
         );
         let observed = std::collections::BTreeSet::from(["a".to_string(), "b".to_string()]);
         let report = correlate_prefetch_residency(
-            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &[
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
             &before,
             &after,
             Some(&observed),
@@ -865,7 +1313,7 @@ mod correlation_tests {
         assert_eq!(report.became_resident, 1);
         assert_eq!(report.unknown, 1);
         assert_eq!(report.access_observed, 2);
-        assert_eq!(report.access_not_observed, 1);
+        assert_eq!(report.access_not_observed, 2);
         assert_eq!(
             report.resources[0].class,
             PrefetchResidencyClass::AlreadyResident
@@ -878,5 +1326,11 @@ mod correlation_tests {
         assert_eq!(report.redundant, 1);
         assert_eq!(report.potentially_useful, 1);
         assert_eq!(report.benefit_unknown, 1);
+        assert_eq!(report.ineffective, 1);
+        assert!(!report.before_access_observation_available);
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("before-access")));
     }
 }

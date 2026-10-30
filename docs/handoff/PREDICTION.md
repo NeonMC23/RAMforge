@@ -149,28 +149,92 @@ mapping delta, and feedback counters. JSON and human output use the same data.
 
 `--residency-observe` uses Linux `mincore()` over bounded tensor page ranges
 located through `/proc/self/maps`. It never faults pages in, evicts pages, or
-exposes addresses. Missing mappings, unsupported kernels, and pages beyond the
-inspection budget are **unknown**, not nonresident. Full snapshots include
-resident/nonresident/unknown counts and observation time.
+exposes virtual/physical addresses. Missing mappings, unsupported kernels, and
+pages beyond the inspection budget are **unknown**, not nonresident.
+
+### Targeted sampling
+
+When prediction is enabled, prediction and planning run first because they do
+not depend on page residency. The selected prefetch names are then passed to
+`observe_page_residency_targeted`. Observation order is deterministic:
+
+1. selected prefetch resources in inventory order;
+2. non-selected resources with the remaining page budget.
+
+Unique physical pages are keyed by native mapping index and page index, so
+overlapping tensor ranges in one mapping consume the page budget once. Pages in
+missing/unreadable mappings remain unknown. A selected resource larger than
+the remaining budget is reported as partially observed, not as resident; its
+unobserved pages stay unknown. A general sample never inherits targeted
+coverage claims.
+
+Snapshots expose separate populations: configured page budget, selected
+resources fully/partially/not observed, targeted pages available and sampled,
+general pages available and sampled, unique inspected pages, resident,
+nonresident, and unknown pages. `targeted_coverage_bps` and
+`general_coverage_bps` refer to those separate populations and must not be
+combined into one headline percentage. The resource list includes `targeted`,
+`total_pages`, `inspected_pages`, `unknown_pages`, and `sampled` so partial
+coverage is visible per resource.
+
+On SmolLM2 at a 2,048-page budget, targeting changed the earlier arbitrary
+sample into 2,048/4,065 selected pages sampled (33 selected resources fully
+observed, 4 partial, 19 not observed); remaining general budget was 0. A
+64-page budget sampled 64 targeted pages (2 fully observed, 5 partial, 49 not
+observed). These partial results are not evidence for the unobserved resources.
+
+### Observation points and attribution
+
+Available snapshots are initial (after static prediction/planning, before
+staging), post-staging, and final. A safe observation immediately before each
+native resource access is **not implemented**: llama.cpp/ggml does not expose
+an access callback at the required lifetime boundary, and adding one would
+require a native change. The missing interval is explicit;
+`before_access_observation_available=false`. Consequently eviction before
+access and avoided reactive-load causality remain unknown. Do not infer them
+from the final snapshot or from ordering alone.
 
 Prefetch correlation compares selected resource page snapshots before and
-after staging. Each selected resource is classified as already resident,
-became resident, remained nonresident, or unknown; benefit is redundant,
-potentially useful, wasted, clearly useful, or unknown. `ClearlyUseful` is
-never assigned without measured physical or performance benefit.
+after staging. Classifications are:
 
-On the SmolLM2 test mapping, full observation found all 25,581 pages resident
-before prefetch; all 57 selected resources were redundant, none became
-resident, and none were clearly useful. Full observation cost about 54 ms per
-snapshot (158 ms for three), versus about 3.7 ms per 2,048-page sample; the
-sample left 23,533 pages unknown. Observation is disabled by default.
+- `AlreadyResident` -> `Redundant`;
+- `BecameResident` + observed access -> `PotentiallyUseful`;
+- `BecameResident` + no observed access -> `Wasted`;
+- `RemainedNonResident` -> `Ineffective`;
+- insufficient/partial pages -> `Unknown`.
+
+`ClearlyUseful` and `EvictedBeforeUse` are not assigned without a before-access
+observation and per-resource benefit evidence. An accepted staging request is
+never treated as proof of residency.
+
+### Measured overhead
+
+Earlier full observation on the SmolLM2 mapping covered 25,581 pages at roughly
+54 ms/snapshot. The targeted implementation uses interval arithmetic for the
+available population instead of allocating one key per page, so the 64-page
+sampling budget stays small: in the final runs, all three snapshots together
+cost about 1.6–3.8 ms for SmolLM2 and 3.4–4.0 ms for Qwen2.5-1.5B. This is
+diagnostic overhead, not normal execution overhead. Observation remains
+disabled by default.
 
 End-to-end latency includes model load, profile/history loading, prediction,
-planning, staging, inference, and explicit synchronization. TTFT excludes
-pre-execution staging; inference latency is not a proxy for total run cost.
-In the five-repetition 256 MiB matrix, predictive TTFT was sometimes lower but
-end-to-end latency was worse for short workloads (for example 285.1 vs 295.0 ms
-and 447.9 vs 469.5 ms). No speedup is claimed.
+planning, staging, observation, inference, and explicit synchronization. TTFT
+excludes pre-execution staging; inference latency is not a proxy for total run
+cost. Report serialization is outside `end_to_end_ns`; process wall time
+includes it.
+
+### Controlled cache conditions
+
+`scripts/prediction-bench.py --cache-condition isolated-nonresident` copies the
+model to an isolated file, calls `fsync` then `posix_fadvise(POSIX_FADV_DONTNEED)`
+only on that copy, and verifies initial page-cache state with `mincore` before
+starting RAMforge. No global cache drop, privileged command, or modification
+of the source model is used. The method is labeled controlled only when every
+probed page is nonresident. Partial, warm, unknown, and preparation-failure
+runs remain distinct; `cache_controlled=false` is preserved. The profile copy
+is rewritten only for model path/size/mtime identity; access records are
+unchanged. This controls the file-page-cache state at process start, not the
+model's mapped residency after loading and not physical reclamation.
 
 ## Calibration findings
 
@@ -209,7 +273,10 @@ unknown bytes, predictions and precision/recall, staged/newly resident/
 redundant/ineffective/wasted/deferred/rejected bytes, eviction-before-access,
 reread bytes, peak residency, budget violations, prediction/planning/
 observation/staging/reread/execution/synchronization costs, total end-to-end
-cost, and net benefit.
+cost, and net benefit. Simulated observation also reports targeted/general
+page coverage, partial selected resources, before-access availability, and a
+cache-condition label. These are synthetic model parameters; they are not
+hardware measurements and are never fed into empirical claims.
 
 Accounting:
 

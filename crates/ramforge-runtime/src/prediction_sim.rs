@@ -33,6 +33,20 @@ pub enum SimPrefetchTiming {
     Late,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimObservationMode {
+    Disabled,
+    General,
+    Targeted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimCacheCondition {
+    Warm,
+    ControlledNonresident,
+    Uncontrolled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimResource {
     pub name: String,
@@ -85,7 +99,11 @@ pub struct SimScenario {
     pub test_sequence: Vec<String>,
     pub prefetch_effect: SimPrefetchEffect,
     pub prefetch_timing: SimPrefetchTiming,
-    pub observe: bool,
+    pub observation_mode: SimObservationMode,
+    /// Zero means the available population is not budget-limited.
+    pub observation_page_budget: usize,
+    pub before_access_observation: bool,
+    pub cache_condition: SimCacheCondition,
     pub costs: SimCosts,
 }
 
@@ -134,6 +152,17 @@ pub struct SimResult {
     pub reread_bytes: u64,
     pub peak_resident_bytes: u64,
     pub budget_violations: u64,
+    pub observation_mode: &'static str,
+    pub observation_page_budget: usize,
+    pub targeted_pages_available: u64,
+    pub targeted_pages_sampled: u64,
+    pub general_pages_available: u64,
+    pub general_pages_sampled: u64,
+    pub selected_resources_fully_observed: usize,
+    pub selected_resources_partially_observed: usize,
+    pub selected_resources_not_observed: usize,
+    pub before_access_observation_available: bool,
+    pub cache_condition: &'static str,
     pub prediction_cost_ns: u64,
     pub planning_cost_ns: u64,
     pub observation_cost_ns: u64,
@@ -240,7 +269,7 @@ fn run_strategy(
     strategy: SimStrategy,
     _unused: Option<()>,
 ) -> Result<SimResult, String> {
-    let (config, observe) = strategy_config(scenario, strategy);
+    let (config, _observe) = strategy_config(scenario, strategy);
     let predictions = if config.enabled {
         predict_from_profile(&config, Some(profile), inventory, None)
     } else {
@@ -461,11 +490,6 @@ fn run_strategy(
     if scenario.prefetch_effect == SimPrefetchEffect::Unknown {
         notes.push("prefetch residency outcome is unknown".to_string());
     }
-    let total_pages = scenario
-        .resources
-        .iter()
-        .map(|resource| resource.bytes.div_ceil(4096))
-        .sum::<u64>();
     let prediction_cost_ns = if config.enabled {
         scenario.costs.prediction_ns
     } else {
@@ -476,14 +500,50 @@ fn run_strategy(
     } else {
         0
     };
-    let observation_cost_ns = if observe {
-        scenario
-            .costs
-            .observation_ns_per_page
-            .saturating_mul(total_pages)
+    let observation_active =
+        config.enabled && scenario.observation_mode != SimObservationMode::Disabled;
+    let (targeted_pages_available, general_pages_available) =
+        observation_pages(scenario, &selected_names);
+    let (targeted_pages_sampled, general_pages_sampled) = if !observation_active {
+        (0, 0)
     } else {
-        0
+        match scenario.observation_mode {
+            SimObservationMode::Disabled => (0, 0),
+            SimObservationMode::General => {
+                let available = targeted_pages_available.saturating_add(general_pages_available);
+                let budget = if scenario.observation_page_budget == 0 {
+                    available
+                } else {
+                    scenario.observation_page_budget as u64
+                };
+                (0, budget.min(available))
+            }
+            SimObservationMode::Targeted => {
+                let budget = if scenario.observation_page_budget == 0 {
+                    u64::MAX
+                } else {
+                    scenario.observation_page_budget as u64
+                };
+                let targeted = budget.min(targeted_pages_available);
+                let remaining = budget.saturating_sub(targeted);
+                (targeted, remaining.min(general_pages_available))
+            }
+        }
     };
+    let (fully, partial, not_observed) = if observation_active {
+        selected_coverage(
+            scenario,
+            &selected_names,
+            targeted_pages_sampled,
+            scenario.observation_mode == SimObservationMode::Targeted,
+        )
+    } else {
+        (0, 0, selected_names.len())
+    };
+    let observation_cost_ns = scenario
+        .costs
+        .observation_ns_per_page
+        .saturating_mul(targeted_pages_sampled.saturating_add(general_pages_sampled));
     let staging_cost_ns = if staged_bytes > 0 || deferred_bytes > 0 || rejected_bytes > 0 {
         scenario.costs.staging_ns
     } else {
@@ -530,6 +590,29 @@ fn run_strategy(
         reread_bytes,
         peak_resident_bytes: peak,
         budget_violations,
+        observation_mode: if !observation_active {
+            "disabled"
+        } else {
+            match scenario.observation_mode {
+                SimObservationMode::Disabled => "disabled",
+                SimObservationMode::General => "general",
+                SimObservationMode::Targeted => "targeted",
+            }
+        },
+        observation_page_budget: scenario.observation_page_budget,
+        targeted_pages_available,
+        targeted_pages_sampled,
+        general_pages_available,
+        general_pages_sampled,
+        selected_resources_fully_observed: fully,
+        selected_resources_partially_observed: partial,
+        selected_resources_not_observed: not_observed,
+        before_access_observation_available: scenario.before_access_observation,
+        cache_condition: match scenario.cache_condition {
+            SimCacheCondition::Warm => "warm",
+            SimCacheCondition::ControlledNonresident => "controlled-nonresident",
+            SimCacheCondition::Uncontrolled => "uncontrolled",
+        },
         prediction_cost_ns,
         planning_cost_ns,
         observation_cost_ns,
@@ -557,7 +640,7 @@ fn strategy_config(scenario: &SimScenario, strategy: SimStrategy) -> (Prediction
                 max_in_flight: 1,
                 lookahead: scenario.prediction_horizon,
             },
-            scenario.observe,
+            scenario.observation_mode != SimObservationMode::Disabled,
         ),
         SimStrategy::Conservative => (
             PredictionConfig {
@@ -568,7 +651,7 @@ fn strategy_config(scenario: &SimScenario, strategy: SimStrategy) -> (Prediction
                 max_in_flight: 1,
                 lookahead: scenario.prediction_horizon,
             },
-            scenario.observe,
+            scenario.observation_mode != SimObservationMode::Disabled,
         ),
         SimStrategy::Aggressive => (
             PredictionConfig {
@@ -579,7 +662,7 @@ fn strategy_config(scenario: &SimScenario, strategy: SimStrategy) -> (Prediction
                 max_in_flight: 1,
                 lookahead: scenario.prediction_horizon,
             },
-            scenario.observe,
+            scenario.observation_mode != SimObservationMode::Disabled,
         ),
     }
 }
@@ -644,6 +727,57 @@ fn scenario_inputs(
     Ok((inventory, profile))
 }
 
+fn observation_pages(scenario: &SimScenario, selected: &BTreeSet<String>) -> (u64, u64) {
+    let mut targeted: BTreeSet<(Option<u32>, u64)> = BTreeSet::new();
+    let mut general: BTreeSet<(Option<u32>, u64)> = BTreeSet::new();
+    for (index, resource) in scenario.resources.iter().enumerate() {
+        let pages = resource.bytes.div_ceil(4096);
+        let group = resource.overlap_group.or(Some(1_000_000 + index as u32));
+        for page in 0..pages {
+            let key = (group, page);
+            if selected.contains(&resource.name) {
+                targeted.insert(key);
+            } else {
+                general.insert(key);
+            }
+        }
+    }
+    general.retain(|key| !targeted.contains(key));
+    (targeted.len() as u64, general.len() as u64)
+}
+
+fn selected_coverage(
+    scenario: &SimScenario,
+    selected: &BTreeSet<String>,
+    sampled_pages: u64,
+    targeted: bool,
+) -> (usize, usize, usize) {
+    let mut budget = sampled_pages;
+    let mut fully = 0;
+    let mut partial = 0;
+    let mut not_observed = 0;
+    for name in selected {
+        let pages: u64 = scenario
+            .resources
+            .iter()
+            .filter(|resource| resource.name == *name)
+            .map(|resource| resource.bytes.div_ceil(4096))
+            .sum();
+        if !targeted || pages == 0 {
+            not_observed += 1;
+        } else if budget >= pages {
+            budget -= pages;
+            fully += 1;
+        } else if budget > 0 {
+            partial += 1;
+            budget = 0;
+        } else {
+            not_observed += 1;
+        }
+    }
+    (fully, partial, not_observed)
+}
+
 /// Required deterministic scenario family. `budget` and `window` are explicit
 /// so callers can compare the same initial conditions across strategies.
 pub fn standard_scenarios(budget_bytes: u64, staging_window_bytes: u64) -> Vec<SimScenario> {
@@ -660,7 +794,10 @@ pub fn standard_scenarios(budget_bytes: u64, staging_window_bytes: u64) -> Vec<S
             test_sequence: test.iter().map(|name| (*name).to_string()).collect(),
             prefetch_effect: SimPrefetchEffect::MakesResident,
             prefetch_timing: SimPrefetchTiming::OnTime,
-            observe: false,
+            observation_mode: SimObservationMode::Disabled,
+            observation_page_budget: 0,
+            before_access_observation: false,
+            cache_condition: SimCacheCondition::Uncontrolled,
             costs: SimCosts::default(),
         };
     let r = |name: &str, initial| SimResource {
@@ -808,7 +945,8 @@ pub fn standard_scenarios(budget_bytes: u64, staging_window_bytes: u64) -> Vec<S
     result[13].budget_bytes = 4096;
     result[13].staging_window_bytes = 4096;
     result[13].speculative_budget_bytes = 0;
-    result[14].observe = true;
+    result[14].observation_mode = SimObservationMode::Targeted;
+    result[14].observation_page_budget = 4096;
     result[14].costs.observation_ns_per_page = 1_000_000;
     result[15].costs.prediction_ns = 1_000_000;
     result[15].costs.staging_ns = 1_000_000;
@@ -854,7 +992,10 @@ mod tests {
                 .collect(),
             prefetch_effect: SimPrefetchEffect::MakesResident,
             prefetch_timing: SimPrefetchTiming::OnTime,
-            observe: false,
+            observation_mode: SimObservationMode::Disabled,
+            observation_page_budget: 0,
+            before_access_observation: false,
+            cache_condition: SimCacheCondition::Uncontrolled,
             costs: SimCosts::default(),
         }
     }
@@ -971,7 +1112,8 @@ mod tests {
             &["a"],
             &["a"],
         );
-        scenario.observe = true;
+        scenario.observation_mode = SimObservationMode::Targeted;
+        scenario.observation_page_budget = 4096;
         scenario.costs.observation_ns_per_page = 1_000_000;
         let result = simulate(&scenario).expect("simulation");
         assert!(result.predictive.observation_cost_ns > 0);
@@ -1016,6 +1158,60 @@ mod tests {
         assert_eq!(result.predictive.predicted_resources, 2);
         assert!(result.predictive.staged_bytes <= 4096);
         assert_eq!(result.predictive.budget_violations, 0);
+    }
+
+    #[test]
+    fn targeted_observation_respects_budget_and_reports_partial_coverage() {
+        let mut scenario = scenario(
+            "targeted-partial",
+            vec![SimResource {
+                bytes: 8192,
+                ..resource("a", SimInitialResidency::NonResident)
+            }],
+            &["a"],
+            &["a"],
+        );
+        scenario.observation_mode = SimObservationMode::Targeted;
+        scenario.observation_page_budget = 1;
+        let result = simulate(&scenario).expect("simulation");
+        let predictive = &result.predictive;
+        assert_eq!(predictive.targeted_pages_available, 2);
+        assert_eq!(predictive.targeted_pages_sampled, 1);
+        assert_eq!(predictive.selected_resources_fully_observed, 0);
+        assert_eq!(predictive.selected_resources_partially_observed, 1);
+        assert_eq!(predictive.selected_resources_not_observed, 0);
+        assert!(predictive.observation_cost_ns > 0);
+    }
+
+    #[test]
+    fn general_observation_does_not_claim_targeted_coverage() {
+        let mut scenario = scenario(
+            "general",
+            vec![resource("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        );
+        scenario.observation_mode = SimObservationMode::General;
+        scenario.observation_page_budget = 1;
+        let result = simulate(&scenario).expect("simulation");
+        assert_eq!(result.predictive.targeted_pages_sampled, 0);
+        assert_eq!(result.predictive.selected_resources_not_observed, 1);
+        assert_eq!(result.predictive.general_pages_sampled, 1);
+    }
+
+    #[test]
+    fn cache_condition_and_before_access_availability_are_explicit() {
+        let mut scenario = scenario(
+            "cache",
+            vec![resource("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        );
+        scenario.cache_condition = SimCacheCondition::ControlledNonresident;
+        scenario.before_access_observation = false;
+        let result = simulate(&scenario).expect("simulation");
+        assert_eq!(result.predictive.cache_condition, "controlled-nonresident");
+        assert!(!result.predictive.before_access_observation_available);
     }
 
     #[test]

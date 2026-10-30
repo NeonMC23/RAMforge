@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 522 passed, 0 failed, 18 ignored.
+- `cargo test --workspace`: 531 passed, 0 failed, 18 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -309,6 +309,10 @@ Not run or not claimed:
 - Prediction JSON report and profile/history identity validation: passed.
 - Prediction never sets `release_authorized=true`; `FinalUseProven` remains
   unreachable for model weights.
+- Cache-preparation helper tests: `mincore` probe counts, missing-source failure,
+  copy/preparation failure invalidating cold classification, warm versus
+  controlled distinction, source-file immutability, and profile-identity
+  rewriting for an identical copy.
 - `scripts/prediction-bench.py` five-arm/four-workload matrix:
   - 100/100 no-pressure runs succeeded, 5 repetitions;
   - 100/100 256 MiB cgroup runs succeeded, 5 repetitions;
@@ -322,19 +326,47 @@ Not run or not claimed:
   precision 100%, recall 23.5%, 57 prefetch-followed, 57 benefit-unknown,
   7 duplicate/overlap avoided. Correct prediction is not useful prefetch.
 - `mincore` observation tests cover maps parsing, page alignment, zero ranges,
-  bounded sampling, unknown pages, and shared/overlap correlation.
-- Full observation: 25,581 pages, all resident before staging; 57 selected
-  resources all redundant; observation 53.8 ms/snapshot (158.5 ms total).
-- Sampled observation (2,048 pages): 3.7 ms/snapshot, 23,533 unknown pages,
-  57 correlation-unknown resources.
+  targeted-first ordering, remaining-budget general sampling, overlap
+  deduplication, partial selected resources, missing selected ranges, zero
+  budget, unreadable/missing mappings, unknown pages, and shared/overlap
+  correlation.
+- Earlier warm observation: 25,581 pages, all resident before staging; 57
+  selected resources all redundant; observation 53.8 ms/snapshot (158.5 ms
+  total). With a 2,048-page targeted budget: 2,048/4,065 selected pages
+  sampled, 33 selected resources fully observed, 4 partial, 19 not observed.
+  With 64 targeted pages: 2 fully observed, 5 partial, 49 not observed. These
+  partial results are not evidence for unobserved resources.
+- Targeted observation uses interval arithmetic for the available population
+  instead of allocating a key per page. Three 64-page snapshots cost about
+  1.6–3.8 ms for SmolLM2 and 3.4–4.0 ms for Qwen2.5-1.5B in the final runs.
+  It remains diagnostic-only and disabled by default.
 - End-to-end timing includes setup/prediction/staging/inference; TTFT excludes
   staging. Five-repetition pressure matrix: baseline vs predictive end-to-end
   short-short 285.09 vs 294.98 ms, short-long 447.93 vs 469.54 ms,
   long-short 911.15 vs 921.13 ms. No predictive speedup is claimed.
-- Deterministic simulator: 16 scenarios x 5 strategies, 522 tests. `useful`
-  baseline 10,217 ns vs predictive 2,675 ns, net +7,542 ns; observation-overhead
-  net -992,458 ns; already-resident is redundant and unknown outcomes set
-  `benefit_known=false`. All simulated budget violations are zero.
+- Deterministic simulator: 16 scenarios x 5 strategies. `useful` baseline
+  10,217 ns vs predictive 2,675 ns, net +7,542 ns; observation-overhead net
+  -992,458 ns; already-resident is redundant and unknown outcomes set
+  `benefit_known=false`. Simulator results now expose targeted/general page
+  coverage, partial selected resources, before-access availability, and cache
+  condition labels. All simulated budget violations are zero.
+- Controlled file-cache benchmark (SmolLM2, five repetitions, 64 targeted
+  pages, 100/100 controlled-nonresident and 100/100 warm runs succeeded).
+  Controlled predictive end-to-end medians were 343.3, 475.7, 922.5, and
+  378.9 ms versus baseline 323.9, 491.4, 907.7, and 363.5 ms for
+  short-short/short-long/long-short/alternate: one workload improved, three
+  worsened. Conservative was 318.1, 470.1, 933.8, and 377.4 ms; aggressive
+  was 319.7, 492.9, 926.4, and 370.1 ms. Predictive inference and TTFT were
+  lower on all four, but end-to-end cost was not consistently better. Warm
+  predictive end-to-end was worse on all four. No speedup is claimed.
+  Mapping delta was 0 B; controlled major faults were 3/3/5/5 baseline versus
+  3/3/5/5 predictive and 2/2/4/4 aggressive.
+- Qwen2.5-1.5B Q4_0: 100/100 controlled-nonresident runs succeeded, five
+  repetitions per arm/workload. Predictive end-to-end medians were 1349.6,
+  2323.4, 6951.4, and 1988.1 ms versus baseline 1371.3, 2213.1, 6987.3, and
+  1996.2 ms for short-short/short-long/long-short/alternate. It was faster on
+  three workloads and slower on short-long, with wide variability; this is not
+  a general speedup. Mapping delta was 0 B.')
 
 ## Native lifetime validation — 2026-10-30
 
@@ -357,7 +389,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          522 passed, 0 failed, 18 ignored
+cargo test --workspace                          531 passed, 0 failed, 18 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

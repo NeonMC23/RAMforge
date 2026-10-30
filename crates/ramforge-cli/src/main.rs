@@ -13,8 +13,8 @@ use ramforge_runtime::memory_ledger::MemoryLedger;
 use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::page_residency::{
     correlate_prefetch_residency, evict_file_cache, model_mapping_residency,
-    observe_page_residency, PageObservationConfig, PageRange, PageResidencySnapshot,
-    PrefetchCorrelationReport,
+    observe_page_residency, observe_page_residency_targeted, PageObservationConfig, PageRange,
+    PageResidencySnapshot, PrefetchCorrelationReport,
 };
 use ramforge_runtime::prediction::{
     load_prediction_history, predict_from_profile, PredictionConfig, PredictionHistory,
@@ -239,11 +239,12 @@ enum Commands {
         #[arg(long, value_name = "PATH", requires = "graph_trace")]
         residency_profile_save: Option<PathBuf>,
 
-        /// Observe bounded per-resource page residency with Linux mincore
+        /// Observe bounded per-resource page residency with Linux mincore;
+        /// predicted prefetch resources are sampled first
         #[arg(long)]
         residency_observe: bool,
 
-        /// Maximum pages inspected per residency snapshot
+        /// Maximum unique pages inspected per residency snapshot
         #[arg(
             long,
             value_name = "N",
@@ -1383,15 +1384,15 @@ fn run_forgecore_inference(
         } else {
             None
         };
-        page_before = observation_ranges
-            .as_ref()
-            .map(|ranges| observe_page_residency(ranges, observation_config));
         let current = process_rss()
             .or_else(|| ResidencySnapshot::capture_paths(&shard_paths).mapping_rss_bytes)
             .or(Some(manager.inventory().summary.page_bytes));
         let admission = manager.admission(current);
         residency_admission = Some(admission.clone());
 
+        // Prediction/planning is static and does not depend on page residency.
+        // It must run before observation so the selected population can be
+        // sampled first without a second full observation pass.
         if prediction {
             let prediction_started = Instant::now();
             let predictions = predict_from_profile(
@@ -1418,35 +1419,6 @@ fn run_forgecore_inference(
                 admission.outcome == AdmissionOutcome::Rejected,
             );
             prediction_ns = Some(prediction_started.elapsed().as_nanos());
-            let before = ResidencySnapshot::capture_paths(&shard_paths);
-            let mut execution = execute_staging(&prediction_config, &plan, |indices| {
-                model
-                    .prefetch_tensor_pages(indices)
-                    .map_err(|error| error.to_string())
-            });
-            let after = ResidencySnapshot::capture_paths(&shard_paths);
-            execution.mapping_before_bytes = before.mapping_rss_bytes;
-            execution.mapping_after_bytes = after.mapping_rss_bytes;
-            eprintln!(
-                "Prediction plan: predictions={} high={} medium={} low={} stage={} prefetch={} requested={} accepted={} deferred={} rejected={} history_valid={}",
-                predictions.predictions.len(),
-                predictions.high_confidence,
-                predictions.medium_confidence,
-                predictions.low_confidence,
-                plan.stage_keys.len(),
-                plan.prefetch_keys.len(),
-                format_bytes(plan.requested_bytes()),
-                format_bytes(execution.native_accepted_bytes),
-                plan.deferred,
-                plan.rejected,
-                predictions.history_valid
-            );
-            for note in &plan.notes {
-                eprintln!("  prediction note: {note}");
-            }
-            if let Some(error) = &execution.error {
-                eprintln!("  prediction staging error: {error}");
-            }
             prefetch_names = plan
                 .decisions
                 .iter()
@@ -1459,20 +1431,83 @@ fn run_forgecore_inference(
                 })
                 .map(|decision| decision.name.clone())
                 .collect();
-            page_after_staging = observation_ranges
-                .as_ref()
-                .map(|ranges| observe_page_residency(ranges, observation_config));
             prediction_set = Some(predictions);
             prediction_plan = Some(plan);
-            staging_ns = Some(execution.elapsed_ns);
-            prediction_staging = Some(execution);
         } else if let Some(limit) = residency_prefetch_bytes {
             let plan = if loaded_profile.is_some() {
                 manager.staging_plan_with_profile(limit, loaded_profile.as_ref())
             } else {
                 manager.staging_plan(limit)
             };
-            residency_staging = Some(plan.clone());
+            prefetch_names = plan
+                .selected
+                .iter()
+                .filter_map(|key| {
+                    manager
+                        .inventory()
+                        .get(*key)
+                        .map(|resource| resource.name.clone())
+                })
+                .collect();
+            residency_staging = Some(plan);
+        }
+
+        let selected_names: std::collections::BTreeSet<String> =
+            prefetch_names.iter().cloned().collect();
+        let observe = |ranges: &[PageRange]| {
+            if selected_names.is_empty() {
+                observe_page_residency(ranges, observation_config)
+            } else {
+                observe_page_residency_targeted(ranges, &selected_names, observation_config)
+            }
+        };
+        page_before = observation_ranges.as_deref().map(observe);
+
+        if prediction {
+            let plan = prediction_plan
+                .as_ref()
+                .expect("prediction plan exists when prediction is enabled");
+            eprintln!(
+                "Prediction plan: predictions={} high={} medium={} low={} stage={} prefetch={} requested={} deferred={} rejected={}",
+                prediction_set.as_ref().map_or(0, |set| set.predictions.len()),
+                prediction_set.as_ref().map_or(0, |set| set.high_confidence),
+                prediction_set.as_ref().map_or(0, |set| set.medium_confidence),
+                prediction_set.as_ref().map_or(0, |set| set.low_confidence),
+                plan.stage_keys.len(),
+                plan.prefetch_keys.len(),
+                format_bytes(plan.requested_bytes()),
+                plan.deferred,
+                plan.rejected
+            );
+            for note in &plan.notes {
+                eprintln!("  prediction note: {note}");
+            }
+            let before = ResidencySnapshot::capture_paths(&shard_paths);
+            let mut execution = execute_staging(&prediction_config, plan, |indices| {
+                model
+                    .prefetch_tensor_pages(indices)
+                    .map_err(|error| error.to_string())
+            });
+            let after = ResidencySnapshot::capture_paths(&shard_paths);
+            execution.mapping_before_bytes = before.mapping_rss_bytes;
+            execution.mapping_after_bytes = after.mapping_rss_bytes;
+            eprintln!(
+                "Prediction staging: native_requested={} accepted={} mapping_before={} mapping_after={} delta={}",
+                format_bytes(plan.requested_bytes()),
+                format_bytes(execution.native_accepted_bytes),
+                optional_bytes(before.mapping_rss_bytes),
+                optional_bytes(after.mapping_rss_bytes),
+                before
+                    .mapping_delta(&after)
+                    .map(|delta| format!("{delta:+} bytes"))
+                    .unwrap_or_else(|| "unavailable".to_string())
+            );
+            if let Some(error) = &execution.error {
+                eprintln!("  prediction staging error: {error}");
+            }
+            staging_ns = Some(execution.elapsed_ns);
+            prediction_staging = Some(execution);
+        } else if let Some(plan) = residency_staging.as_ref() {
             eprintln!(
                 "Residency staging plan: selected={} requested_pages={} skipped={}",
                 plan.selected.len(),
@@ -1501,19 +1536,6 @@ fn run_forgecore_inference(
                         .map(|delta| format!("{delta:+} bytes"))
                         .unwrap_or_else(|| "unavailable".to_string())
                 );
-                prefetch_names = plan
-                    .selected
-                    .iter()
-                    .filter_map(|key| {
-                        manager
-                            .inventory()
-                            .get(*key)
-                            .map(|resource| resource.name.clone())
-                    })
-                    .collect();
-                page_after_staging = observation_ranges
-                    .as_ref()
-                    .map(|ranges| observe_page_residency(ranges, observation_config));
                 residency_staging_result = Some(StagingResult {
                     requested_keys: plan.selected.clone(),
                     native_requested_bytes: requested,
@@ -1523,6 +1545,8 @@ fn run_forgecore_inference(
                 });
             }
         }
+
+        page_after_staging = observation_ranges.as_deref().map(observe);
 
         if page_after_staging.is_none() {
             page_after_staging = observation_ranges
@@ -2056,13 +2080,26 @@ fn run_forgecore_inference(
     }
 
     if let Some(ranges) = observation_ranges.as_ref() {
-        page_after = Some(observe_page_residency(
-            ranges,
-            PageObservationConfig {
-                max_pages: residency_observe_pages,
-                max_resources: 512,
-            },
-        ));
+        let selected_names: std::collections::BTreeSet<String> =
+            prefetch_names.iter().cloned().collect();
+        page_after = Some(if selected_names.is_empty() {
+            observe_page_residency(
+                ranges,
+                PageObservationConfig {
+                    max_pages: residency_observe_pages,
+                    max_resources: 512,
+                },
+            )
+        } else {
+            observe_page_residency_targeted(
+                ranges,
+                &selected_names,
+                PageObservationConfig {
+                    max_pages: residency_observe_pages,
+                    max_resources: 512,
+                },
+            )
+        });
         if let (Some(before), Some(after_staging)) =
             (page_before.as_ref(), page_after_staging.as_ref())
         {
@@ -2389,6 +2426,17 @@ fn sim_result_json(result: &ramforge_runtime::prediction_sim::SimResult) -> serd
         "reread_bytes": result.reread_bytes,
         "peak_resident_bytes": result.peak_resident_bytes,
         "budget_violations": result.budget_violations,
+        "observation_mode": result.observation_mode,
+        "observation_page_budget": result.observation_page_budget,
+        "targeted_pages_available": result.targeted_pages_available,
+        "targeted_pages_sampled": result.targeted_pages_sampled,
+        "general_pages_available": result.general_pages_available,
+        "general_pages_sampled": result.general_pages_sampled,
+        "selected_resources_fully_observed": result.selected_resources_fully_observed,
+        "selected_resources_partially_observed": result.selected_resources_partially_observed,
+        "selected_resources_not_observed": result.selected_resources_not_observed,
+        "before_access_observation_available": result.before_access_observation_available,
+        "cache_condition": result.cache_condition,
         "prediction_cost_ns": result.prediction_cost_ns,
         "planning_cost_ns": result.planning_cost_ns,
         "observation_cost_ns": result.observation_cost_ns,
@@ -2432,12 +2480,16 @@ fn print_sim_comparison(
     ] {
         let result = comparison.result(strategy);
         println!(
-            "  {:<11} total_ns={} net_benefit_ns={} improved={} known={} predicted={} correct={} fp={} fn={} staged={} new_resident={} redundant={} ineffective={} wasted={} evicted={} reread={} peak={} violations={}",
+            "  {:<11} total_ns={} net_benefit_ns={} improved={} known={} observed={} targeted={}/{} cache={} predicted={} correct={} fp={} fn={} staged={} new_resident={} redundant={} ineffective={} wasted={} evicted={} reread={} peak={} violations={}",
             result.strategy,
             result.total_end_to_end_ns,
             result.net_benefit_ns,
             result.improved,
             result.benefit_known,
+            result.observation_mode,
+            result.targeted_pages_sampled,
+            result.targeted_pages_available,
+            result.cache_condition,
             result.predicted_resources,
             result.correct_predictions,
             result.false_positives,
@@ -3169,6 +3221,21 @@ fn page_snapshot_json(snapshot: &PageResidencySnapshot) -> serde_json::Value {
         "unique_nonresident_pages": snapshot.unique_nonresident_pages,
         "unique_unknown_pages": snapshot.unique_unknown_pages,
         "sampled": snapshot.sampled,
+        "targeted": snapshot.targeted.as_ref().map(|coverage| serde_json::json!({
+            "selected_resources": coverage.selected_resources,
+            "selected_resources_fully_observed": coverage.selected_resources_fully_observed,
+            "selected_resources_partially_observed": coverage.selected_resources_partially_observed,
+            "selected_resources_not_observed": coverage.selected_resources_not_observed,
+            "targeted_pages_available": coverage.targeted_pages_available,
+            "targeted_pages_sampled": coverage.targeted_pages_sampled,
+            "targeted_pages_unknown": coverage.targeted_pages_unknown,
+            "general_pages_available": coverage.general_pages_available,
+            "general_pages_sampled": coverage.general_pages_sampled,
+            "general_pages_unknown": coverage.general_pages_unknown,
+            "targeted_coverage_bps": coverage.targeted_coverage_bps,
+            "general_coverage_bps": coverage.general_coverage_bps,
+            "page_budget": coverage.page_budget,
+        })),
         "elapsed_ns": snapshot.elapsed_ns,
         "unsupported_reason": snapshot.unsupported_reason,
         "resources": snapshot.resources.iter().take(512).map(|resource| serde_json::json!({
@@ -3182,6 +3249,7 @@ fn page_snapshot_json(snapshot: &PageResidencySnapshot) -> serde_json::Value {
             "nonresident_pages": resource.nonresident_pages,
             "unknown_pages": resource.unknown_pages,
             "sampled": resource.sampled,
+            "targeted": resource.targeted,
             "error": resource.error,
         })).collect::<Vec<_>>(),
     })
@@ -3200,7 +3268,10 @@ fn prefetch_correlation_json(correlation: &PrefetchCorrelationReport) -> serde_j
         "potentially_useful": correlation.potentially_useful,
         "redundant": correlation.redundant,
         "wasted": correlation.wasted,
+        "ineffective": correlation.ineffective,
+        "evicted_before_use": correlation.evicted_before_use,
         "benefit_unknown": correlation.benefit_unknown,
+        "before_access_observation_available": correlation.before_access_observation_available,
         "notes": correlation.notes,
         "resources": correlation.resources.iter().map(|resource| serde_json::json!({
             "tensor": resource.name,
@@ -3319,6 +3390,20 @@ fn print_residency_report(report: &ResidencyReport) {
             before.unknown_pages,
             before.elapsed_ns as f64 / 1_000_000.0
         );
+        if let Some(targeted) = &before.targeted {
+            eprintln!(
+                "    targeted: selected={} full={} partial={} not_observed={} targeted_pages={}/{} general_pages={}/{} budget={}",
+                targeted.selected_resources,
+                targeted.selected_resources_fully_observed,
+                targeted.selected_resources_partially_observed,
+                targeted.selected_resources_not_observed,
+                targeted.targeted_pages_sampled,
+                targeted.targeted_pages_available,
+                targeted.general_pages_sampled,
+                targeted.general_pages_available,
+                targeted.page_budget
+            );
+        }
         if let Some(after) = &report.page_after_staging {
             eprintln!(
                 "    after_staging: resident={} nonresident={} unknown={} inspected={} sampled={} observation_ms={:.3}",
@@ -3332,7 +3417,7 @@ fn print_residency_report(report: &ResidencyReport) {
         }
         if let Some(correlation) = &report.prefetch_correlation {
             eprintln!(
-                "    prefetch correlation: already_resident={} became_resident={} remained_nonresident={} unknown={} access_observed={} access_not_observed={} access_unknown={} clearly_useful={} potentially_useful={} redundant={} wasted={} benefit_unknown={}",
+                "    prefetch correlation: already_resident={} became_resident={} remained_nonresident={} unknown={} access_observed={} access_not_observed={} access_unknown={} clearly_useful={} potentially_useful={} redundant={} ineffective={} wasted={} evicted_before_use={} benefit_unknown={} before_access_observed={}",
                 correlation.already_resident,
                 correlation.became_resident,
                 correlation.remained_nonresident,
@@ -3343,8 +3428,11 @@ fn print_residency_report(report: &ResidencyReport) {
                 correlation.clearly_useful,
                 correlation.potentially_useful,
                 correlation.redundant,
+                correlation.ineffective,
                 correlation.wasted,
-                correlation.benefit_unknown
+                correlation.evicted_before_use,
+                correlation.benefit_unknown,
+                correlation.before_access_observation_available
             );
             for note in &correlation.notes {
                 eprintln!("      correlation note: {note}");

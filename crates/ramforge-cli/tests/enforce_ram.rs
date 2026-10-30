@@ -173,6 +173,29 @@ fn simulate_command_is_deterministic_and_budget_safe() {
     assert!(all.status.success());
     let all_value: serde_json::Value = serde_json::from_slice(&all.stdout).expect("all scenarios");
     assert_eq!(all_value["scenarios"].as_array().unwrap().len(), 16);
+    let observation = ramforge()
+        .args([
+            "simulate",
+            "--budget",
+            "12K",
+            "--window",
+            "8K",
+            "--scenario",
+            "observation-overhead",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(observation.status.success());
+    let observation_value: serde_json::Value =
+        serde_json::from_slice(&observation.stdout).expect("observation simulation");
+    let predictive = &observation_value["scenarios"][0]["predictive"];
+    assert_eq!(predictive["observation_mode"], "targeted");
+    assert_eq!(predictive["observation_page_budget"], 4096);
+    assert!(predictive["targeted_pages_sampled"].as_u64().unwrap() > 0);
+    assert!(predictive["observation_cost_ns"].as_u64().unwrap() > 0);
+    assert_eq!(predictive["before_access_observation_available"], false);
+    assert_eq!(predictive["improved"], false);
 }
 
 #[test]
@@ -894,6 +917,18 @@ fn prediction_staging_is_bounded_and_reports_feedback() {
     assert_eq!(observation["before"]["supported"], true);
     assert_eq!(observation["before"]["sampled"], false);
     assert!(observation["before"]["resident_pages"].as_u64().unwrap() > 0);
+    let targeted = &observation["before"]["targeted"];
+    assert!(targeted["selected_resources"].as_u64().unwrap() > 0);
+    assert!(targeted["targeted_pages_sampled"].as_u64().unwrap() > 0);
+    assert_eq!(targeted["page_budget"], 32768);
+    assert_eq!(
+        targeted["selected_resources_fully_observed"],
+        targeted["selected_resources"]
+    );
+    assert_eq!(
+        observation["prefetch_correlation"]["before_access_observation_available"],
+        false
+    );
     assert!(
         observation["prefetch_correlation"]["already_resident"]
             .as_u64()

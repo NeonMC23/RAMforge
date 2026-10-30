@@ -52,6 +52,24 @@ For prediction runs, `PREFETCH_MODES` defaults to `off` because
 `--prediction` and `--residency-prefetch` are mutually exclusive. Graph tracing
 is enabled automatically so feedback and profile saves are valid.
 
+The prediction harness in `scripts/prediction-bench.py` additionally supports:
+
+```sh
+python3 scripts/prediction-bench.py \
+  --model /models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
+  --profile profile.json --observe --observe-pages 64 \
+  --cache-condition isolated-nonresident --repeats 5
+```
+
+`isolated-nonresident` copies the model to a separate file, flushes the copy,
+applies `POSIX_FADV_DONTNEED` only to that copy, and verifies the probed pages
+with `mmap` + `mincore` before each run. The source file is not modified and no
+global cache command is used. A run is marked controlled only when every probed
+page is nonresident. `warm` uses the same isolated copy and verification without
+the cache hint; partial, unknown, and preparation-failure states are recorded
+separately. These labels control file-page-cache state at process start, not
+mapped residency after loading or physical reclamation.
+
 The script writes:
 
 - `results.tsv` — one row per run;
@@ -222,6 +240,8 @@ per-resource proof.
 Predictive staging latency was measured separately: median native prefetch call
 latency was 3.9–5.4 ms across workloads in a two-repeat constrained smoke run.
 TTFT excludes that pre-operation staging time; process wall time includes it.
+`end_to_end_ns` also excludes report serialization; the harness wall-clock column
+includes it.
 
 End-to-end latency (model load + profile/history + prediction + planning +
 staging + inference + explicit synchronization), five repetitions:
@@ -251,19 +271,106 @@ and 7 duplicate/overlap requests avoided. The 100% precision reflects that all
 predicted model tensors are touched by a transformer execution; it does not
 mean 64 useful prefetches.
 
-Qwen2.5-1.5B Q4_0, one repetition, 1 GiB target, no cgroup enforcement,
-20/20 runs succeeded:
+### Qwen2.5-1.5B Q4_0, five repetitions, controlled-nonresident
 
-| Workload | Baseline end-to-end | Predictive end-to-end | Baseline inference | Predictive inference |
-|---|---:|---:|---:|---:|
-| alternate | 1474.6 ms | 1576.4 ms | 777.9 ms | 826.4 ms |
-| short-long | 1853.5 ms | 1923.4 ms | 1106.5 ms | 1151.2 ms |
-| short-short | 1053.7 ms | 1018.4 ms | 322.4 ms | 315.4 ms |
-| long-short | 6578.0 ms | 6629.5 ms | 5890.0 ms | 5929.8 ms |
+100/100 runs succeeded. The isolated copy was verified nonresident before every
+run (`cache_controlled=true`); model, profile identity, 1 GiB target, and
+four workloads were otherwise unchanged. Each observation sampled 64 selected
+pages; one selected resource was fully observed, one to two were partial, and
+36–43 were not observed.
 
-Mapping delta was 0 B and major-fault delta was 0 in every arm. Prediction was
-worse on three workloads and slightly better on short-short; one repetition is
-not sufficient to generalize. This is a CPU-only, uncontrolled-cache result.
+| Workload | Baseline e2e | Reactive e2e | Predictive e2e | Conservative e2e | Aggressive e2e | Baseline/Predictive inference |
+|---|---:|---:|---:|---:|---:|---:|
+| short-short | 1371.3 ms | 1336.9 ms | 1349.6 ms | 1366.2 ms | 1363.0 ms | 697.5 / 681.8 ms |
+| short-long | 2213.1 ms | 2235.8 ms | 2323.4 ms | 2388.9 ms | 2242.9 ms | 1481.7 / 1554.9 ms |
+| long-short | 6987.3 ms | 6957.9 ms | 6951.4 ms | 7136.1 ms | 6904.9 ms | 6302.9 / 6281.8 ms |
+| alternate | 1996.2 ms | 1947.6 ms | 1988.1 ms | 1984.8 ms | 2044.5 ms | 1241.9 / 1227.8 ms |
+
+Predictive was faster than baseline on three of four workloads and slower on
+short-long; conservative was slower on all four, and aggressive was mixed. This
+is a five-repetition CPU-only controlled file-cache result, not a general
+speedup claim. Mapping delta was 0 B. Major-fault medians were 60/61/61/62 for
+baseline versus 59/60/60/61 for predictive and 57/58/58/59 for aggressive.
+Only 64 targeted pages were sampled in each run, so most selected resources
+remain unknown.
+
+## Controlled file-cache experiments (2026-10-30)
+
+Both matrices used SmolLM2-135M Q4_K_M, a loaded execution profile, 192 MiB
+`--ram`, 256 context, five repetitions, rotated arm order, and
+`--observe --residency-observe-pages 64`. All 200 runs succeeded. The model was
+an isolated copy; the source model was never modified. Warm and
+isolated-nonresident matrices are kept separate.
+
+Cache preparation:
+
+- `warm`: isolated copy, populated read, `mmap` + `mincore` verification, no
+  cache hint; all 100 probes reported warm pages; `cache_controlled=false`.
+- `isolated-nonresident`: isolated copy, `fsync`, `posix_fadvise(DONTNEED)` on
+  that copy only, then `mmap` + `mincore` verification; all 100 probes reported
+  every probed page nonresident; `cache_controlled=true`.
+- No global cache drop, privileged command, or source-file eviction was used.
+  This controls file-page-cache state at process start, not mapped residency
+  after model load or physical reclamation.
+
+### Controlled-nonresident medians
+
+| Workload | Arm | End-to-end | Inference | TTFT | Observation | Major faults | Residency transition |
+|---|---|---:|---:|---:|---:|---:|---|
+| short-short | baseline | 323.9 ms | 78.9 ms | 78.8 ms | 1.6 ms | 3 | general sample |
+| short-short | reactive | 338.0 ms | 75.2 ms | 75.1 ms | 7.2 ms | 3 | 64 targeted pages; 2 potential, 0 unknown claim |
+| short-short | predictive | 343.3 ms | 73.4 ms | 73.4 ms | 3.8 ms | 3 | 64 targeted pages; 2 potential, 56 unknown |
+| short-short | conservative | 318.1 ms | 79.4 ms | 79.3 ms | 1.8 ms | 3 | no staging |
+| short-short | aggressive | 319.7 ms | 72.4 ms | 72.4 ms | 3.1 ms | 2 | 64 targeted pages; 2 potential, 57 unknown |
+| short-long | baseline | 491.4 ms | 192.6 ms | 78.8 ms | 1.7 ms | 3 | general sample |
+| short-long | reactive | 467.2 ms | 181.8 ms | 67.3 ms | 5.8 ms | 3 | targeted sample |
+| short-long | predictive | 475.7 ms | 182.8 ms | 65.9 ms | 3.7 ms | 3 | 2 potential, 56 unknown |
+| short-long | conservative | 470.1 ms | 189.9 ms | 79.2 ms | 1.7 ms | 3 | no staging |
+| short-long | aggressive | 492.9 ms | 194.2 ms | 69.9 ms | 3.0 ms | 2 | 2 potential, 57 unknown |
+| long-short | baseline | 907.7 ms | 693.0 ms | 692.9 ms | 1.6 ms | 5 | general sample |
+| long-short | reactive | 931.1 ms | 693.8 ms | 693.7 ms | 5.7 ms | 5 | targeted sample |
+| long-short | predictive | 922.5 ms | 689.0 ms | 688.9 ms | 3.0 ms | 5 | 2 potential, 56 unknown |
+| long-short | conservative | 933.8 ms | 696.4 ms | 696.3 ms | 1.8 ms | 5 | no staging |
+| long-short | aggressive | 926.4 ms | 688.5 ms | 688.4 ms | 3.2 ms | 4 | 2 potential, 57 unknown |
+| alternate | baseline | 363.5 ms | 128.2 ms | 84.7 ms | 1.7 ms | 5 | general sample |
+| alternate | reactive | 374.0 ms | 126.2 ms | 81.2 ms | 5.8 ms | 5 | targeted sample |
+| alternate | predictive | 378.9 ms | 123.0 ms | 77.0 ms | 2.9 ms | 5 | 2 potential, 56 unknown |
+| alternate | conservative | 377.4 ms | 131.6 ms | 86.1 ms | 1.7 ms | 5 | no staging |
+| alternate | aggressive | 370.1 ms | 122.0 ms | 77.5 ms | 3.1 ms | 4 | 2 potential, 57 unknown |
+
+Predictive inference and TTFT were lower than baseline on all four workloads,
+but end-to-end latency improved only on short-long and worsened on the other
+three. Conservative and aggressive were also mixed. There is no repeatable net
+benefit. The baseline and predictive initial-residency observations cover
+different populations: baseline sampled general inventory pages (64 resident),
+while predictive sampled 64 selected pages (0 resident before staging, 64 after
+staging). Only one selected resource was fully observed in the 64-page sample
+(two in the SmolLM2 profile reported here); the rest were partial or unknown.
+Those transitions are `potentially_useful` with access unknown; no
+`clearly_useful` claim and no avoided-load attribution are made.
+
+### Warm medians
+
+| Workload | Arm | End-to-end | Inference | TTFT | Observation | Resident before | Redundant selected |
+|---|---|---:|---:|---:|---:|---:|---:|
+| short-short | baseline | 236.4 ms | 31.6 ms | 31.5 ms | 1.6 ms | 64 general | — |
+| short-short | reactive | 243.4 ms | 31.0 ms | 30.9 ms | 6.0 ms | 64 targeted | 2 |
+| short-short | predictive | 247.9 ms | 31.7 ms | 31.7 ms | 3.0 ms | 64 targeted | 2 |
+| short-short | conservative | 256.3 ms | 32.3 ms | 32.3 ms | 1.7 ms | 64 general | 0 |
+| short-short | aggressive | 250.1 ms | 31.5 ms | 31.5 ms | 3.1 ms | 64 targeted | 2 |
+| short-long | baseline | 402.5 ms | 136.6 ms | 31.6 ms | 1.6 ms | 64 general | — |
+| short-long | predictive | 410.4 ms | 133.9 ms | 31.6 ms | 2.9 ms | 64 targeted | 2 |
+| long-short | baseline | 857.9 ms | 648.3 ms | 648.2 ms | 1.6 ms | 64 general | — |
+| long-short | predictive | 896.3 ms | 666.4 ms | 666.4 ms | 2.9 ms | 64 targeted | 2 |
+| alternate | baseline | 333.2 ms | 93.2 ms | 48.3 ms | 1.6 ms | 64 general | — |
+| alternate | predictive | 341.8 ms | 94.1 ms | 48.0 ms | 2.9 ms | 64 targeted | 2 |
+
+In the warm condition, selected pages were already resident; the fully observed
+selected resources were redundant, while partial/unobserved resources remain
+unknown. Predictive end-to-end was worse than baseline on all four workloads
+(by 6.9–38.4 ms), because prediction/observation/staging overhead was added with
+no residency work to do. Mapping-RSS delta was 0 B and major-fault delta was 0
+in every warm arm.
 
 Interpretation:
 
@@ -275,6 +382,17 @@ Interpretation:
   causal speedup.
 - No-pressure runs were neutral or slightly slower with prediction. No RSS or
   mapping reduction was observed.
+- In the controlled SmolLM2 matrix, predictive inference/TTFT improved on all
+  four workloads, but end-to-end latency improved on one and worsened on three.
+  Conservative and aggressive were also mixed. The Qwen controlled matrix was
+  faster on three of four workloads and slower on short-long, with wide
+  variability. No statistically supported general speedup is claimed.
+- Baseline and predictive observation samples cover different populations.
+  Never compare their resident-page counts as if they were the same sample.
+- The isolated-copy method controls file-page-cache state at process start; it
+  does not prove model-mapping nonresidency after loading or physical
+  reclamation. Before-access residency and per-resource avoided-load causality
+  remain unknown.
 - The results do not justify claiming a general performance improvement.
 
 ## Caveats

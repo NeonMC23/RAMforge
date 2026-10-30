@@ -2,7 +2,7 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
-> **Residency observability and end-to-end accounting (2026-10-30):** RAMforge now has bounded Linux `mincore()` per-resource page snapshots, before/after prefetch residency correlation, benefit classification, and separate end-to-end versus inference timing. Observation is opt-in and reports sampled/unknown pages honestly. Full observation of SmolLM2 (25,581 pages) cost about 54 ms per snapshot and found all selected prefetch pages already resident; predictive staging was redundant on that mapping. End-to-end benchmarking now includes setup, prediction, planning, staging, inference, and synchronization, so TTFT cannot be mistaken for total cost. See [PREDICTION.md](docs/handoff/PREDICTION.md) and [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
+> **Targeted residency observation and controlled cache validation (2026-10-30):** RAMforge now samples selected prefetch resources first within a bounded `mincore()` page budget, reports selected versus general coverage separately, deduplicates overlapping pages, and preserves partial/unknown coverage. A safe benchmark mode creates an isolated model copy, uses `POSIX_FADV_DONTNEED` only on that copy, verifies page-cache state with `mincore`, and labels controlled, warm, partial, unknown, and failed preparation distinctly. Before-access residency remains unavailable without a native access callback, so eviction-before-use and causal benefit stay unknown. See [PREDICTION.md](docs/handoff/PREDICTION.md), [MEMORY_ACCOUNTING.md](docs/handoff/MEMORY_ACCOUNTING.md), and [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
 >
 > **Predictive residency (2026-10-30):** RAMforge now has a deterministic predictive staging layer over validated profiles: bounded confidence-ranked predictions, high-confidence staging and medium-confidence speculative prefetch, explicit budget/admission decisions, feedback history, and a deterministic simulator. Prediction is advisory only; `release_authorized` is always false and release still requires the native quiescence gate. See [PREDICTION.md](docs/handoff/PREDICTION.md).
 >
@@ -511,25 +511,36 @@ expose addresses. Mappings that cannot be found, unsupported platforms, and
 pages above the inspection limit are `unknown`, never zero.
 
 Human and JSON reports include resident/nonresident/unknown pages, sampled
-status, inspection elapsed time, and before/after-staging snapshots. Prefetch
-correlation distinguishes:
+status, inspection elapsed time, and before/after-staging snapshots. Prediction
+is static, so it runs before the initial observation; selected prefetch
+resources are then sampled first and the remaining page budget covers general
+mappings. Overlapping tensor ranges in one native mapping consume the budget
+once. Selected, general, partial, and unknown populations are reported
+separately; a partially observed tensor is never called fully resident.
+Prefetch correlation distinguishes:
 
 - already resident before prefetch;
 - became resident after prefetch;
 - remained nonresident;
 - unknown;
 - access observed/not observed/unknown;
-- clearly useful, potentially useful, redundant, wasted, or benefit unknown.
+- clearly useful, potentially useful, redundant, ineffective, wasted,
+  evicted-before-use, or benefit unknown.
 
 "Clearly useful" is not assigned without a measured physical/performance
-benefit. On the tested SmolLM2 mapping, all 25,581 inspected pages were resident
-before staged prefetch; all 57 selected resources were classified redundant.
-Full observation cost about **54 ms per snapshot**, or **158 ms** for the three
-snapshots in one run, versus roughly **3.7 ms** per 2,048-page sampled snapshot.
-Sampled observation left 23,533 pages unknown. Observation is therefore off by
-default and must not be enabled for normal throughput measurements.
+benefit. Before-access residency is not observed, so eviction before use and
+avoided-load causality remain unknown. Targeted sampling uses the same bounded
+observation and remains diagnostic-only; it is off by default and must not be
+enabled for normal throughput measurements. Full observation previously cost
+about **54 ms per snapshot**, or **158 ms** for three snapshots; a 64-page
+targeted snapshot still cost about **37 ms**, so metadata-population overhead
+is visible.
 
-The five-arm benchmark now reports both inference latency and end-to-end
+The five-arm benchmark supports separate warm and controlled-nonresident runs
+via `--cache-condition warm|isolated-nonresident`. The controlled mode copies
+the model, applies `fsync` + `POSIX_FADV_DONTNEED` only to that copy, and
+verifies every probed page with `mincore`; preparation failure never becomes a
+cold claim. The five-arm benchmark reports both inference latency and end-to-end
 latency. In the 256 MiB cgroup matrix, predictive TTFT was lower on several
 workloads, but end-to-end latency was not: short-short was 285.1 ms baseline
 vs 295.0 ms predictive; short-long 447.9 vs 469.5 ms; long-short 911.2 vs
@@ -1040,7 +1051,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **522 tests, 0 failed, 18 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **531 tests, 0 failed, 18 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 
