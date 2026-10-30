@@ -580,9 +580,10 @@ predictions, requested/accepted **17,375,232 B**, and still **0 B** observed
 mapping delta. A five-repetition, four-workload matrix found no mapping/RSS
 reduction. Under a 256 MiB cgroup, predictive medians had fewer major faults
 and lower TTFT on three workloads, but the long-workload result was
-neutral/slightly worse. Cache state was uncontrolled, so this is an association,
-not a proven causal speedup. See
-[BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
+neutral/slightly worse. A one-repetition Qwen2.5-1.5B matrix was worse for
+three of four workloads and slightly better for one; no general speedup is
+claimed. Cache state was uncontrolled, so these are associations, not proven
+causal improvements. See [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
 
 The deterministic simulator:
 

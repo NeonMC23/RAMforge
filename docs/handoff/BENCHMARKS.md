@@ -251,6 +251,20 @@ and 7 duplicate/overlap requests avoided. The 100% precision reflects that all
 predicted model tensors are touched by a transformer execution; it does not
 mean 64 useful prefetches.
 
+Qwen2.5-1.5B Q4_0, one repetition, 1 GiB target, no cgroup enforcement,
+20/20 runs succeeded:
+
+| Workload | Baseline end-to-end | Predictive end-to-end | Baseline inference | Predictive inference |
+|---|---:|---:|---:|---:|
+| alternate | 1474.6 ms | 1576.4 ms | 777.9 ms | 826.4 ms |
+| short-long | 1853.5 ms | 1923.4 ms | 1106.5 ms | 1151.2 ms |
+| short-short | 1053.7 ms | 1018.4 ms | 322.4 ms | 315.4 ms |
+| long-short | 6578.0 ms | 6629.5 ms | 5890.0 ms | 5929.8 ms |
+
+Mapping delta was 0 B and major-fault delta was 0 in every arm. Prediction was
+worse on three workloads and slightly better on short-short; one repetition is
+not sufficient to generalize. This is a CPU-only, uncontrolled-cache result.
+
 Interpretation:
 
 - 100% prediction match is not 100% useful prefetch; all model weights are
