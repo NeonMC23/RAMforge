@@ -38,6 +38,8 @@ fn help_lists_memory_control_flags() {
         "--prediction-max-inflight",
         "--prediction-history-load",
         "--prediction-history-save",
+        "--residency-observe",
+        "--residency-observe-pages",
         "--residency-prefetch",
         "--graph-trace",
         "--graph-trace-events",
@@ -668,6 +670,14 @@ fn json_report_is_versioned_and_keeps_measurements_distinct() {
     assert!(report["native_lifetime"]["context_id"].is_u64());
     assert!(report["resource_lifetime_states"].is_object());
     assert!(report["process_faults"]["after_minor"].is_u64());
+    assert!(
+        report["execution_timing"]["end_to_end_ns"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(report["execution_timing"]["inference_ns"].as_u64().unwrap() > 0);
+    assert!(report["residency_observation"]["before"].is_null());
     assert!(report["admission"]["eligible_reclaimable_bytes"].is_u64());
     assert_eq!(report["admission"]["native_contract_version"], 1);
     assert!(report["profile_source"].is_string());
@@ -819,6 +829,9 @@ fn prediction_staging_is_bounded_and_reports_feedback() {
             "16M",
             "--prediction-history-save",
             history_path.to_str().unwrap(),
+            "--residency-observe",
+            "--residency-observe-pages",
+            "32768",
             "--residency-report-json",
             report_path.to_str().unwrap(),
             "--prompt",
@@ -854,6 +867,29 @@ fn prediction_staging_is_bounded_and_reports_feedback() {
             <= requested
     );
     assert!(prediction["history"]["total_predictions"].as_u64().unwrap() > 0);
+    let observation = &report["residency_observation"];
+    assert_eq!(observation["before"]["supported"], true);
+    assert_eq!(observation["before"]["sampled"], false);
+    assert!(observation["before"]["resident_pages"].as_u64().unwrap() > 0);
+    assert!(
+        observation["prefetch_correlation"]["already_resident"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        report["execution_timing"]["end_to_end_ns"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(report["execution_timing"]["inference_ns"].as_u64().unwrap() > 0);
+    assert!(
+        report["execution_timing"]["observation_ns"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 }
 
 #[test]

@@ -159,6 +159,12 @@ python3 scripts/prediction-bench.py \
 python3 scripts/prediction-bench.py \
   --model MODEL.gguf --profile profile.json --history history.json \
   --out /tmp/pred-press --repeats 5 --target 256M --enforce
+
+# bounded residency observation (diagnostic; adds measurable overhead)
+python3 scripts/prediction-bench.py \
+  --model MODEL.gguf --profile profile.json --history history.json \
+  --out /tmp/pred-observe --repeats 2 --target 192M \
+  --observe --observe-pages 32768
 ```
 
 Arms: baseline (no prediction/no prefetch), reactive (existing bounded
@@ -185,6 +191,28 @@ Under a 256 MiB cgroup, five repetitions:
 | short-short | 73.74 ms | 65.74 ms | 64.65 ms | 3 / 2 |
 | long-short | 689.54 ms | 695.68 ms | 714.56 ms | 5 / 4 |
 
+Page residency is observed with `mincore()` over bounded ranges located via
+`/proc/self/maps`. Full observation (25,581 pages) costs about 54 ms per
+snapshot; three snapshots cost about 158 ms. A 2,048-page sample costs about
+3.7 ms per snapshot but leaves 23,533 pages unknown. Full observation found all
+25,581 pages resident before prefetch; all 57 selected resources were
+`already_resident`/`redundant`, 0 became resident, 0 remained nonresident, and
+0 were clearly useful. Sampled observation classified 57 as unknown. This is
+why observation is off by default.
+
+Three-run observation overhead comparison (prediction enabled, same workload,
+uncontrolled cache):
+
+| Observation | End-to-end median | Inference median | Observation time |
+|---|---:|---:|---:|
+| none | 231.44 ms | 18.10 ms | 0 ms |
+| sampled 2,048 pages | 248.78 ms | 19.47 ms | 11.49 ms |
+| full 32,768-page budget (25,581 actual) | 357.92 ms | 19.25 ms | 158.72 ms |
+
+The full observation added ~126 ms over no observation, over 5× the measured
+inference time for this short workload. Detailed observation is therefore a
+diagnostic mode, not a default benchmark configuration.
+
 Page faults are process-wide `/proc/self/stat` counters sampled before model
 load and after decode. They include loader, tokenizer, trace, and harness
 activity; the harness reports deltas but cannot attribute them exclusively to
@@ -194,6 +222,24 @@ per-resource proof.
 Predictive staging latency was measured separately: median native prefetch call
 latency was 3.9–5.4 ms across workloads in a two-repeat constrained smoke run.
 TTFT excludes that pre-operation staging time; process wall time includes it.
+
+End-to-end latency (model load + profile/history + prediction + planning +
+staging + inference + explicit synchronization), five repetitions:
+
+| Workload / condition | Baseline end-to-end | Predictive end-to-end | Baseline inference | Predictive inference |
+|---|---:|---:|---:|---:|
+| short-short / no pressure | 236.62 ms | 252.52 ms | 30.68 ms | 31.42 ms |
+| short-long / no pressure | 397.00 ms | 400.05 ms | 136.01 ms | 131.00 ms |
+| alternate / no pressure | 321.75 ms | 330.15 ms | 89.96 ms | 92.05 ms |
+| long-short / no pressure | 875.17 ms | 876.69 ms | 662.69 ms | 658.24 ms |
+| short-short / 256 MiB | 285.09 ms | 294.98 ms | 68.54 ms | 66.04 ms |
+| short-long / 256 MiB | 447.93 ms | 469.54 ms | 173.18 ms | 172.29 ms |
+| alternate / 256 MiB | 375.03 ms | 379.08 ms | 131.77 ms | 121.83 ms |
+| long-short / 256 MiB | 911.15 ms | 921.13 ms | 696.69 ms | 682.56 ms |
+
+Under the cgroup, inference latency sometimes improved while end-to-end latency
+worsened because profile/prediction/staging/setup cost is included. No
+predictive speedup is claimed.
 
 RSS remained around 168–184 MiB; mapping delta was **0 B** in all arms, so no
 physical mapping residency benefit was observed. Prediction metrics for the

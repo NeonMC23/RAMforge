@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **511 tests, 0 failed, 18 ignored**. The ignored
+  environment variables passes **515 tests, 0 failed, 18 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -61,6 +61,30 @@
   layer/range release.
 - See [../../scripts/test.sh](../../scripts/test.sh) for the reproducible test
   invocation.
+
+## Residency observability and end-to-end accounting (2026-10-30)
+
+- `page_residency.rs` now provides bounded per-resource Linux `mincore()`
+  snapshots over ranges located through `/proc/self/maps`, with resident,
+  nonresident, and unknown counts, unique-page accounting, sampling, and
+  explicit unsupported/error states. No addresses or physical data are exposed.
+- Prefetch correlation classifies already resident, became resident, remained
+  nonresident, unknown; benefit is clearly useful, potentially useful,
+  redundant, wasted, or unknown. `ClearlyUseful` requires measured benefit.
+- Full observation of SmolLM2 (25,581 pages) cost about 54 ms/snapshot (158 ms
+  for three); 2,048-page sampling cost about 3.7 ms but left 23,533 pages
+  unknown. All 57 selected resources were already resident/redundant; no
+  prefetch-induced residency was observed.
+- `ExecutionTiming` now records model load, profile load, history load,
+  prediction, planning, staging, observation, inference, explicit
+  synchronization, and end-to-end time. TTFT excludes staging; end-to-end does
+  not.
+- Five-repetition matrices show prediction can lower inference/TTFT on some
+  workloads while worsening end-to-end latency; for example, 256 MiB
+  short-short was 285.1 ms baseline vs 295.0 ms predictive end-to-end. No
+  speedup is claimed.
+- `scripts/prediction-bench.py` supports observation (`--observe`), component
+  timing, residency correlation, page faults, and human/JSON summaries.
 
 ## Predictive residency milestone (2026-10-30)
 

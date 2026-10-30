@@ -11,7 +11,11 @@ use ramforge_runtime::execution_profile::{
 use ramforge_runtime::graph_manifest::{GraphManifest, LastUseStatus};
 use ramforge_runtime::memory_ledger::MemoryLedger;
 use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
-use ramforge_runtime::page_residency::{evict_file_cache, model_mapping_residency};
+use ramforge_runtime::page_residency::{
+    correlate_prefetch_residency, evict_file_cache, model_mapping_residency,
+    observe_page_residency, PageObservationConfig, PageRange, PageResidencySnapshot,
+    PrefetchCorrelationReport,
+};
 use ramforge_runtime::prediction::{
     load_prediction_history, predict_from_profile, PredictionConfig, PredictionHistory,
     PredictionMetrics, PredictionSet,
@@ -21,10 +25,10 @@ use ramforge_runtime::prediction_planner::{
 };
 use ramforge_runtime::residency_engine::process_faults;
 use ramforge_runtime::residency_engine::{
-    AdmissionDecision, AdmissionOutcome, DecisionAction, ManagerError, ModelGeneration, ModelId,
-    OperationContext, OperationTiming, ResidencyCapabilities, ResidencyManager, ResidencyPlan,
-    ResidencyPolicy, ResidencyPolicyMode, ResidencyReport, ResidencySnapshot, ResourceInventory,
-    StagingPlan, StagingResult,
+    AdmissionDecision, AdmissionOutcome, DecisionAction, ExecutionTiming, ManagerError,
+    ModelGeneration, ModelId, OperationContext, OperationTiming, ResidencyCapabilities,
+    ResidencyManager, ResidencyPlan, ResidencyPolicy, ResidencyPolicyMode, ResidencyReport,
+    ResidencySnapshot, ResourceInventory, StagingPlan, StagingResult,
 };
 use ramforge_runtime::{
     DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
@@ -231,6 +235,19 @@ enum Commands {
         #[arg(long, value_name = "PATH", requires = "graph_trace")]
         residency_profile_save: Option<PathBuf>,
 
+        /// Observe bounded per-resource page residency with Linux mincore
+        #[arg(long)]
+        residency_observe: bool,
+
+        /// Maximum pages inspected per residency snapshot
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 4096,
+            requires = "residency_observe"
+        )]
+        residency_observe_pages: usize,
+
         /// Best-effort bounded page prefetch budget (MADV_WILLNEED hint)
         #[arg(long, value_name = "SIZE", conflicts_with = "prediction")]
         residency_prefetch: Option<String>,
@@ -380,6 +397,8 @@ fn main() {
             residency_profile_load,
             residency_profile_save,
             residency_prefetch,
+            residency_observe,
+            residency_observe_pages,
             prediction,
             prediction_min_confidence,
             prediction_window,
@@ -450,6 +469,8 @@ fn main() {
                 residency_profile_load,
                 residency_profile_save,
                 residency_prefetch,
+                residency_observe,
+                residency_observe_pages,
                 prediction,
                 prediction_min_confidence,
                 prediction_window,
@@ -561,6 +582,8 @@ fn run_inference(
     residency_profile_load: Option<PathBuf>,
     residency_profile_save: Option<PathBuf>,
     residency_prefetch: Option<String>,
+    residency_observe: bool,
+    residency_observe_pages: usize,
     prediction: bool,
     prediction_min_confidence: Option<u8>,
     prediction_window: Option<String>,
@@ -679,6 +702,7 @@ fn run_inference(
         || residency_profile_load.is_some()
         || residency_profile_save.is_some()
         || residency_prefetch_bytes.is_some()
+        || residency_observe
         || prediction
         || prediction_history_load.is_some()
         || prediction_history_save.is_some();
@@ -717,6 +741,8 @@ fn run_inference(
             residency_profile_load.clone(),
             residency_profile_save.clone(),
             residency_prefetch_bytes,
+            residency_observe,
+            residency_observe_pages,
             prediction_config,
             prediction,
             prediction_history_load.clone(),
@@ -772,6 +798,7 @@ fn run_inference(
         || residency_profile_load.is_some()
         || residency_profile_save.is_some()
         || residency_prefetch_bytes.is_some()
+        || residency_observe
         || prediction
         || prediction_history_load.is_some()
         || prediction_history_save.is_some();
@@ -1046,6 +1073,8 @@ fn run_forgecore_inference(
     residency_profile_load: Option<PathBuf>,
     residency_profile_save: Option<PathBuf>,
     residency_prefetch_bytes: Option<u64>,
+    residency_observe: bool,
+    residency_observe_pages: usize,
     prediction_config: PredictionConfig,
     prediction: bool,
     prediction_history_load: Option<PathBuf>,
@@ -1061,6 +1090,7 @@ fn run_forgecore_inference(
     profile: bool,
     memory_report: bool,
 ) -> anyhow::Result<()> {
+    let run_started = Instant::now();
     let model_load_started = Instant::now();
     let rss_before_load = process_rss();
     let (minor_faults_before_load, major_faults_before_load) = process_faults();
@@ -1106,6 +1136,7 @@ fn run_forgecore_inference(
     if no_prefetch {
         model_options = model_options.with_no_prefetch();
     }
+    let native_model_load_started = Instant::now();
     let mut model = ForgeCoreModel::load_for_execution_with_options(
         &primary_path,
         execution,
@@ -1113,6 +1144,7 @@ fn run_forgecore_inference(
         model_options,
     )
     .map_err(|error| anyhow::anyhow!(error))?;
+    let native_model_load_ns = native_model_load_started.elapsed().as_nanos();
     let rss_after_load = process_rss();
     if release_mapping_pages {
         let before = model_mapping_residency(&primary_path);
@@ -1225,10 +1257,14 @@ fn run_forgecore_inference(
         None
     };
     let mut loaded_profile: Option<ExecutionProfile> = None;
+    let mut profile_load_ns: Option<u128> = None;
+    let history_load_ns: Option<u128> = None;
     if let (Some(path), Some(identity)) =
         (residency_profile_load.as_ref(), profile_identity.as_ref())
     {
+        let started = Instant::now();
         let profile = load_profile(path, identity).map_err(|error| anyhow::anyhow!(error))?;
+        profile_load_ns = Some(started.elapsed().as_nanos());
         eprintln!(
             "Residency profile loaded: path={} entries={} complete_observations={}",
             path.display(),
@@ -1256,6 +1292,15 @@ fn run_forgecore_inference(
     let mut prediction_plan: Option<PredictionPlan> = None;
     let mut prediction_staging: Option<StagingExecution> = None;
     let mut prediction_metrics: Option<PredictionMetrics> = None;
+    let mut page_before: Option<PageResidencySnapshot> = None;
+    let mut page_after_staging: Option<PageResidencySnapshot> = None;
+    let mut page_after: Option<PageResidencySnapshot> = None;
+    let mut prefetch_correlation: Option<PrefetchCorrelationReport> = None;
+    let mut observation_ranges: Option<Vec<PageRange>> = None;
+    let mut prefetch_names: Vec<String> = Vec::new();
+    let mut prediction_ns: Option<u128> = None;
+    let mut planning_ns: Option<u128> = None;
+    let mut staging_ns: Option<u128> = None;
     let residency_started = Instant::now();
     let mut residency_manager = if residency_policy != ResidencyPolicyArg::Off
         || residency_report
@@ -1324,6 +1369,18 @@ fn run_forgecore_inference(
     let mut residency_staging: Option<StagingPlan> = None;
     let mut residency_staging_result: Option<StagingResult> = None;
     if let Some(manager) = residency_manager.as_mut() {
+        let observation_config = PageObservationConfig {
+            max_pages: residency_observe_pages,
+            max_resources: 512,
+        };
+        observation_ranges = if residency_observe {
+            Some(manager.inventory().page_ranges(&shard_paths))
+        } else {
+            None
+        };
+        page_before = observation_ranges
+            .as_ref()
+            .map(|ranges| observe_page_residency(ranges, observation_config));
         let current = process_rss()
             .or_else(|| ResidencySnapshot::capture_paths(&shard_paths).mapping_rss_bytes)
             .or(Some(manager.inventory().summary.page_bytes));
@@ -1331,6 +1388,7 @@ fn run_forgecore_inference(
         residency_admission = Some(admission.clone());
 
         if prediction {
+            let prediction_started = Instant::now();
             let predictions = predict_from_profile(
                 &prediction_config,
                 loaded_profile.as_ref(),
@@ -1354,6 +1412,7 @@ fn run_forgecore_inference(
                 manager.policy().safety_reserve_bytes,
                 admission.outcome == AdmissionOutcome::Rejected,
             );
+            prediction_ns = Some(prediction_started.elapsed().as_nanos());
             let before = ResidencySnapshot::capture_paths(&shard_paths);
             let mut execution = execute_staging(&prediction_config, &plan, |indices| {
                 model
@@ -1383,8 +1442,24 @@ fn run_forgecore_inference(
             if let Some(error) = &execution.error {
                 eprintln!("  prediction staging error: {error}");
             }
+            prefetch_names = plan
+                .decisions
+                .iter()
+                .filter(|decision| {
+                    matches!(
+                        decision.action,
+                        ramforge_runtime::prediction_planner::PredictiveAction::StageNow
+                            | ramforge_runtime::prediction_planner::PredictiveAction::Prefetch
+                    )
+                })
+                .map(|decision| decision.name.clone())
+                .collect();
+            page_after_staging = observation_ranges
+                .as_ref()
+                .map(|ranges| observe_page_residency(ranges, observation_config));
             prediction_set = Some(predictions);
             prediction_plan = Some(plan);
+            staging_ns = Some(execution.elapsed_ns);
             prediction_staging = Some(execution);
         } else if let Some(limit) = residency_prefetch_bytes {
             let plan = if loaded_profile.is_some() {
@@ -1405,9 +1480,11 @@ fn run_forgecore_inference(
             if !plan.is_empty() {
                 let indices: Vec<i32> = plan.selected.iter().map(|key| key.tensor_index).collect();
                 let before = ResidencySnapshot::capture_paths(&shard_paths);
+                let staging_started = Instant::now();
                 let requested = model
                     .prefetch_tensor_pages(&indices)
                     .map_err(|error| anyhow::anyhow!(error))?;
+                staging_ns = Some(staging_started.elapsed().as_nanos());
                 let after = ResidencySnapshot::capture_paths(&shard_paths);
                 eprintln!(
                     "Residency staging result: native_requested={} mapping_before={} mapping_after={} delta={}",
@@ -1419,6 +1496,19 @@ fn run_forgecore_inference(
                         .map(|delta| format!("{delta:+} bytes"))
                         .unwrap_or_else(|| "unavailable".to_string())
                 );
+                prefetch_names = plan
+                    .selected
+                    .iter()
+                    .filter_map(|key| {
+                        manager
+                            .inventory()
+                            .get(*key)
+                            .map(|resource| resource.name.clone())
+                    })
+                    .collect();
+                page_after_staging = observation_ranges
+                    .as_ref()
+                    .map(|ranges| observe_page_residency(ranges, observation_config));
                 residency_staging_result = Some(StagingResult {
                     requested_keys: plan.selected.clone(),
                     native_requested_bytes: requested,
@@ -1429,6 +1519,11 @@ fn run_forgecore_inference(
             }
         }
 
+        if page_after_staging.is_none() {
+            page_after_staging = observation_ranges
+                .as_ref()
+                .map(|ranges| observe_page_residency(ranges, observation_config));
+        }
         if !residency_report && residency_policy != ResidencyPolicyArg::Off {
             eprintln!(
                 "Residency admission: {:?}; current={} soft_target={} hard_limit={} reserve={}",
@@ -1446,9 +1541,11 @@ fn run_forgecore_inference(
             required: manager.inventory().file_backed_keys(),
             pinned: Default::default(),
         };
+        let planning_started = Instant::now();
         let plan = manager
             .plan_with_profile(current, &context, loaded_profile.as_ref())
             .map_err(|error| anyhow::anyhow!(error))?;
+        planning_ns = Some(planning_started.elapsed().as_nanos());
         if !residency_report && residency_policy != ResidencyPolicyArg::Off {
             print_residency_plan("pre-operation", &plan);
         }
@@ -1883,6 +1980,10 @@ fn run_forgecore_inference(
         native_context_id = Some(lifetime.context_id);
         native_execution_generation = Some(lifetime.execution_generation);
     }
+    let synchronization_started = Instant::now();
+    session.synchronize();
+    let synchronization_ns = Some(synchronization_started.elapsed().as_nanos());
+    let end_to_end_ns = run_started.elapsed().as_nanos();
     drop(session);
 
     let mut post_operation_plan = None;
@@ -1949,6 +2050,33 @@ fn run_forgecore_inference(
         residency_after = Some(ResidencySnapshot::capture_paths(&shard_paths));
     }
 
+    if let Some(ranges) = observation_ranges.as_ref() {
+        page_after = Some(observe_page_residency(
+            ranges,
+            PageObservationConfig {
+                max_pages: residency_observe_pages,
+                max_resources: 512,
+            },
+        ));
+        if let (Some(before), Some(after_staging)) =
+            (page_before.as_ref(), page_after_staging.as_ref())
+        {
+            let observed_names = execution_profile.as_ref().map(|profile| {
+                profile
+                    .access
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>()
+            });
+            prefetch_correlation = Some(correlate_prefetch_residency(
+                &prefetch_names,
+                before,
+                after_staging,
+                observed_names.as_ref(),
+            ));
+        }
+    }
+
     if residency_report || residency_report_json.is_some() {
         if let (Some(manager), Some(admission), Some(before), Some(after)) = (
             residency_manager.as_ref(),
@@ -2001,6 +2129,29 @@ fn run_forgecore_inference(
                 prediction_staging: prediction_staging.clone(),
                 prediction_metrics: prediction_metrics.clone(),
                 prediction_history: prediction_history.as_ref().map(|history| history.summary()),
+                page_before: page_before.clone(),
+                page_after_staging: page_after_staging.clone(),
+                page_after: page_after.clone(),
+                prefetch_correlation: prefetch_correlation.clone(),
+                execution_timing: ExecutionTiming {
+                    model_load_ns: Some(native_model_load_ns),
+                    profile_load_ns,
+                    history_load_ns,
+                    prediction_ns,
+                    planning_ns,
+                    staging_ns,
+                    observation_ns: [
+                        page_before.as_ref().map(|value| value.elapsed_ns),
+                        page_after_staging.as_ref().map(|value| value.elapsed_ns),
+                        page_after.as_ref().map(|value| value.elapsed_ns),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .reduce(|left, right| left.saturating_add(right)),
+                    inference_ns: Some(total_generation_elapsed.as_nanos()),
+                    synchronization_ns,
+                    end_to_end_ns,
+                },
                 ledger: MemoryLedger::from_inventory(
                     manager.model_id().clone(),
                     manager.inventory().generation,
@@ -2755,6 +2906,12 @@ fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
             })
         }),
         "resource_lifetime_states": report.lifetime_counts,
+        "residency_observation": {
+            "before": report.page_before.as_ref().map(page_snapshot_json),
+            "after_staging": report.page_after_staging.as_ref().map(page_snapshot_json),
+            "after": report.page_after.as_ref().map(page_snapshot_json),
+            "prefetch_correlation": report.prefetch_correlation.as_ref().map(prefetch_correlation_json),
+        },
         "prediction": report.prediction_set.as_ref().map(|set| {
             let plan = report.prediction_plan.as_ref();
             serde_json::json!({
@@ -2888,6 +3045,18 @@ fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
                 "observed_consumers": pattern.observed_consumers,
             })).collect::<Vec<_>>(),
         })),
+        "execution_timing": {
+            "model_load_ns": report.execution_timing.model_load_ns,
+            "profile_load_ns": report.execution_timing.profile_load_ns,
+            "history_load_ns": report.execution_timing.history_load_ns,
+            "prediction_ns": report.execution_timing.prediction_ns,
+            "planning_ns": report.execution_timing.planning_ns,
+            "staging_ns": report.execution_timing.staging_ns,
+            "observation_ns": report.execution_timing.observation_ns,
+            "inference_ns": report.execution_timing.inference_ns,
+            "synchronization_ns": report.execution_timing.synchronization_ns,
+            "end_to_end_ns": report.execution_timing.end_to_end_ns,
+        },
         "timing": {
             "prompt_tokens": report.timing.prompt_tokens,
             "generated_tokens": report.timing.generated_tokens,
@@ -2938,6 +3107,68 @@ fn plan_json_value(plan: &ResidencyPlan) -> serde_json::Value {
         "estimated_after_bytes": plan.estimated_after_bytes,
         "estimated_budget_met": plan.estimated_budget_met,
         "notes": plan.notes,
+    })
+}
+
+fn page_snapshot_json(snapshot: &PageResidencySnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "supported": snapshot.supported,
+        "source": snapshot.source,
+        "page_size": snapshot.page_size,
+        "inspected_pages": snapshot.inspected_pages,
+        "total_pages": snapshot.total_pages,
+        "resident_pages": snapshot.resident_pages,
+        "nonresident_pages": snapshot.nonresident_pages,
+        "unknown_pages": snapshot.unknown_pages,
+        "unique_resident_pages": snapshot.unique_resident_pages,
+        "unique_nonresident_pages": snapshot.unique_nonresident_pages,
+        "unique_unknown_pages": snapshot.unique_unknown_pages,
+        "sampled": snapshot.sampled,
+        "elapsed_ns": snapshot.elapsed_ns,
+        "unsupported_reason": snapshot.unsupported_reason,
+        "resources": snapshot.resources.iter().take(512).map(|resource| serde_json::json!({
+            "tensor": resource.name,
+            "tensor_index": resource.tensor_index,
+            "generation": resource.generation,
+            "mapping_index": resource.mapping_index,
+            "total_pages": resource.total_pages,
+            "inspected_pages": resource.inspected_pages,
+            "resident_pages": resource.resident_pages,
+            "nonresident_pages": resource.nonresident_pages,
+            "unknown_pages": resource.unknown_pages,
+            "sampled": resource.sampled,
+            "error": resource.error,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn prefetch_correlation_json(correlation: &PrefetchCorrelationReport) -> serde_json::Value {
+    serde_json::json!({
+        "already_resident": correlation.already_resident,
+        "became_resident": correlation.became_resident,
+        "remained_nonresident": correlation.remained_nonresident,
+        "unknown": correlation.unknown,
+        "access_observed": correlation.access_observed,
+        "access_not_observed": correlation.access_not_observed,
+        "access_unknown": correlation.access_unknown,
+        "clearly_useful": correlation.clearly_useful,
+        "potentially_useful": correlation.potentially_useful,
+        "redundant": correlation.redundant,
+        "wasted": correlation.wasted,
+        "benefit_unknown": correlation.benefit_unknown,
+        "notes": correlation.notes,
+        "resources": correlation.resources.iter().map(|resource| serde_json::json!({
+            "tensor": resource.name,
+            "before_resident_pages": resource.before_resident_pages,
+            "before_total_pages": resource.before_total_pages,
+            "before_unknown_pages": resource.before_unknown_pages,
+            "after_resident_pages": resource.after_resident_pages,
+            "after_total_pages": resource.after_total_pages,
+            "after_unknown_pages": resource.after_unknown_pages,
+            "class": format!("{:?}", resource.class),
+            "benefit": format!("{:?}", resource.benefit),
+            "access_observed": resource.access_observed,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -3029,6 +3260,51 @@ fn print_residency_report(report: &ResidencyReport) {
                 _ => "unavailable".to_string(),
             }
         );
+    }
+    if let Some(before) = &report.page_before {
+        eprintln!(
+            "  Page residency: supported={} source={} sampled={} inspected={} total={} resident={} nonresident={} unknown={} observation_ms={:.3}",
+            before.supported,
+            before.source,
+            before.sampled,
+            before.inspected_pages,
+            before.total_pages,
+            before.resident_pages,
+            before.nonresident_pages,
+            before.unknown_pages,
+            before.elapsed_ns as f64 / 1_000_000.0
+        );
+        if let Some(after) = &report.page_after_staging {
+            eprintln!(
+                "    after_staging: resident={} nonresident={} unknown={} inspected={} sampled={} observation_ms={:.3}",
+                after.resident_pages,
+                after.nonresident_pages,
+                after.unknown_pages,
+                after.inspected_pages,
+                after.sampled,
+                after.elapsed_ns as f64 / 1_000_000.0
+            );
+        }
+        if let Some(correlation) = &report.prefetch_correlation {
+            eprintln!(
+                "    prefetch correlation: already_resident={} became_resident={} remained_nonresident={} unknown={} access_observed={} access_not_observed={} access_unknown={} clearly_useful={} potentially_useful={} redundant={} wasted={} benefit_unknown={}",
+                correlation.already_resident,
+                correlation.became_resident,
+                correlation.remained_nonresident,
+                correlation.unknown,
+                correlation.access_observed,
+                correlation.access_not_observed,
+                correlation.access_unknown,
+                correlation.clearly_useful,
+                correlation.potentially_useful,
+                correlation.redundant,
+                correlation.wasted,
+                correlation.benefit_unknown
+            );
+            for note in &correlation.notes {
+                eprintln!("      correlation note: {note}");
+            }
+        }
     }
     eprintln!("  Resource lifetime states: {:?}", report.lifetime_counts);
     eprintln!(
@@ -3130,6 +3406,19 @@ fn print_residency_report(report: &ResidencyReport) {
         optional_bytes(report.after.cgroup_current_bytes),
         optional_bytes(report.after.cgroup_peak_bytes),
         report.after.cgroup_events
+    );
+    eprintln!(
+        "  Execution timing: end_to_end={} model_load={:?} profile_load={:?} history_load={:?} prediction={:?} planning={:?} staging={:?} observation={:?} inference={:?} synchronization={:?}",
+        format_duration(std::time::Duration::from_nanos(report.execution_timing.end_to_end_ns as u64)),
+        report.execution_timing.model_load_ns,
+        report.execution_timing.profile_load_ns,
+        report.execution_timing.history_load_ns,
+        report.execution_timing.prediction_ns,
+        report.execution_timing.planning_ns,
+        report.execution_timing.staging_ns,
+        report.execution_timing.observation_ns,
+        report.execution_timing.inference_ns,
+        report.execution_timing.synchronization_ns
     );
     eprintln!(
         "  Timing: prompt_tokens={} generated_tokens={} ttft={} decode={} total={} stop={} output_fingerprint={}",

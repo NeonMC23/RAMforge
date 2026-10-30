@@ -2,6 +2,8 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
+> **Residency observability and end-to-end accounting (2026-10-30):** RAMforge now has bounded Linux `mincore()` per-resource page snapshots, before/after prefetch residency correlation, benefit classification, and separate end-to-end versus inference timing. Observation is opt-in and reports sampled/unknown pages honestly. Full observation of SmolLM2 (25,581 pages) cost about 54 ms per snapshot and found all selected prefetch pages already resident; predictive staging was redundant on that mapping. End-to-end benchmarking now includes setup, prediction, planning, staging, inference, and synchronization, so TTFT cannot be mistaken for total cost. See [PREDICTION.md](docs/handoff/PREDICTION.md) and [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
+>
 > **Predictive residency (2026-10-30):** RAMforge now has a deterministic predictive staging layer over validated profiles: bounded confidence-ranked predictions, high-confidence staging and medium-confidence speculative prefetch, explicit budget/admission decisions, feedback history, and a deterministic simulator. Prediction is advisory only; `release_authorized` is always false and release still requires the native quiescence gate. See [PREDICTION.md](docs/handoff/PREDICTION.md).
 >
 > **Native lifetime contract (2026-10-30):** forgeCORE now exposes the pinned native execution-quiescence/ownership contract: model/context instance identities, execution generations, active/in-flight contexts, a point-in-time quiescence observation, and a non-blocking release gate that returns `EBUSY` while any context has asynchronous compute in flight. RAMforge binds that contract into its planner and lifetime state machine, persists validated execution profiles, and reports the contract facts. Intra-decode eviction remains unsupported because synchronized completion is still not proof of future reuse. See [GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md).
@@ -164,6 +166,10 @@ Flags:
 - `--prediction-history-load PATH`: validated feedback history.
 - `--prediction-history-save PATH`: atomically save feedback after a complete
   trace (requires `--graph-trace`).
+- `--residency-observe`: bounded Linux `mincore()` per-resource page residency
+  observation. It is non-invasive and disabled by default.
+- `--residency-observe-pages N`: page inspection limit (default 4096). Pages
+  above the limit are reported unknown, never nonresident.
 - `--residency-prefetch SIZE`: best-effort bounded tensor-page prefetch
   (`MADV_WILLNEED` hint). The plan deduplicates overlapping page ranges;
   requested, native-accepted, and observed mapping changes are reported
@@ -477,7 +483,10 @@ and requested 63.98 MiB of deduplicated page ranges; the native accepted
 63.98 MiB and mapping RSS stayed at 98.87 MiB, an honest zero-change hint.
 
 The report now includes prompt tokens, generated tokens, TTFT, decode/total
-wall time, stop reason, and an output token fingerprint. It remains diagnostic:
+wall time, stop reason, and an output token fingerprint. It also separates
+end-to-end time from inference latency: end-to-end includes model/profile/
+history loading, prediction, planning, staging, inference, and explicit
+synchronization; TTFT is not used as a proxy for total cost. It remains diagnostic:
 the soft target is not a hard limit, release submission is not physical
 reclamation, and cgroup usage can stay flat while mapping/process RSS falls.
 Persisted profile example:
@@ -494,7 +503,40 @@ ramforge profile profile.json --model model.gguf --json
 A reproducible harness is documented in
 [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
 
-### Predictive staging
+### Residency observation and end-to-end cost
+
+`PageResidencySnapshot` uses Linux `mincore()` on bounded tensor page ranges
+located through `/proc/self/maps`. It does not fault pages in, evict pages, or
+expose addresses. Mappings that cannot be found, unsupported platforms, and
+pages above the inspection limit are `unknown`, never zero.
+
+Human and JSON reports include resident/nonresident/unknown pages, sampled
+status, inspection elapsed time, and before/after-staging snapshots. Prefetch
+correlation distinguishes:
+
+- already resident before prefetch;
+- became resident after prefetch;
+- remained nonresident;
+- unknown;
+- access observed/not observed/unknown;
+- clearly useful, potentially useful, redundant, wasted, or benefit unknown.
+
+"Clearly useful" is not assigned without a measured physical/performance
+benefit. On the tested SmolLM2 mapping, all 25,581 inspected pages were resident
+before staged prefetch; all 57 selected resources were classified redundant.
+Full observation cost about **54 ms per snapshot**, or **158 ms** for the three
+snapshots in one run, versus roughly **3.7 ms** per 2,048-page sampled snapshot.
+Sampled observation left 23,533 pages unknown. Observation is therefore off by
+default and must not be enabled for normal throughput measurements.
+
+The five-arm benchmark now reports both inference latency and end-to-end
+latency. In the 256 MiB cgroup matrix, predictive TTFT was lower on several
+workloads, but end-to-end latency was not: short-short was 285.1 ms baseline
+vs 295.0 ms predictive; short-long 447.9 vs 469.5 ms; long-short 911.2 vs
+921.1 ms. The staging/prediction overhead and variance outweighed the TTFT
+association. No predictive speedup is claimed.
+
+## Predictive staging
 
 `prediction.rs`, `prediction_planner.rs`, and `prediction_sim.rs` implement a
 deterministic predictor/planner/coordinator. It consumes a validated execution
@@ -993,7 +1035,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **511 tests, 0 failed, 18 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **515 tests, 0 failed, 18 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

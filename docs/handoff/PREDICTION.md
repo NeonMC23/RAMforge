@@ -145,6 +145,33 @@ The report's `prediction` section contains the source, confidence counts,
 predictions, planner decisions, requested/accepted staging bytes, observed
 mapping delta, and feedback counters. JSON and human output use the same data.
 
+## Residency observation and cost accounting
+
+`--residency-observe` uses Linux `mincore()` over bounded tensor page ranges
+located through `/proc/self/maps`. It never faults pages in, evicts pages, or
+exposes addresses. Missing mappings, unsupported kernels, and pages beyond the
+inspection budget are **unknown**, not nonresident. Full snapshots include
+resident/nonresident/unknown counts and observation time.
+
+Prefetch correlation compares selected resource page snapshots before and
+after staging. Each selected resource is classified as already resident,
+became resident, remained nonresident, or unknown; benefit is redundant,
+potentially useful, wasted, clearly useful, or unknown. `ClearlyUseful` is
+never assigned without measured physical or performance benefit.
+
+On the SmolLM2 test mapping, full observation found all 25,581 pages resident
+before prefetch; all 57 selected resources were redundant, none became
+resident, and none were clearly useful. Full observation cost about 54 ms per
+snapshot (158 ms for three), versus about 3.7 ms per 2,048-page sample; the
+sample left 23,533 pages unknown. Observation is disabled by default.
+
+End-to-end latency includes model load, profile/history loading, prediction,
+planning, staging, inference, and explicit synchronization. TTFT excludes
+pre-execution staging; inference latency is not a proxy for total run cost.
+In the five-repetition 256 MiB matrix, predictive TTFT was sometimes lower but
+end-to-end latency was worse for short workloads (for example 285.1 vs 295.0 ms
+and 447.9 vs 469.5 ms). No speedup is claimed.
+
 ## Calibration findings
 
 On the SmolLM2 test profile, 64 predicted model resources all matched the next

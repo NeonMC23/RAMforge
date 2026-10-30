@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 511 passed, 0 failed, 18 ignored.
+- `cargo test --workspace`: 515 passed, 0 failed, 18 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -321,6 +321,16 @@ Not run or not claimed:
 - Metric calibration: 64 predicted, 64 matched observed, 63 within horizon,
   precision 100%, recall 23.5%, 57 prefetch-followed, 57 benefit-unknown,
   7 duplicate/overlap avoided. Correct prediction is not useful prefetch.
+- `mincore` observation tests cover maps parsing, page alignment, zero ranges,
+  bounded sampling, unknown pages, and shared/overlap correlation.
+- Full observation: 25,581 pages, all resident before staging; 57 selected
+  resources all redundant; observation 53.8 ms/snapshot (158.5 ms total).
+- Sampled observation (2,048 pages): 3.7 ms/snapshot, 23,533 unknown pages,
+  57 correlation-unknown resources.
+- End-to-end timing includes setup/prediction/staging/inference; TTFT excludes
+  staging. Five-repetition pressure matrix: baseline vs predictive end-to-end
+  short-short 285.09 vs 294.98 ms, short-long 447.93 vs 469.54 ms,
+  long-short 911.15 vs 921.13 ms. No predictive speedup is claimed.
 
 ## Native lifetime validation — 2026-10-30
 
@@ -343,7 +353,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          511 passed, 0 failed, 18 ignored
+cargo test --workspace                          515 passed, 0 failed, 18 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

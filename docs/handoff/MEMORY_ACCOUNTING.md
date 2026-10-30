@@ -189,6 +189,27 @@ explicit non-release outcomes. A failed native release is recorded as
 `ReleaseFailed` and the application report retains the error; it is never
 reported as a complete release.
 
+## Per-page residency observation
+
+`PageResidencySnapshot` (`page_residency.rs`) uses Linux `mincore()` over
+bounded page ranges. Virtual addresses are located only through
+`/proc/self/maps`; no pointers are exposed. Observation does not fault pages in
+or evict them. It distinguishes resident, nonresident, and unknown pages; a
+page beyond the inspection budget is unknown, never nonresident. Overlapping
+tensor ranges are reported per resource, with unique-page totals deduplicated.
+Non-Linux, missing mappings, and `mincore` errors are explicit unsupported or
+unknown states. `pagemap` is not used because permissions are commonly
+restricted.
+
+## Execution timing
+
+`ExecutionTiming` separates model load, profile load, history load, prediction,
+planning, staging, observation, inference, and explicit synchronization, plus
+end-to-end time. End-to-end starts at command entry and includes setup,
+staging, inference, and synchronization; it excludes report serialization.
+`inference_ns` starts at prompt processing. Nested timers are not summed to
+invent end-to-end time. TTFT excludes pre-execution staging.
+
 ## Prediction accounting
 
 Predictive staging records three separate quantities: page bytes selected by

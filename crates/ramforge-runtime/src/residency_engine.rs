@@ -15,7 +15,9 @@ use crate::cgroup::{self, CgroupEvents, CgroupStats};
 use crate::execution_profile::{ExecutionProfile, ProfileIdentity};
 use crate::memory_ledger::MemoryLedger;
 use crate::memory_report::{process_rss, process_rss_peak};
-use crate::page_residency::model_mapping_residency;
+use crate::page_residency::{
+    model_mapping_residency, PageRange, PageResidencySnapshot, PrefetchCorrelationReport,
+};
 use crate::prediction::{PredictionHistorySummary, PredictionMetrics, PredictionSet};
 use crate::prediction_planner::{PredictionPlan, StagingExecution};
 use crate::resource_lifetime::{LifetimeEvent, ResourceLifetime as ResourceLifetimeTracker};
@@ -403,6 +405,28 @@ impl ResourceInventory {
             .iter()
             .filter(|resource| resource.file_backed)
             .map(|resource| resource.key)
+            .collect()
+    }
+
+    /// Build bounded observation ranges from native mapping metadata. The
+    /// shard list is ordered by native mapping index; missing shards become
+    /// unknown, never zero-resident.
+    pub fn page_ranges(&self, shard_paths: &[PathBuf]) -> Vec<PageRange> {
+        self.resources
+            .iter()
+            .map(|resource| PageRange {
+                name: resource.name.clone(),
+                tensor_index: resource.key.tensor_index,
+                generation: resource.key.generation,
+                mapping_index: resource.mapping_index,
+                mapping_path: resource
+                    .mapping_index
+                    .and_then(|index| shard_paths.get(index as usize).cloned()),
+                page_start: resource.page_start,
+                page_end: resource.page_end,
+                page_size: resource.page_size,
+                mapping_size: resource.mapping_size,
+            })
             .collect()
     }
 
@@ -1276,6 +1300,22 @@ pub struct OperationTiming {
     pub output_fingerprint: String,
 }
 
+/// End-to-end timing boundaries. All fields are measured with monotonic clocks;
+/// nested timers are not added together to form `end_to_end_ns`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionTiming {
+    pub model_load_ns: Option<u128>,
+    pub profile_load_ns: Option<u128>,
+    pub history_load_ns: Option<u128>,
+    pub prediction_ns: Option<u128>,
+    pub planning_ns: Option<u128>,
+    pub staging_ns: Option<u128>,
+    pub observation_ns: Option<u128>,
+    pub inference_ns: Option<u128>,
+    pub synchronization_ns: Option<u128>,
+    pub end_to_end_ns: u128,
+}
+
 /// Structured per-operation residency report. Estimates and observations are
 /// separate fields; a native release result is not an RSS measurement.
 #[derive(Debug, Clone)]
@@ -1305,6 +1345,11 @@ pub struct ResidencyReport {
     pub prediction_staging: Option<StagingExecution>,
     pub prediction_metrics: Option<PredictionMetrics>,
     pub prediction_history: Option<PredictionHistorySummary>,
+    pub page_before: Option<PageResidencySnapshot>,
+    pub page_after_staging: Option<PageResidencySnapshot>,
+    pub page_after: Option<PageResidencySnapshot>,
+    pub prefetch_correlation: Option<PrefetchCorrelationReport>,
+    pub execution_timing: ExecutionTiming,
     pub ledger: MemoryLedger,
     pub before: ResidencySnapshot,
     pub after: ResidencySnapshot,

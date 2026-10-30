@@ -50,7 +50,9 @@ def git_head(path):
         return None
 
 
-def command_for(binary, model, profile, history, target, ctx, prompt, tokens, arm, enforce, timeout):
+def command_for(
+    binary, model, profile, history, target, ctx, prompt, tokens, arm, enforce, timeout, observe, observe_pages
+):
     cfg = ARMS[arm]
     json_path = None  # filled by caller
     cmd = [
@@ -97,6 +99,8 @@ def command_for(binary, model, profile, history, target, ctx, prompt, tokens, ar
         cmd += ["--residency-prefetch", "64M"]
     if enforce:
         cmd += ["--enforce-ram", "--enforce-timeout", str(timeout)]
+    if observe:
+        cmd += ["--residency-observe", "--residency-observe-pages", str(observe_pages)]
     return cmd
 
 
@@ -108,9 +112,14 @@ def parse_report(path, arm, workload, repeat, order, wall_ns, status, stderr):
         plan = prediction.get("plan") or {}
         staging = prediction.get("staging") or {}
         history = prediction.get("history") or {}
+        observation = report.get("residency_observation") or {}
+        page_before = observation.get("before") or {}
+        page_after_staging = observation.get("after_staging") or {}
+        correlation = observation.get("prefetch_correlation") or {}
         before = (report.get("measurements") or {}).get("before") or {}
         after = (report.get("measurements") or {}).get("after") or {}
         timing = report.get("timing") or {}
+        execution_timing = report.get("execution_timing") or {}
         faults = report.get("process_faults") or {}
         app = report.get("application") or {}
         native = report.get("native_lifetime") or {}
@@ -124,6 +133,15 @@ def parse_report(path, arm, workload, repeat, order, wall_ns, status, stderr):
             "ttft_ns": timing.get("ttft_ns"),
             "decode_ns": timing.get("decode_ns"),
             "total_ns": timing.get("total_ns"),
+            "end_to_end_ns": execution_timing.get("end_to_end_ns"),
+            "inference_ns": execution_timing.get("inference_ns"),
+            "profile_load_ns": execution_timing.get("profile_load_ns"),
+            "history_load_ns": execution_timing.get("history_load_ns"),
+            "prediction_planning_ns": execution_timing.get("prediction_ns"),
+            "residency_planning_ns": execution_timing.get("planning_ns"),
+            "staging_timing_ns": execution_timing.get("staging_ns"),
+            "observation_timing_ns": execution_timing.get("observation_ns"),
+            "synchronization_ns": execution_timing.get("synchronization_ns"),
             "output_fingerprint": timing.get("output_fingerprint"),
             "rss_before": before.get("process_rss_bytes"),
             "rss_after": after.get("process_rss_bytes"),
@@ -166,6 +184,21 @@ def parse_report(path, arm, workload, repeat, order, wall_ns, status, stderr):
             "prefetch_requested_bytes": metrics.get("prefetch_requested_bytes"),
             "prefetch_accepted_bytes": metrics.get("prefetch_accepted_bytes"),
             "staging_latency_ns": staging.get("elapsed_ns"),
+            "observation_before_ns": page_before.get("elapsed_ns"),
+            "observation_after_staging_ns": page_after_staging.get("elapsed_ns"),
+            "observation_inspected_pages": page_before.get("inspected_pages"),
+            "observation_sampled": page_before.get("sampled"),
+            "resident_pages_before": page_before.get("resident_pages"),
+            "resident_pages_after_staging": page_after_staging.get("resident_pages"),
+            "unknown_pages_before": page_before.get("unknown_pages"),
+            "prefetch_already_resident": correlation.get("already_resident"),
+            "prefetch_became_resident": correlation.get("became_resident"),
+            "prefetch_remained_nonresident": correlation.get("remained_nonresident"),
+            "prefetch_correlation_unknown": correlation.get("unknown"),
+            "prefetch_redundant": correlation.get("redundant"),
+            "prefetch_potentially_useful": correlation.get("potentially_useful"),
+            "prefetch_wasted": correlation.get("wasted"),
+            "prefetch_clearly_useful": correlation.get("clearly_useful"),
             "prefetch_accepted_resources": metrics.get("prefetch_accepted_resources"),
             "prefetch_followed": metrics.get("prefetch_followed_by_observed_access"),
             "prefetch_not_followed": metrics.get("prefetch_not_followed_by_observed_access"),
@@ -218,6 +251,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--enforce", action="store_true")
+    parser.add_argument("--observe", action="store_true", help="enable bounded page residency observation")
+    parser.add_argument("--observe-pages", type=int, default=2048)
     args = parser.parse_args()
     if not args.model or not args.profile:
         parser.error("--model and --profile are required")
@@ -255,6 +290,8 @@ def main():
                     arm,
                     args.enforce,
                     args.timeout,
+                    args.observe,
+                    args.observe_pages,
                 )
                 cmd += ["--residency-report-json", str(json_path)]
                 start = time.time_ns()
@@ -308,6 +345,15 @@ def main():
                 "failures": sum(1 for row in selected if row.get("status") != 0),
                 "ttft_ns": spread(selected, "ttft_ns"),
                 "total_ns": spread(selected, "total_ns"),
+                "end_to_end_ns": spread(selected, "end_to_end_ns"),
+                "inference_ns": spread(selected, "inference_ns"),
+                "profile_load_ns": spread(selected, "profile_load_ns"),
+                "history_load_ns": spread(selected, "history_load_ns"),
+                "prediction_planning_ns": spread(selected, "prediction_planning_ns"),
+                "residency_planning_ns": spread(selected, "residency_planning_ns"),
+                "staging_timing_ns": spread(selected, "staging_timing_ns"),
+                "observation_timing_ns": spread(selected, "observation_timing_ns"),
+                "synchronization_ns": spread(selected, "synchronization_ns"),
                 "rss_after": spread(selected, "rss_after"),
                 "rss_peak": spread(selected, "rss_peak"),
                 "cgroup_peak": spread(selected, "cgroup_peak"),
@@ -328,6 +374,20 @@ def main():
                 "prefetch_requested_bytes": median(selected, "prefetch_requested_bytes"),
                 "prefetch_accepted_bytes": median(selected, "prefetch_accepted_bytes"),
                 "staging_latency_ns": spread(selected, "staging_latency_ns"),
+                "observation_before_ns": spread(selected, "observation_before_ns"),
+                "observation_after_staging_ns": spread(selected, "observation_after_staging_ns"),
+                "observation_inspected_pages": median(selected, "observation_inspected_pages"),
+                "observation_sampled": median(selected, "observation_sampled"),
+                "resident_pages_before": median(selected, "resident_pages_before"),
+                "resident_pages_after_staging": median(selected, "resident_pages_after_staging"),
+                "prefetch_already_resident": median(selected, "prefetch_already_resident"),
+                "prefetch_became_resident": median(selected, "prefetch_became_resident"),
+                "prefetch_remained_nonresident": median(selected, "prefetch_remained_nonresident"),
+                "prefetch_correlation_unknown": median(selected, "prefetch_correlation_unknown"),
+                "prefetch_redundant": median(selected, "prefetch_redundant"),
+                "prefetch_potentially_useful": median(selected, "prefetch_potentially_useful"),
+                "prefetch_wasted": median(selected, "prefetch_wasted"),
+                "prefetch_clearly_useful": median(selected, "prefetch_clearly_useful"),
                 "prefetch_followed": median(selected, "prefetch_followed"),
                 "prefetch_not_followed": median(selected, "prefetch_not_followed"),
                 "prefetch_unknown": median(selected, "prefetch_unknown"),
@@ -337,7 +397,7 @@ def main():
         "RAMforge prediction benchmark (simulation not included)",
         f"model={args.model}",
         f"profile={args.profile} history={args.history or 'none'}",
-        f"target={args.target} enforce={args.enforce} repeats={args.repeats}",
+        f"target={args.target} enforce={args.enforce} observe={args.observe} observe_pages={args.observe_pages} repeats={args.repeats}",
         f"cache_controlled={summary['cache_controlled']} ({summary['cache_note']})",
         f"runs={summary['runs']} failures={summary['failures']}",
     ]
@@ -348,11 +408,14 @@ def main():
             ttft = entry.get("ttft_ns") or {}
             major = entry.get("major_faults_delta") or {}
             lines.append(
-                "  {arm}: ttft_median_ns={ttft} ttft_min={tmin} ttft_max={tmax} "
+                "  {arm}: end_to_end_median_ns={e2e} inference_median_ns={inference} "
+                "ttft_median_ns={ttft} ttft_min={tmin} ttft_max={tmax} "
                 "major_fault_delta_median={major} accepted_bytes={accepted} "
                 "matched={matched} within_horizon={within} precision_bps={precision} "
                 "recall_bps={recall} staging_latency_ns={staging}".format(
                     arm=arm,
+                    e2e=(entry.get("end_to_end_ns") or {}).get("median"),
+                    inference=(entry.get("inference_ns") or {}).get("median"),
                     ttft=ttft.get("median"),
                     tmin=ttft.get("min"),
                     tmax=ttft.get("max"),
