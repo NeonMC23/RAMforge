@@ -86,6 +86,7 @@ pub struct StagingExecution {
     pub attempted_keys: Vec<ResourceKey>,
     pub requested_bytes: u64,
     pub native_accepted_bytes: u64,
+    pub elapsed_ns: u128,
     pub operations: usize,
     pub configured_max_in_flight: u16,
     pub error: Option<String>,
@@ -387,6 +388,7 @@ where
             .collect(),
         requested_bytes: plan.requested_bytes(),
         native_accepted_bytes: 0,
+        elapsed_ns: 0,
         operations: 0,
         configured_max_in_flight: config.max_in_flight,
         error: None,
@@ -398,10 +400,12 @@ where
         return execution;
     }
     execution.operations = 1;
+    let started = std::time::Instant::now();
     match prefetch(&indices) {
         Ok(bytes) => execution.native_accepted_bytes = bytes,
         Err(error) => execution.error = Some(error),
     }
+    execution.elapsed_ns = started.elapsed().as_nanos();
     execution
 }
 

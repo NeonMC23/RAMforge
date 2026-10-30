@@ -191,6 +191,10 @@ activity; the harness reports deltas but cannot attribute them exclusively to
 prefetch. Process RSS and cgroup usage are also process/group measurements, not
 per-resource proof.
 
+Predictive staging latency was measured separately: median native prefetch call
+latency was 3.9–5.4 ms across workloads in a two-repeat constrained smoke run.
+TTFT excludes that pre-operation staging time; process wall time includes it.
+
 RSS remained around 168–184 MiB; mapping delta was **0 B** in all arms, so no
 physical mapping residency benefit was observed. Prediction metrics for the
 warm history were stable across workloads: 64 generated, 64 matched overall,

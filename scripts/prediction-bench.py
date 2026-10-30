@@ -165,6 +165,7 @@ def parse_report(path, arm, workload, repeat, order, wall_ns, status, stderr):
             "prefetch_requested_resources": metrics.get("prefetch_requested_resources"),
             "prefetch_requested_bytes": metrics.get("prefetch_requested_bytes"),
             "prefetch_accepted_bytes": metrics.get("prefetch_accepted_bytes"),
+            "staging_latency_ns": staging.get("elapsed_ns"),
             "prefetch_accepted_resources": metrics.get("prefetch_accepted_resources"),
             "prefetch_followed": metrics.get("prefetch_followed_by_observed_access"),
             "prefetch_not_followed": metrics.get("prefetch_not_followed_by_observed_access"),
@@ -326,12 +327,46 @@ def main():
                 "bucket_low_precision_bps": median(selected, "bucket_low_precision_bps"),
                 "prefetch_requested_bytes": median(selected, "prefetch_requested_bytes"),
                 "prefetch_accepted_bytes": median(selected, "prefetch_accepted_bytes"),
+                "staging_latency_ns": spread(selected, "staging_latency_ns"),
                 "prefetch_followed": median(selected, "prefetch_followed"),
                 "prefetch_not_followed": median(selected, "prefetch_not_followed"),
                 "prefetch_unknown": median(selected, "prefetch_unknown"),
             }
     (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    lines = [
+        "RAMforge prediction benchmark (simulation not included)",
+        f"model={args.model}",
+        f"profile={args.profile} history={args.history or 'none'}",
+        f"target={args.target} enforce={args.enforce} repeats={args.repeats}",
+        f"cache_controlled={summary['cache_controlled']} ({summary['cache_note']})",
+        f"runs={summary['runs']} failures={summary['failures']}",
+    ]
+    for workload in summary["workloads"]:
+        lines.append(f"\n[{workload}]")
+        for arm in ARMS:
+            entry = summary["summary"][workload][arm]
+            ttft = entry.get("ttft_ns") or {}
+            major = entry.get("major_faults_delta") or {}
+            lines.append(
+                "  {arm}: ttft_median_ns={ttft} ttft_min={tmin} ttft_max={tmax} "
+                "major_fault_delta_median={major} accepted_bytes={accepted} "
+                "matched={matched} within_horizon={within} precision_bps={precision} "
+                "recall_bps={recall} staging_latency_ns={staging}".format(
+                    arm=arm,
+                    ttft=ttft.get("median"),
+                    tmin=ttft.get("min"),
+                    tmax=ttft.get("max"),
+                    major=major.get("median"),
+                    accepted=entry.get("prefetch_accepted_bytes"),
+                    matched=entry.get("prediction_matched"),
+                    within=entry.get("prediction_within_horizon"),
+                    precision=entry.get("prediction_precision_bps"),
+                    recall=entry.get("prediction_recall_bps"),
+                    staging=(entry.get("staging_latency_ns") or {}).get("median"),
+                )
+            )
+    (out / "summary.txt").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
     return 0 if summary["failures"] == 0 else 1
 
 

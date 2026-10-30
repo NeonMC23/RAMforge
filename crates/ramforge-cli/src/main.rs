@@ -2833,6 +2833,7 @@ fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
                 "staging": report.prediction_staging.as_ref().map(|staging| serde_json::json!({
                     "requested_bytes": staging.requested_bytes,
                     "native_accepted_bytes": staging.native_accepted_bytes,
+                    "elapsed_ns": staging.elapsed_ns,
                     "observed_mapping_delta_bytes": staging.observed_mapping_delta(),
                     "operations": staging.operations,
                     "configured_max_in_flight": staging.configured_max_in_flight,

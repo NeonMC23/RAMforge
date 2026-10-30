@@ -158,8 +158,10 @@ physical prefetch or performance gain.
 Cold-start predictions were medium confidence; a warm feedback history raised
 them to high confidence. The real-model benchmark did not find a universal
 speedup. Under a 256 MiB cgroup, predictive arms showed fewer major faults and
-lower TTFT on some workloads, but long-workload results were mixed and this was
-not a controlled cold-cache experiment.
+lower TTFT on several workloads, but long-workload results were mixed and this
+was not a controlled cold-cache experiment. Synchronous native prefetch latency
+was about 3.9–5.4 ms in the constrained smoke matrix; TTFT excludes that
+pre-operation time, while process wall time includes it.
 
 ## Deterministic simulation
 
