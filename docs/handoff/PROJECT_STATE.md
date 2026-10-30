@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **515 tests, 0 failed, 18 ignored**. The ignored
+  environment variables passes **522 tests, 0 failed, 18 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -85,6 +85,11 @@
   speedup is claimed.
 - `scripts/prediction-bench.py` supports observation (`--observe`), component
   timing, residency correlation, page faults, and human/JSON summaries.
+- The deterministic simulator now runs baseline/reactive/predictive/
+  conservative/aggressive over 16 required scenarios, with initial residency,
+  staging effects, eviction, unknown states, component costs, end-to-end cost,
+  net benefit, and explicit `benefit_known`. `ramforge simulate --scenario all`
+  exports the bounded versioned report.
 
 ## Predictive residency milestone (2026-10-30)
 

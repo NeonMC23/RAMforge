@@ -146,7 +146,11 @@ enum Commands {
         #[arg(long, default_value = "8K")]
         window: String,
 
-        /// Use a deliberately mismatched test sequence
+        /// Scenario: useful, already-resident, no-residency-effect, incorrect-prediction, all, ...
+        #[arg(long, default_value = "useful")]
+        scenario: String,
+
+        /// Use the deliberately mismatched prediction scenario
         #[arg(long)]
         wrong_history: bool,
 
@@ -367,10 +371,11 @@ fn main() {
         Commands::Simulate {
             budget,
             window,
+            scenario,
             wrong_history,
             json,
         } => {
-            if let Err(error) = run_simulation(&budget, &window, wrong_history, json) {
+            if let Err(error) = run_simulation(&budget, &window, &scenario, wrong_history, json) {
                 eprintln!("Error: {error}");
                 std::process::exit(1);
             }
@@ -2314,100 +2319,140 @@ fn run_profile_inspect(
 fn run_simulation(
     budget: &str,
     window: &str,
+    scenario_name: &str,
     wrong_history: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    use ramforge_runtime::prediction_sim::{simulate, SimResource, SimScenario};
+    use ramforge_runtime::prediction_sim::{simulate, standard_scenarios};
     let budget =
         parse_memory_size(budget).map_err(|error| anyhow::anyhow!("invalid --budget: {error}"))?;
     let window =
         parse_memory_size(window).map_err(|error| anyhow::anyhow!("invalid --window: {error}"))?;
-    let names = ["a", "b", "c", "d", "e"];
-    let scenario = SimScenario {
-        name: "deterministic-five-resource".to_string(),
-        budget_bytes: budget,
-        staging_window_bytes: window.min(budget),
-        speculative_budget_bytes: window.saturating_div(2).min(budget),
-        min_confidence_bps: 5_000,
-        prediction_horizon: 4,
-        resources: names
-            .iter()
-            .map(|name| SimResource {
-                name: (*name).to_string(),
-                bytes: 4096,
-                file_backed: true,
-                known_size: true,
-            })
-            .collect(),
-        training_sequence: names.iter().map(|name| (*name).to_string()).collect(),
-        test_sequence: if wrong_history {
-            vec!["e".to_string()]
-        } else {
-            names.iter().map(|name| (*name).to_string()).collect()
-        },
-    };
-    let result = simulate(&scenario).map_err(|error| anyhow::anyhow!(error))?;
+    let mut scenarios = standard_scenarios(budget, window.min(budget));
+    if wrong_history {
+        scenarios.retain(|scenario| scenario.name == "incorrect-prediction");
+    } else if scenario_name != "all" {
+        scenarios.retain(|scenario| scenario.name == scenario_name);
+    }
+    if scenarios.is_empty() {
+        return Err(anyhow::anyhow!(
+            "unknown simulation scenario '{}'; use --scenario all or one of: useful, already-resident, no-residency-effect, predicted-never-accessed, incorrect-prediction, incorrect-already-resident, late-prefetch, staging-rejected, deferred-then-accessed, evicted-before-access, unknown-initial, unknown-effect, overlapping-duplicate, constrained-competition, observation-overhead, prediction-cost-worse",
+            scenario_name
+        ));
+    }
     if json {
+        let reports = scenarios
+            .iter()
+            .map(|scenario| {
+                let comparison = simulate(scenario).map_err(|error| anyhow::anyhow!(error))?;
+                Ok::<_, anyhow::Error>(sim_comparison_json(&comparison))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         println!(
             "{}",
             serde_json::json!({
-                "baseline": {
-                    "strategy": result.baseline.strategy,
-                    "hits": result.baseline.hits,
-                    "misses": result.baseline.misses,
-                    "reread_bytes": result.baseline.reread_bytes,
-                    "peak_resident_bytes": result.baseline.peak_resident_bytes,
-                    "budget_violations": result.baseline.budget_violations,
-                },
-                "predictive": {
-                    "strategy": result.predictive.strategy,
-                    "hits": result.predictive.hits,
-                    "misses": result.predictive.misses,
-                    "reread_bytes": result.predictive.reread_bytes,
-                    "staged_bytes": result.predictive.staged_bytes,
-                    "wasted_staged_bytes": result.predictive.wasted_staged_bytes,
-                    "predicted_resources": result.predictive.predicted_resources,
-                    "matched_resources": result.predictive.matched_resources,
-                    "within_horizon_matches": result.predictive.within_horizon_matches,
-                    "prediction_precision_bps": result.predictive.prediction_precision_bps,
-                    "prediction_recall_bps": result.predictive.prediction_recall_bps,
-                    "peak_resident_bytes": result.predictive.peak_resident_bytes,
-                    "budget_violations": result.predictive.budget_violations,
-                    "release_authorized": result.predictive.release_authorized,
-                },
-                "miss_reduction": result.miss_reduction(),
-                "reread_byte_reduction": result.reread_byte_reduction(),
+                "schema_version": 1,
+                "kind": "ramforge.prediction_simulation",
                 "simulation_only": true,
+                "scenarios": reports,
             })
         );
     } else {
-        println!("Simulation: {}", scenario.name);
-        println!(
-            "  baseline: hits={} misses={} reread_bytes={} peak={} violations={}",
-            result.baseline.hits,
-            result.baseline.misses,
-            result.baseline.reread_bytes,
-            result.baseline.peak_resident_bytes,
-            result.baseline.budget_violations
-        );
-        println!(
-            "  predictive: hits={} misses={} reread_bytes={} staged_bytes={} wasted={} peak={} violations={} release_authorized={}",
-            result.predictive.hits,
-            result.predictive.misses,
-            result.predictive.reread_bytes,
-            result.predictive.staged_bytes,
-            result.predictive.wasted_staged_bytes,
-            result.predictive.peak_resident_bytes,
-            result.predictive.budget_violations,
-            result.predictive.release_authorized
-        );
-        println!(
-            "  miss_reduction={} reread_byte_reduction={} (simulation only, not hardware evidence)",
-            result.miss_reduction(),
-            result.reread_byte_reduction()
-        );
+        for scenario in &scenarios {
+            let comparison = simulate(scenario).map_err(|error| anyhow::anyhow!(error))?;
+            print_sim_comparison(scenario.name.as_str(), &comparison);
+        }
     }
     Ok(())
+}
+
+fn sim_result_json(result: &ramforge_runtime::prediction_sim::SimResult) -> serde_json::Value {
+    serde_json::json!({
+        "strategy": result.strategy,
+        "initial_resident_bytes": result.initial_resident_bytes,
+        "initial_nonresident_bytes": result.initial_nonresident_bytes,
+        "initial_unknown_bytes": result.initial_unknown_bytes,
+        "predicted_resources": result.predicted_resources,
+        "correct_predictions": result.correct_predictions,
+        "false_positives": result.false_positives,
+        "false_negatives": result.false_negatives,
+        "precision_bps": result.precision_bps,
+        "recall_bps": result.recall_bps,
+        "staged_bytes": result.staged_bytes,
+        "newly_resident_bytes": result.newly_resident_bytes,
+        "redundant_staged_bytes": result.redundant_staged_bytes,
+        "ineffective_staged_bytes": result.ineffective_staged_bytes,
+        "wasted_staged_bytes": result.wasted_staged_bytes,
+        "deferred_bytes": result.deferred_bytes,
+        "rejected_bytes": result.rejected_bytes,
+        "evicted_before_access_bytes": result.evicted_before_access_bytes,
+        "reread_bytes": result.reread_bytes,
+        "peak_resident_bytes": result.peak_resident_bytes,
+        "budget_violations": result.budget_violations,
+        "prediction_cost_ns": result.prediction_cost_ns,
+        "planning_cost_ns": result.planning_cost_ns,
+        "observation_cost_ns": result.observation_cost_ns,
+        "staging_cost_ns": result.staging_cost_ns,
+        "reread_cost_ns": result.reread_cost_ns,
+        "execution_cost_ns": result.execution_cost_ns,
+        "synchronization_cost_ns": result.synchronization_cost_ns,
+        "total_end_to_end_ns": result.total_end_to_end_ns,
+        "net_benefit_ns": result.net_benefit_ns,
+        "improved": result.improved,
+        "benefit_known": result.benefit_known,
+        "notes": result.notes,
+    })
+}
+
+fn sim_comparison_json(
+    comparison: &ramforge_runtime::prediction_sim::SimComparison,
+) -> serde_json::Value {
+    serde_json::json!({
+        "scenario": comparison.scenario,
+        "baseline": sim_result_json(&comparison.baseline),
+        "reactive": sim_result_json(&comparison.reactive),
+        "predictive": sim_result_json(&comparison.predictive),
+        "conservative": sim_result_json(&comparison.conservative),
+        "aggressive": sim_result_json(&comparison.aggressive),
+    })
+}
+
+fn print_sim_comparison(
+    scenario: &str,
+    comparison: &ramforge_runtime::prediction_sim::SimComparison,
+) {
+    use ramforge_runtime::prediction_sim::SimStrategy;
+    println!("Simulation: {scenario} (simulation only, not hardware evidence)");
+    for strategy in [
+        SimStrategy::Baseline,
+        SimStrategy::Reactive,
+        SimStrategy::Predictive,
+        SimStrategy::Conservative,
+        SimStrategy::Aggressive,
+    ] {
+        let result = comparison.result(strategy);
+        println!(
+            "  {:<11} total_ns={} net_benefit_ns={} improved={} known={} predicted={} correct={} fp={} fn={} staged={} new_resident={} redundant={} ineffective={} wasted={} evicted={} reread={} peak={} violations={}",
+            result.strategy,
+            result.total_end_to_end_ns,
+            result.net_benefit_ns,
+            result.improved,
+            result.benefit_known,
+            result.predicted_resources,
+            result.correct_predictions,
+            result.false_positives,
+            result.false_negatives,
+            result.staged_bytes,
+            result.newly_resident_bytes,
+            result.redundant_staged_bytes,
+            result.ineffective_staged_bytes,
+            result.wasted_staged_bytes,
+            result.evicted_before_access_bytes,
+            result.reread_bytes,
+            result.peak_resident_bytes,
+            result.budget_violations
+        );
+    }
 }
 
 fn output_support() {

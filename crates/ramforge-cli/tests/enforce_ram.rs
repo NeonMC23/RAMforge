@@ -147,9 +147,32 @@ fn simulate_command_is_deterministic_and_budget_safe() {
     assert_eq!(first.stdout, second.stdout);
     let value: serde_json::Value = serde_json::from_slice(&first.stdout).expect("simulation JSON");
     assert_eq!(value["simulation_only"], true);
-    assert_eq!(value["predictive"]["budget_violations"], 0);
-    assert_eq!(value["predictive"]["release_authorized"], false);
-    assert!(value["miss_reduction"].as_u64().unwrap() > 0);
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["scenarios"][0]["scenario"], "useful");
+    assert_eq!(value["scenarios"][0]["predictive"]["budget_violations"], 0);
+    assert!(
+        value["scenarios"][0]["predictive"]["net_benefit_ns"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(value["scenarios"][0]["predictive"]["improved"], true);
+    let all = ramforge()
+        .args([
+            "simulate",
+            "--budget",
+            "12K",
+            "--window",
+            "8K",
+            "--scenario",
+            "all",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(all.status.success());
+    let all_value: serde_json::Value = serde_json::from_slice(&all.stdout).expect("all scenarios");
+    assert_eq!(all_value["scenarios"].as_array().unwrap().len(), 16);
 }
 
 #[test]

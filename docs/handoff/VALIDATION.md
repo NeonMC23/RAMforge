@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 515 passed, 0 failed, 18 ignored.
+- `cargo test --workspace`: 522 passed, 0 failed, 18 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -331,6 +331,10 @@ Not run or not claimed:
   staging. Five-repetition pressure matrix: baseline vs predictive end-to-end
   short-short 285.09 vs 294.98 ms, short-long 447.93 vs 469.54 ms,
   long-short 911.15 vs 921.13 ms. No predictive speedup is claimed.
+- Deterministic simulator: 16 scenarios x 5 strategies, 522 tests. `useful`
+  baseline 10,217 ns vs predictive 2,675 ns, net +7,542 ns; observation-overhead
+  net -992,458 ns; already-resident is redundant and unknown outcomes set
+  `benefit_known=false`. All simulated budget violations are zero.
 
 ## Native lifetime validation — 2026-10-30
 
@@ -353,7 +357,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          515 passed, 0 failed, 18 ignored
+cargo test --workspace                          522 passed, 0 failed, 18 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

@@ -192,23 +192,48 @@ pre-operation time, while process wall time includes it.
 
 ## Deterministic simulation
 
-```sh
-ramforge simulate --budget 12K --window 8K --json
-ramforge simulate --budget 12K --window 8K --wrong-history
+`ramforge simulate` exposes 16 required deterministic scenarios via
+`--scenario NAME` or `--scenario all`.
+
+Scenario names:
+
+`useful`, `already-resident`, `no-residency-effect`, `predicted-never-accessed`,
+`incorrect-prediction`, `incorrect-already-resident`, `late-prefetch`,
+`staging-rejected`, `deferred-then-accessed`, `evicted-before-access`,
+`unknown-initial`, `unknown-effect`, `overlapping-duplicate`,
+`constrained-competition`, `observation-overhead`, `prediction-cost-worse`.
+
+Each scenario runs five equivalent strategies: baseline, reactive, predictive,
+conservative, aggressive. Every result reports initial resident/nonresident/
+unknown bytes, predictions and precision/recall, staged/newly resident/
+redundant/ineffective/wasted/deferred/rejected bytes, eviction-before-access,
+reread bytes, peak residency, budget violations, prediction/planning/
+observation/staging/reread/execution/synchronization costs, total end-to-end
+cost, and net benefit.
+
+Accounting:
+
+```text
+total = setup + prediction + planning + observation + staging
+      + reread + execution + synchronization
+net_benefit = baseline_total - strategy_total
+improved = benefit_known AND net_benefit > 0
 ```
 
-The simulator compares a baseline against predictive staging with a synthetic
-five-resource model. It reports hits/misses, reread bytes, staged/wasted bytes,
-prediction precision/recall and within-horizon matches, peak resident bytes,
-budget violations, and release authorization. For the standard 12K/8K scenario,
-prediction matches 2 of 5 test accesses (precision 100%, recall 40%); the
-wrong-history scenario matches 0 (precision 0%) and wastes 8,192 bytes. It is
-simulation evidence only, not hardware performance evidence.
+`benefit_known` is false for unknown initial residency or unknown staging effect.
+Unknown pages are never counted as reclaimable or useful. Prediction precision
+is reported independently from net benefit.
 
-Tests cover correct/wrong history, zero budget, unknown size, bounded staging,
-admission rejection, stale identity, and the invariant that prediction never
-authorizes release.
+Standard `useful` 12K/8K scenario: baseline 10,217 ns, predictive 2,675 ns,
+net benefit **7,542 ns**; 4,096 staged/newly resident bytes, 4,096 reread bytes
+avoided. `observation-overhead` scenario: predictive total 1,002,675 ns,
+net benefit **-992,458 ns**; a correct prediction is slower because observation
+cost dominates. `already-resident` stages 4,096 redundant bytes and does not
+improve. `unknown-effect` and `unknown-initial` mark benefit unknown and cannot
+claim improvement. Standard scenarios are deterministic, budget-safe, and
+tested for all strategies.
 
+These are simulated nanosecond units, not hardware measurements.
 ## Limitations
 
 - Prediction is heuristic, not a model of guaranteed future access.

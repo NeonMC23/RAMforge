@@ -1,7 +1,7 @@
-//! Deterministic predictive-residency simulation.
+//! Deterministic predictive-prefetch simulation.
 //!
-//! Simulation is not hardware evidence. It verifies planner invariants,
-//! budget bounds, and feedback behavior without touching native memory.
+//! Simulation is not hardware evidence. The goal is to make lifetime, staging,
+//! residency, eviction, and end-to-end cost accounting explicit and testable.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -9,8 +9,29 @@ use forge_core::TensorMappingInfo;
 
 use crate::execution_profile::{AccessPattern, ExecutionProfile};
 use crate::prediction::{predict_from_profile, PredictionConfig};
-use crate::prediction_planner::{plan_predictions, PredictiveAction, PredictiveReason};
+use crate::prediction_planner::{plan_predictions, PredictiveAction};
 use crate::residency_engine::{ModelGeneration, ModelId, ResourceInventory};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimInitialResidency {
+    Resident,
+    NonResident,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimPrefetchEffect {
+    MakesResident,
+    NoEffect,
+    Fail,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimPrefetchTiming {
+    OnTime,
+    Late,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimResource {
@@ -18,6 +39,37 @@ pub struct SimResource {
     pub bytes: u64,
     pub file_backed: bool,
     pub known_size: bool,
+    pub initial: SimInitialResidency,
+    /// Resources with the same group share mapping pages in the synthetic
+    /// inventory, allowing overlap/deduplication scenarios.
+    pub overlap_group: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimCosts {
+    pub setup_ns: u64,
+    pub prediction_ns: u64,
+    pub planning_ns: u64,
+    pub observation_ns_per_page: u64,
+    pub staging_ns: u64,
+    pub reread_ns_per_byte: u64,
+    pub execution_ns_per_access: u64,
+    pub synchronization_ns: u64,
+}
+
+impl Default for SimCosts {
+    fn default() -> Self {
+        Self {
+            setup_ns: 1_000,
+            prediction_ns: 100,
+            planning_ns: 50,
+            observation_ns_per_page: 10,
+            staging_ns: 500,
+            reread_ns_per_byte: 2,
+            execution_ns_per_access: 1_000,
+            synchronization_ns: 25,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,45 +83,94 @@ pub struct SimScenario {
     pub resources: Vec<SimResource>,
     pub training_sequence: Vec<String>,
     pub test_sequence: Vec<String>,
+    pub prefetch_effect: SimPrefetchEffect,
+    pub prefetch_timing: SimPrefetchTiming,
+    pub observe: bool,
+    pub costs: SimCosts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimStrategy {
+    Baseline,
+    Reactive,
+    Predictive,
+    Conservative,
+    Aggressive,
+}
+
+impl SimStrategy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Reactive => "reactive",
+            Self::Predictive => "predictive",
+            Self::Conservative => "conservative",
+            Self::Aggressive => "aggressive",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimResult {
     pub scenario: String,
-    pub strategy: String,
-    pub hits: u64,
-    pub misses: u64,
-    pub reread_bytes: u64,
+    pub strategy: &'static str,
+    pub initial_resident_bytes: u64,
+    pub initial_nonresident_bytes: u64,
+    pub initial_unknown_bytes: u64,
+    pub predicted_resources: usize,
+    pub correct_predictions: usize,
+    pub false_positives: usize,
+    pub false_negatives: usize,
+    pub precision_bps: Option<u16>,
+    pub recall_bps: Option<u16>,
     pub staged_bytes: u64,
+    pub newly_resident_bytes: u64,
+    pub redundant_staged_bytes: u64,
+    pub ineffective_staged_bytes: u64,
     pub wasted_staged_bytes: u64,
+    pub deferred_bytes: u64,
+    pub rejected_bytes: u64,
+    pub evicted_before_access_bytes: u64,
+    pub reread_bytes: u64,
     pub peak_resident_bytes: u64,
     pub budget_violations: u64,
-    pub staged_resources: usize,
-    pub predicted_resources: usize,
-    pub matched_resources: usize,
-    pub within_horizon_matches: usize,
-    pub prediction_precision_bps: Option<u16>,
-    pub prediction_recall_bps: Option<u16>,
-    pub deferred: usize,
-    pub rejected: usize,
-    pub release_authorized: bool,
+    pub prediction_cost_ns: u64,
+    pub planning_cost_ns: u64,
+    pub observation_cost_ns: u64,
+    pub staging_cost_ns: u64,
+    pub reread_cost_ns: u64,
+    pub execution_cost_ns: u64,
+    pub synchronization_cost_ns: u64,
+    pub total_end_to_end_ns: u64,
+    pub net_benefit_ns: i128,
+    pub improved: bool,
+    pub benefit_known: bool,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimComparison {
+    pub scenario: String,
     pub baseline: SimResult,
+    pub reactive: SimResult,
     pub predictive: SimResult,
+    pub conservative: SimResult,
+    pub aggressive: SimResult,
 }
 
 impl SimComparison {
-    pub fn miss_reduction(&self) -> u64 {
-        self.baseline.misses.saturating_sub(self.predictive.misses)
+    pub fn result(&self, strategy: SimStrategy) -> &SimResult {
+        match strategy {
+            SimStrategy::Baseline => &self.baseline,
+            SimStrategy::Reactive => &self.reactive,
+            SimStrategy::Predictive => &self.predictive,
+            SimStrategy::Conservative => &self.conservative,
+            SimStrategy::Aggressive => &self.aggressive,
+        }
     }
 
-    pub fn reread_byte_reduction(&self) -> u64 {
-        self.baseline
-            .reread_bytes
-            .saturating_sub(self.predictive.reread_bytes)
+    pub fn net_benefit(&self, strategy: SimStrategy) -> i128 {
+        self.result(strategy).net_benefit_ns
     }
 }
 
@@ -80,195 +181,421 @@ pub fn simulate(scenario: &SimScenario) -> Result<SimComparison, String> {
     if scenario.staging_window_bytes > scenario.budget_bytes {
         return Err("staging window exceeds simulation budget".to_string());
     }
-    let config = PredictionConfig {
-        enabled: true,
-        min_confidence_bps: scenario.min_confidence_bps,
-        staging_window_bytes: scenario.staging_window_bytes,
-        speculative_budget_bytes: scenario
-            .speculative_budget_bytes
-            .min(scenario.staging_window_bytes),
-        max_in_flight: 1,
-        lookahead: 64,
-    };
-    config.validate().map_err(|error| error.to_string())?;
     let (inventory, profile) = scenario_inputs(scenario)?;
-    let predictions = predict_from_profile(&config, Some(&profile), &inventory, None);
-    let plan = plan_predictions(
-        &config,
-        &predictions,
+    let baseline = run_strategy(scenario, &inventory, &profile, SimStrategy::Baseline, None)?;
+    let reactive = run_strategy(scenario, &inventory, &profile, SimStrategy::Reactive, None)?;
+    let predictive = run_strategy(
+        scenario,
         &inventory,
-        Some(0),
-        Some(scenario.budget_bytes),
-        0,
-        false,
-    );
-    let baseline = run_strategy(scenario, &inventory, &BTreeSet::new(), "baseline")?;
-    let staged: BTreeSet<i32> = plan
-        .stage_keys
-        .iter()
-        .chain(plan.prefetch_keys.iter())
-        .map(|key| key.tensor_index)
-        .collect();
-    let predictive = run_strategy(scenario, &inventory, &staged, "predictive")?;
-
-    let _ = plan.decisions.iter().any(|decision| {
-        decision.action == PredictiveAction::ReleaseAtBoundary
-            || decision.reason == PredictiveReason::ReleaseNotAuthorized
-    });
-    let mut predictive = predictive;
-    predictive.staged_bytes = plan.requested_bytes();
-    predictive.staged_resources = staged.len();
-    predictive.deferred = plan.deferred;
-    predictive.rejected = plan.rejected;
-    predictive.release_authorized = plan.release_authorized;
-    let predicted_names: BTreeSet<&str> = staged
-        .iter()
-        .filter_map(|key| {
-            inventory
-                .resources
-                .iter()
-                .find(|resource| resource.key.tensor_index == *key)
-                .map(|resource| resource.name.as_str())
-        })
-        .collect();
-    let accessed: BTreeSet<&str> = scenario.test_sequence.iter().map(String::as_str).collect();
-    let matched_names: BTreeSet<&str> = predicted_names
-        .iter()
-        .filter(|name| accessed.contains(**name))
-        .copied()
-        .collect();
-    predictive.predicted_resources = predicted_names.len();
-    predictive.matched_resources = matched_names.len();
-    predictive.within_horizon_matches = scenario
-        .test_sequence
-        .iter()
-        .take(scenario.prediction_horizon)
-        .filter(|name| matched_names.contains(name.as_str()))
-        .count();
-    predictive.prediction_precision_bps = (!predicted_names.is_empty())
-        .then(|| ((matched_names.len() * 10_000) / predicted_names.len()) as u16);
-    predictive.prediction_recall_bps =
-        (!accessed.is_empty()).then(|| ((matched_names.len() * 10_000) / accessed.len()) as u16);
-    let mut wasted = 0u64;
-    for key in &staged {
-        if let Some(resource) = inventory
-            .resources
-            .iter()
-            .find(|r| r.key.tensor_index == *key)
-        {
-            if !accessed.contains(resource.name.as_str()) {
-                wasted = wasted.saturating_add(resource.page_bytes);
-            }
-        }
-    }
-    predictive.wasted_staged_bytes = wasted;
-    Ok(SimComparison {
+        &profile,
+        SimStrategy::Predictive,
+        None,
+    )?;
+    let conservative = run_strategy(
+        scenario,
+        &inventory,
+        &profile,
+        SimStrategy::Conservative,
+        None,
+    )?;
+    let aggressive = run_strategy(
+        scenario,
+        &inventory,
+        &profile,
+        SimStrategy::Aggressive,
+        None,
+    )?;
+    let baseline_total = baseline.total_end_to_end_ns;
+    let mut comparison = SimComparison {
+        scenario: scenario.name.clone(),
         baseline,
+        reactive,
         predictive,
-    })
+        conservative,
+        aggressive,
+    };
+    for strategy in [
+        SimStrategy::Reactive,
+        SimStrategy::Predictive,
+        SimStrategy::Conservative,
+        SimStrategy::Aggressive,
+    ] {
+        let result = match strategy {
+            SimStrategy::Baseline => &mut comparison.baseline,
+            SimStrategy::Reactive => &mut comparison.reactive,
+            SimStrategy::Predictive => &mut comparison.predictive,
+            SimStrategy::Conservative => &mut comparison.conservative,
+            SimStrategy::Aggressive => &mut comparison.aggressive,
+        };
+        result.net_benefit_ns = baseline_total as i128 - result.total_end_to_end_ns as i128;
+        result.improved = result.benefit_known && result.net_benefit_ns > 0;
+    }
+    Ok(comparison)
 }
 
 fn run_strategy(
     scenario: &SimScenario,
     inventory: &ResourceInventory,
-    prestaged: &BTreeSet<i32>,
-    strategy: &str,
+    profile: &ExecutionProfile,
+    strategy: SimStrategy,
+    _unused: Option<()>,
 ) -> Result<SimResult, String> {
-    let sizes: BTreeMap<&str, u64> = inventory
+    let (config, observe) = strategy_config(scenario, strategy);
+    let predictions = if config.enabled {
+        predict_from_profile(&config, Some(profile), inventory, None)
+    } else {
+        crate::prediction::PredictionSet::empty(
+            inventory.model_id.clone(),
+            inventory.generation,
+            "prediction disabled",
+        )
+    };
+    let resident_before = scenario
         .resources
         .iter()
-        .map(|resource| (resource.name.as_str(), resource.page_bytes))
+        .filter(|resource| resource.initial == SimInitialResidency::Resident)
+        .map(|resource| resource.bytes)
+        .sum();
+    let initial_nonresident = scenario
+        .resources
+        .iter()
+        .filter(|resource| resource.initial == SimInitialResidency::NonResident)
+        .map(|resource| resource.bytes)
+        .sum();
+    let initial_unknown = scenario
+        .resources
+        .iter()
+        .filter(|resource| resource.initial == SimInitialResidency::Unknown)
+        .map(|resource| resource.bytes)
+        .sum();
+    let plan = if config.enabled {
+        plan_predictions(
+            &config,
+            &predictions,
+            inventory,
+            Some(resident_before),
+            Some(scenario.budget_bytes),
+            0,
+            false,
+        )
+    } else {
+        Default::default()
+    };
+    let selected_names: BTreeSet<String> = plan
+        .decisions
+        .iter()
+        .filter(|decision| {
+            matches!(
+                decision.action,
+                PredictiveAction::StageNow | PredictiveAction::Prefetch
+            )
+        })
+        .map(|decision| decision.name.clone())
         .collect();
-    let mut resident = BTreeMap::<String, u64>::new();
-    let mut resident_bytes = 0u64;
-    let mut hits = 0u64;
-    let mut misses = 0u64;
-    let mut reread = 0u64;
-    let mut staged_bytes = 0u64;
-    let mut peak = 0u64;
-    let mut violations = 0u64;
+    let predicted_names: BTreeSet<String> = predictions
+        .predictions
+        .iter()
+        .map(|prediction| prediction.name.clone())
+        .collect();
+    let test_names: BTreeSet<String> = scenario.test_sequence.iter().cloned().collect();
+    let correct = predicted_names.intersection(&test_names).count();
+    let false_positives = predicted_names.difference(&test_names).count();
+    let false_negatives = test_names.difference(&predicted_names).count();
+    let precision_bps =
+        (!predicted_names.is_empty()).then(|| ((correct * 10_000) / predicted_names.len()) as u16);
+    let recall_bps =
+        (!test_names.is_empty()).then(|| ((correct * 10_000) / test_names.len()) as u16);
 
-    for key in prestaged {
-        let Some(resource) = inventory
-            .resources
-            .iter()
-            .find(|r| r.key.tensor_index == *key)
-        else {
-            continue;
-        };
-        let bytes = resource.page_bytes;
-        if bytes == 0 || resident.contains_key(&resource.name) {
-            continue;
+    let mut resident: BTreeMap<String, (u64, usize, bool)> = BTreeMap::new();
+    let mut resident_bytes = 0u64;
+    let mut peak = 0u64;
+    let mut budget_violations = 0u64;
+    let mut staged_bytes = 0u64;
+    let mut redundant_staged_bytes = 0u64;
+    let mut newly_resident_bytes = 0u64;
+    let mut ineffective_staged_bytes = 0u64;
+    let mut deferred_bytes = 0u64;
+    let mut rejected_bytes = 0u64;
+    let mut staged_pending: BTreeSet<String> = BTreeSet::new();
+    let mut evicted_before_access_bytes = 0u64;
+    let mut reread_bytes = 0u64;
+    let mut benefit_known =
+        initial_unknown == 0 && scenario.prefetch_effect != SimPrefetchEffect::Unknown;
+    let mut notes = Vec::new();
+
+    for resource in &scenario.resources {
+        if resource.initial == SimInitialResidency::Resident {
+            if resident_bytes.saturating_add(resource.bytes) <= scenario.budget_bytes {
+                resident.insert(resource.name.clone(), (resource.bytes, 0, false));
+                resident_bytes = resident_bytes.saturating_add(resource.bytes);
+            } else {
+                budget_violations = budget_violations.saturating_add(1);
+                notes.push(format!(
+                    "initial resident resource {} exceeds budget",
+                    resource.name
+                ));
+            }
         }
-        if resident_bytes.saturating_add(bytes) > scenario.budget_bytes {
-            continue;
-        }
-        resident.insert(resource.name.clone(), bytes);
-        resident_bytes = resident_bytes.saturating_add(bytes);
-        staged_bytes = staged_bytes.saturating_add(bytes);
-        peak = peak.max(resident_bytes);
     }
 
+    if scenario.prefetch_timing == SimPrefetchTiming::OnTime {
+        for name in &selected_names {
+            let Some(resource) = scenario
+                .resources
+                .iter()
+                .find(|resource| resource.name == *name)
+            else {
+                continue;
+            };
+            if resident.contains_key(name) {
+                redundant_staged_bytes = redundant_staged_bytes.saturating_add(resource.bytes);
+                staged_bytes = staged_bytes.saturating_add(resource.bytes);
+                continue;
+            }
+            match scenario.prefetch_effect {
+                SimPrefetchEffect::MakesResident => {
+                    if resident_bytes.saturating_add(resource.bytes) > scenario.budget_bytes {
+                        deferred_bytes = deferred_bytes.saturating_add(resource.bytes);
+                    } else {
+                        resident.insert(name.clone(), (resource.bytes, 0, true));
+                        resident_bytes = resident_bytes.saturating_add(resource.bytes);
+                        peak = peak.max(resident_bytes);
+                        staged_bytes = staged_bytes.saturating_add(resource.bytes);
+                        newly_resident_bytes = newly_resident_bytes.saturating_add(resource.bytes);
+                        staged_pending.insert(name.clone());
+                    }
+                }
+                SimPrefetchEffect::NoEffect => {
+                    staged_bytes = staged_bytes.saturating_add(resource.bytes);
+                    ineffective_staged_bytes =
+                        ineffective_staged_bytes.saturating_add(resource.bytes);
+                }
+                SimPrefetchEffect::Fail => {
+                    rejected_bytes = rejected_bytes.saturating_add(resource.bytes);
+                    benefit_known = false;
+                }
+                SimPrefetchEffect::Unknown => {
+                    staged_bytes = staged_bytes.saturating_add(resource.bytes);
+                    ineffective_staged_bytes =
+                        ineffective_staged_bytes.saturating_add(resource.bytes);
+                    benefit_known = false;
+                }
+            }
+        }
+    }
+
+    let mut last_order = 0usize;
     for name in &scenario.test_sequence {
-        let Some(&bytes) = sizes.get(name.as_str()) else {
+        last_order += 1;
+        let Some(resource) = scenario
+            .resources
+            .iter()
+            .find(|resource| resource.name == *name)
+        else {
             return Err(format!(
                 "simulation sequence references unknown resource {name}"
             ));
         };
         if resident.contains_key(name) {
-            hits += 1;
+            staged_pending.remove(name);
+            if let Some(entry) = resident.get_mut(name) {
+                entry.1 = last_order;
+            }
             continue;
         }
-        misses += 1;
-        reread = reread.saturating_add(bytes);
-        if resident_bytes.saturating_add(bytes) > scenario.budget_bytes {
-            // Deterministic LRU-ish eviction by lexicographic key is not
-            // sufficient; evict the lexicographically first resident until fit.
-            while resident_bytes.saturating_add(bytes) > scenario.budget_bytes {
-                let Some(oldest) = resident.keys().next().cloned() else {
-                    break;
-                };
-                if let Some(old) = resident.remove(&oldest) {
-                    resident_bytes = resident_bytes.saturating_sub(old);
+        // Reactive load of the currently accessed resource. Evict staged/other
+        // pages only when the budget requires it.
+        while resident_bytes.saturating_add(resource.bytes) > scenario.budget_bytes {
+            let victim = resident
+                .iter()
+                .min_by_key(|(_, (_, order, _))| *order)
+                .map(|(name, _)| name.clone());
+            let Some(victim) = victim else {
+                break;
+            };
+            if let Some((bytes, _, _)) = resident.remove(&victim) {
+                resident_bytes = resident_bytes.saturating_sub(bytes);
+                if staged_pending.remove(&victim) {
+                    evicted_before_access_bytes = evicted_before_access_bytes.saturating_add(bytes);
                 }
             }
         }
-        if resident_bytes.saturating_add(bytes) > scenario.budget_bytes {
-            violations = violations.saturating_add(1);
+        reread_bytes = reread_bytes.saturating_add(resource.bytes);
+        if resident_bytes.saturating_add(resource.bytes) > scenario.budget_bytes {
+            budget_violations = budget_violations.saturating_add(1);
             continue;
         }
-        resident.insert(name.clone(), bytes);
-        resident_bytes = resident_bytes.saturating_add(bytes);
+        resident.insert(name.clone(), (resource.bytes, last_order, false));
+        resident_bytes = resident_bytes.saturating_add(resource.bytes);
         peak = peak.max(resident_bytes);
     }
+    let wasted_staged_bytes = selected_names
+        .iter()
+        .filter(|name| !test_names.contains(*name))
+        .filter_map(|name| {
+            scenario
+                .resources
+                .iter()
+                .find(|resource| resource.name == *name)
+                .map(|resource| resource.bytes)
+        })
+        .sum();
+    if scenario.prefetch_timing == SimPrefetchTiming::Late && !selected_names.is_empty() {
+        staged_bytes = selected_names
+            .iter()
+            .filter_map(|name| {
+                scenario
+                    .resources
+                    .iter()
+                    .find(|resource| resource.name == *name)
+            })
+            .map(|resource| resource.bytes)
+            .sum();
+        notes.push("prefetch arrived after the evaluation accesses".to_string());
+    }
+    if initial_unknown > 0 {
+        notes.push(
+            "initial unknown residency treated as nonresident for cost, not as proof".to_string(),
+        );
+    }
+    if scenario.prefetch_effect == SimPrefetchEffect::Unknown {
+        notes.push("prefetch residency outcome is unknown".to_string());
+    }
+    let total_pages = scenario
+        .resources
+        .iter()
+        .map(|resource| resource.bytes.div_ceil(4096))
+        .sum::<u64>();
+    let prediction_cost_ns = if config.enabled {
+        scenario.costs.prediction_ns
+    } else {
+        0
+    };
+    let planning_cost_ns = if config.enabled {
+        scenario.costs.planning_ns
+    } else {
+        0
+    };
+    let observation_cost_ns = if observe {
+        scenario
+            .costs
+            .observation_ns_per_page
+            .saturating_mul(total_pages)
+    } else {
+        0
+    };
+    let staging_cost_ns = if staged_bytes > 0 || deferred_bytes > 0 || rejected_bytes > 0 {
+        scenario.costs.staging_ns
+    } else {
+        0
+    };
+    let reread_cost_ns = scenario
+        .costs
+        .reread_ns_per_byte
+        .saturating_mul(reread_bytes);
+    let execution_cost_ns = scenario
+        .costs
+        .execution_ns_per_access
+        .saturating_mul(scenario.test_sequence.len() as u64);
+    let total_end_to_end_ns = scenario
+        .costs
+        .setup_ns
+        .saturating_add(prediction_cost_ns)
+        .saturating_add(planning_cost_ns)
+        .saturating_add(observation_cost_ns)
+        .saturating_add(staging_cost_ns)
+        .saturating_add(reread_cost_ns)
+        .saturating_add(execution_cost_ns)
+        .saturating_add(scenario.costs.synchronization_ns);
     Ok(SimResult {
         scenario: scenario.name.clone(),
-        strategy: strategy.to_string(),
-        hits,
-        misses,
-        reread_bytes: reread,
+        strategy: strategy.label(),
+        initial_resident_bytes: resident_before,
+        initial_nonresident_bytes: initial_nonresident,
+        initial_unknown_bytes: initial_unknown,
+        predicted_resources: predicted_names.len(),
+        correct_predictions: correct,
+        false_positives,
+        false_negatives,
+        precision_bps,
+        recall_bps,
         staged_bytes,
-        wasted_staged_bytes: 0,
+        newly_resident_bytes,
+        redundant_staged_bytes,
+        ineffective_staged_bytes,
+        wasted_staged_bytes,
+        deferred_bytes,
+        rejected_bytes,
+        evicted_before_access_bytes,
+        reread_bytes,
         peak_resident_bytes: peak,
-        budget_violations: violations,
-        staged_resources: 0,
-        predicted_resources: 0,
-        matched_resources: 0,
-        within_horizon_matches: 0,
-        prediction_precision_bps: None,
-        prediction_recall_bps: None,
-        deferred: 0,
-        rejected: 0,
-        release_authorized: false,
+        budget_violations,
+        prediction_cost_ns,
+        planning_cost_ns,
+        observation_cost_ns,
+        staging_cost_ns,
+        reread_cost_ns,
+        execution_cost_ns,
+        synchronization_cost_ns: scenario.costs.synchronization_ns,
+        total_end_to_end_ns,
+        net_benefit_ns: 0,
+        improved: false,
+        benefit_known,
+        notes,
     })
+}
+
+fn strategy_config(scenario: &SimScenario, strategy: SimStrategy) -> (PredictionConfig, bool) {
+    match strategy {
+        SimStrategy::Baseline | SimStrategy::Reactive => (PredictionConfig::default(), false),
+        SimStrategy::Predictive => (
+            PredictionConfig {
+                enabled: true,
+                min_confidence_bps: scenario.min_confidence_bps,
+                staging_window_bytes: scenario.staging_window_bytes,
+                speculative_budget_bytes: scenario.speculative_budget_bytes,
+                max_in_flight: 1,
+                lookahead: scenario.prediction_horizon,
+            },
+            scenario.observe,
+        ),
+        SimStrategy::Conservative => (
+            PredictionConfig {
+                enabled: true,
+                min_confidence_bps: 7_500,
+                staging_window_bytes: scenario.staging_window_bytes / 2,
+                speculative_budget_bytes: 0,
+                max_in_flight: 1,
+                lookahead: scenario.prediction_horizon,
+            },
+            scenario.observe,
+        ),
+        SimStrategy::Aggressive => (
+            PredictionConfig {
+                enabled: true,
+                min_confidence_bps: 2_500,
+                staging_window_bytes: scenario.staging_window_bytes,
+                speculative_budget_bytes: scenario.speculative_budget_bytes,
+                max_in_flight: 1,
+                lookahead: scenario.prediction_horizon,
+            },
+            scenario.observe,
+        ),
+    }
 }
 
 fn scenario_inputs(
     scenario: &SimScenario,
 ) -> Result<(ResourceInventory, ExecutionProfile), String> {
     let mut mappings = Vec::new();
-    let mut offset = 0u64;
+    let mut offsets: BTreeMap<u32, u64> = BTreeMap::new();
     for (index, resource) in scenario.resources.iter().enumerate() {
+        let group = resource.overlap_group.unwrap_or(index as u32);
+        let offset = if resource.overlap_group.is_some() {
+            0
+        } else {
+            *offsets.get(&group).unwrap_or(&0)
+        };
         let size = if resource.known_size {
             resource.bytes
         } else {
@@ -284,7 +611,7 @@ fn scenario_inputs(
         mappings.push(TensorMappingInfo {
             name: resource.name.clone(),
             file_backed: resource.file_backed,
-            mapping_index: resource.file_backed.then_some(index as u32),
+            mapping_index: resource.file_backed.then_some(group),
             mapping_size: offset.saturating_add(size).max(1),
             offset,
             size,
@@ -292,7 +619,9 @@ fn scenario_inputs(
             page_start,
             page_end,
         });
-        offset = offset.saturating_add(size.max(1));
+        if size > 0 && resource.overlap_group.is_none() {
+            offsets.insert(group, offset.saturating_add(size.max(1)));
+        }
     }
     let inventory = ResourceInventory::from_tensor_mappings(
         ModelId(scenario.name.clone()),
@@ -301,7 +630,7 @@ fn scenario_inputs(
     )
     .map_err(|error| error.to_string())?;
     let mut profile = ExecutionProfile::new(ModelId(scenario.name.clone()), ModelGeneration(1));
-    profile.complete_observations = 2;
+    profile.complete_observations = 1;
     for (order, name) in scenario.training_sequence.iter().enumerate() {
         let access = profile.access.entry(name.clone()).or_insert(AccessPattern {
             first_order: order,
@@ -315,74 +644,390 @@ fn scenario_inputs(
     Ok((inventory, profile))
 }
 
+/// Required deterministic scenario family. `budget` and `window` are explicit
+/// so callers can compare the same initial conditions across strategies.
+pub fn standard_scenarios(budget_bytes: u64, staging_window_bytes: u64) -> Vec<SimScenario> {
+    let base =
+        |name: &str, resources: Vec<SimResource>, train: &[&str], test: &[&str]| SimScenario {
+            name: name.to_string(),
+            budget_bytes,
+            staging_window_bytes,
+            speculative_budget_bytes: staging_window_bytes,
+            min_confidence_bps: 5_000,
+            prediction_horizon: 8,
+            resources,
+            training_sequence: train.iter().map(|name| (*name).to_string()).collect(),
+            test_sequence: test.iter().map(|name| (*name).to_string()).collect(),
+            prefetch_effect: SimPrefetchEffect::MakesResident,
+            prefetch_timing: SimPrefetchTiming::OnTime,
+            observe: false,
+            costs: SimCosts::default(),
+        };
+    let r = |name: &str, initial| SimResource {
+        name: name.to_string(),
+        bytes: 4096,
+        file_backed: true,
+        known_size: true,
+        initial,
+        overlap_group: None,
+    };
+    let mut result = vec![
+        base(
+            "useful",
+            vec![r("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        ),
+        base(
+            "already-resident",
+            vec![r("a", SimInitialResidency::Resident)],
+            &["a"],
+            &["a"],
+        ),
+        base(
+            "no-residency-effect",
+            vec![r("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        ),
+        base(
+            "predicted-never-accessed",
+            vec![r("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &[],
+        ),
+        base(
+            "incorrect-prediction",
+            vec![
+                r("a", SimInitialResidency::NonResident),
+                r("b", SimInitialResidency::NonResident),
+            ],
+            &["a"],
+            &["b"],
+        ),
+        base(
+            "incorrect-already-resident",
+            vec![
+                r("a", SimInitialResidency::Resident),
+                r("b", SimInitialResidency::NonResident),
+            ],
+            &["a"],
+            &["b"],
+        ),
+        base(
+            "late-prefetch",
+            vec![r("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        ),
+        base(
+            "staging-rejected",
+            vec![r("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        ),
+        base(
+            "deferred-then-accessed",
+            vec![
+                r("a", SimInitialResidency::NonResident),
+                r("b", SimInitialResidency::NonResident),
+            ],
+            &["a", "b"],
+            &["b", "a"],
+        ),
+        base(
+            "evicted-before-access",
+            vec![
+                r("a", SimInitialResidency::NonResident),
+                r("b", SimInitialResidency::NonResident),
+            ],
+            &["a"],
+            &["b", "a"],
+        ),
+        base(
+            "unknown-initial",
+            vec![r("a", SimInitialResidency::Unknown)],
+            &["a"],
+            &["a"],
+        ),
+        base(
+            "unknown-effect",
+            vec![r("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        ),
+        base(
+            "overlapping-duplicate",
+            vec![
+                SimResource {
+                    overlap_group: Some(0),
+                    ..r("a", SimInitialResidency::NonResident)
+                },
+                SimResource {
+                    overlap_group: Some(0),
+                    ..r("b", SimInitialResidency::NonResident)
+                },
+            ],
+            &["a", "b"],
+            &["a", "b"],
+        ),
+        base(
+            "constrained-competition",
+            vec![
+                r("a", SimInitialResidency::NonResident),
+                r("b", SimInitialResidency::NonResident),
+                r("c", SimInitialResidency::NonResident),
+            ],
+            &["a", "b", "c"],
+            &["a", "b", "c"],
+        ),
+        base(
+            "observation-overhead",
+            vec![r("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        ),
+        base(
+            "prediction-cost-worse",
+            vec![r("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        ),
+    ];
+    // Scenario-specific conditions.
+    result[2].prefetch_effect = SimPrefetchEffect::NoEffect;
+    result[6].prefetch_timing = SimPrefetchTiming::Late;
+    result[7].staging_window_bytes = 0;
+    result[7].speculative_budget_bytes = 0;
+    result[8].staging_window_bytes = 4096;
+    result[8].speculative_budget_bytes = 0;
+    result[9].budget_bytes = 4096;
+    result[9].staging_window_bytes = 4096;
+    result[9].speculative_budget_bytes = 0;
+    result[11].prefetch_effect = SimPrefetchEffect::Unknown;
+    result[13].budget_bytes = 4096;
+    result[13].staging_window_bytes = 4096;
+    result[13].speculative_budget_bytes = 0;
+    result[14].observe = true;
+    result[14].costs.observation_ns_per_page = 1_000_000;
+    result[15].costs.prediction_ns = 1_000_000;
+    result[15].costs.staging_ns = 1_000_000;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scenario(wrong: bool) -> SimScenario {
-        let names = ["a", "b", "c", "d", "e"];
+    fn resource(name: &str, initial: SimInitialResidency) -> SimResource {
+        SimResource {
+            name: name.to_string(),
+            bytes: 4096,
+            file_backed: true,
+            known_size: true,
+            initial,
+            overlap_group: None,
+        }
+    }
+
+    fn scenario(
+        name: &str,
+        resources: Vec<SimResource>,
+        initial_sequence: &[&str],
+        test_sequence: &[&str],
+    ) -> SimScenario {
         SimScenario {
-            name: if wrong { "wrong" } else { "correct" }.to_string(),
-            budget_bytes: 12 * 1024,
-            staging_window_bytes: 8 * 1024,
-            speculative_budget_bytes: 8 * 1024,
+            name: name.to_string(),
+            budget_bytes: 8192,
+            staging_window_bytes: 8192,
+            speculative_budget_bytes: 8192,
             min_confidence_bps: 5_000,
             prediction_horizon: 4,
-            resources: names
+            resources,
+            training_sequence: initial_sequence
                 .iter()
-                .map(|name| SimResource {
-                    name: (*name).to_string(),
-                    bytes: 4096,
-                    file_backed: true,
-                    known_size: true,
-                })
+                .map(|name| (*name).to_string())
                 .collect(),
-            training_sequence: names.iter().map(|name| (*name).to_string()).collect(),
-            test_sequence: if wrong {
-                vec!["e".to_string()]
-            } else {
-                names.iter().map(|name| (*name).to_string()).collect()
-            },
+            test_sequence: test_sequence
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            prefetch_effect: SimPrefetchEffect::MakesResident,
+            prefetch_timing: SimPrefetchTiming::OnTime,
+            observe: false,
+            costs: SimCosts::default(),
         }
     }
 
     #[test]
-    fn predictive_staging_reduces_simulated_rereads() {
-        let result = simulate(&scenario(false)).expect("simulation");
-        assert!(result.predictive.hits > result.baseline.hits);
-        assert!(result.predictive.predicted_resources > 0);
-        assert!(result.predictive.matched_resources > 0);
-        assert_eq!(result.predictive.prediction_precision_bps, Some(10_000));
-        assert!(result.predictive.prediction_recall_bps.is_some());
-        assert!(result.miss_reduction() > 0);
-        assert!(result.reread_byte_reduction() > 0);
-        assert_eq!(result.predictive.budget_violations, 0);
-        assert!(!result.predictive.release_authorized);
-        assert!(result.predictive.peak_resident_bytes <= 12 * 1024);
+    fn useful_prefetch_beats_reactive_but_prediction_precision_is_not_benefit() {
+        let result = simulate(&scenario(
+            "useful",
+            vec![resource("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        ))
+        .expect("simulation");
+        assert!(result.predictive.newly_resident_bytes > 0);
+        assert!(result.predictive.redundant_staged_bytes == 0);
+        assert_eq!(result.predictive.correct_predictions, 1);
+        assert!(result.predictive.net_benefit_ns > 0);
+        assert!(result.predictive.improved);
+        assert_eq!(result.baseline.budget_violations, 0);
     }
 
     #[test]
-    fn wrong_prediction_is_bounded_and_wasted_bytes_are_reported() {
-        let result = simulate(&scenario(true)).expect("simulation");
-        assert_eq!(result.predictive.budget_violations, 0);
-        assert!(result.predictive.wasted_staged_bytes > 0);
-        assert_eq!(result.predictive.matched_resources, 0);
-        assert_eq!(result.predictive.prediction_precision_bps, Some(0));
-        assert!(!result.predictive.release_authorized);
+    fn already_resident_prefetch_is_redundant() {
+        let result = simulate(&scenario(
+            "redundant",
+            vec![resource("a", SimInitialResidency::Resident)],
+            &["a"],
+            &["a"],
+        ))
+        .expect("simulation");
+        assert_eq!(result.predictive.redundant_staged_bytes, 4096);
+        assert_eq!(result.predictive.newly_resident_bytes, 0);
+        assert!(!result.predictive.improved);
     }
 
     #[test]
-    fn zero_budget_is_rejected() {
-        let mut scenario = scenario(false);
-        scenario.budget_bytes = 0;
-        assert!(simulate(&scenario).is_err());
-    }
-
-    #[test]
-    fn unknown_size_resources_are_not_staged() {
-        let mut scenario = scenario(false);
-        scenario.resources[0].known_size = false;
+    fn no_effect_staging_is_ineffective() {
+        let mut scenario = scenario(
+            "no-effect",
+            vec![resource("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        );
+        scenario.prefetch_effect = SimPrefetchEffect::NoEffect;
         let result = simulate(&scenario).expect("simulation");
+        assert_eq!(result.predictive.ineffective_staged_bytes, 4096);
+        assert_eq!(result.predictive.newly_resident_bytes, 0);
+        assert!(!result.predictive.improved);
+    }
+
+    #[test]
+    fn unknown_residency_is_not_counted_as_a_benefit() {
+        let mut scenario = scenario(
+            "unknown",
+            vec![resource("a", SimInitialResidency::Unknown)],
+            &["a"],
+            &["a"],
+        );
+        scenario.prefetch_effect = SimPrefetchEffect::Unknown;
+        let result = simulate(&scenario).expect("simulation");
+        assert_eq!(result.predictive.initial_unknown_bytes, 4096);
+        assert!(!result.predictive.benefit_known);
+        assert!(!result.predictive.improved);
+    }
+
+    #[test]
+    fn wrong_prediction_wastes_staging() {
+        let result = simulate(&scenario(
+            "wrong",
+            vec![resource("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &[],
+        ))
+        .expect("simulation");
+        assert_eq!(result.predictive.false_positives, 1);
+        assert!(result.predictive.wasted_staged_bytes > 0);
+        assert!(!result.predictive.improved);
+    }
+
+    #[test]
+    fn late_prefetch_does_not_help() {
+        let mut scenario = scenario(
+            "late",
+            vec![resource("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        );
+        scenario.prefetch_timing = SimPrefetchTiming::Late;
+        let result = simulate(&scenario).expect("simulation");
+        assert_eq!(result.predictive.newly_resident_bytes, 0);
+        assert!(!result.predictive.improved);
+    }
+
+    #[test]
+    fn staging_can_be_rejected_by_budget() {
+        let mut scenario = scenario(
+            "rejected",
+            vec![resource("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        );
+        scenario.staging_window_bytes = 0;
+        scenario.speculative_budget_bytes = 0;
+        let result = simulate(&scenario).expect("simulation");
+        assert_eq!(result.predictive.newly_resident_bytes, 0);
+        assert!(!result.predictive.improved);
+    }
+
+    #[test]
+    fn observation_overhead_can_exceed_benefit() {
+        let mut scenario = scenario(
+            "observation",
+            vec![resource("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        );
+        scenario.observe = true;
+        scenario.costs.observation_ns_per_page = 1_000_000;
+        let result = simulate(&scenario).expect("simulation");
+        assert!(result.predictive.observation_cost_ns > 0);
+        assert!(!result.predictive.improved);
+    }
+
+    #[test]
+    fn standard_scenarios_are_deterministic_and_budget_safe() {
+        let scenarios = standard_scenarios(12 * 1024, 8 * 1024);
+        assert_eq!(scenarios.len(), 16);
+        for scenario in scenarios {
+            let first = simulate(&scenario).expect("simulation");
+            let second = simulate(&scenario).expect("repeat");
+            assert_eq!(first, second, "nondeterministic {}", scenario.name);
+            for strategy in [
+                SimStrategy::Baseline,
+                SimStrategy::Reactive,
+                SimStrategy::Predictive,
+                SimStrategy::Conservative,
+                SimStrategy::Aggressive,
+            ] {
+                let result = first.result(strategy);
+                assert_eq!(
+                    result.budget_violations, 0,
+                    "{} {}",
+                    scenario.name, result.strategy
+                );
+                assert!(result.peak_resident_bytes <= scenario.budget_bytes);
+                assert!(!result.improved || result.benefit_known);
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_duplicate_is_staged_once_and_budget_is_respected() {
+        let scenarios = standard_scenarios(12 * 1024, 8 * 1024);
+        let overlap = scenarios
+            .iter()
+            .find(|scenario| scenario.name == "overlapping-duplicate")
+            .expect("overlap scenario");
+        let result = simulate(overlap).expect("simulation");
+        assert_eq!(result.predictive.predicted_resources, 2);
+        assert!(result.predictive.staged_bytes <= 4096);
         assert_eq!(result.predictive.budget_violations, 0);
+    }
+
+    #[test]
+    fn all_strategies_are_deterministic() {
+        let scenario = scenario(
+            "determinism",
+            vec![resource("a", SimInitialResidency::NonResident)],
+            &["a"],
+            &["a"],
+        );
+        let first = simulate(&scenario).expect("first");
+        let second = simulate(&scenario).expect("second");
+        assert_eq!(first, second);
     }
 }
