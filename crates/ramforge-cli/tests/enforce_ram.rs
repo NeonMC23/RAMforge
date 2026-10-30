@@ -31,6 +31,13 @@ fn help_lists_memory_control_flags() {
         "--residency-report-json",
         "--residency-profile-load",
         "--residency-profile-save",
+        "--prediction",
+        "--prediction-min-confidence",
+        "--prediction-window",
+        "--prediction-speculative",
+        "--prediction-max-inflight",
+        "--prediction-history-load",
+        "--prediction-history-save",
         "--residency-prefetch",
         "--graph-trace",
         "--graph-trace-events",
@@ -79,6 +86,68 @@ fn profile_command_inspects_versioned_profile() {
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["entries"], 1);
     assert_eq!(value["model_identity_validated"], false);
+}
+
+#[test]
+fn prediction_requires_profile_and_rejects_bad_bounds() {
+    let output = ramforge()
+        .args([
+            "run",
+            "/nonexistent/model.gguf",
+            "--ram",
+            "64M",
+            "--prompt",
+            "hi",
+            "--backend",
+            "forgecore",
+            "--prediction",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("--prediction requires --residency-profile-load"));
+
+    let output = ramforge()
+        .args([
+            "run",
+            "/nonexistent/model.gguf",
+            "--ram",
+            "64M",
+            "--prompt",
+            "hi",
+            "--backend",
+            "forgecore",
+            "--prediction",
+            "--residency-profile-load",
+            "/tmp/profile.json",
+            "--prediction-min-confidence",
+            "101",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("min confidence must be between 0 and 10000"));
+}
+
+#[test]
+fn simulate_command_is_deterministic_and_budget_safe() {
+    let first = ramforge()
+        .args(["simulate", "--budget", "12K", "--window", "8K", "--json"])
+        .output()
+        .unwrap();
+    let second = ramforge()
+        .args(["simulate", "--budget", "12K", "--window", "8K", "--json"])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    assert_eq!(first.stdout, second.stdout);
+    let value: serde_json::Value = serde_json::from_slice(&first.stdout).expect("simulation JSON");
+    assert_eq!(value["simulation_only"], true);
+    assert_eq!(value["predictive"]["budget_violations"], 0);
+    assert_eq!(value["predictive"]["release_authorized"], false);
+    assert!(value["miss_reduction"].as_u64().unwrap() > 0);
 }
 
 #[test]
@@ -667,6 +736,123 @@ fn profile_save_then_validate_has_matching_model_identity() {
     let value: serde_json::Value = serde_json::from_str(&stdout).expect("validate JSON");
     assert_eq!(value["valid"], true);
     assert_eq!(value["model_identity_validated"], true);
+}
+
+#[test]
+#[ignore = "requires cgroup v2 delegation, a real model, and libggml"]
+fn prediction_staging_is_bounded_and_reports_feedback() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let profile_path = std::env::temp_dir().join(format!(
+        "ramforge-prediction-profile-{}.json",
+        std::process::id()
+    ));
+    let history_path = std::env::temp_dir().join(format!(
+        "ramforge-prediction-history-{}.json",
+        std::process::id()
+    ));
+    let report_path = std::env::temp_dir().join(format!(
+        "ramforge-prediction-report-{}.json",
+        std::process::id()
+    ));
+    let save = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--graph-trace",
+            "--graph-trace-events",
+            "16384",
+            "--residency-policy",
+            "reuse-aware",
+            "--residency-target",
+            "128M",
+            "--residency-profile-save",
+            profile_path.to_str().unwrap(),
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        save.status.success(),
+        "profile save failed: {}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+
+    let output = ramforge()
+        .args([
+            "run",
+            &model,
+            "--ram",
+            "192M",
+            "--enforce-ram",
+            "--ctx",
+            "256",
+            "--no-repack",
+            "--graph-trace",
+            "--graph-trace-events",
+            "16384",
+            "--residency-policy",
+            "observe",
+            "--residency-target",
+            "128M",
+            "--residency-profile-load",
+            profile_path.to_str().unwrap(),
+            "--prediction",
+            "--prediction-min-confidence",
+            "40",
+            "--prediction-window",
+            "64M",
+            "--prediction-speculative",
+            "16M",
+            "--prediction-history-save",
+            history_path.to_str().unwrap(),
+            "--residency-report-json",
+            report_path.to_str().unwrap(),
+            "--prompt",
+            "The capital of France is",
+            "--max-tokens",
+            "1",
+            "--temperature",
+            "0",
+            "--backend",
+            "forgecore",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&report_path).unwrap_or_else(|_| panic!("missing report: {stderr}")),
+    )
+    .expect("prediction report JSON");
+    let _ = std::fs::remove_file(&profile_path);
+    let _ = std::fs::remove_file(&history_path);
+    let _ = std::fs::remove_file(&report_path);
+    assert!(output.status.success(), "prediction run failed: {stderr}");
+    let prediction = &report["prediction"];
+    assert_eq!(prediction["source"], "Profile");
+    assert!(prediction["counts"]["predictions"].as_u64().unwrap() > 0);
+    let requested = prediction["plan"]["requested_bytes"].as_u64().unwrap();
+    assert!(requested <= 64 * 1024 * 1024);
+    assert_eq!(prediction["plan"]["release_authorized"], false);
+    assert!(
+        prediction["staging"]["native_accepted_bytes"]
+            .as_u64()
+            .unwrap()
+            <= requested
+    );
+    assert!(prediction["history"]["total_predictions"].as_u64().unwrap() > 0);
 }
 
 #[test]

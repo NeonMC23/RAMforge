@@ -41,15 +41,29 @@ ENFORCE_TIMEOUT=${ENFORCE_TIMEOUT:-120}
 GRAPH_TRACE_EVENTS=${GRAPH_TRACE_EVENTS:-16384}
 PROFILE_SAVE=${PROFILE_SAVE:-}
 PROFILE_LOAD=${PROFILE_LOAD:-}
+PREDICTION=${PREDICTION:-0}
+PREDICTION_MIN_CONFIDENCE=${PREDICTION_MIN_CONFIDENCE:-40}
+PREDICTION_WINDOW=${PREDICTION_WINDOW:-64M}
+PREDICTION_SPECULATIVE=${PREDICTION_SPECULATIVE:-16M}
+PREDICTION_HISTORY_LOAD=${PREDICTION_HISTORY_LOAD:-}
+PREDICTION_HISTORY_SAVE=${PREDICTION_HISTORY_SAVE:-}
 OUT=${RAMFORGE_BENCH_OUT:-bench-out}
 BACKEND=${BACKEND:-forgecore}
 POLICIES=${POLICIES:-"off observe conservative memory-bound reuse-aware active"}
-PREFETCH_MODES=${PREFETCH_MODES:-"off on"}
+if [ "$PREDICTION" = "1" ]; then
+  if [ -z "$PROFILE_LOAD" ]; then
+    echo "error: PREDICTION=1 requires PROFILE_LOAD" >&2
+    exit 2
+  fi
+  PREFETCH_MODES=${PREFETCH_MODES:-off}
+else
+  PREFETCH_MODES=${PREFETCH_MODES:-"off on"}
+fi
 mkdir -p "$OUT"
 RESULTS="$OUT/results.tsv"
 
 if [ ! -f "$RESULTS" ]; then
-  printf 'timestamp\tpolicy\tprefetch\trepeat\tstatus\twall_ns\tmodel\tgeneration\tselected\tprofile_used\tprofile_source\tnative_contract\tnative_quiescent\tlifetime_states\testimated_reclaim_bytes\tobserved_mapping_delta_bytes\trss_before\trss_after\tcgroup_before\tcgroup_after\tstaging_requested_bytes\tstaging_native_requested_bytes\tnative_released_bytes\ttrace_complete\tttft_ns\tdecode_ns\ttotal_ns\toutput_fingerprint\tstderr_sha256\n' > "$RESULTS"
+  printf 'timestamp\tpolicy\tprefetch\trepeat\tstatus\twall_ns\tmodel\tgeneration\tselected\tprofile_used\tprofile_source\tnative_contract\tnative_quiescent\tlifetime_states\tprediction_count\tprediction_staged\tprediction_requested_bytes\tprediction_accepted_bytes\tprediction_hits\tprediction_misses\testimated_reclaim_bytes\tobserved_mapping_delta_bytes\trss_before\trss_after\tcgroup_before\tcgroup_after\tstaging_requested_bytes\tstaging_native_requested_bytes\tnative_released_bytes\ttrace_complete\tttft_ns\tdecode_ns\ttotal_ns\toutput_fingerprint\tstderr_sha256\n' > "$RESULTS"
 fi
 
 for policy in $POLICIES; do
@@ -73,13 +87,23 @@ for policy in $POLICIES; do
       else
         set -- "$@" --no-prefetch
       fi
-      if [ "$policy" = "reuse-aware" ]; then
+      if [ "$policy" = "reuse-aware" ] || [ "$PREDICTION" = "1" ]; then
         set -- "$@" --graph-trace --graph-trace-events "$GRAPH_TRACE_EVENTS"
-        if [ -n "$PROFILE_SAVE" ]; then
+        if [ -n "$PROFILE_SAVE" ] && [ "$policy" = "reuse-aware" ]; then
           set -- "$@" --residency-profile-save "$PROFILE_SAVE"
         fi
-        if [ -n "$PROFILE_LOAD" ]; then
-          set -- "$@" --residency-profile-load "$PROFILE_LOAD"
+      fi
+      if [ -n "$PROFILE_LOAD" ]; then
+        set -- "$@" --residency-profile-load "$PROFILE_LOAD"
+      fi
+      if [ "$PREDICTION" = "1" ]; then
+        set -- "$@" --prediction --prediction-min-confidence "$PREDICTION_MIN_CONFIDENCE" \
+          --prediction-window "$PREDICTION_WINDOW" --prediction-speculative "$PREDICTION_SPECULATIVE"
+        if [ -n "$PREDICTION_HISTORY_LOAD" ]; then
+          set -- "$@" --prediction-history-load "$PREDICTION_HISTORY_LOAD"
+        fi
+        if [ -n "$PREDICTION_HISTORY_SAVE" ]; then
+          set -- "$@" --prediction-history-save "$PREDICTION_HISTORY_SAVE"
         fi
       fi
       if [ "$ENFORCE" = "1" ]; then
@@ -103,6 +127,10 @@ profile = report.get("profile") or {}
 timing = report.get("timing") or {}
 native = report.get("native_lifetime") or {}
 lifetimes = report.get("resource_lifetime_states") or {}
+prediction = report.get("prediction") or {}
+pred_plan = prediction.get("plan") or {}
+pred_staging = prediction.get("staging") or {}
+pred_history = prediction.get("history") or {}
 before = (report.get("measurements") or {}).get("before") or {}
 after = (report.get("measurements") or {}).get("after") or {}
 row = [
@@ -111,6 +139,12 @@ row = [
     plan.get("selected_count", len(plan.get("selected") or [])), plan.get("profile_used"),
     report.get("profile_source"), native.get("contract_version"), native.get("quiescent"),
     json.dumps(lifetimes, sort_keys=True),
+    prediction.get("prediction_count"),
+    (pred_plan.get("stage_count") or 0) + (pred_plan.get("prefetch_count") or 0),
+    pred_plan.get("requested_bytes"),
+    pred_staging.get("native_accepted_bytes"),
+    pred_history.get("hits"),
+    pred_history.get("misses"),
     (report.get("estimated_vs_observed") or {}).get("estimated_reclaim_bytes"),
     (report.get("estimated_vs_observed") or {}).get("observed_mapping_delta_bytes"),
     before.get("process_rss_bytes"), after.get("process_rss_bytes"),

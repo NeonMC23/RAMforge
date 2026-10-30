@@ -297,6 +297,19 @@ Not run or not claimed:
 - reproducible cross-machine performance;
 - exact KV-cache or graph-scratch byte accounting.
 
+## Predictive residency validation — 2026-10-30
+
+- `cargo test --workspace`: 509 passed, 0 failed, 18 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- `ramforge simulate` deterministic output and budget safety: passed.
+- Real prediction run with saved profile: 64 predictions, 16,650,240 B
+  requested/accepted, mapping delta 0 B; feedback saved atomically.
+- Warm-history run: 64 high-confidence predictions, 17,375,232 B
+  requested/accepted, mapping delta 0 B.
+- Prediction JSON report and profile/history identity validation: passed.
+- Prediction never sets `release_authorized=true`; `FinalUseProven` remains
+  unreachable for model weights.
+
 ## Native lifetime validation — 2026-10-30
 
 ForgeCORE pin: `457c4f75193b004ed01c1cc0c8e620a4a7683196`.
@@ -318,7 +331,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          493 passed, 0 failed, 17 ignored
+cargo test --workspace                          509 passed, 0 failed, 18 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

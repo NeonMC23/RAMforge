@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use clap::{Parser, Subcommand, ValueEnum};
 use ramforge_core::{
     discover_model_set, parse_memory_size, ChatMessage, ChatTemplate, GgufModel, GgufModelSet,
@@ -10,11 +12,18 @@ use ramforge_runtime::graph_manifest::{GraphManifest, LastUseStatus};
 use ramforge_runtime::memory_ledger::MemoryLedger;
 use ramforge_runtime::memory_report::{process_rss, ForgeCoreMemoryReport};
 use ramforge_runtime::page_residency::{evict_file_cache, model_mapping_residency};
+use ramforge_runtime::prediction::{
+    load_prediction_history, predict_from_profile, PredictionConfig, PredictionHistory,
+    PredictionSet,
+};
+use ramforge_runtime::prediction_planner::{
+    execute_staging, plan_predictions, PredictionPlan, StagingExecution,
+};
 use ramforge_runtime::residency_engine::{
-    AdmissionDecision, DecisionAction, ManagerError, ModelGeneration, ModelId, OperationContext,
-    OperationTiming, ResidencyCapabilities, ResidencyManager, ResidencyPlan, ResidencyPolicy,
-    ResidencyPolicyMode, ResidencyReport, ResidencySnapshot, ResourceInventory, StagingPlan,
-    StagingResult,
+    AdmissionDecision, AdmissionOutcome, DecisionAction, ManagerError, ModelGeneration, ModelId,
+    OperationContext, OperationTiming, ResidencyCapabilities, ResidencyManager, ResidencyPlan,
+    ResidencyPolicy, ResidencyPolicyMode, ResidencyReport, ResidencySnapshot, ResourceInventory,
+    StagingPlan, StagingResult,
 };
 use ramforge_runtime::{
     DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
@@ -122,6 +131,24 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Run a deterministic prediction/residency simulation
+    Simulate {
+        /// Simulated memory budget
+        #[arg(long, default_value = "12K")]
+        budget: String,
+
+        /// Simulated staging window
+        #[arg(long, default_value = "8K")]
+        window: String,
+
+        /// Use a deliberately mismatched test sequence
+        #[arg(long)]
+        wrong_history: bool,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
     /// Run real inference; select legacy or explicit ForgeCore execution
     Run {
         /// Path to the GGUF model file
@@ -204,8 +231,36 @@ enum Commands {
         residency_profile_save: Option<PathBuf>,
 
         /// Best-effort bounded page prefetch budget (MADV_WILLNEED hint)
-        #[arg(long, value_name = "SIZE")]
+        #[arg(long, value_name = "SIZE", conflicts_with = "prediction")]
         residency_prefetch: Option<String>,
+
+        /// Enable deterministic predictive staging from a loaded profile
+        #[arg(long)]
+        prediction: bool,
+
+        /// Minimum prediction confidence (percent, 0-100)
+        #[arg(long, value_name = "PERCENT", requires = "prediction")]
+        prediction_min_confidence: Option<u8>,
+
+        /// Bound on predicted page bytes considered for staging
+        #[arg(long, value_name = "SIZE", requires = "prediction")]
+        prediction_window: Option<String>,
+
+        /// Portion of the staging window reserved for low-priority speculative hints
+        #[arg(long, value_name = "SIZE", requires = "prediction")]
+        prediction_speculative: Option<String>,
+
+        /// Maximum configured in-flight staging operations (synchronous implementation executes one native call)
+        #[arg(long, value_name = "N", default_value_t = 1, requires = "prediction")]
+        prediction_max_inflight: u16,
+
+        /// Load a validated prediction feedback history from PATH
+        #[arg(long, value_name = "PATH", requires = "prediction")]
+        prediction_history_load: Option<PathBuf>,
+
+        /// Save prediction feedback history atomically to PATH (requires graph trace)
+        #[arg(long, value_name = "PATH", requires_all = ["prediction", "graph_trace"])]
+        prediction_history_save: Option<PathBuf>,
 
         /// Enable bounded scheduler graph tracing (adds per-node synchronization overhead)
         #[arg(long)]
@@ -291,6 +346,17 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Simulate {
+            budget,
+            window,
+            wrong_history,
+            json,
+        } => {
+            if let Err(error) = run_simulation(&budget, &window, wrong_history, json) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Run {
             model,
             ram,
@@ -313,6 +379,13 @@ fn main() {
             residency_profile_load,
             residency_profile_save,
             residency_prefetch,
+            prediction,
+            prediction_min_confidence,
+            prediction_window,
+            prediction_speculative,
+            prediction_max_inflight,
+            prediction_history_load,
+            prediction_history_save,
             graph_trace,
             graph_trace_events,
             graph_trace_detail,
@@ -376,6 +449,13 @@ fn main() {
                 residency_profile_load,
                 residency_profile_save,
                 residency_prefetch,
+                prediction,
+                prediction_min_confidence,
+                prediction_window,
+                prediction_speculative,
+                prediction_max_inflight,
+                prediction_history_load,
+                prediction_history_save,
                 graph_trace,
                 graph_trace_events,
                 graph_trace_detail,
@@ -480,6 +560,13 @@ fn run_inference(
     residency_profile_load: Option<PathBuf>,
     residency_profile_save: Option<PathBuf>,
     residency_prefetch: Option<String>,
+    prediction: bool,
+    prediction_min_confidence: Option<u8>,
+    prediction_window: Option<String>,
+    prediction_speculative: Option<String>,
+    prediction_max_inflight: u16,
+    prediction_history_load: Option<PathBuf>,
+    prediction_history_save: Option<PathBuf>,
     graph_trace: bool,
     graph_trace_events: usize,
     graph_trace_detail: bool,
@@ -519,6 +606,43 @@ fn run_inference(
             "--residency-target must be greater than zero"
         ));
     }
+    let default_prediction = PredictionConfig::default();
+    let prediction_min_bps = prediction_min_confidence
+        .map(|percent| u16::from(percent).saturating_mul(100))
+        .unwrap_or(default_prediction.min_confidence_bps);
+    let prediction_window_bytes = prediction_window
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --prediction-window: {error}"))?
+        .unwrap_or(default_prediction.staging_window_bytes);
+    let prediction_speculative_bytes = prediction_speculative
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --prediction-speculative: {error}"))?
+        .unwrap_or(default_prediction.speculative_budget_bytes);
+    let prediction_config = PredictionConfig {
+        enabled: prediction,
+        min_confidence_bps: prediction_min_bps,
+        staging_window_bytes: prediction_window_bytes,
+        speculative_budget_bytes: prediction_speculative_bytes,
+        max_in_flight: prediction_max_inflight,
+        lookahead: default_prediction.lookahead,
+    };
+    prediction_config
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    if prediction && residency_profile_load.is_none() {
+        return Err(anyhow::anyhow!(
+            "--prediction requires --residency-profile-load"
+        ));
+    }
+    if prediction && residency_prefetch_bytes.is_some() {
+        return Err(anyhow::anyhow!(
+            "--prediction and --residency-prefetch are mutually exclusive"
+        ));
+    }
     if let Some(target) = residency_target_bytes {
         if residency_reserve_bytes > target {
             return Err(anyhow::anyhow!(
@@ -553,7 +677,10 @@ fn run_inference(
         || residency_report_json.is_some()
         || residency_profile_load.is_some()
         || residency_profile_save.is_some()
-        || residency_prefetch_bytes.is_some();
+        || residency_prefetch_bytes.is_some()
+        || prediction
+        || prediction_history_load.is_some()
+        || prediction_history_save.is_some();
     if residency_requested
         && (release_mapping_pages || inspect_layer.is_some() || release_layer.is_some())
     {
@@ -589,6 +716,10 @@ fn run_inference(
             residency_profile_load.clone(),
             residency_profile_save.clone(),
             residency_prefetch_bytes,
+            prediction_config,
+            prediction,
+            prediction_history_load.clone(),
+            prediction_history_save.clone(),
             graph_trace,
             graph_trace_events,
             graph_trace_detail,
@@ -639,7 +770,10 @@ fn run_inference(
         || residency_report_json.is_some()
         || residency_profile_load.is_some()
         || residency_profile_save.is_some()
-        || residency_prefetch_bytes.is_some();
+        || residency_prefetch_bytes.is_some()
+        || prediction
+        || prediction_history_load.is_some()
+        || prediction_history_save.is_some();
     if residency_requested {
         return Err(anyhow::anyhow!(
             "residency policy, target, reserve, prefetch, and report controls are only supported with --backend forgecore"
@@ -911,6 +1045,10 @@ fn run_forgecore_inference(
     residency_profile_load: Option<PathBuf>,
     residency_profile_save: Option<PathBuf>,
     residency_prefetch_bytes: Option<u64>,
+    prediction_config: PredictionConfig,
+    prediction: bool,
+    prediction_history_load: Option<PathBuf>,
+    prediction_history_save: Option<PathBuf>,
     graph_trace: bool,
     graph_trace_events: usize,
     graph_trace_detail: bool,
@@ -1065,21 +1203,25 @@ fn run_forgecore_inference(
             );
         }
     }
-    let profile_identity =
-        if graph_trace || residency_profile_load.is_some() || residency_profile_save.is_some() {
-            let model_file_bytes = model_set.total_file_bytes();
-            Some(
-                ProfileIdentity::from_model_path(
-                    model.path(),
-                    model_file_bytes,
-                    1,
-                    ForgeCoreModel::native_contract_version(),
-                )
-                .map_err(|error| anyhow::anyhow!(error))?,
+    let profile_identity = if graph_trace
+        || residency_profile_load.is_some()
+        || residency_profile_save.is_some()
+        || prediction_history_load.is_some()
+        || prediction_history_save.is_some()
+    {
+        let model_file_bytes = model_set.total_file_bytes();
+        Some(
+            ProfileIdentity::from_model_path(
+                model.path(),
+                model_file_bytes,
+                1,
+                ForgeCoreModel::native_contract_version(),
             )
-        } else {
-            None
-        };
+            .map_err(|error| anyhow::anyhow!(error))?,
+        )
+    } else {
+        None
+    };
     let mut loaded_profile: Option<ExecutionProfile> = None;
     if let (Some(path), Some(identity)) =
         (residency_profile_load.as_ref(), profile_identity.as_ref())
@@ -1093,12 +1235,33 @@ fn run_forgecore_inference(
         );
         loaded_profile = Some(profile);
     }
+    let mut prediction_history: Option<PredictionHistory> = None;
+    if let (Some(path), Some(identity)) =
+        (prediction_history_load.as_ref(), profile_identity.as_ref())
+    {
+        let history =
+            load_prediction_history(path, identity).map_err(|error| anyhow::anyhow!(error))?;
+        eprintln!(
+            "Prediction history loaded: path={} records={} hits={} misses={}",
+            path.display(),
+            history.records.len(),
+            history.hits,
+            history.misses
+        );
+        prediction_history = Some(history);
+    }
+    let mut prediction_set: Option<PredictionSet> = None;
+    let mut prediction_plan: Option<PredictionPlan> = None;
+    let mut prediction_staging: Option<StagingExecution> = None;
     let residency_started = Instant::now();
     let mut residency_manager = if residency_policy != ResidencyPolicyArg::Off
         || residency_report
         || residency_report_json.is_some()
         || residency_profile_load.is_some()
         || residency_profile_save.is_some()
+        || prediction
+        || prediction_history_load.is_some()
+        || prediction_history_save.is_some()
         || residency_target.is_some()
         || residency_reserve != 0
         || residency_prefetch_bytes.is_some()
@@ -1158,7 +1321,69 @@ fn run_forgecore_inference(
     let mut residency_staging: Option<StagingPlan> = None;
     let mut residency_staging_result: Option<StagingResult> = None;
     if let Some(manager) = residency_manager.as_mut() {
-        if let Some(limit) = residency_prefetch_bytes {
+        let current = process_rss()
+            .or_else(|| ResidencySnapshot::capture_paths(&shard_paths).mapping_rss_bytes)
+            .or(Some(manager.inventory().summary.page_bytes));
+        let admission = manager.admission(current);
+        residency_admission = Some(admission.clone());
+
+        if prediction {
+            let predictions = predict_from_profile(
+                &prediction_config,
+                loaded_profile.as_ref(),
+                manager.inventory(),
+                prediction_history.as_ref(),
+            );
+            if prediction_history.is_none() {
+                if let Some(identity) = profile_identity.clone() {
+                    prediction_history = Some(PredictionHistory::new(identity));
+                }
+            }
+            if let Some(history) = prediction_history.as_mut() {
+                history.record_predictions(&predictions);
+            }
+            let plan = plan_predictions(
+                &prediction_config,
+                &predictions,
+                manager.inventory(),
+                current,
+                manager.hard_limit_bytes(),
+                manager.policy().safety_reserve_bytes,
+                admission.outcome == AdmissionOutcome::Rejected,
+            );
+            let before = ResidencySnapshot::capture_paths(&shard_paths);
+            let mut execution = execute_staging(&prediction_config, &plan, |indices| {
+                model
+                    .prefetch_tensor_pages(indices)
+                    .map_err(|error| error.to_string())
+            });
+            let after = ResidencySnapshot::capture_paths(&shard_paths);
+            execution.mapping_before_bytes = before.mapping_rss_bytes;
+            execution.mapping_after_bytes = after.mapping_rss_bytes;
+            eprintln!(
+                "Prediction plan: predictions={} high={} medium={} low={} stage={} prefetch={} requested={} accepted={} deferred={} rejected={} history_valid={}",
+                predictions.predictions.len(),
+                predictions.high_confidence,
+                predictions.medium_confidence,
+                predictions.low_confidence,
+                plan.stage_keys.len(),
+                plan.prefetch_keys.len(),
+                format_bytes(plan.requested_bytes()),
+                format_bytes(execution.native_accepted_bytes),
+                plan.deferred,
+                plan.rejected,
+                predictions.history_valid
+            );
+            for note in &plan.notes {
+                eprintln!("  prediction note: {note}");
+            }
+            if let Some(error) = &execution.error {
+                eprintln!("  prediction staging error: {error}");
+            }
+            prediction_set = Some(predictions);
+            prediction_plan = Some(plan);
+            prediction_staging = Some(execution);
+        } else if let Some(limit) = residency_prefetch_bytes {
             let plan = if loaded_profile.is_some() {
                 manager.staging_plan_with_profile(limit, loaded_profile.as_ref())
             } else {
@@ -1200,10 +1425,7 @@ fn run_forgecore_inference(
                 });
             }
         }
-        let current = process_rss()
-            .or_else(|| ResidencySnapshot::capture_paths(&shard_paths).mapping_rss_bytes)
-            .or(Some(manager.inventory().summary.page_bytes));
-        let admission = manager.admission(current);
+
         if !residency_report && residency_policy != ResidencyPolicyArg::Off {
             eprintln!(
                 "Residency admission: {:?}; current={} soft_target={} hard_limit={} reserve={}",
@@ -1227,7 +1449,6 @@ fn run_forgecore_inference(
         if !residency_report && residency_policy != ResidencyPolicyArg::Off {
             print_residency_plan("pre-operation", &plan);
         }
-        residency_admission = Some(admission);
         pre_operation_plan = Some(plan);
         manager
             .begin_operation()
@@ -1569,6 +1790,38 @@ fn run_forgecore_inference(
                     profile.access.len()
                 );
             }
+            if prediction {
+                if profile.is_valid_for(&manager.model_id().clone(), manager.inventory().generation)
+                {
+                    if let (Some(set), Some(plan)) =
+                        (prediction_set.as_ref(), prediction_plan.as_ref())
+                    {
+                        if let Some(history) = prediction_history.as_mut() {
+                            history.record_feedback(set, &profile, &plan.staged_bytes_by_name);
+                            let summary = history.summary();
+                            eprintln!(
+                                "Prediction feedback: hits={} misses={} staged_requests={} wasted_bytes={} accuracy_bps={:?}",
+                                summary.hits,
+                                summary.misses,
+                                summary.staged_requests,
+                                summary.wasted_bytes,
+                                summary.accuracy_bps
+                            );
+                        }
+                    }
+                }
+                if let Some(path) = prediction_history_save.as_ref() {
+                    let history = prediction_history.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("prediction history save requested without a history")
+                    })?;
+                    history.save(path).map_err(|error| anyhow::anyhow!(error))?;
+                    eprintln!(
+                        "Prediction history saved: path={} records={}",
+                        path.display(),
+                        history.records.len()
+                    );
+                }
+            }
             execution_profile = Some(profile);
         }
         let unknown = manifest
@@ -1713,6 +1966,10 @@ fn run_forgecore_inference(
                 native_context_id,
                 native_execution_generation,
                 lifetime_counts: manager.lifetime_counts(),
+                prediction_set: prediction_set.clone(),
+                prediction_plan: prediction_plan.clone(),
+                prediction_staging: prediction_staging.clone(),
+                prediction_history: prediction_history.as_ref().map(|history| history.summary()),
                 ledger: MemoryLedger::from_inventory(
                     manager.model_id().clone(),
                     manager.inventory().generation,
@@ -1872,6 +2129,99 @@ fn run_profile_inspect(
     Ok(())
 }
 
+fn run_simulation(
+    budget: &str,
+    window: &str,
+    wrong_history: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    use ramforge_runtime::prediction_sim::{simulate, SimResource, SimScenario};
+    let budget =
+        parse_memory_size(budget).map_err(|error| anyhow::anyhow!("invalid --budget: {error}"))?;
+    let window =
+        parse_memory_size(window).map_err(|error| anyhow::anyhow!("invalid --window: {error}"))?;
+    let names = ["a", "b", "c", "d", "e"];
+    let scenario = SimScenario {
+        name: "deterministic-five-resource".to_string(),
+        budget_bytes: budget,
+        staging_window_bytes: window.min(budget),
+        speculative_budget_bytes: window.saturating_div(2).min(budget),
+        min_confidence_bps: 5_000,
+        resources: names
+            .iter()
+            .map(|name| SimResource {
+                name: (*name).to_string(),
+                bytes: 4096,
+                file_backed: true,
+                known_size: true,
+            })
+            .collect(),
+        training_sequence: names.iter().map(|name| (*name).to_string()).collect(),
+        test_sequence: if wrong_history {
+            vec!["e".to_string()]
+        } else {
+            names.iter().map(|name| (*name).to_string()).collect()
+        },
+    };
+    let result = simulate(&scenario).map_err(|error| anyhow::anyhow!(error))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "baseline": {
+                    "strategy": result.baseline.strategy,
+                    "hits": result.baseline.hits,
+                    "misses": result.baseline.misses,
+                    "reread_bytes": result.baseline.reread_bytes,
+                    "peak_resident_bytes": result.baseline.peak_resident_bytes,
+                    "budget_violations": result.baseline.budget_violations,
+                },
+                "predictive": {
+                    "strategy": result.predictive.strategy,
+                    "hits": result.predictive.hits,
+                    "misses": result.predictive.misses,
+                    "reread_bytes": result.predictive.reread_bytes,
+                    "staged_bytes": result.predictive.staged_bytes,
+                    "wasted_staged_bytes": result.predictive.wasted_staged_bytes,
+                    "peak_resident_bytes": result.predictive.peak_resident_bytes,
+                    "budget_violations": result.predictive.budget_violations,
+                    "release_authorized": result.predictive.release_authorized,
+                },
+                "miss_reduction": result.miss_reduction(),
+                "reread_byte_reduction": result.reread_byte_reduction(),
+                "simulation_only": true,
+            })
+        );
+    } else {
+        println!("Simulation: {}", scenario.name);
+        println!(
+            "  baseline: hits={} misses={} reread_bytes={} peak={} violations={}",
+            result.baseline.hits,
+            result.baseline.misses,
+            result.baseline.reread_bytes,
+            result.baseline.peak_resident_bytes,
+            result.baseline.budget_violations
+        );
+        println!(
+            "  predictive: hits={} misses={} reread_bytes={} staged_bytes={} wasted={} peak={} violations={} release_authorized={}",
+            result.predictive.hits,
+            result.predictive.misses,
+            result.predictive.reread_bytes,
+            result.predictive.staged_bytes,
+            result.predictive.wasted_staged_bytes,
+            result.predictive.peak_resident_bytes,
+            result.predictive.budget_violations,
+            result.predictive.release_authorized
+        );
+        println!(
+            "  miss_reduction={} reread_byte_reduction={} (simulation only, not hardware evidence)",
+            result.miss_reduction(),
+            result.reread_byte_reduction()
+        );
+    }
+    Ok(())
+}
+
 fn output_support() {
     use ramforge_runtime::support::{
         execution_architectures, forgecore_execution_architectures, ARCHITECTURES, QUANTIZATIONS,
@@ -1949,6 +2299,14 @@ fn output_support() {
     println!(
         "  native lifetime contract: {:?}",
         capabilities.native_lifetime_contract
+    );
+    println!(
+        "  predictive staging: {:?}",
+        capabilities.predictive_staging
+    );
+    println!(
+        "  prediction history: {:?}",
+        capabilities.prediction_history
     );
     println!(
         "  context-owned resource release: {:?}",
@@ -2360,6 +2718,76 @@ fn residency_report_json_value(report: &ResidencyReport) -> serde_json::Value {
             })
         }),
         "resource_lifetime_states": report.lifetime_counts,
+        "prediction": report.prediction_set.as_ref().map(|set| {
+            let plan = report.prediction_plan.as_ref();
+            serde_json::json!({
+                "enabled": true,
+                "source": format!("{:?}", set.source),
+                "profile_version": set.profile_version,
+                "complete_observations": set.complete_observations,
+                "prediction_count": set.predictions.len(),
+                "high_confidence": set.high_confidence,
+                "medium_confidence": set.medium_confidence,
+                "low_confidence": set.low_confidence,
+                "counts": {
+                    "predictions": set.predictions.len(),
+                    "high": set.high_confidence,
+                    "medium": set.medium_confidence,
+                    "low": set.low_confidence,
+                },
+                "history_valid": set.history_valid,
+                "rejected": set.rejected,
+                "warnings": set.warnings,
+                "predictions": set.predictions.iter().map(|prediction| serde_json::json!({
+                    "tensor": prediction.name,
+                    "tensor_index": prediction.key.tensor_index,
+                    "predicted_order": prediction.predicted_order,
+                    "expected_distance": prediction.expected_distance,
+                    "confidence_bps": prediction.confidence_bps,
+                    "confidence": format!("{:?}", prediction.confidence),
+                    "size_bytes": prediction.size_bytes,
+                    "known_size": prediction.known_size,
+                    "reason": prediction.reason,
+                })).collect::<Vec<_>>(),
+                "plan": plan.map(|plan| serde_json::json!({
+                    "stage_count": plan.stage_keys.len(),
+                    "prefetch_count": plan.prefetch_keys.len(),
+                    "requested_bytes": plan.requested_bytes(),
+                    "deferred": plan.deferred,
+                    "rejected": plan.rejected,
+                    "release_authorized": plan.release_authorized,
+                    "notes": plan.notes,
+                    "decisions": plan.decisions.iter().map(|decision| serde_json::json!({
+                        "tensor": decision.name,
+                        "action": format!("{:?}", decision.action),
+                        "reason": format!("{:?}", decision.reason),
+                        "confidence_bps": decision.confidence_bps,
+                        "predicted_order": decision.predicted_order,
+                        "requested_bytes": decision.requested_bytes,
+                        "detail": decision.detail,
+                    })).collect::<Vec<_>>(),
+                })),
+                "staging": report.prediction_staging.as_ref().map(|staging| serde_json::json!({
+                    "requested_bytes": staging.requested_bytes,
+                    "native_accepted_bytes": staging.native_accepted_bytes,
+                    "observed_mapping_delta_bytes": staging.observed_mapping_delta(),
+                    "operations": staging.operations,
+                    "configured_max_in_flight": staging.configured_max_in_flight,
+                    "error": staging.error,
+                    "cancelled": staging.cancelled,
+                })),
+                "history": report.prediction_history.as_ref().map(|history| serde_json::json!({
+                    "records": history.records,
+                    "total_predictions": history.total_predictions,
+                    "hits": history.hits,
+                    "misses": history.misses,
+                    "staged_requests": history.staged_requests,
+                    "staged_bytes": history.staged_bytes,
+                    "wasted_bytes": history.wasted_bytes,
+                    "accuracy_bps": history.accuracy_bps,
+                })),
+            })
+        }),
         "native_lifetime": {
             "contract_version": report.native_contract_version,
             "model_instance_id": report.native_model_instance,

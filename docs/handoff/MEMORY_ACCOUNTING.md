@@ -189,6 +189,16 @@ explicit non-release outcomes. A failed native release is recorded as
 `ReleaseFailed` and the application report retains the error; it is never
 reported as a complete release.
 
+## Prediction accounting
+
+Predictive staging records three separate quantities: page bytes selected by
+the planner, bytes accepted by the native prefetch call, and observed mapping
+changes. None is physical reclamation or a residency guarantee. Prediction
+never authorizes release; `release_authorized` remains false and the native
+quiescence/lifetime gate remains authoritative. Prediction history records
+hits, misses, planned staging bytes, and wasted speculative bytes; it is
+bounded and identity-validated. See [PREDICTION.md](PREDICTION.md).
+
 ## Policy profiles
 
 The existing `off` / `observe` / `active` CLI values remain compatible. New

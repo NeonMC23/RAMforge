@@ -7,15 +7,16 @@ This directory is the transfer package for a new developer or agent arriving wit
 1. [PROJECT_STATE.md](PROJECT_STATE.md) — what exists, what is supported, and the current conclusion.
 2. [ARCHITECTURE.md](ARCHITECTURE.md) — the actual source-tree architecture and its boundaries.
 3. [CURRENT_INFERENCE_ENGINE.md](CURRENT_INFERENCE_ENGINE.md) — the current numerical and streaming implementation.
-4. [MEMORY_ACCOUNTING.md](MEMORY_ACCOUNTING.md) — ledger categories, provenance, reconciliation, policy profiles, and report semantics.
-5. [GRAPH_SAFETY.md](GRAPH_SAFETY.md) — trace/manifest/profile guarantees and the intra-decode safety blocker.
-6. [BENCHMARKS.md](BENCHMARKS.md) — reproducible residency benchmark commands, columns, baseline, and caveats.
-7. [QWEN25_CORRECTNESS_INVESTIGATION.md](QWEN25_CORRECTNESS_INVESTIGATION.md) — the numerical-divergence evidence and its limits.
-8. [REBUILD_PLAN.md](REBUILD_PLAN.md) — the proposed ForgeCore replacement plan.
-9. [VALIDATION.md](VALIDATION.md) — commands, results, diagnostic entry points, and unavailable evidence.
-10. [PHASE_2_ENGINEERING_REPORT.md](PHASE_2_ENGINEERING_REPORT.md) — the implemented pinned ForgeCore adapter and historical validation record.
-11. [PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md) — static device discovery, explicit selection, adapter integration, and current validation status.
-12. [REPOSITORY_TRANSFER.md](REPOSITORY_TRANSFER.md) — how to start a new repository/session without losing the useful infrastructure or historical evidence.
+4. [PREDICTION.md](PREDICTION.md) — predictive staging, confidence, feedback, simulation, and limits.
+5. [MEMORY_ACCOUNTING.md](MEMORY_ACCOUNTING.md) — ledger categories, provenance, reconciliation, policy profiles, and report semantics.
+6. [GRAPH_SAFETY.md](GRAPH_SAFETY.md) — trace/manifest/profile guarantees and the intra-decode safety blocker.
+7. [BENCHMARKS.md](BENCHMARKS.md) — reproducible residency benchmark commands, columns, baseline, and caveats.
+8. [QWEN25_CORRECTNESS_INVESTIGATION.md](QWEN25_CORRECTNESS_INVESTIGATION.md) — the numerical-divergence evidence and its limits.
+9. [REBUILD_PLAN.md](REBUILD_PLAN.md) — the proposed ForgeCore replacement plan.
+10. [VALIDATION.md](VALIDATION.md) — commands, results, diagnostic entry points, and unavailable evidence.
+11. [PHASE_2_ENGINEERING_REPORT.md](PHASE_2_ENGINEERING_REPORT.md) — the implemented pinned ForgeCore adapter and historical validation record.
+12. [PHASE_4_ENGINEERING_REPORT.md](PHASE_4_ENGINEERING_REPORT.md) — static device discovery, explicit selection, adapter integration, and current validation status.
+13. [REPOSITORY_TRANSFER.md](REPOSITORY_TRANSFER.md) — how to start a new repository/session without losing the useful infrastructure or historical evidence.
 
 ## Evidence labels
 

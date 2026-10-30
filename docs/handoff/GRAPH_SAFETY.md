@@ -151,6 +151,15 @@ release boundary where no graph, cached graph, or backend retains the range.
 Until such a contract exists, intra-decode streaming/eviction is documented as
 unsupported.
 
+## Prediction and release safety
+
+Predictions may order staging and may inform which profile is used at a
+post-operation boundary, but `PredictionPlan::release_authorized` is always
+false. Confidence, predicted reuse, and graph-order evidence are not lifetime
+proof and cannot promote a resource to `ReleaseEligible`. Native quiescence,
+native exclusive gate acquisition, model/context identity, and the manager's
+safe-boundary lifecycle remain mandatory.
+
 ## Operational checks
 
 - `ramforge support` reports graph dependency/last-use analysis as partial and

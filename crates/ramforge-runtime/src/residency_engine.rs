@@ -16,6 +16,8 @@ use crate::execution_profile::{ExecutionProfile, ProfileIdentity};
 use crate::memory_ledger::MemoryLedger;
 use crate::memory_report::{process_rss, process_rss_peak};
 use crate::page_residency::model_mapping_residency;
+use crate::prediction::{PredictionHistorySummary, PredictionSet};
+use crate::prediction_planner::{PredictionPlan, StagingExecution};
 use crate::resource_lifetime::{LifetimeEvent, ResourceLifetime as ResourceLifetimeTracker};
 
 /// Stable identity for one loaded model within a runtime session.
@@ -469,6 +471,8 @@ pub struct ResidencyCapabilities {
     pub graph_dependency_analysis: CapabilityState,
     pub proven_last_use_completion: CapabilityState,
     pub native_lifetime_contract: CapabilityState,
+    pub predictive_staging: CapabilityState,
+    pub prediction_history: CapabilityState,
     pub context_owned_release: CapabilityState,
     pub between_operation_residency: CapabilityState,
     pub intra_decode_residency: CapabilityState,
@@ -502,6 +506,8 @@ impl ResidencyCapabilities {
             // graph/token cannot reuse a weight.
             proven_last_use_completion: CapabilityState::PartiallySupported,
             native_lifetime_contract: CapabilityState::Supported,
+            predictive_staging: CapabilityState::Supported,
+            prediction_history: CapabilityState::Supported,
             context_owned_release: CapabilityState::Unsupported,
             between_operation_residency: CapabilityState::Supported,
             intra_decode_residency: CapabilityState::Unsupported,
@@ -1274,6 +1280,10 @@ pub struct ResidencyReport {
     pub native_context_id: Option<u64>,
     pub native_execution_generation: Option<u64>,
     pub lifetime_counts: BTreeMap<String, usize>,
+    pub prediction_set: Option<PredictionSet>,
+    pub prediction_plan: Option<PredictionPlan>,
+    pub prediction_staging: Option<StagingExecution>,
+    pub prediction_history: Option<PredictionHistorySummary>,
     pub ledger: MemoryLedger,
     pub before: ResidencySnapshot,
     pub after: ResidencySnapshot,

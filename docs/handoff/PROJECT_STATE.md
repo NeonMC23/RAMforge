@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **493 tests, 0 failed, 17 ignored**. The ignored
+  environment variables passes **509 tests, 0 failed, 18 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -61,6 +61,34 @@
   layer/range release.
 - See [../../scripts/test.sh](../../scripts/test.sh) for the reproducible test
   invocation.
+
+## Predictive residency milestone (2026-10-30)
+
+- `prediction.rs` — deterministic profile/history-based predictions with
+  stable tensor names, confidence basis points, predicted order, and history
+  identity validation.
+- `prediction_planner.rs` — high-confidence staging and medium-confidence
+  speculative prefetch within strict windows; unknown-size/anonymous/
+  admission-rejected resources are rejected or deferred; page ranges are
+  deduplicated; `release_authorized=false`.
+- `prediction_sim.rs` — deterministic simulator comparing baseline and
+  predictive staging with budget/adversarial tests.
+- Prediction feedback history is versioned, bounded, atomically written, and
+  contains hit/miss/staging/waste counters. It never contains transient native
+  IDs.
+- CLI: `--prediction*`, `--prediction-history-*`, and `ramforge simulate`.
+- Reports include confidence counts, predictions, planner decisions,
+  requested/accepted staging bytes, observed mapping delta, and feedback.
+
+Measured SmolLM2-135M Q4_K_M, one token, loaded profile: 64 predictions,
+requested/accepted 16,650,240 B, observed mapping delta 0 B on the first run;
+with warm feedback, 64 high-confidence predictions and 17,375,232 B
+requested/accepted, still 0 B mapping delta. These are hint/accounting
+measurements, not throughput claims.
+
+The simulator (`ramforge simulate --budget 12K --window 8K --json`) compares
+baseline and predictive staging with zero simulated budget violations; it is
+not hardware evidence.
 
 ## Native lifetime and safe residency milestone (2026-10-30)
 

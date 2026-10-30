@@ -2,6 +2,8 @@
 
 RAMforge is a local inference runtime designed to run AI models that may be significantly larger than the available RAM or VRAM by treating RAM, VRAM, and storage as a hierarchical memory system.
 
+> **Predictive residency (2026-10-30):** RAMforge now has a deterministic predictive staging layer over validated profiles: bounded confidence-ranked predictions, high-confidence staging and medium-confidence speculative prefetch, explicit budget/admission decisions, feedback history, and a deterministic simulator. Prediction is advisory only; `release_authorized` is always false and release still requires the native quiescence gate. See [PREDICTION.md](docs/handoff/PREDICTION.md).
+>
 > **Native lifetime contract (2026-10-30):** forgeCORE now exposes the pinned native execution-quiescence/ownership contract: model/context instance identities, execution generations, active/in-flight contexts, a point-in-time quiescence observation, and a non-blocking release gate that returns `EBUSY` while any context has asynchronous compute in flight. RAMforge binds that contract into its planner and lifetime state machine, persists validated execution profiles, and reports the contract facts. Intra-decode eviction remains unsupported because synchronized completion is still not proof of future reuse. See [GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md).
 >
 > **Graph-aware residency (2026-10-25):** RAMforge now builds a unified model-scoped memory ledger, execution profiles from bounded graph traces (with validated optional persistence), deduplicated bounded staging plans, and deterministic `conservative`/`memory-bound`/`reuse-aware` policy profiles in addition to `off`/`observe`/`active`. Operation reports include explicit provenance, reconciliation, requested versus native-accepted versus observed bytes, timing, and an output fingerprint; `--residency-report-json PATH` emits schema version 1. Release mutations remain restricted to the post-operation safe boundary. Intra-decode eviction is still unsupported because the pinned callback does not prove resource lifetime. See [MEMORY_ACCOUNTING.md](docs/handoff/MEMORY_ACCOUNTING.md), [GRAPH_SAFETY.md](docs/handoff/GRAPH_SAFETY.md), and [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
@@ -151,6 +153,17 @@ Flags:
   profile (requires `--graph-trace`). Incomplete captures are rejected.
 - `ramforge profile PATH [--model MODEL] [--json]`: inspect a persisted profile
   and, when `--model` is supplied, validate model identity.
+- `--prediction`: enable deterministic predictive staging from
+  `--residency-profile-load`. It conflicts with `--residency-prefetch`.
+- `--prediction-min-confidence PERCENT`: minimum confidence (0–100).
+- `--prediction-window SIZE`: strict predicted page-byte staging window.
+- `--prediction-speculative SIZE`: portion of the window for medium-confidence
+  speculative hints.
+- `--prediction-max-inflight N`: configured concurrency bound; the current
+  implementation executes one synchronous native prefetch call.
+- `--prediction-history-load PATH`: validated feedback history.
+- `--prediction-history-save PATH`: atomically save feedback after a complete
+  trace (requires `--graph-trace`).
 - `--residency-prefetch SIZE`: best-effort bounded tensor-page prefetch
   (`MADV_WILLNEED` hint). The plan deduplicates overlapping page ranges;
   requested, native-accepted, and observed mapping changes are reported
@@ -480,6 +493,60 @@ ramforge profile profile.json --model model.gguf --json
 
 A reproducible harness is documented in
 [BENCHMARKS.md](docs/handoff/BENCHMARKS.md).
+
+### Predictive staging
+
+`prediction.rs`, `prediction_planner.rs`, and `prediction_sim.rs` implement a
+deterministic predictor/planner/coordinator. It consumes a validated execution
+profile and optional feedback history, matches only stable tensor names, and
+ranks predicted accesses by confidence and observed graph order.
+
+High-confidence predictions may be staged within `--prediction-window`;
+medium-confidence predictions may use only `--prediction-speculative`.
+Unknown-size, anonymous, admission-rejected, and below-threshold resources are
+rejected or deferred with explicit reasons. Page ranges are deduplicated before
+the native prefetch call. Requested bytes, native-accepted bytes, and observed
+mapping changes remain separate.
+
+Prediction never authorizes release. The report's `prediction.plan.release_authorized`
+is always false; release still uses the manager plan plus the native lifetime
+gate at a post-operation boundary. `FinalUseProven` remains unreachable for
+model weights.
+
+```sh
+ramforge run model.gguf --backend forgecore --ram 192M --ctx 256 \
+  --no-repack --graph-trace --graph-trace-events 16384 \
+  --residency-policy observe --residency-target 128M \
+  --residency-profile-load profile.json \
+  --prediction --prediction-min-confidence 40 \
+  --prediction-window 64M --prediction-speculative 16M \
+  --prediction-history-save prediction-history.json \
+  --residency-report
+```
+
+SmolLM2-135M Q4_K_M, 1 token, one loaded profile, 64 predictions:
+
+- 64 medium-confidence predictions initially; 56 selected for speculative
+  prefetch after confidence/budget filtering;
+- requested **16,650,240 B**, native-accepted **16,650,240 B**;
+- observed mapping RSS delta **0 B** — a successful hint with no observable
+  residency change;
+- feedback: 64 hits, 0 misses, 0 wasted staged bytes for that trace.
+
+With a warm feedback history, the same profile produced 64 high-confidence
+predictions, requested/accepted **17,375,232 B**, and still **0 B** observed
+mapping delta. These are hint/accounting measurements, not claims of physical
+residency or throughput improvement.
+
+The deterministic simulator:
+
+```sh
+ramforge simulate --budget 12K --window 8K --json
+```
+
+reports baseline vs predictive hits/misses, reread bytes, staged/wasted bytes,
+peak resident bytes, zero budget violations, and `release_authorized=false`.
+See [PREDICTION.md](docs/handoff/PREDICTION.md).
 
 ### GPT-NeoX-20B under 8 GiB
 
@@ -922,7 +989,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **493 tests, 0 failed, 17 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **509 tests, 0 failed, 18 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

@@ -202,7 +202,7 @@ The tokenizer has no chat-template application. It encodes the prompt text suppl
 - `inspect MODEL [--json]`;
 - `plan MODEL --ram SIZE [--json]`;
 - `support`;
-- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--ctx N] [--enforce-ram] [--enforce-timeout S] [--no-repack] [--no-prefetch] [--release-mapping-pages] [--inspect-layer N | --release-layer N] [--residency-policy off|observe|conservative|memory-bound|reuse-aware|active] [--residency-target SIZE] [--residency-reserve SIZE] [--residency-report] [--residency-report-json PATH] [--residency-profile-load PATH] [--residency-profile-save PATH] [--residency-prefetch SIZE] [--graph-trace] [--graph-trace-events N] [--graph-trace-detail] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
+- `run MODEL --ram SIZE --prompt TEXT [--backend legacy|forgecore] [--device cpu|id:<device-id>|backend:<backend-id>:<index>] [--ctx N] [--enforce-ram] [--enforce-timeout S] [--no-repack] [--no-prefetch] [--release-mapping-pages] [--inspect-layer N | --release-layer N] [--residency-policy off|observe|conservative|memory-bound|reuse-aware|active] [--residency-target SIZE] [--residency-reserve SIZE] [--residency-report] [--residency-report-json PATH] [--residency-profile-load PATH] [--residency-profile-save PATH] [--prediction] [--prediction-min-confidence PERCENT] [--prediction-window SIZE] [--prediction-speculative SIZE] [--prediction-max-inflight N] [--prediction-history-load PATH] [--prediction-history-save PATH] [--residency-prefetch SIZE] [--graph-trace] [--graph-trace-events N] [--graph-trace-detail] [--max-tokens N] [--temperature T] [--top-k K] [--top-p P] [--verbose] [--profile] [--memory-report]`.
 
 The static Phase-4 device boundary is in `crates/ramforge-runtime/src/execution.rs`.
 `DeviceRegistry::discover()` is a safe ForgeCore snapshot; CPU is selectable,
@@ -241,6 +241,14 @@ The forgeCORE backend has a RAMforge-owned residency layer:
   Profiles can be persisted in a bounded/versioned file with model identity,
   size/mtime, inventory generation, and native contract validation; transient
   native IDs are never serialized.
+- `prediction.rs` builds deterministic predicted accesses from validated
+  profiles and feedback history. Stable names only; transient native IDs are
+  never persisted or used as identities.
+- `prediction_planner.rs` turns predictions into bounded staging decisions
+  with explicit confidence/budget/admission reasons. It never authorizes
+  release.
+- `prediction_sim.rs` provides a deterministic simulator and tests for budget
+  safety, wrong/stale history, unknown sizes, and safe-boundary invariants.
 - `resource_lifetime.rs` is the explicit resource state machine. Graph-node
   completion cannot promote a resource directly to release eligibility; only
   a synchronized operation boundary with native quiescence can do that.

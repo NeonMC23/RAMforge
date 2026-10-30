@@ -48,6 +48,10 @@ The harness passes `--residency-policy reuse-aware` with `--graph-trace` and
 is expected to be incomplete; the profile is then rejected and the plan reports
 `profile_used=false`.
 
+For prediction runs, `PREFETCH_MODES` defaults to `off` because
+`--prediction` and `--residency-prefetch` are mutually exclusive. Graph tracing
+is enabled automatically so feedback and profile saves are valid.
+
 The script writes:
 
 - `results.tsv` — one row per run;
@@ -68,6 +72,8 @@ Important columns:
 - `staging_requested_bytes` — deduplicated page-range budget from RAMforge;
 - `staging_native_requested_bytes` — bytes accepted by the native prefetch;
 - `profile_source` — `current_trace`, `loaded_file`, or `none`;
+- `prediction_count`, `prediction_staged`, `prediction_requested_bytes`,
+  `prediction_accepted_bytes`, `prediction_hits`, `prediction_misses`;
 - `native_contract`, `native_quiescent`, `lifetime_states` — native contract
   version, point-in-time quiescence, and resource state counts;
 - `native_released_bytes` — bytes submitted to `madvise`, not confirmed
@@ -136,6 +142,21 @@ Record `native_lifetime.contract_version`, `model_instance_id`, `quiescent`,
 `context_id`, `execution_generation`, `resource_lifetime_states`, and
 `profile_source`. A `Busy` release is a failure/partial result, not a
 successful reclamation.
+
+## Predictive measurements
+
+SmolLM2-135M Q4_K_M, one token, loaded profile, `PREDICTION=1`:
+
+- 64 medium-confidence predictions;
+- 56 selected for speculative prefetch; 8 deferred by page-range deduplication/window;
+- requested **16,650,240 B**, native-accepted **16,650,240 B**;
+- observed mapping RSS delta **0 B**;
+- feedback: 64 hits, 0 misses, 0 wasted staged bytes for that trace.
+
+With a warm feedback history, confidence classified all 64 as high:
+**17,375,232 B** requested/accepted, mapping delta still **0 B**. These are
+hint/accounting measurements, not evidence of throughput or physical residency
+improvement.
 
 ## Caveats
 
