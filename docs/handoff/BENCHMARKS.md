@@ -344,8 +344,8 @@ three. Conservative and aggressive were also mixed. There is no repeatable net
 benefit. The baseline and predictive initial-residency observations cover
 different populations: baseline sampled general inventory pages (64 resident),
 while predictive sampled 64 selected pages (0 resident before staging, 64 after
-staging). Only one selected resource was fully observed in the 64-page sample
-(two in the SmolLM2 profile reported here); the rest were partial or unknown.
+staging). Two selected resources were fully observed in the SmolLM2 64-page
+sample, three were partial, and 51 were not observed.
 Those transitions are `potentially_useful` with access unknown; no
 `clearly_useful` claim and no avoided-load attribution are made.
 

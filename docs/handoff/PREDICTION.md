@@ -180,7 +180,7 @@ coverage is visible per resource.
 On SmolLM2 at a 2,048-page budget, targeting changed the earlier arbitrary
 sample into 2,048/4,065 selected pages sampled (33 selected resources fully
 observed, 4 partial, 19 not observed); remaining general budget was 0. A
-64-page budget sampled 64 targeted pages (2 fully observed, 5 partial, 49 not
+64-page budget sampled 64 targeted pages (2 fully observed, 3 partial, 51 not
 observed). These partial results are not evidence for the unobserved resources.
 
 ### Observation points and attribution

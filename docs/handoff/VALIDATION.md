@@ -334,7 +334,7 @@ Not run or not claimed:
   selected resources all redundant; observation 53.8 ms/snapshot (158.5 ms
   total). With a 2,048-page targeted budget: 2,048/4,065 selected pages
   sampled, 33 selected resources fully observed, 4 partial, 19 not observed.
-  With 64 targeted pages: 2 fully observed, 5 partial, 49 not observed. These
+  With 64 targeted pages: 2 fully observed, 3 partial, 51 not observed. These
   partial results are not evidence for unobserved resources.
 - Targeted observation uses interval arithmetic for the available population
   instead of allocating a key per page. Three 64-page snapshots cost about
