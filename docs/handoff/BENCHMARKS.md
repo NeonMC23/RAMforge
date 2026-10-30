@@ -154,9 +154,11 @@ SmolLM2-135M Q4_K_M, one token, loaded profile, `PREDICTION=1`:
 - feedback: 64 hits, 0 misses, 0 wasted staged bytes for that trace.
 
 With a warm feedback history, confidence classified all 64 as high:
-**17,375,232 B** requested/accepted, mapping delta still **0 B**. These are
-hint/accounting measurements, not evidence of throughput or physical residency
-improvement.
+**17,375,232 B** requested/accepted, mapping delta still **0 B**. A same-model
+one-token A/B (baseline `off`/`observe` vs prediction, two repeats, no
+enforcement) showed mapping delta **0 B** and essentially unchanged process RSS
+in both arms. These are hint/accounting measurements; this workload did not
+demonstrate a throughput or RSS improvement.
 
 ## Caveats
 
