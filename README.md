@@ -186,6 +186,9 @@ Flags:
   completion, or release-safety proof.
 - `--node-dispatch-events N`: retained event bound (default 4096); overflow
   drops oldest events and reports `dropped_events`.
+- `--node-dispatch-sample-pages N`: sample up to N file-backed pages per
+  declared source before dispatch; 0 disables sampling. Samples are bounded,
+  partial-aware, and do not prove a read or residency during kernel execution.
 - `--node-dispatch-detail`: print individual dispatch events.
 
 ### Enforced budget matrix

@@ -69,7 +69,7 @@ pub use crate::forgecore::{
 };
 pub use forge_core::{
     NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSummary,
-    PageReleaseResult, TensorMappingInfo, MAX_NODE_DISPATCH_EVENTS,
+    PageReleaseResult, PageSample, PageSampleStatus, TensorMappingInfo, MAX_NODE_DISPATCH_EVENTS,
 };
 pub use orchestration::{
     OrchestratedRuntime, OrchestrationError, OrchestrationRequest, PlanningSession,

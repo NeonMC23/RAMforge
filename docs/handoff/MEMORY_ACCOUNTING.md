@@ -230,6 +230,20 @@ states remain separate and are recorded in `summary.json` and `results.tsv`.
 This verifies file-page-cache state at process start; it is not proof of
 physical reclamation, PSS, or model-mapping residency after loading.
 
+## Mapping identity and pre-dispatch residency
+
+Native tensor mapping metadata carries a model-instance generation, mapping id,
+file path/size, offset, size, page size, and validated page bounds. File offsets
+and page ranges are validated against the current mapped fragment; unmapped or
+non-file-backed tensors have no mapping identity rather than a guessed one.
+
+`Model::sample_tensor_pages` uses Linux `mincore()` over the validated
+file-backed page range. It is bounded to 4,096 pages per call, allocates no
+callback storage, deduplicates the contiguous range naturally, and reports
+unknown pages on mapping/mincore failure. A truncated sample is partial, not a
+mapping census. A sample is a point-in-time observation; residency may change
+before or during kernel execution. It never authorizes release.
+
 ## CPU node-dispatch observation
 
 An opt-in CPU observer records one event per non-empty, compute-enabled graph

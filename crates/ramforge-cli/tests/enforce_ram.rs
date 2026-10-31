@@ -46,6 +46,7 @@ fn help_lists_memory_control_flags() {
         "--graph-trace-detail",
         "--node-dispatch-observe",
         "--node-dispatch-events",
+        "--node-dispatch-sample-pages",
         "--node-dispatch-detail",
     ] {
         assert!(text.contains(flag), "help must list {flag}: {text}");
@@ -1099,6 +1100,8 @@ fn node_dispatch_observer_reports_diagnostic_events() {
             "--node-dispatch-observe",
             "--node-dispatch-events",
             "4096",
+            "--node-dispatch-sample-pages",
+            "64",
             "--residency-report-json",
             path.to_str().unwrap(),
             "--prompt",
@@ -1130,6 +1133,17 @@ fn node_dispatch_observer_reports_diagnostic_events() {
     assert_eq!(dispatch["identity_mismatches"], 0);
     assert_eq!(dispatch["events"][0]["backend"], "cpu");
     assert!(dispatch["events"][0]["node_count"].as_u64().unwrap() > 0);
+    assert!(dispatch["sampled_sources"].as_u64().unwrap() > 0);
+    assert!(dispatch["requested_pages"].as_u64().unwrap() > 0);
+    assert_eq!(
+        dispatch["resident_pages"].as_u64().unwrap()
+            + dispatch["nonresident_pages"].as_u64().unwrap()
+            + dispatch["unknown_pages"].as_u64().unwrap(),
+        dispatch["sampled_pages"].as_u64().unwrap()
+    );
+    assert!(dispatch["truncated_samples"].as_u64().unwrap() > 0);
+    let sample = &dispatch["events"][0]["source_samples"][0]["sample"];
+    assert!(sample["mapping_generation"].as_u64().unwrap() > 0);
     assert_eq!(
         dispatch["semantics"],
         "CPU node dispatch start; not a tensor read or residency proof"

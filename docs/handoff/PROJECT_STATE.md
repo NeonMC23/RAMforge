@@ -79,14 +79,17 @@
 - RAMforge exposes `--node-dispatch-observe`, `--node-dispatch-events`, and
   `--node-dispatch-detail`. Correlation uses only exact unique inventory names;
   unmatched events remain unattributed. No dispatch event authorizes release.
-- The observer is not combined with page residency sampling. The native CPU
-  callback has no validated file-backed mapping identity, so a pre-dispatch
-  residency sample is intentionally omitted.
+- Native mapping metadata now carries mapping id and model-instance generation,
+  file path/size, and validated page bounds. `--node-dispatch-sample-pages N`
+  samples up to N file-backed pages per declared source before event storage
+  and the observer barrier. Sampling is opt-in, per-source, partial-aware, and
+  never authorizes release. It is residency observation only, not proof of a
+  read or fault.
 - Five-decode overhead smoke (SmolLM2, tiny-batch decode): one thread
   observer off 22.20 ms vs on 20.39–21.22 ms; four threads off 9.76 ms vs on
   10.51–10.96 ms. The spread is noisy; no speedup is claimed. Events were
   bounded and no drops occurred in these settings.
-- forgeCORE tests: 388 passed, 4 ignored. RAMforge tests: 531 passed, 19
+- forgeCORE tests: 390 passed, 5 ignored. RAMforge tests: 531 passed, 19
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.

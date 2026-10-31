@@ -370,7 +370,7 @@ Not run or not claimed:
 
 ## CPU node-dispatch validation — 2026-10-31
 
-- forgeCORE `cargo test --workspace`: **388 passed, 0 failed, 4 ignored**.
+- forgeCORE `cargo test --workspace`: **390 passed, 0 failed, 5 ignored**.
   New `node_dispatch` tests cover disabled-by-default behavior, installation
   and removal, event drain, overflow, multiple contexts, four-worker
   exactly-once publication, identity fields, and bounded options.
@@ -387,6 +387,11 @@ Not run or not claimed:
   one thread off 22.20 ms vs on 20.39–21.22 ms; four threads off 9.76 ms vs
   on 10.51–10.96 ms. The spread is noisy; no speedup is claimed. Events were
   bounded, with no drops in the measured settings.
+- Pre-dispatch sampling smoke: one thread 22.15 ms disabled vs 39.75 ms at 64
+  pages/source; four threads 11.15 vs 11.10 ms (within noise). Sampling is
+  diagnostic-only and disabled by default.
+- Mapping metadata tests check a nonzero model-instance generation, mapping id,
+  file path/size, exact page bounds, and bounded/partial native sampling.
 - No pre-dispatch residency sampling was added. Source-name correlation is
   exact-unique only; unknown names remain unattributed. Dispatch events never
   authorize release or eviction.

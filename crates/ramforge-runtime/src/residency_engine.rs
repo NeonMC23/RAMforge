@@ -132,6 +132,10 @@ pub struct TensorResource {
     pub layer: LayerIdentity,
     pub file_backed: bool,
     pub mapping_index: Option<u32>,
+    pub mapping_id: Option<u64>,
+    pub mapping_generation: Option<u64>,
+    pub mapping_file_path: Option<String>,
+    pub mapping_file_size: Option<u64>,
     pub mapping_size: u64,
     pub offset: u64,
     pub logical_bytes: u64,
@@ -309,6 +313,10 @@ impl ResourceInventory {
                 layer,
                 file_backed,
                 mapping_index: mapping.mapping_index,
+                mapping_id: mapping.mapping_id,
+                mapping_generation: mapping.mapping_generation,
+                mapping_file_path: mapping.file_path.clone(),
+                mapping_file_size: mapping.file_size,
                 mapping_size: mapping.mapping_size,
                 offset: mapping.offset,
                 logical_bytes: mapping.size,
@@ -1328,6 +1336,15 @@ pub struct NodeDispatchObservation {
     pub source_truncated_events: usize,
     pub node_name_truncated_events: usize,
     pub identity_mismatches: usize,
+    pub sampled_sources: usize,
+    pub requested_pages: u64,
+    pub sampled_pages: u64,
+    pub resident_pages: u64,
+    pub nonresident_pages: u64,
+    pub unknown_pages: u64,
+    pub partial_samples: usize,
+    pub sampling_errors: usize,
+    pub truncated_samples: usize,
     pub notes: Vec<String>,
 }
 
@@ -1941,6 +1958,10 @@ mod tests {
             page_size: 4096,
             page_start: offset & !4095,
             page_end: (offset + size + 4095) & !4095,
+            mapping_id: None,
+            mapping_generation: None,
+            file_path: None,
+            file_size: None,
         }
     }
 

@@ -395,6 +395,24 @@ Interpretation:
   remain unknown.
 - The results do not justify claiming a general performance improvement.
 
+### Pre-dispatch sampling overhead
+
+A second five-decode smoke run on SmolLM2-135M Q4_K_M measured sampled-source
+overhead:
+
+| Workers | Sample pages/source | Median decode | Events |
+|---|---:|---:|---:|
+| 1 | 0 (disabled) | 22.15 ms | 10,300 |
+| 1 | 64 | 39.75 ms | 10,300 |
+| 4 | 0 | 11.15 ms | 10,300 |
+| 4 | 64 | 11.10 ms | 10,300 |
+
+The one-worker sampling run was about 79% slower; the four-worker result was
+within noise. Sampling performs one bounded `mincore()` sample per declared
+source per dispatched node, so its cost scales with source count and node
+count. It remains opt-in and diagnostic-only. No speedup or I/O avoidance is
+claimed.
+
 ## CPU node-dispatch observer overhead (2026-10-31)
 
 Manual smoke test: SmolLM2-135M Q4_K_M, tiny decode, five measured repetitions

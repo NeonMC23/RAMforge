@@ -701,6 +701,10 @@ fn scenario_inputs(
             page_size,
             page_start,
             page_end,
+            mapping_id: None,
+            mapping_generation: None,
+            file_path: None,
+            file_size: None,
         });
         if size > 0 && resource.overlap_group.is_none() {
             offsets.insert(group, offset.saturating_add(size.max(1)));

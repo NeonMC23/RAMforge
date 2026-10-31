@@ -32,7 +32,7 @@ use ramforge_runtime::residency_engine::{
 };
 use ramforge_runtime::{
     DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
-    ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, NodeDispatchOptions,
+    ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, NodeDispatchOptions, PageSampleStatus,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -305,6 +305,10 @@ enum Commands {
         #[arg(long, default_value_t = 4096, requires = "node_dispatch_observe")]
         node_dispatch_events: usize,
 
+        /// Maximum file-backed pages sampled per declared source tensor
+        #[arg(long, default_value_t = 0, requires = "node_dispatch_observe")]
+        node_dispatch_sample_pages: u64,
+
         /// Print individual CPU node-dispatch events
         #[arg(long, requires = "node_dispatch_observe")]
         node_dispatch_detail: bool,
@@ -429,6 +433,7 @@ fn main() {
             graph_trace_detail,
             node_dispatch_observe,
             node_dispatch_events,
+            node_dispatch_sample_pages,
             node_dispatch_detail,
             enforce_ram,
             enforce_timeout,
@@ -504,6 +509,7 @@ fn main() {
                 graph_trace_detail,
                 node_dispatch_observe,
                 node_dispatch_events,
+                node_dispatch_sample_pages,
                 node_dispatch_detail,
                 max_tokens,
                 temperature,
@@ -620,6 +626,7 @@ fn run_inference(
     graph_trace_detail: bool,
     node_dispatch_observe: bool,
     node_dispatch_events: usize,
+    node_dispatch_sample_pages: u64,
     node_dispatch_detail: bool,
     max_tokens: usize,
     temperature: f32,
@@ -722,6 +729,11 @@ fn run_inference(
             "--node-dispatch-events must be greater than zero"
         ));
     }
+    if node_dispatch_observe && node_dispatch_sample_pages > 4096 {
+        return Err(anyhow::anyhow!(
+            "--node-dispatch-sample-pages must be at most 4096"
+        ));
+    }
     let device_selection = device
         .parse::<DeviceSelection>()
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -790,6 +802,7 @@ fn run_inference(
             graph_trace_detail,
             node_dispatch_observe,
             node_dispatch_events,
+            node_dispatch_sample_pages,
             node_dispatch_detail,
             max_tokens,
             temperature,
@@ -1125,6 +1138,7 @@ fn run_forgecore_inference(
     graph_trace_detail: bool,
     node_dispatch_observe: bool,
     node_dispatch_events: usize,
+    node_dispatch_sample_pages: u64,
     node_dispatch_detail: bool,
     max_tokens: usize,
     temperature: f32,
@@ -1663,6 +1677,7 @@ fn run_forgecore_inference(
         session
             .set_node_dispatch_observer(Some(NodeDispatchOptions {
                 max_events: node_dispatch_events,
+                sample_pages: node_dispatch_sample_pages,
             }))
             .map_err(|error| anyhow::anyhow!(error))?;
         eprintln!(
@@ -2085,6 +2100,15 @@ fn run_forgecore_inference(
             let mut source_truncated_events = 0usize;
             let mut node_name_truncated_events = 0usize;
             let mut identity_mismatches = 0usize;
+            let mut sampled_sources = 0usize;
+            let mut requested_pages = 0u64;
+            let mut sampled_pages = 0u64;
+            let mut resident_pages = 0u64;
+            let mut nonresident_pages = 0u64;
+            let mut unknown_pages = 0u64;
+            let mut partial_samples = 0usize;
+            let mut sampling_errors = 0usize;
+            let mut truncated_samples = 0usize;
             for event in &events {
                 if expected_model.is_some_and(|id| id != event.model_instance_id)
                     || expected_context.is_some_and(|id| id != event.context_id)
@@ -2112,6 +2136,32 @@ fn run_forgecore_inference(
                 } else {
                     attributed_events += 1;
                     matched.extend(event_matched);
+                }
+                for source in &event.source_samples {
+                    if let Some(sample) = source.sample {
+                        sampled_sources += 1;
+                        requested_pages = requested_pages.saturating_add(sample.requested_pages);
+                        sampled_pages = sampled_pages.saturating_add(sample.sampled_pages);
+                        resident_pages = resident_pages.saturating_add(sample.resident_pages);
+                        nonresident_pages = nonresident_pages.saturating_add(sample.nonresident_pages);
+                        unknown_pages = unknown_pages.saturating_add(sample.unknown_pages);
+                        if sample.status == PageSampleStatus::Partial {
+                            partial_samples += 1;
+                        }
+                        if matches!(
+                            sample.status,
+                            PageSampleStatus::Error
+                                | PageSampleStatus::Unsupported
+                                | PageSampleStatus::Stale
+                                | PageSampleStatus::Missing
+                                | PageSampleStatus::Unknown
+                        ) {
+                            sampling_errors += 1;
+                        }
+                        if sample.truncated {
+                            truncated_samples += 1;
+                        }
+                    }
                 }
                 source_truncated_events += usize::from(event.sources_truncated);
                 node_name_truncated_events += usize::from(event.node_name_truncated);
@@ -2159,6 +2209,15 @@ fn run_forgecore_inference(
                 source_truncated_events,
                 node_name_truncated_events,
                 identity_mismatches,
+                sampled_sources,
+                requested_pages,
+                sampled_pages,
+                resident_pages,
+                nonresident_pages,
+                unknown_pages,
+                partial_samples,
+                sampling_errors,
+                truncated_samples,
                 notes,
             });
         }
@@ -3385,6 +3444,15 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
         "source_truncated_events": observation.source_truncated_events,
         "node_name_truncated_events": observation.node_name_truncated_events,
         "identity_mismatches": observation.identity_mismatches,
+        "sampled_sources": observation.sampled_sources,
+        "requested_pages": observation.requested_pages,
+        "sampled_pages": observation.sampled_pages,
+        "resident_pages": observation.resident_pages,
+        "nonresident_pages": observation.nonresident_pages,
+        "unknown_pages": observation.unknown_pages,
+        "partial_samples": observation.partial_samples,
+        "sampling_errors": observation.sampling_errors,
+        "truncated_samples": observation.truncated_samples,
         "notes": observation.notes,
         "events_serialized": observation.events.len().min(512),
         "events_omitted": observation.events.len().saturating_sub(512),
@@ -3402,6 +3470,23 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
             "op_name": event.op_name,
             "op_name_truncated": event.op_name_truncated,
             "source_names": event.source_names,
+            "source_samples": event.source_samples.iter().map(|source| serde_json::json!({
+                "name": source.name,
+                "sample": source.sample.map(|sample| serde_json::json!({
+                    "requested_pages": sample.requested_pages,
+                    "sampled_pages": sample.sampled_pages,
+                    "resident_pages": sample.resident_pages,
+                    "nonresident_pages": sample.nonresident_pages,
+                    "unknown_pages": sample.unknown_pages,
+                    "page_size": sample.page_size,
+                    "max_pages": sample.max_pages,
+                    "mapping_id": sample.mapping_id,
+                    "mapping_generation": sample.mapping_generation,
+                    "truncated": sample.truncated,
+                    "error": sample.error,
+                    "status": format!("{:?}", sample.status),
+                })),
+            })).collect::<Vec<_>>(),
             "sources_truncated": event.sources_truncated,
         })).collect::<Vec<_>>(),
     })

@@ -737,6 +737,10 @@ mod tests {
                     page_size: 4096,
                     page_start: 0,
                     page_end: 4096,
+                    mapping_id: None,
+                    mapping_generation: None,
+                    file_path: None,
+                    file_size: None,
                 },
                 TensorMappingInfo {
                     name: "blk.0.b".to_string(),
@@ -748,6 +752,10 @@ mod tests {
                     page_size: 4096,
                     page_start: 4096,
                     page_end: 8192,
+                    mapping_id: None,
+                    mapping_generation: None,
+                    file_path: None,
+                    file_size: None,
                 },
             ],
         )

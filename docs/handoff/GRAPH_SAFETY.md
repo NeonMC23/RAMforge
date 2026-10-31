@@ -29,6 +29,32 @@ It retains no native pointers. Trace buffer overflow increments dropped events
 and does not silently present a truncated capture as complete.
 
 
+## Mapping identity and pre-dispatch sampling
+
+`TensorMappingInfo` now carries the native mapping id and model-instance
+generation, the validated file path/size, and the page-aligned tensor range in
+addition to file offset/size. The generation is the live model instance id, so
+a model/mapping set recreated by a later load cannot reuse an old generation.
+Non-file-backed or currently unmapped tensors remain `file_backed=false` and
+have no mapping identity.
+
+`Model::sample_tensor_pages(name, max_pages)` samples only a named tensor's
+validated file-backed range through native Linux `mincore()`. It does not
+dereference a RAMforge-supplied pointer, does not scan the model, and caps the
+sample at 4,096 pages. The result reports requested/sampled/resident/
+nonresident/unknown pages, page size, mapping id/generation, truncation, error,
+and status. Unknown pages are never treated as nonresident. This is a
+point-in-time residency observation, not proof of a physical read, page fault,
+I/O, or final use.
+
+With `--node-dispatch-sample-pages N`, forgeCORE samples each declared source
+name before storing the node-dispatch event and before the observer barrier
+that releases workers into the kernel. Sampling is per declared source; a
+source that is not a unique file-backed model tensor remains missing or
+unsupported. The event preserves the per-source sample, including mapping
+generation and truncation. Sampling is disabled at `N=0` (the default), never
+runs in every worker, and never authorizes release or eviction.
+
 ## CPU node-dispatch observer
 
 `--node-dispatch-observe` installs a separate, opt-in observer in the patched
