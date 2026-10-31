@@ -392,9 +392,11 @@ Not run or not claimed:
   diagnostic-only and disabled by default.
 - Mapping metadata tests check a nonzero model-instance generation, mapping id,
   file path/size, exact page bounds, and bounded/partial native sampling.
-- No pre-dispatch residency sampling was added. Source-name correlation is
-  exact-unique only; unknown names remain unattributed. Dispatch events never
-  authorize release or eviction.
+- Pre-dispatch sampling is implemented for validated file-backed tensor
+  ranges and remains opt-in (`--node-dispatch-sample-pages`, default 0).
+  Source-name correlation is exact-unique only; unknown names remain
+  unattributed. Dispatch and residency observations never authorize release
+  or eviction.
 
 ## Native lifetime validation — 2026-10-30
 
