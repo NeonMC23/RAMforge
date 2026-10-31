@@ -2143,7 +2143,8 @@ fn run_forgecore_inference(
                         requested_pages = requested_pages.saturating_add(sample.requested_pages);
                         sampled_pages = sampled_pages.saturating_add(sample.sampled_pages);
                         resident_pages = resident_pages.saturating_add(sample.resident_pages);
-                        nonresident_pages = nonresident_pages.saturating_add(sample.nonresident_pages);
+                        nonresident_pages =
+                            nonresident_pages.saturating_add(sample.nonresident_pages);
                         unknown_pages = unknown_pages.saturating_add(sample.unknown_pages);
                         if sample.status == PageSampleStatus::Partial {
                             partial_samples += 1;
@@ -3482,6 +3483,11 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
                     "max_pages": sample.max_pages,
                     "mapping_id": sample.mapping_id,
                     "mapping_generation": sample.mapping_generation,
+                    "mapping_size": sample.mapping_size,
+                    "tensor_offset": sample.tensor_offset,
+                    "tensor_size": sample.tensor_size,
+                    "page_start": sample.page_start,
+                    "page_end": sample.page_end,
                     "truncated": sample.truncated,
                     "error": sample.error,
                     "status": format!("{:?}", sample.status),
