@@ -242,7 +242,9 @@ file-backed page range. It is bounded to 4,096 pages per call, allocates no
 callback storage, deduplicates the contiguous range naturally, and reports
 unknown pages on mapping/mincore failure. A truncated sample is partial, not a
 mapping census. A sample is a point-in-time observation; residency may change
-before or during kernel execution. It never authorizes release.
+before or during kernel execution. It never authorizes release. The aggregate
+report marks `sampling_complete=false` for disabled, partial, truncated,
+missing, or failed samples.
 
 ## CPU node-dispatch observation
 
@@ -255,10 +257,9 @@ incomplete capture explicit. The observer adds no callback or observer-only
 barrier when disabled.
 
 RAMforge correlates source names only by exact unique inventory names. Unknown
-or truncated source identities stay unattributed. No pre-dispatch residency
-sampling is performed because the CPU callback does not expose a validated
-file-backed mapping identity safely; a raw tensor pointer is not a durable
-resource key. Dispatch events never authorize release or eviction.
+or truncated source identities stay unattributed. Optional pre-dispatch
+sampling uses validated native mapping names and page bounds; it is bounded,
+per-source, partial-aware, and never authorizes release or eviction.
 
 ## Execution timing
 

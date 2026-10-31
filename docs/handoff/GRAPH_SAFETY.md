@@ -91,9 +91,12 @@ report preserves `unattributed_events`, source/name truncation counts, and
 explicit limitations. A dispatch event is not a residency observation and is
 not used to authorize eviction or `FinalUseProven`.
 
-No pre-dispatch page-residency sample is implemented: the CPU callback has no
-validated file-backed mapping path or safe stable pointer-to-resource contract,
-and a raw tensor pointer is not a durable resource identity.
+Pre-dispatch sampling is implemented only for validated file-backed tensor
+names through native mapping generation and page bounds. It is opt-in (default
+zero pages), per declared source, bounded, and may be partial or missing for
+intermediate/non-model tensors. It does not expose a pointer or claim a read.
+The report sets `sampling_complete=false` for disabled, partial, truncated,
+missing, or failed samples.
 
 ## What a completed node-group event proves
 

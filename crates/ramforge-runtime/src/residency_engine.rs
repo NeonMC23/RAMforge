@@ -1345,6 +1345,7 @@ pub struct NodeDispatchObservation {
     pub partial_samples: usize,
     pub sampling_errors: usize,
     pub truncated_samples: usize,
+    pub sampling_complete: bool,
     pub notes: Vec<String>,
 }
 

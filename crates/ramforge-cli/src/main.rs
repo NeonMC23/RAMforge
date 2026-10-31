@@ -2219,6 +2219,10 @@ fn run_forgecore_inference(
                 partial_samples,
                 sampling_errors,
                 truncated_samples,
+                sampling_complete: sampled_sources > 0
+                    && partial_samples == 0
+                    && sampling_errors == 0
+                    && truncated_samples == 0,
                 notes,
             });
         }
@@ -3454,6 +3458,7 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
         "partial_samples": observation.partial_samples,
         "sampling_errors": observation.sampling_errors,
         "truncated_samples": observation.truncated_samples,
+        "sampling_complete": observation.sampling_complete,
         "notes": observation.notes,
         "events_serialized": observation.events.len().min(512),
         "events_omitted": observation.events.len().saturating_sub(512),
