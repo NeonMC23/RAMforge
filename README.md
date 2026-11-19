@@ -191,8 +191,9 @@ Flags:
 - `--node-dispatch-sample-budget N`: maximum fresh unique pages sampled per
   execution; resets at each decode. Reused cache observations do not consume it.
 - `--node-dispatch-sample-strategy systematic|targeted|adaptive`: deterministic
-  sampling policy. Systematic ignores cache; targeted prioritizes uncached
-  ranges; adaptive reuses fresh complete cache entries and samples stale ranges.
+  sampling policy. Systematic ignores cache; targeted skips fresh cached ranges
+  and samples the rest; adaptive reuses fresh complete cache entries and samples
+  stale ranges.
 - `--node-dispatch-cache-capacity N`: bounded adaptive range-cache capacity.
 - `--node-dispatch-cache-ttl N`: freshness window in event sequences.
 - `--node-dispatch-force-fresh`: force systematic/no-cache behavior.

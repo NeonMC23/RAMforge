@@ -88,9 +88,9 @@
 - Five-decode overhead smoke (SmolLM2, tiny-batch decode): one thread
   observer off 15.98 ms vs on 17.54–18.26 ms; four threads off 6.42 ms vs on
   6.83–6.97 ms. Sampling at 64 pages/range and 4,096-page execution budget was
-  within noise at one/four threads. Strategy medians were 17.95/17.09/17.22 ms
-  for systematic/targeted/adaptive; adaptive reported 252 cache reuses. The
-  spread is noisy; no speedup is claimed.
+  within noise at one/four threads. Across four strategy smoke runs, systematic
+  was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
+  (252 reuses). The spread is noisy; no speedup is claimed.
 - forgeCORE tests: 396 passed, 6 ignored. RAMforge tests: 532 passed, 19
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,

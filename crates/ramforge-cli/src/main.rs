@@ -2310,6 +2310,7 @@ fn run_forgecore_inference(
                 fresh_sampled_pages,
                 reused_pages,
                 cache_reuses: summary.cache_reuses,
+                cache_skips: summary.cache_skips,
                 cache_evictions: summary.cache_evictions,
                 notes,
             });
@@ -3531,6 +3532,7 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
             "retained_events": observation.summary.retained_events,
             "max_events": observation.summary.max_events,
             "cache_reuses": observation.summary.cache_reuses,
+            "cache_skips": observation.summary.cache_skips,
             "cache_evictions": observation.summary.cache_evictions,
             "budget_total": observation.summary.budget_total,
             "budget_remaining": observation.summary.budget_remaining,
@@ -3558,6 +3560,7 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
         "fresh_sampled_pages": observation.fresh_sampled_pages,
         "reused_pages": observation.reused_pages,
         "cache_reuses": observation.cache_reuses,
+        "cache_skips": observation.cache_skips,
         "cache_evictions": observation.cache_evictions,
         "notes": observation.notes,
         "events_serialized": observation.events.len().min(512),

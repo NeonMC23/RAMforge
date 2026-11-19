@@ -66,8 +66,9 @@ alignment is validated from native mapping metadata.
 Sampling is opt-in. `--node-dispatch-sample-strategy` selects:
 
 - `systematic`: deterministic mapping/page order, no adaptive cache;
-- `targeted`: prioritize ranges without a fresh cached observation; fresh
-  cached ranges are not resampled;
+- `targeted`: sample uncached ranges and skip ranges with a fresh complete
+  cached observation; skipped ranges are reported as `cache_skips` and are not
+  presented as fresh samples;
 - `adaptive`: reuse a fresh complete cached range observation, otherwise
   sample it.
 

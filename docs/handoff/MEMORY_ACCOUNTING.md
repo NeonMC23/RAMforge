@@ -253,7 +253,8 @@ Duplicate or overlapping pages are sampled once; unique-page totals are kept
 separate from source-reference counts. The per-execution budget is unique-page based and strict for fresh samples;
 reused cached observations are reported separately and do not consume it. Systematic, targeted, and adaptive strategies share the same
 budget and accounting. Adaptive cache entries are bounded range observations
-with mapping generation, event-sequence freshness, and explicit reuse markers.
+with mapping generation, event-sequence freshness, and explicit reuse and skip
+markers.
 A cached observation is never represented as a fresh `mincore()` result.
 
 ## CPU node-dispatch observation

@@ -1151,6 +1151,7 @@ fn node_dispatch_observer_reports_diagnostic_events() {
     assert!(sample["mapping_generation"].as_u64().unwrap() > 0);
     assert!(sample["mapping_id"].as_u64().unwrap() < 1_000_000);
     assert!(sample["fresh_sampled_pages"].as_u64().unwrap() > 0);
+    assert!(dispatch["cache_skips"].as_u64().is_some());
     assert_eq!(
         dispatch["semantics"],
         "CPU node dispatch start; not a tensor read or residency proof"

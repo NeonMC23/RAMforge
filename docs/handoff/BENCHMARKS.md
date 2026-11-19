@@ -402,25 +402,27 @@ overhead:
 
 | Workers | Sample pages/source | Median decode | Events |
 |---|---:|---:|---:|
-| 1 | 0 (disabled) | 16.91 ms | 10,300 |
-| 1 | 64 | 16.94 ms | 10,300 |
-| 4 | 0 | 6.63 ms | 10,300 |
-| 4 | 64 | 6.29 ms | 10,300 |
+| 1 | 0 (disabled) | 17.22 ms | 10,300 |
+| 1 | 64 | 17.61 ms | 10,300 |
+| 4 | 0 | 6.54 ms | 10,300 |
+| 4 | 64 | 6.66 ms | 10,300 |
 
 Strategy comparison at one worker, five decodes, 64 pages/range, 4,096-page
-execution budget:
+execution budget. Ranges cover four independent smoke runs:
 
-| Strategy | Median decode | Cache reuses |
-|---|---:|---:|
-| systematic | 17.95 ms | 0 |
-| targeted | 17.09 ms | 0 |
-| adaptive | 17.22 ms | 252 |
+| Strategy | Median decode | Cache reuses | Cache skips |
+|---|---:|---:|---:|
+| systematic | 17.6–19.4 ms | 0 | 0 |
+| targeted | 17.6–18.1 ms | 0 | 252 |
+| adaptive | 17.7–19.7 ms | 252 | 0 |
 
-The differences are small and noisy; adaptive reuse occurred but did not show a
-clear latency benefit in this smoke test.
+The differences are dominated by run-to-run noise; adaptive reuse occurred but
+did not show a clear latency benefit in this smoke test. Targeted skipped 252
+fresh ranges instead of sampling them, which is a behavioral difference rather
+than a measured speedup.
 
-The one-worker sampling run was effectively within noise in this run; the
-four-worker result was also within noise. Sampling performs one bounded
+A second sampling run measured 18.53/17.67 ms at one worker and 6.45/8.14 ms at
+four workers; the spread is dominated by run-to-run noise. Sampling performs one bounded
 `mincore()` sample per merged range per dispatched node, subject to a strict
 per-execution unique-page budget. It remains opt-in and diagnostic-only. No
 speedup or I/O avoidance is claimed.

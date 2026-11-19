@@ -387,11 +387,12 @@ Not run or not claimed:
   one thread off 15.98 ms vs on 17.54–18.26 ms; four threads off 6.42 ms vs
   on 6.83–6.97 ms. The spread is noisy; no speedup is claimed. Events were
   bounded, with no drops in the measured settings.
-- Pre-dispatch sampling smoke: one thread 16.91 ms disabled vs 16.94 ms at
-  64 pages/range/4,096-page execution budget; four threads 6.63 vs 6.29 ms
-  (within noise). Strategy medians: systematic 17.95 ms, targeted 17.09 ms,
-  adaptive 17.22 ms; adaptive reported 252 cache reuses. Sampling is
-  diagnostic-only and disabled by default.
+- Pre-dispatch sampling smoke: one thread 17.22 ms disabled vs 17.61 ms at
+  64 pages/range/4,096-page execution budget; four threads 6.54 vs 6.66 ms.
+  A second run measured 18.53/17.67 ms and 6.45/8.14 ms. Strategy ranges across
+  four runs: systematic 17.6–19.4 ms, targeted 17.6–18.1 ms with 252 skips,
+  adaptive 17.7–19.7 ms with 252 reuses. Differences are dominated by noise.
+  Sampling is diagnostic-only and disabled by default.
 - Mapping metadata tests check a nonzero model-instance generation, mapping id,
   file path/size, exact page bounds, and bounded/partial native sampling.
 - Pre-dispatch sampling is implemented for validated file-backed tensor

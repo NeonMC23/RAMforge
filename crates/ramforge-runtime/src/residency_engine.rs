@@ -1353,6 +1353,7 @@ pub struct NodeDispatchObservation {
     pub fresh_sampled_pages: u64,
     pub reused_pages: u64,
     pub cache_reuses: u64,
+    pub cache_skips: u64,
     pub cache_evictions: u64,
     pub notes: Vec<String>,
 }
