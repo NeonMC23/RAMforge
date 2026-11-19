@@ -1339,6 +1339,9 @@ pub struct NodeDispatchObservation {
     pub sampled_sources: usize,
     pub requested_pages: u64,
     pub sampled_pages: u64,
+    pub unsampled_pages: u64,
+    pub budget_total: u64,
+    pub budget_remaining: u64,
     pub resident_pages: u64,
     pub nonresident_pages: u64,
     pub unknown_pages: u64,
@@ -1346,6 +1349,11 @@ pub struct NodeDispatchObservation {
     pub sampling_errors: usize,
     pub truncated_samples: usize,
     pub sampling_complete: bool,
+    pub sampling_strategy: String,
+    pub fresh_sampled_pages: u64,
+    pub reused_pages: u64,
+    pub cache_reuses: u64,
+    pub cache_evictions: u64,
     pub notes: Vec<String>,
 }
 

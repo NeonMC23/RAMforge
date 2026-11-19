@@ -187,8 +187,15 @@ Flags:
 - `--node-dispatch-events N`: retained event bound (default 4096); overflow
   drops oldest events and reports `dropped_events`.
 - `--node-dispatch-sample-pages N`: sample up to N file-backed pages per
-  declared source before dispatch; 0 disables sampling. Samples are bounded,
-  partial-aware, and do not prove a read or residency during kernel execution.
+  merged dispatch range; 0 disables sampling.
+- `--node-dispatch-sample-budget N`: maximum fresh unique pages sampled per
+  execution; resets at each decode. Reused cache observations do not consume it.
+- `--node-dispatch-sample-strategy systematic|targeted|adaptive`: deterministic
+  sampling policy. Systematic ignores cache; targeted prioritizes uncached
+  ranges; adaptive reuses fresh complete cache entries and samples stale ranges.
+- `--node-dispatch-cache-capacity N`: bounded adaptive range-cache capacity.
+- `--node-dispatch-cache-ttl N`: freshness window in event sequences.
+- `--node-dispatch-force-fresh`: force systematic/no-cache behavior.
 - `--node-dispatch-detail`: print individual dispatch events.
 
 ### Enforced budget matrix
@@ -1063,7 +1070,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **531 tests, 0 failed, 19 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **532 tests, 0 failed, 19 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

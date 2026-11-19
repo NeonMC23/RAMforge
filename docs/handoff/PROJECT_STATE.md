@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **531 tests, 0 failed, 19 ignored**. The ignored
+  environment variables passes **532 tests, 0 failed, 19 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -86,10 +86,12 @@
   never authorizes release. It is residency observation only, not proof of a
   read or fault.
 - Five-decode overhead smoke (SmolLM2, tiny-batch decode): one thread
-  observer off 22.20 ms vs on 20.39–21.22 ms; four threads off 9.76 ms vs on
-  10.51–10.96 ms. The spread is noisy; no speedup is claimed. Events were
-  bounded and no drops occurred in these settings.
-- forgeCORE tests: 390 passed, 5 ignored. RAMforge tests: 531 passed, 19
+  observer off 15.98 ms vs on 17.54–18.26 ms; four threads off 6.42 ms vs on
+  6.83–6.97 ms. Sampling at 64 pages/range and 4,096-page execution budget was
+  within noise at one/four threads. Strategy medians were 17.95/17.09/17.22 ms
+  for systematic/targeted/adaptive; adaptive reported 252 cache reuses. The
+  spread is noisy; no speedup is claimed.
+- forgeCORE tests: 396 passed, 6 ignored. RAMforge tests: 532 passed, 19
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.

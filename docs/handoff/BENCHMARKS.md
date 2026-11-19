@@ -402,16 +402,28 @@ overhead:
 
 | Workers | Sample pages/source | Median decode | Events |
 |---|---:|---:|---:|
-| 1 | 0 (disabled) | 22.15 ms | 10,300 |
-| 1 | 64 | 39.75 ms | 10,300 |
-| 4 | 0 | 11.15 ms | 10,300 |
-| 4 | 64 | 11.10 ms | 10,300 |
+| 1 | 0 (disabled) | 16.91 ms | 10,300 |
+| 1 | 64 | 16.94 ms | 10,300 |
+| 4 | 0 | 6.63 ms | 10,300 |
+| 4 | 64 | 6.29 ms | 10,300 |
 
-The one-worker sampling run was about 79% slower; the four-worker result was
-within noise. Sampling performs one bounded `mincore()` sample per declared
-source per dispatched node, so its cost scales with source count and node
-count. It remains opt-in and diagnostic-only. No speedup or I/O avoidance is
-claimed.
+Strategy comparison at one worker, five decodes, 64 pages/range, 4,096-page
+execution budget:
+
+| Strategy | Median decode | Cache reuses |
+|---|---:|---:|
+| systematic | 17.95 ms | 0 |
+| targeted | 17.09 ms | 0 |
+| adaptive | 17.22 ms | 252 |
+
+The differences are small and noisy; adaptive reuse occurred but did not show a
+clear latency benefit in this smoke test.
+
+The one-worker sampling run was effectively within noise in this run; the
+four-worker result was also within noise. Sampling performs one bounded
+`mincore()` sample per merged range per dispatched node, subject to a strict
+per-execution unique-page budget. It remains opt-in and diagnostic-only. No
+speedup or I/O avoidance is claimed.
 
 ## CPU node-dispatch observer overhead (2026-10-31)
 
@@ -421,12 +433,12 @@ compute-enabled node and drains after each repetition.
 
 | Workers | Observer | Median decode | Events | Dropped |
 |---|---:|---:|---:|---:|
-| 1 | off | 22.20 ms | 0 | 0 |
-| 1 | on, drained | 20.39 ms | 2,575 | 0 |
-| 1 | on, not drained | 21.22 ms | 3,090 | 0 |
-| 4 | off | 9.76 ms | 0 | 0 |
-| 4 | on, drained | 10.51 ms | 2,575 | 0 |
-| 4 | on, not drained | 10.96 ms | 3,090 | 0 |
+| 1 | off | 15.98 ms | 0 | 0 |
+| 1 | on, drained | 17.54 ms | 2,575 | 0 |
+| 1 | on, not drained | 18.26 ms | 3,090 | 0 |
+| 4 | off | 6.42 ms | 0 | 0 |
+| 4 | on, drained | 6.83 ms | 2,575 | 0 |
+| 4 | on, not drained | 6.97 ms | 3,090 | 0 |
 
 These medians come from one five-decode smoke run and are visibly noisy; the
 four-worker enabled results are about 8–12% slower in this run, while earlier

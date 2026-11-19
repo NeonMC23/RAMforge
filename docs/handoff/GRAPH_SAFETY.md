@@ -47,13 +47,38 @@ and status. Unknown pages are never treated as nonresident. This is a
 point-in-time residency observation, not proof of a physical read, page fault,
 I/O, or final use.
 
-With `--node-dispatch-sample-pages N`, forgeCORE samples each declared source
-name before storing the node-dispatch event and before the observer barrier
-that releases workers into the kernel. Sampling is per declared source; a
-source that is not a unique file-backed model tensor remains missing or
-unsupported. The event preserves the per-source sample, including mapping
+With `--node-dispatch-sample-pages N`, forgeCORE merges the declared source
+mapping ranges, samples unique pages before storing the node-dispatch event,
+and blocks at the observer barrier before releasing workers into the kernel.
+A source that is not a unique file-backed model tensor remains missing or
+unsupported. The event stores each source's validated mapping range for
+attribution and one deduplicated dispatch-level sample with mapping
 generation and truncation. Sampling is disabled at `N=0` (the default), never
 runs in every worker, and never authorizes release or eviction.
+
+### Deduplication, budgets, and strategies
+
+Source ranges are merged by mapping id/generation before sampling, so one
+page shared by multiple sources contributes once to dispatch-level unique-page
+totals while each source keeps its mapping range and reference count. Page
+alignment is validated from native mapping metadata.
+
+Sampling is opt-in. `--node-dispatch-sample-strategy` selects:
+
+- `systematic`: deterministic mapping/page order, no adaptive cache;
+- `targeted`: prioritize ranges without a fresh cached observation; fresh
+  cached ranges are not resampled;
+- `adaptive`: reuse a fresh complete cached range observation, otherwise
+  sample it.
+
+`--node-dispatch-sample-budget` is a strict per-execution budget for fresh
+`mincore()` pages; it resets at each decode and is shared across dispatches. It
+cannot be exceeded by overlapping sources. Reused cached observations are
+reported separately and do not consume the fresh-sampling budget. `--node-dispatch-sample-pages` caps one merged range.
+`--node-dispatch-cache-ttl` controls freshness in event-sequence units;
+`--node-dispatch-cache-capacity` bounds cache storage. Reused pages are reported
+as `reused_pages`, never as fresh `mincore()` results. Budget-excluded and
+partial pages are reported explicitly.
 
 ## CPU node-dispatch observer
 

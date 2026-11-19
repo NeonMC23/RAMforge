@@ -32,7 +32,8 @@ use ramforge_runtime::residency_engine::{
 };
 use ramforge_runtime::{
     DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
-    ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, NodeDispatchOptions, PageSampleStatus,
+    ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, NodeDispatchOptions,
+    NodeSamplingStrategy, PageSampleStatus,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -305,9 +306,29 @@ enum Commands {
         #[arg(long, default_value_t = 4096, requires = "node_dispatch_observe")]
         node_dispatch_events: usize,
 
-        /// Maximum file-backed pages sampled per declared source tensor
+        /// Maximum file-backed pages sampled per merged dispatch range
         #[arg(long, default_value_t = 0, requires = "node_dispatch_observe")]
         node_dispatch_sample_pages: u64,
+
+        /// Maximum fresh unique pages sampled per execution
+        #[arg(long, default_value_t = 4096, requires = "node_dispatch_observe")]
+        node_dispatch_sample_budget: u64,
+
+        /// Sampling strategy: systematic, targeted, or adaptive
+        #[arg(long, default_value = "targeted", requires = "node_dispatch_observe")]
+        node_dispatch_sample_strategy: String,
+
+        /// Cache capacity for adaptive complete-range observations
+        #[arg(long, default_value_t = 1024, requires = "node_dispatch_observe")]
+        node_dispatch_cache_capacity: usize,
+
+        /// Freshness window for adaptive cache entries, in event sequences
+        #[arg(long, default_value_t = 1024, requires = "node_dispatch_observe")]
+        node_dispatch_cache_ttl: u64,
+
+        /// Force systematic sampling without adaptive cache reuse
+        #[arg(long, requires = "node_dispatch_observe")]
+        node_dispatch_force_fresh: bool,
 
         /// Print individual CPU node-dispatch events
         #[arg(long, requires = "node_dispatch_observe")]
@@ -434,6 +455,11 @@ fn main() {
             node_dispatch_observe,
             node_dispatch_events,
             node_dispatch_sample_pages,
+            node_dispatch_sample_budget,
+            node_dispatch_sample_strategy,
+            node_dispatch_cache_capacity,
+            node_dispatch_cache_ttl,
+            node_dispatch_force_fresh,
             node_dispatch_detail,
             enforce_ram,
             enforce_timeout,
@@ -510,6 +536,11 @@ fn main() {
                 node_dispatch_observe,
                 node_dispatch_events,
                 node_dispatch_sample_pages,
+                node_dispatch_sample_budget,
+                node_dispatch_sample_strategy,
+                node_dispatch_cache_capacity,
+                node_dispatch_cache_ttl,
+                node_dispatch_force_fresh,
                 node_dispatch_detail,
                 max_tokens,
                 temperature,
@@ -589,6 +620,17 @@ fn prepare_prompt(
     Ok(rendered)
 }
 
+fn parse_sampling_strategy(value: &str) -> anyhow::Result<NodeSamplingStrategy> {
+    match value {
+        "systematic" => Ok(NodeSamplingStrategy::Systematic),
+        "targeted" => Ok(NodeSamplingStrategy::Targeted),
+        "adaptive" => Ok(NodeSamplingStrategy::Adaptive),
+        other => Err(anyhow::anyhow!(
+            "unknown --node-dispatch-sample-strategy '{other}'"
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_inference(
     model_path: PathBuf,
@@ -627,6 +669,11 @@ fn run_inference(
     node_dispatch_observe: bool,
     node_dispatch_events: usize,
     node_dispatch_sample_pages: u64,
+    node_dispatch_sample_budget: u64,
+    node_dispatch_sample_strategy: String,
+    node_dispatch_cache_capacity: usize,
+    node_dispatch_cache_ttl: u64,
+    node_dispatch_force_fresh: bool,
     node_dispatch_detail: bool,
     max_tokens: usize,
     temperature: f32,
@@ -734,6 +781,12 @@ fn run_inference(
             "--node-dispatch-sample-pages must be at most 4096"
         ));
     }
+    if node_dispatch_observe && node_dispatch_sample_budget > 4096 {
+        return Err(anyhow::anyhow!(
+            "--node-dispatch-sample-budget must be at most 4096"
+        ));
+    }
+    parse_sampling_strategy(&node_dispatch_sample_strategy)?;
     let device_selection = device
         .parse::<DeviceSelection>()
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -803,6 +856,11 @@ fn run_inference(
             node_dispatch_observe,
             node_dispatch_events,
             node_dispatch_sample_pages,
+            node_dispatch_sample_budget,
+            node_dispatch_sample_strategy,
+            node_dispatch_cache_capacity,
+            node_dispatch_cache_ttl,
+            node_dispatch_force_fresh,
             node_dispatch_detail,
             max_tokens,
             temperature,
@@ -1139,6 +1197,11 @@ fn run_forgecore_inference(
     node_dispatch_observe: bool,
     node_dispatch_events: usize,
     node_dispatch_sample_pages: u64,
+    node_dispatch_sample_budget: u64,
+    node_dispatch_sample_strategy: String,
+    node_dispatch_cache_capacity: usize,
+    node_dispatch_cache_ttl: u64,
+    node_dispatch_force_fresh: bool,
     node_dispatch_detail: bool,
     max_tokens: usize,
     temperature: f32,
@@ -1148,6 +1211,11 @@ fn run_forgecore_inference(
     profile: bool,
     memory_report: bool,
 ) -> anyhow::Result<()> {
+    let sampling_strategy = if node_dispatch_force_fresh {
+        NodeSamplingStrategy::Systematic
+    } else {
+        parse_sampling_strategy(&node_dispatch_sample_strategy)?
+    };
     let run_started = Instant::now();
     let model_load_started = Instant::now();
     let rss_before_load = process_rss();
@@ -1678,6 +1746,10 @@ fn run_forgecore_inference(
             .set_node_dispatch_observer(Some(NodeDispatchOptions {
                 max_events: node_dispatch_events,
                 sample_pages: node_dispatch_sample_pages,
+                sample_budget: node_dispatch_sample_budget,
+                strategy: sampling_strategy,
+                cache_capacity: node_dispatch_cache_capacity,
+                cache_ttl_events: node_dispatch_cache_ttl,
             }))
             .map_err(|error| anyhow::anyhow!(error))?;
         eprintln!(
@@ -2103,12 +2175,15 @@ fn run_forgecore_inference(
             let mut sampled_sources = 0usize;
             let mut requested_pages = 0u64;
             let mut sampled_pages = 0u64;
+            let mut unsampled_pages = 0u64;
             let mut resident_pages = 0u64;
             let mut nonresident_pages = 0u64;
             let mut unknown_pages = 0u64;
             let mut partial_samples = 0usize;
             let mut sampling_errors = 0usize;
             let mut truncated_samples = 0usize;
+            let mut fresh_sampled_pages = 0u64;
+            let mut reused_pages = 0u64;
             for event in &events {
                 if expected_model.is_some_and(|id| id != event.model_instance_id)
                     || expected_context.is_some_and(|id| id != event.context_id)
@@ -2138,30 +2213,35 @@ fn run_forgecore_inference(
                     matched.extend(event_matched);
                 }
                 for source in &event.source_samples {
-                    if let Some(sample) = source.sample {
+                    if event.dispatch_sample.is_some() && source.requested_pages > 0 {
                         sampled_sources += 1;
-                        requested_pages = requested_pages.saturating_add(sample.requested_pages);
-                        sampled_pages = sampled_pages.saturating_add(sample.sampled_pages);
-                        resident_pages = resident_pages.saturating_add(sample.resident_pages);
-                        nonresident_pages =
-                            nonresident_pages.saturating_add(sample.nonresident_pages);
-                        unknown_pages = unknown_pages.saturating_add(sample.unknown_pages);
-                        if sample.status == PageSampleStatus::Partial {
-                            partial_samples += 1;
-                        }
-                        if matches!(
-                            sample.status,
-                            PageSampleStatus::Error
-                                | PageSampleStatus::Unsupported
-                                | PageSampleStatus::Stale
-                                | PageSampleStatus::Missing
-                                | PageSampleStatus::Unknown
-                        ) {
-                            sampling_errors += 1;
-                        }
-                        if sample.truncated {
-                            truncated_samples += 1;
-                        }
+                    }
+                }
+                if let Some(sample) = event.dispatch_sample {
+                    requested_pages = requested_pages.saturating_add(sample.requested_pages);
+                    sampled_pages = sampled_pages.saturating_add(sample.sampled_pages);
+                    unsampled_pages = unsampled_pages.saturating_add(sample.unsampled_pages);
+                    fresh_sampled_pages =
+                        fresh_sampled_pages.saturating_add(sample.fresh_sampled_pages);
+                    reused_pages = reused_pages.saturating_add(sample.reused_pages);
+                    resident_pages = resident_pages.saturating_add(sample.resident_pages);
+                    nonresident_pages = nonresident_pages.saturating_add(sample.nonresident_pages);
+                    unknown_pages = unknown_pages.saturating_add(sample.unknown_pages);
+                    if sample.status == PageSampleStatus::Partial {
+                        partial_samples += 1;
+                    }
+                    if matches!(
+                        sample.status,
+                        PageSampleStatus::Error
+                            | PageSampleStatus::Unsupported
+                            | PageSampleStatus::Stale
+                            | PageSampleStatus::Missing
+                            | PageSampleStatus::Unknown
+                    ) {
+                        sampling_errors += 1;
+                    }
+                    if sample.truncated {
+                        truncated_samples += 1;
                     }
                 }
                 source_truncated_events += usize::from(event.sources_truncated);
@@ -2213,16 +2293,24 @@ fn run_forgecore_inference(
                 sampled_sources,
                 requested_pages,
                 sampled_pages,
+                unsampled_pages,
+                budget_total: summary.budget_total,
+                budget_remaining: summary.budget_remaining,
                 resident_pages,
                 nonresident_pages,
                 unknown_pages,
                 partial_samples,
                 sampling_errors,
                 truncated_samples,
-                sampling_complete: sampled_sources > 0
+                sampling_complete: sampled_pages > 0
                     && partial_samples == 0
                     && sampling_errors == 0
                     && truncated_samples == 0,
+                sampling_strategy: format!("{sampling_strategy:?}").to_lowercase(),
+                fresh_sampled_pages,
+                reused_pages,
+                cache_reuses: summary.cache_reuses,
+                cache_evictions: summary.cache_evictions,
                 notes,
             });
         }
@@ -3442,6 +3530,10 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
             "dropped_events": observation.summary.dropped_events,
             "retained_events": observation.summary.retained_events,
             "max_events": observation.summary.max_events,
+            "cache_reuses": observation.summary.cache_reuses,
+            "cache_evictions": observation.summary.cache_evictions,
+            "budget_total": observation.summary.budget_total,
+            "budget_remaining": observation.summary.budget_remaining,
         },
         "attributed_events": observation.attributed_events,
         "unattributed_events": observation.unattributed_events,
@@ -3452,6 +3544,9 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
         "sampled_sources": observation.sampled_sources,
         "requested_pages": observation.requested_pages,
         "sampled_pages": observation.sampled_pages,
+        "unsampled_pages": observation.unsampled_pages,
+        "budget_total": observation.budget_total,
+        "budget_remaining": observation.budget_remaining,
         "resident_pages": observation.resident_pages,
         "nonresident_pages": observation.nonresident_pages,
         "unknown_pages": observation.unknown_pages,
@@ -3459,6 +3554,11 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
         "sampling_errors": observation.sampling_errors,
         "truncated_samples": observation.truncated_samples,
         "sampling_complete": observation.sampling_complete,
+        "sampling_strategy": observation.sampling_strategy,
+        "fresh_sampled_pages": observation.fresh_sampled_pages,
+        "reused_pages": observation.reused_pages,
+        "cache_reuses": observation.cache_reuses,
+        "cache_evictions": observation.cache_evictions,
         "notes": observation.notes,
         "events_serialized": observation.events.len().min(512),
         "events_omitted": observation.events.len().saturating_sub(512),
@@ -3478,6 +3578,11 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
             "source_names": event.source_names,
             "source_samples": event.source_samples.iter().map(|source| serde_json::json!({
                 "name": source.name,
+                "mapping_id": source.mapping_id,
+                "mapping_generation": source.mapping_generation,
+                "page_start": source.page_start,
+                "page_end": source.page_end,
+                "requested_pages": source.requested_pages,
                 "sample": source.sample.map(|sample| serde_json::json!({
                     "requested_pages": sample.requested_pages,
                     "sampled_pages": sample.sampled_pages,
@@ -3499,6 +3604,29 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
                 })),
             })).collect::<Vec<_>>(),
             "sources_truncated": event.sources_truncated,
+            "source_references": event.source_references,
+            "dispatch_sample": event.dispatch_sample.map(|sample| serde_json::json!({
+                "requested_pages": sample.requested_pages,
+                "sampled_pages": sample.sampled_pages,
+                "unsampled_pages": sample.unsampled_pages,
+                "fresh_sampled_pages": sample.fresh_sampled_pages,
+                "reused_pages": sample.reused_pages,
+                "resident_pages": sample.resident_pages,
+                "nonresident_pages": sample.nonresident_pages,
+                "unknown_pages": sample.unknown_pages,
+                "page_size": sample.page_size,
+                "mapping_id": sample.mapping_id,
+                "mapping_generation": sample.mapping_generation,
+                "mapping_size": sample.mapping_size,
+                "tensor_offset": sample.tensor_offset,
+                "tensor_size": sample.tensor_size,
+                "page_start": sample.page_start,
+                "page_end": sample.page_end,
+                "truncated": sample.truncated,
+                "error": sample.error,
+                "status": format!("{:?}", sample.status),
+                "sampled_at_sequence": sample.sampled_at_sequence,
+            })),
         })).collect::<Vec<_>>(),
     })
 }
@@ -4655,5 +4783,27 @@ fn metadata_value_to_json(v: &ramforge_core::MetadataValue) -> serde_json::Value
             let vals: Vec<_> = arr.values.iter().map(metadata_value_to_json).collect();
             serde_json::json!(vals)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_sampling_strategy, NodeSamplingStrategy};
+
+    #[test]
+    fn sampling_strategy_parser_is_explicit() {
+        assert_eq!(
+            parse_sampling_strategy("systematic").unwrap(),
+            NodeSamplingStrategy::Systematic
+        );
+        assert_eq!(
+            parse_sampling_strategy("targeted").unwrap(),
+            NodeSamplingStrategy::Targeted
+        );
+        assert_eq!(
+            parse_sampling_strategy("adaptive").unwrap(),
+            NodeSamplingStrategy::Adaptive
+        );
+        assert!(parse_sampling_strategy("other").is_err());
     }
 }

@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 531 passed, 0 failed, 19 ignored.
+- `cargo test --workspace`: 532 passed, 0 failed, 19 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -370,11 +370,11 @@ Not run or not claimed:
 
 ## CPU node-dispatch validation — 2026-10-31
 
-- forgeCORE `cargo test --workspace`: **390 passed, 0 failed, 5 ignored**.
+- forgeCORE `cargo test --workspace`: **396 passed, 0 failed, 6 ignored**.
   New `node_dispatch` tests cover disabled-by-default behavior, installation
   and removal, event drain, overflow, multiple contexts, four-worker
   exactly-once publication, identity fields, and bounded options.
-- RAMforge `cargo test --workspace`: **531 passed, 0 failed, 19 ignored**.
+- RAMforge `cargo test --workspace`: **532 passed, 0 failed, 19 ignored**.
   The ignored real-model CLI test verifies `--node-dispatch-observe` JSON with
   attributed and unattributed events, zero identity mismatches, CPU backend,
   and bounded serialization.
@@ -384,11 +384,13 @@ Not run or not claimed:
   adds neither callback nor barrier. Four-worker test observed one event per
   active node and strictly increasing event sequence.
 - Observer overhead smoke (SmolLM2, five measured decodes per setting):
-  one thread off 22.20 ms vs on 20.39–21.22 ms; four threads off 9.76 ms vs
-  on 10.51–10.96 ms. The spread is noisy; no speedup is claimed. Events were
+  one thread off 15.98 ms vs on 17.54–18.26 ms; four threads off 6.42 ms vs
+  on 6.83–6.97 ms. The spread is noisy; no speedup is claimed. Events were
   bounded, with no drops in the measured settings.
-- Pre-dispatch sampling smoke: one thread 22.15 ms disabled vs 39.75 ms at 64
-  pages/source; four threads 11.15 vs 11.10 ms (within noise). Sampling is
+- Pre-dispatch sampling smoke: one thread 16.91 ms disabled vs 16.94 ms at
+  64 pages/range/4,096-page execution budget; four threads 6.63 vs 6.29 ms
+  (within noise). Strategy medians: systematic 17.95 ms, targeted 17.09 ms,
+  adaptive 17.22 ms; adaptive reported 252 cache reuses. Sampling is
   diagnostic-only and disabled by default.
 - Mapping metadata tests check a nonzero model-instance generation, mapping id,
   file path/size, exact page bounds, and bounded/partial native sampling.
@@ -419,7 +421,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          531 passed, 0 failed, 19 ignored
+cargo test --workspace                          532 passed, 0 failed, 19 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

@@ -47,6 +47,11 @@ fn help_lists_memory_control_flags() {
         "--node-dispatch-observe",
         "--node-dispatch-events",
         "--node-dispatch-sample-pages",
+        "--node-dispatch-sample-budget",
+        "--node-dispatch-sample-strategy",
+        "--node-dispatch-cache-capacity",
+        "--node-dispatch-cache-ttl",
+        "--node-dispatch-force-fresh",
         "--node-dispatch-detail",
     ] {
         assert!(text.contains(flag), "help must list {flag}: {text}");
@@ -1142,8 +1147,10 @@ fn node_dispatch_observer_reports_diagnostic_events() {
         dispatch["sampled_pages"].as_u64().unwrap()
     );
     assert!(dispatch["truncated_samples"].as_u64().unwrap() > 0);
-    let sample = &dispatch["events"][0]["source_samples"][0]["sample"];
+    let sample = &dispatch["events"][0]["dispatch_sample"];
     assert!(sample["mapping_generation"].as_u64().unwrap() > 0);
+    assert!(sample["mapping_id"].as_u64().unwrap() < 1_000_000);
+    assert!(sample["fresh_sampled_pages"].as_u64().unwrap() > 0);
     assert_eq!(
         dispatch["semantics"],
         "CPU node dispatch start; not a tensor read or residency proof"
