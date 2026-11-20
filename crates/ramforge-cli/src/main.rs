@@ -132,6 +132,10 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
+        /// Redact local paths from the JSON export
+        #[arg(long)]
+        export: bool,
+
         /// Storage path to inspect (repeatable); defaults to the model directory or cwd
         #[arg(long = "storage")]
         storage_paths: Vec<PathBuf>,
@@ -444,6 +448,7 @@ fn main() {
         Commands::Machine {
             model,
             json,
+            export,
             storage_paths,
             ram,
             context,
@@ -457,6 +462,7 @@ fn main() {
             if let Err(error) = run_machine(
                 model,
                 json,
+                export,
                 storage_paths,
                 ram,
                 context,
@@ -652,6 +658,7 @@ fn run_inspect(model_path: PathBuf, json_output: bool, max_tensors: usize) -> an
 fn run_machine(
     model_path: Option<PathBuf>,
     json_output: bool,
+    export: bool,
     storage_paths: Vec<PathBuf>,
     ram: Option<String>,
     context: u32,
@@ -742,10 +749,15 @@ fn run_machine(
             .map(|requirements| compare_plans(&profile, requirements, plans))
     });
     if json_output {
+        let exported = if export {
+            profile.redacted()
+        } else {
+            profile.clone()
+        };
         let mut report = serde_json::json!({
             "schema_version": 1,
             "kind": "ramforge.machine_profile",
-            "profile": profile.to_json().map_err(|error| anyhow::anyhow!(error))?,
+            "profile": exported.to_json().map_err(|error| anyhow::anyhow!(error))?,
         });
         if let Some(requirements) = &requirements {
             report["model_requirements"] = requirements

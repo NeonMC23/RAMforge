@@ -420,6 +420,28 @@ pub fn evaluate_plan(
             } else {
                 let free = device.memory_free_bytes.as_ref().copied().unwrap_or(0);
                 if let Some(required) = estimated_vram.bytes {
+                    if let Some(budget) = plan.vram_budget_bytes {
+                        if required > budget {
+                            reasons.push(PlanReason {
+                                code: "vram_requirement_exceeds_budget".to_string(),
+                                detail: format!(
+                                    "estimated VRAM requirement {required} exceeds budget {budget}"
+                                ),
+                            });
+                            feasibility = Feasibility::Infeasible;
+                            return PlanEvaluation {
+                                plan_id: plan.id.clone(),
+                                profile: plan.profile,
+                                feasibility,
+                                estimated_ram,
+                                estimated_vram,
+                                reasons,
+                                unknown_information: unknown,
+                                storage_dependency: plan.mapping
+                                    != MappingStrategy::ResidentWeights,
+                            };
+                        }
+                    }
                     if required > free {
                         reasons.push(PlanReason {
                             code: "vram_requirement_exceeds_free".to_string(),
@@ -642,6 +664,38 @@ mod tests {
         gpu_plan.device_id = Some("missing".to_string());
         let gpu = evaluate_plan(&machine, &requirements(1000, 200, Some(4096)), &gpu_plan);
         assert_eq!(gpu.feasibility, Feasibility::Infeasible);
+    }
+
+    #[test]
+    fn vram_budget_is_enforced_for_resident_gpu_plans() {
+        let mut machine = profile();
+        let mut gpu = machine.devices[0].clone();
+        gpu.id = "gpu-test".to_string();
+        gpu.kind = "gpu".to_string();
+        gpu.selectable = true;
+        gpu.memory_total_bytes = Observed::known(
+            2000,
+            crate::machine_profile::Provenance::Configured,
+            crate::machine_profile::Freshness::Stable,
+            1,
+        );
+        gpu.memory_free_bytes = Observed::known(
+            1000,
+            crate::machine_profile::Provenance::Configured,
+            crate::machine_profile::Freshness::Dynamic,
+            1,
+        );
+        machine.devices.push(gpu);
+        let mut plan = cpu_plan(MappingStrategy::ResidentWeights, Some(10_000));
+        plan.backend = PlanBackend::Gpu;
+        plan.device_id = Some("gpu-test".to_string());
+        plan.vram_budget_bytes = Some(100);
+        let evaluation = evaluate_plan(&machine, &requirements(1000, 200, Some(4096)), &plan);
+        assert_eq!(evaluation.feasibility, Feasibility::Infeasible);
+        assert!(evaluation
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "vram_requirement_exceeds_budget"));
     }
 
     #[test]

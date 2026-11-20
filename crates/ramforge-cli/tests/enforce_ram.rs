@@ -1206,6 +1206,7 @@ fn machine_profile_reports_resources_requirements_and_plans() {
             "--benchmark-runs",
             "1",
             "--json",
+            "--export",
         ])
         .output()
         .unwrap();
@@ -1218,6 +1219,13 @@ fn machine_profile_reports_resources_requirements_and_plans() {
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["kind"], "ramforge.machine_profile");
     let profile = &report["profile"];
+    assert!(profile["hostname_redacted"].as_bool().unwrap());
+    assert!(profile["storage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|storage| storage["local_path"].is_null()));
+    assert_eq!(profile["memory"]["cgroup"]["path"]["state"], "unavailable");
     assert!(profile["cpu"]["architecture"]["value"].is_string());
     assert!(
         profile["cpu"]["available_threads"]["value"]
@@ -1316,6 +1324,7 @@ fn root_help_lists_machine_command() {
         "--benchmark-size",
         "--benchmark-runs",
         "--json",
+        "--export",
     ] {
         assert!(text.contains(flag), "machine help must list {flag}: {text}");
     }
