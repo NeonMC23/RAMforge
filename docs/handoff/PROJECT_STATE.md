@@ -7,7 +7,7 @@
 ## Local verification (2026-10-25)
 
 - The workspace builds and tests against the pinned `forge-core` revision
-  `457c4f7` with Rust/Cargo 1.98.1 and the workspace native tree at
+  `2d38c8c` with Rust/Cargo 1.99.0 and the workspace native tree at
   `/home/neon/Documents/CODE LOCAL/forge/native` (llama.cpp/ggml v0.5.0 plus
   the documented mmap-no-prefetch patch).
 - `scripts/test.sh --workspace --locked` sets `FORGE_LLAMA_DIR` and the
@@ -50,7 +50,7 @@
   device facts, and (when active) cgroup limit/peak/events/page faults. Without
   `--enforce-ram` it labels the requested budget diagnostic-only; with the flag
   it labels the cgroup v2 `memory.max` enforcement.
-- The `forge-core` pin moved to `457c4f7` to consume
+- The `forge-core` pin moved to `2d38c8c` to consume
   `ModelOptions::use_extra_bufts`, `ModelLoadMode::MmapNoPrefetch`,
   `Model::tensor_mappings()`, `Model::release_tensor_pages()`, bounded
   `Model::prefetch_tensor_pages()`, and `ContextOptions::trace`. The native
@@ -95,6 +95,50 @@
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
+
+## Machine profiles and candidate plans (2026-11-20)
+
+- `machine_profile` adds versioned `Observed<T>` values with explicit known,
+  unavailable, unsupported, and failed states, provenance, stable/dynamic
+  freshness, and collection sequence. Unknown values are never zero.
+- Linux CPU collection reports architecture, vendor/model, hardware logical
+  CPUs, unique physical cores, affinity, process-visible threads, feature
+  flags, SIMD, NUMA nodes, cache topology, frequency, and cgroup CPU quota
+  where available.
+- Memory collection keeps physical capacity, OS availability, swap, process
+  RSS/peak/virtual, configured RAMforge budget, cgroup limit/current/peak/
+  anon/file/mapped/shmem/swap, and PSI pressure separate.
+- Storage collection reports filesystem, mount point, block-device identity,
+  rotational/SSD/NVMe/network/memory-backed/virtual classification when
+  reliable, read-only state, capacity, and available space. A bounded
+  file-scoped read benchmark labels cache condition and never claims physical
+  device throughput.
+- Device/backend profiles derive from the existing safe forgeCORE registry;
+  missing GPUs remain explicit and do not break CPU plans.
+- `ModelRequirements` separates exact file/tensor bytes from estimated KV and
+  unknown requirements. GGUF file size is not treated as total RAM use, and
+  mapped weights are not assumed resident.
+- `ExecutionPlanCandidate`, `evaluate_plan`, and `compare_plans` provide four
+  profiles (performance, balanced, memory-constrained, maximum-model-size),
+  conservative feasibility, explicit reasons/unknowns, and multi-dimensional
+  comparison without a single hidden score.
+- `ramforge machine --model MODEL --ram 1G --json [--export]` emits the
+  machine profile, model requirements, candidate plans, and comparison.
+  `--export` redacts local storage and cgroup paths.
+- Current machine: Linux 7.3.4, i5-11400H (12 logical / 6 physical), 15.39 GiB
+  RAM, btrfs on solid-state `dm-0`, CPU-only devices, SmolLM2-135M Q4_K_M.
+  Exact tensor payload 103,668,480 bytes; estimated 2,048-token KV 47,185,920
+  bytes. With 64 MiB budget the resident performance plan is infeasible and
+  file-backed plans remain conditional; with 1 GiB performance is feasible
+  with constraints.
+- Resource-profile benchmark (5 runs): profile collection median 1.48–2.39 ms,
+  JSON round-trip 0.32–0.50 ms, requirement derivation 0.02–0.03 ms, candidate
+  plans/comparison 0.06–0.07 ms. Single-machine warm observation only.
+- Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
+  `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
+  semantic/removal changes require a version increment.
+- ForgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 567 passed, 22
+  ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)
 

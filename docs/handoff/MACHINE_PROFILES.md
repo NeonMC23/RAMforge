@@ -30,6 +30,22 @@ not introduce a scheduler.
   and graph traces.
 - Native memory/residency reports and the scheduler observation contract.
 
+## Profile schema and persistence
+
+- `MACHINE_PROFILE_SCHEMA_VERSION = 1`.
+- `MachineProfile::validate()` rejects unsupported versions and broken
+  observed-value invariants.
+- Unknown fields are additive-compatible within version 1; removing or
+  changing the meaning of a field requires a version increment.
+- `to_json` / `from_json` round-trip and validate.
+- `collection_sequence` identifies a collection pass; `Observed.sequence`
+  ties each value to it.
+- `Observed.freshness` marks stable hardware facts versus dynamic observations.
+- `MachineProfile::redacted()` removes local storage paths and the cgroup path.
+  `ramforge machine --json --export` uses the redacted form.
+- Local runtime profiles may retain paths; exported profiles should use the
+  redacted form.
+
 ## Important distinctions
 
 - Physical RAM, available RAM, cgroup limits, process RSS, RAMforge-managed
@@ -138,6 +154,27 @@ Planner-facing requirements:
 - Never equate storage throughput with page-cache throughput.
 - Never infer that a model fits because file size is below RAM.
 - Keep plan decisions reproducible from the recorded profile and constraints.
+
+## Current validation
+
+Validated on:
+
+- Linux 7.3.4, x86_64.
+- Intel i5-11400H, 12 logical threads, 6 physical cores.
+- 15.39 GiB physical RAM.
+- btrfs root over an NVMe-backed device-mapper target; `/tmp` is tmpfs.
+- CPU: AVX2/FMA/AVX-512 feature flags, cache topology, NUMA node 0,
+  frequency range, no cgroup CPU quota.
+- Memory: physical/available, process RSS/virtual, cgroup files present but
+  `memory.max` unlimited.
+- Storage: btrfs, block device `dm-0` (253:0), rotational=0, solid-state.
+- Devices: CPU only; no GPU present.
+- Model: SmolLM2-135M Q4_K_M; exact tensor payload 103,668,480 bytes;
+  estimated 2,048-token KV cache 47,185,920 bytes.
+
+Only one physical machine has been exercised. Synthetic tests cover missing
+fields, invalid values, missing GPU devices, budget failures, context limits,
+and serialization. They do not constitute multi-machine validation.
 
 ## Validation procedure for future machines
 

@@ -368,6 +368,24 @@ Not run or not claimed:
   three workloads and slower on short-long, with wide variability; this is not
   a general speedup. Mapping delta was 0 B.')
 
+## Machine profile and candidate plan validation — 2026-11-20
+
+- `cargo test --workspace`: **567 passed, 0 failed, 22 ignored**.
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- `ramforge machine --model ... --ram 1G --json`: passed; includes CPU,
+  memory, storage, device, model requirements, four plans, and comparison.
+- `ramforge machine --model ... --ram 1M --json`: resident performance plan is
+  infeasible; file-backed plans are not reported as definitely feasible.
+- Ignored CLI machine tests: 2 passed.
+- `scripts/resource-profile-bench.sh` with 5 runs: collection median 1.48–2.39
+  ms, serialization round-trip 0.32–0.50 ms, requirements 0.02–0.03 ms,
+  plans/comparison 0.06–0.07 ms.
+- Synthetic tests cover unknown-vs-zero, observed invariants, missing metadata,
+  overflow, missing GPU, context limits, budget failures, redaction, and
+  deterministic serialization.
+- Only one physical machine was exercised. Multi-machine validation remains
+  outstanding.
+
 ## CPU node-dispatch validation — 2026-10-31
 
 - forgeCORE `cargo test --workspace`: **413 passed, 0 failed, 9 ignored**.
