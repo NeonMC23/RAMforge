@@ -397,7 +397,6 @@ fn mapping_totals(maps: &str) -> (Option<u64>, Option<u64>) {
 
 fn scan_model_mapping(path: &Path) -> Option<ModelMappingMemory> {
     let target = path.to_string_lossy();
-    let target_name = path.file_name().map(|name| name.to_string_lossy());
     let text = std::fs::read_to_string("/proc/self/smaps").ok()?;
     let mut matched = false;
     let mut mapped_bytes = 0u64;
@@ -422,10 +421,6 @@ fn scan_model_mapping(path: &Path) -> Option<ModelMappingMemory> {
                             .replace("\\012", "\n")
                             .replace("\\134", "\\");
                         mapped_path == target
-                            || std::path::Path::new(&mapped_path)
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                == target_name.as_deref()
                     });
                     if current_matches {
                         matched = true;
