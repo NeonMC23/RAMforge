@@ -101,7 +101,10 @@ These are local examples, not universal guarantees.
 `RuntimeCalibration::evidence()`. The observed non-KV lifecycle overhead is
 added only when the model fingerprint, backend, context, and requested batch
 match. Otherwise the result includes `calibration_incomparable` and keeps the
-uncalibrated conservative classification. See
+uncalibrated conservative classification. `machine --calibration` emits a
+per-plan `calibration_compatibility` result; only `exact` applies evidence.
+`incomparable`/`incompatible` reject it, while constrained/insufficient
+evidence is displayed but not applied. See
 [RUNTIME_CALIBRATION.md](RUNTIME_CALIBRATION.md).
 
 ## Limits

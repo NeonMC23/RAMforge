@@ -567,6 +567,51 @@ pub fn compare_plans_with_calibration(
     compare_plans_internal(machine, requirements, plans, calibration)
 }
 
+/// Compare plans with per-plan evidence. Each entry is applied only through
+/// the same conservative `evaluate_plan_internal` rules.
+pub fn compare_plans_with_evidence(
+    machine: &MachineProfile,
+    requirements: &ModelRequirements,
+    plans: &[ExecutionPlanCandidate],
+    evidence: &[Option<CalibrationEvidence>],
+) -> PlanComparison {
+    PlanComparison {
+        schema_version: EXECUTION_CANDIDATE_SCHEMA_VERSION,
+        dimensions: comparison_dimensions(),
+        evaluations: plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| {
+                evaluate_plan_internal(
+                    machine,
+                    requirements,
+                    plan,
+                    evidence.get(index).and_then(|value| value.as_ref()),
+                )
+            })
+            .collect(),
+        note: "No single score is produced. Weights or ranking assumptions are not hidden."
+            .to_string(),
+    }
+}
+
+fn comparison_dimensions() -> Vec<String> {
+    vec![
+        "feasibility".to_string(),
+        "estimated_ram".to_string(),
+        "estimated_vram".to_string(),
+        "ram_budget".to_string(),
+        "vram_budget".to_string(),
+        "cpu_threads".to_string(),
+        "context_tokens".to_string(),
+        "batch_tokens".to_string(),
+        "mapping".to_string(),
+        "storage_dependency".to_string(),
+        "unknown_information".to_string(),
+        "reasons".to_string(),
+    ]
+}
+
 fn compare_plans_internal(
     machine: &MachineProfile,
     requirements: &ModelRequirements,
@@ -575,20 +620,7 @@ fn compare_plans_internal(
 ) -> PlanComparison {
     PlanComparison {
         schema_version: EXECUTION_CANDIDATE_SCHEMA_VERSION,
-        dimensions: vec![
-            "feasibility".to_string(),
-            "estimated_ram".to_string(),
-            "estimated_vram".to_string(),
-            "ram_budget".to_string(),
-            "vram_budget".to_string(),
-            "cpu_threads".to_string(),
-            "context_tokens".to_string(),
-            "batch_tokens".to_string(),
-            "mapping".to_string(),
-            "storage_dependency".to_string(),
-            "unknown_information".to_string(),
-            "reasons".to_string(),
-        ],
+        dimensions: comparison_dimensions(),
         evaluations: plans
             .iter()
             .map(|plan| evaluate_plan_internal(machine, requirements, plan, calibration))
@@ -742,6 +774,7 @@ mod tests {
             batch_tokens: Some(1),
             backend: "cpu".to_string(),
             observed_runtime_overhead: RequirementBytes::estimated(600, "test overhead"),
+            compatibility: crate::calibration_compatibility::CompatibilityClass::Exact,
             valid: true,
             reason: None,
         };

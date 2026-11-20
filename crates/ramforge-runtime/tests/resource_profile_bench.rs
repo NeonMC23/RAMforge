@@ -105,8 +105,9 @@ fn resource_profile_benchmark() {
 #[ignore = "manual lifecycle calibration benchmark"]
 fn lifecycle_calibration_benchmark() {
     use ramforge_runtime::{
-        build_attribution, build_calibration, LifecycleRecorder, LifecycleStage, ModelRequirements,
-        RequirementBytes, RuntimeCalibration, RuntimeConfiguration,
+        build_attribution, build_calibration, CompatibilityTarget, LifecycleRecorder,
+        LifecycleStage, ModelRequirements, RequirementBytes, RuntimeCalibration,
+        RuntimeConfiguration,
     };
 
     let runs = std::env::var("CALIBRATION_BENCH_RUNS")
@@ -151,6 +152,7 @@ fn lifecycle_calibration_benchmark() {
         kv_type_v: "f16".to_string(),
         kv_type_source: "fixture".to_string(),
         state_serialization_size_bytes: None,
+        native_contract_version: Some(1),
     };
     let stages = [
         LifecycleStage::Baseline,
@@ -166,6 +168,7 @@ fn lifecycle_calibration_benchmark() {
     let mut snapshot_ns = Vec::with_capacity(runs);
     let mut calibration_ns = Vec::with_capacity(runs);
     let mut serialization_ns = Vec::with_capacity(runs);
+    let mut compatibility_ns = Vec::with_capacity(runs);
     for _ in 0..runs {
         let started = Instant::now();
         let mut recorder = LifecycleRecorder::new(None, Some(1024 * 1024));
@@ -189,6 +192,22 @@ fn lifecycle_calibration_benchmark() {
         let decoded = RuntimeCalibration::from_json(json).expect("decode");
         assert_eq!(decoded.schema_version, 1);
         serialization_ns.push(started.elapsed().as_nanos() as u64);
+        let target = CompatibilityTarget {
+            machine: machine.clone(),
+            requirements: requirements.clone(),
+            runtime: runtime.clone(),
+            observation: calibration.observation.clone(),
+            now_unix_ms: calibration.captured_at_unix_ms.map(|value| value + 1),
+        };
+        let started = Instant::now();
+        for _ in 0..100 {
+            let compatibility = decoded.compatibility(&target);
+            assert_eq!(
+                compatibility.classification,
+                ramforge_runtime::CompatibilityClass::Exact
+            );
+        }
+        compatibility_ns.push(started.elapsed().as_nanos() as u64 / 100);
     }
     let result = serde_json::json!({
         "kind": "ramforge.lifecycle_calibration.benchmark",
@@ -198,6 +217,7 @@ fn lifecycle_calibration_benchmark() {
         "snapshot_ns": {"median": median(&mut snapshot_ns.clone()), "min": snapshot_ns.iter().min(), "max": snapshot_ns.iter().max()},
         "build_calibration_ns": {"median": median(&mut calibration_ns.clone()), "min": calibration_ns.iter().min(), "max": calibration_ns.iter().max()},
         "serialize_roundtrip_ns": {"median": median(&mut serialization_ns.clone()), "min": serialization_ns.iter().min(), "max": serialization_ns.iter().max()},
+        "compatibility_ns": {"median": median(&mut compatibility_ns.clone()), "min": compatibility_ns.iter().min(), "max": compatibility_ns.iter().max()},
         "limitations": ["synthetic fixture requirements", "single-machine warm observation", "not a performance guarantee"],
     });
     eprintln!("{}", serde_json::to_string(&result).expect("result"));

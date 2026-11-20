@@ -114,6 +114,38 @@ Comparisons are deliberately conservative:
 - resident-weights-plus-KV vs model-load RSS delta — **invalid** because RSS
   includes other categories and page-cache effects.
 
+## Compatibility contract
+
+`CalibrationCompatibility` (schema version 1) evaluates dimensions explicitly:
+
+- model fingerprint, file size, tensor count, architecture, quantization;
+- machine OS/kernel, CPU architecture/model, physical RAM, device count/classes;
+- backend, device id;
+- native contract version, load mode, repacking;
+- requested and effective context, batch, micro-batch, sequence count, threads;
+- KV types and the source of the KV type information;
+- cache condition and whether it is known;
+- pressure class, cgroup limit, freshness, measurement completeness.
+
+Result classes:
+
+| Class | Evidence use |
+|---|---|
+| `exact` | apply |
+| `compatible_with_constraints` | display only |
+| `incompatible` | reject |
+| `incomparable` | reject |
+| `insufficient_evidence` | display only |
+
+Only `exact` may change plan feasibility. Missing effective values, unknown
+cache conditions, stale records, or incomplete lifecycles cannot silently
+authorize reuse. A different CPU/model class is `incomparable`; model,
+backend, runtime, or cache mismatches are `incompatible`.
+
+Freshness is bounded by `MAX_CALIBRATION_AGE_MS` (7 days). The classification,
+matched, mismatched, missing, and constraint dimensions, limitations, and
+reasons are serialized so CLI consumers can explain the decision.
+
 ## Plan integration
 
 `CalibrationEvidence` is produced from a calibration record. The plan evaluator
@@ -126,8 +158,11 @@ applies its observed runtime overhead only when all match:
 - calibration validity.
 
 Otherwise it emits `calibration_incomparable` and preserves the existing
-conservative behavior. `ramforge machine --calibration FILE` supplies evidence
-to plan comparison; no plan is selected or executed automatically.
+conservative behavior. `ramforge machine --calibration FILE` supplies
+per-plan compatibility results and evidence to plan comparison; no plan is
+selected or executed automatically. Use `--no-repack`, `--no-prefetch`,
+`--ubatch`, and `--sequences` to describe the candidate runtime configuration
+exactly; otherwise compatibility remains conservative.
 
 ## CLI
 
@@ -168,7 +203,8 @@ Five-run smoke:
 
 - 9 lifecycle snapshots: median ca. 2.4–2.6 ms per run;
 - calibration build: ca. 0.02 ms;
-- JSON round-trip: ca. 1.1 ms.
+- JSON round-trip: ca. 1.1 ms;
+- compatibility evaluation: ca. 13.5 µs per record in the synthetic benchmark.
 
 Snapshot cost is dominated by `/proc` and device discovery. No per-decode
 polling is performed.

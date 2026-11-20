@@ -19,6 +19,7 @@ pub(crate) mod accounting;
 pub mod backend;
 pub mod cgroup;
 pub mod calibration;
+pub mod calibration_compatibility;
 pub(crate) mod compute_dispatch;
 pub mod discovery;
 pub mod execution;
@@ -78,15 +79,21 @@ pub use forge_core::{
     NodeDispatchSummary, NodeSamplingStrategy, PageReleaseResult, PageSample, PageSampleStatus,
     TensorMappingInfo, MAX_NODE_DISPATCH_EVENTS,
 };
+pub use calibration_compatibility::{
+    CalibrationCompatibility, CompatibilityClass, CompatibilityTarget, DimensionResult,
+    DimensionStatus, EvidenceUse, CALIBRATION_COMPATIBILITY_SCHEMA_VERSION,
+    MAX_CALIBRATION_AGE_MS,
+};
 pub use execution_candidate::{
-    candidate_plans, compare_plans, compare_plans_with_calibration, evaluate_plan,
-    evaluate_plan_with_calibration, CandidateRequest, ExecutionPlanCandidate, Feasibility,
-    MappingStrategy, PlanBackend, PlanComparison, PlanEvaluation, PlanProfile, PlanReason,
-    EXECUTION_CANDIDATE_SCHEMA_VERSION,
+    candidate_plans, compare_plans, compare_plans_with_calibration, compare_plans_with_evidence,
+    evaluate_plan, evaluate_plan_with_calibration, CandidateRequest, ExecutionPlanCandidate,
+    Feasibility, MappingStrategy, PlanBackend, PlanComparison, PlanEvaluation, PlanProfile,
+    PlanReason, EXECUTION_CANDIDATE_SCHEMA_VERSION,
 };
 pub use machine_profile::{
-    collect_machine_profile, CpuRuntimeSettings, MachineProfile, MachineProfileConfig,
-    StorageBenchmarkConfig, StorageProfile, MACHINE_PROFILE_SCHEMA_VERSION,
+    collect_machine_profile, CpuRuntimeSettings, Freshness, MachineProfile, MachineProfileConfig,
+    ObservationState, Observed, Provenance, StorageBenchmarkConfig, StorageProfile,
+    MACHINE_PROFILE_SCHEMA_VERSION,
 };
 pub use model_requirements::{
     model_file_fingerprint, model_requirements, ModelRequirementConfig, ModelRequirements,
@@ -113,7 +120,8 @@ pub use ramforge_core::{
 };
 pub use runtime_calibration::{
     build_attribution, build_calibration, CalibrationEvidence, EstimateComparison, MachineIdentity,
-    ModelIdentity, RuntimeCalibration, RuntimeConfiguration, RUNTIME_CALIBRATION_SCHEMA_VERSION,
+    ModelIdentity, ObservationConditions, RuntimeCalibration, RuntimeConfiguration,
+    KV_TYPE_SOURCE_ADAPTER_DEFAULT, RUNTIME_CALIBRATION_SCHEMA_VERSION,
 };
 pub use runtime_measurement::{
     capture_snapshot, BackendMemorySnapshot, LifecycleDeltas, LifecycleRecorder, LifecycleStage,

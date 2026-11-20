@@ -556,6 +556,7 @@ Synthetic lifecycle fixture, warm/local/uncontrolled, five-run smoke:
 | 9 lifecycle snapshots | 2.70 ms | 2.25 ms | 3.41 ms |
 | Calibration build | 0.022 ms | 0.019 ms | 0.038 ms |
 | JSON serialize/deserialize/validate | 1.21 ms | 1.09 ms | 1.52 ms |
+| Compatibility evaluation | 13.5 µs | 12.6 µs | 13.5 µs |
 
 Snapshot cost is dominated by `/proc` parsing and device discovery. No
 per-decode polling occurs. These values are not a performance guarantee.

@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **577 tests, 0 failed, 24 ignored**. The ignored
+  environment variables passes **590 tests, 0 failed, 24 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -91,7 +91,7 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 577 passed, 24
+- forgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 590 passed, 24
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
@@ -122,7 +122,15 @@
   delta is not a KV measurement.
 - Lifecycle benchmark: 9 snapshots ca. 2.3–3.4 ms per run; calibration build
   ca. 0.02 ms; JSON round-trip ca. 1.1–1.5 ms. Warm, single-machine.
-- RAMforge tests: 577 passed, 24 ignored.
+- Compatibility contract schema 1 evaluates model, machine, backend/device,
+  runtime configuration, effective context/batch/ubatch/sequences/threads,
+  KV types, load mode, repacking, native version, cache condition, pressure,
+  cgroup, freshness, and measurement completeness. Only exact matches apply
+  evidence; constrained evidence is display-only; incompatible/incomparable
+  evidence is rejected.
+- `ramforge machine --calibration` emits per-plan compatibility decisions and
+  accepts `--no-repack`, `--no-prefetch`, `--ubatch`, and `--sequences`.
+- RAMforge tests: 590 passed, 24 ignored.
 
 ## Machine profiles and candidate plans (2026-11-20)
 
@@ -165,7 +173,7 @@
 - Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
   `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
   semantic/removal changes require a version increment.
-- ForgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 577 passed, 24
+- ForgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 590 passed, 24
   ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)

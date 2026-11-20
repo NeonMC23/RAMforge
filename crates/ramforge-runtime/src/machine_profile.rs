@@ -184,6 +184,8 @@ pub struct MachineProfile {
     pub schema_version: u32,
     pub collection_sequence: u64,
     pub collected_at_unix_ms: Option<u64>,
+    pub os: String,
+    pub kernel: Option<String>,
     pub hostname_redacted: bool,
     pub cpu: CpuProfile,
     pub memory: MemoryProfile,
@@ -321,6 +323,10 @@ pub fn collect_machine_profile(config: &MachineProfileConfig) -> MachineProfile 
         schema_version: MACHINE_PROFILE_SCHEMA_VERSION,
         collection_sequence: sequence,
         collected_at_unix_ms: unix_millis(),
+        os: std::env::consts::OS.to_string(),
+        kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .ok()
+            .map(|value| value.trim().to_string()),
         hostname_redacted: false,
         cpu,
         memory,

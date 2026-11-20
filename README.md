@@ -203,8 +203,11 @@ Flags:
 model inspected/loaded, context created, prompt processed, decode steady,
 context destroyed, model unloaded, final), model mapping residency, system/
 cgroup facts, predicted requirements, estimate comparisons, and attribution.
-`ramforge machine --calibration FILE` applies compatible calibration evidence
-to candidate-plan feasibility. See
+`ramforge machine --calibration FILE` evaluates per-plan compatibility and
+applies evidence only for exact matches. Candidate runtime flags
+`--no-repack`, `--no-prefetch`, `--ubatch`, and `--sequences` make the
+comparison explicit; unknown or mismatched dimensions remain incompatible or
+insufficient and are not silently applied. See
 [RUNTIME_CALIBRATION.md](docs/handoff/RUNTIME_CALIBRATION.md).
 
 The node-dispatch JSON report also contains `scheduler_observation`, a
@@ -1087,7 +1090,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **577 tests, 0 failed, 24 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **590 tests, 0 failed, 24 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

@@ -1320,6 +1320,11 @@ fn root_help_lists_machine_command() {
         "--context",
         "--batch",
         "--threads",
+        "--no-prefetch",
+        "--no-repack",
+        "--ubatch",
+        "--sequences",
+        "--calibration",
         "--benchmark-storage",
         "--benchmark-size",
         "--benchmark-runs",
@@ -1442,6 +1447,15 @@ fn calibration_records_lifecycle_and_comparisons() {
             "200M",
             "--context",
             "256",
+            "--batch",
+            "1",
+            "--threads",
+            "4",
+            "--ubatch",
+            "256",
+            "--sequences",
+            "1",
+            "--no-repack",
             "--calibration",
             path.to_str().unwrap(),
             "--json",
@@ -1463,5 +1477,10 @@ fn calibration_records_lifecycle_and_comparisons() {
             .unwrap()
             .iter()
             .any(|reason| reason["code"] == "calibration_applied")));
+    assert!(plan["calibration_compatibility"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["result"]["classification"] == "exact"));
     let _ = std::fs::remove_file(&path);
 }

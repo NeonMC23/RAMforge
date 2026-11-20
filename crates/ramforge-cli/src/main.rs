@@ -32,12 +32,13 @@ use ramforge_runtime::residency_engine::{
 };
 use ramforge_runtime::{
     build_attribution, build_calibration, candidate_plans, collect_machine_profile, compare_plans,
-    compare_plans_with_calibration, model_requirements, CandidateRequest, CpuRuntimeSettings,
-    DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
-    ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, LifecycleRecorder, LifecycleStage,
-    MachineProfileConfig, ModelRequirementConfig, NodeDispatchOptions, NodeSamplingStrategy,
-    PageSampleStatus, RuntimeCalibration, RuntimeConfiguration, SchedulerObservation,
-    StorageBenchmarkConfig,
+    compare_plans_with_evidence, model_requirements, CandidateRequest, CompatibilityTarget,
+    CpuRuntimeSettings, DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions,
+    ForgeCoreLogits, ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, LifecycleRecorder,
+    LifecycleStage, MachineProfileConfig, ModelRequirementConfig, NodeDispatchOptions,
+    NodeSamplingStrategy, ObservationConditions, Observed, PageSampleStatus, RuntimeCalibration,
+    RuntimeConfiguration, SchedulerObservation, StorageBenchmarkConfig,
+    KV_TYPE_SOURCE_ADAPTER_DEFAULT,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -206,6 +207,22 @@ enum Commands {
         /// Candidate CPU thread count (0 = process-visible count)
         #[arg(long, default_value_t = 0)]
         threads: u32,
+
+        /// Candidate model load mode: mmap or mmap-no-prefetch
+        #[arg(long)]
+        no_prefetch: bool,
+
+        /// Candidate repacking state (disabled when set)
+        #[arg(long)]
+        no_repack: bool,
+
+        /// Candidate effective micro-batch size (0 = context size)
+        #[arg(long, default_value_t = 0)]
+        ubatch: u32,
+
+        /// Candidate maximum sequence count
+        #[arg(long, default_value_t = 1)]
+        sequences: u32,
 
         /// Run a bounded storage read benchmark on the inspected path
         #[arg(long)]
@@ -536,6 +553,10 @@ fn main() {
             context,
             batch,
             threads,
+            no_prefetch,
+            no_repack,
+            ubatch,
+            sequences,
             benchmark_storage,
             benchmark_size,
             benchmark_block,
@@ -551,6 +572,10 @@ fn main() {
                 context,
                 batch,
                 threads,
+                no_prefetch,
+                no_repack,
+                ubatch,
+                sequences,
                 benchmark_storage,
                 &benchmark_size,
                 &benchmark_block,
@@ -885,8 +910,9 @@ fn run_calibration(
         effective_threads_batch: Some(effective_threads_batch),
         kv_type_k: "f16".to_string(),
         kv_type_v: "f16".to_string(),
-        kv_type_source: "adapter default; native effective-type getter unavailable".to_string(),
+        kv_type_source: KV_TYPE_SOURCE_ADAPTER_DEFAULT.to_string(),
         state_serialization_size_bytes: state_size,
+        native_contract_version: Some(ForgeCoreModel::native_contract_version()),
     };
     let calibration = build_calibration(
         &machine,
@@ -965,6 +991,10 @@ fn run_machine(
     context: u32,
     batch: u32,
     threads: u32,
+    no_prefetch: bool,
+    no_repack: bool,
+    ubatch: u32,
+    sequences: u32,
     benchmark_storage: bool,
     benchmark_size: &str,
     benchmark_block: &str,
@@ -1044,16 +1074,100 @@ fn run_machine(
             },
         )
     });
-    let calibration_evidence = calibration
+    let calibration_record = if let Some(path) = calibration.as_ref() {
+        let bytes = std::fs::read(path)?;
+        let value = serde_json::from_slice(&bytes)?;
+        Some(RuntimeCalibration::from_json(value).map_err(|error| anyhow::anyhow!(error))?)
+    } else {
+        None
+    };
+    let pressure_class = profile
+        .memory
+        .pressure
         .as_ref()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .and_then(|value| RuntimeCalibration::from_json(value).ok())
-        .map(|calibration| calibration.evidence());
+        .map(|pressure| {
+            let some = pressure.some_avg10.unwrap_or(0);
+            if some <= 100 {
+                "low"
+            } else if some <= 500 {
+                "elevated"
+            } else {
+                "high"
+            }
+        })
+        .unwrap_or("unknown")
+        .to_string();
+    let current_observation = ObservationConditions {
+        cache_condition: "warm-uncontrolled".to_string(),
+        cache_condition_known: true,
+        cgroup_limit_bytes: profile.memory.cgroup.limit_bytes.clone(),
+        pressure_class,
+        baseline_rss_bytes: Observed::unavailable("not captured at plan time", 0),
+        snapshot_count: 0,
+        missing_stages: Vec::new(),
+        measurement_complete: true,
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    let mut compatibilities = Vec::new();
+    let mut plan_evidence = Vec::new();
+    if let (Some(calibration_record), Some(requirements), Some(plans)) = (
+        calibration_record.as_ref(),
+        requirements.as_ref(),
+        plans.as_ref(),
+    ) {
+        for plan in plans {
+            let target_runtime = RuntimeConfiguration {
+                backend: match plan.backend {
+                    ramforge_runtime::PlanBackend::Cpu => "cpu".to_string(),
+                    ramforge_runtime::PlanBackend::Gpu => "gpu".to_string(),
+                },
+                device_id: plan.device_id.clone().or_else(|| Some("cpu".to_string())),
+                load_mode: Some(
+                    if no_prefetch {
+                        "mmap-no-prefetch"
+                    } else {
+                        "mmap"
+                    }
+                    .to_string(),
+                ),
+                weight_repacking: Some(if no_repack { "disabled" } else { "enabled" }.to_string()),
+                requested_context_tokens: Some(plan.context_tokens),
+                effective_context_tokens: Some(plan.context_tokens),
+                requested_batch_tokens: Some(plan.batch_tokens),
+                effective_batch_tokens: Some(plan.context_tokens),
+                effective_ubatch_tokens: Some(if ubatch == 0 {
+                    plan.context_tokens
+                } else {
+                    ubatch
+                }),
+                effective_sequence_max: Some(sequences),
+                effective_threads: Some(plan.cpu_threads),
+                effective_threads_batch: Some(plan.cpu_threads),
+                kv_type_k: "f16".to_string(),
+                kv_type_v: "f16".to_string(),
+                kv_type_source: KV_TYPE_SOURCE_ADAPTER_DEFAULT.to_string(),
+                state_serialization_size_bytes: None,
+                native_contract_version: Some(ForgeCoreModel::native_contract_version()),
+            };
+            let target = CompatibilityTarget {
+                machine: profile.clone(),
+                requirements: requirements.clone(),
+                runtime: target_runtime,
+                observation: current_observation.clone(),
+                now_unix_ms: now_ms,
+            };
+            let (evidence, compatibility) = calibration_record.evidence_for(&target);
+            compatibilities.push((plan.id.clone(), compatibility));
+            plan_evidence.push(Some(evidence));
+        }
+    }
     let comparison = plans.as_ref().and_then(|plans| {
         requirements.as_ref().map(|requirements| {
-            if let Some(evidence) = calibration_evidence.as_ref() {
-                compare_plans_with_calibration(&profile, requirements, plans, Some(evidence))
+            if calibration_record.is_some() {
+                compare_plans_with_evidence(&profile, requirements, plans, &plan_evidence)
             } else {
                 compare_plans(&profile, requirements, plans)
             }
@@ -1083,6 +1197,15 @@ fn run_machine(
             report["plan_comparison"] = comparison
                 .to_json()
                 .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        if !compatibilities.is_empty() {
+            report["calibration_compatibility"] = serde_json::json!(compatibilities
+                .iter()
+                .map(|(id, compatibility)| serde_json::json!({
+                    "plan_id": id,
+                    "result": compatibility,
+                }))
+                .collect::<Vec<_>>());
         }
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -1163,6 +1286,15 @@ fn run_machine(
                 evaluation.feasibility,
                 evaluation.estimated_ram.bytes,
                 evaluation.estimated_vram.bytes
+            );
+        }
+        for (plan_id, compatibility) in &compatibilities {
+            println!(
+                "Calibration {}: {:?} ({:?}) {}",
+                plan_id,
+                compatibility.classification,
+                compatibility.evidence_use,
+                compatibility.reasons.join("; ")
             );
         }
         println!("{}", comparison.note);
