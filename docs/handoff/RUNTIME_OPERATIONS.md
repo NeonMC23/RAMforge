@@ -145,7 +145,7 @@ filesystem identity. It never copies or deletes without explicit action.
 copy:
 
 - copies to a temporary destination;
-- fsyncs and verifies byte count and bounded fingerprint;
+- fsyncs and verifies byte count and a full-file FNV-1a fingerprint;
 - renames into place;
 - preserves the source;
 - does not delete or replace the source automatically.

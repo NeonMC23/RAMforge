@@ -179,7 +179,7 @@ pub fn copy_model_verified(
             source_preserved: true,
             notes: vec![
                 "Source file was preserved unchanged.".to_string(),
-                "Destination was verified by byte count and bounded fingerprint.".to_string(),
+                "Destination was verified by byte count and full-file FNV-1a.".to_string(),
                 "No performance benefit is implied by copying.".to_string(),
             ],
         }),
@@ -192,17 +192,23 @@ pub fn copy_model_verified(
 
 fn file_fingerprint(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
-    let size = file.metadata().map_err(|error| error.to_string())?.len();
-    let mut header = vec![0u8; 64 * 1024];
-    let read = file.read(&mut header).map_err(|error| error.to_string())?;
+    let mut buffer = [0u8; 64 * 1024];
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in &header[..read] {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    let mut total = 0u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        for byte in &buffer[..read] {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
-    hash ^= size;
+    hash ^= total;
     hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    Ok(format!("fnv1a64:{hash:016x}:size={size}"))
+    Ok(format!("fnv1a64-full:{hash:016x}:size={total}"))
 }
 
 #[cfg(test)]
