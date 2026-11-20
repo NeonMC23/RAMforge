@@ -64,6 +64,8 @@ pub struct PageAccount {
     pub nonresident_pages: u64,
     pub unknown_pages: u64,
     pub observation_error: u32,
+    /// Event sequence at which the dispatch sample was taken or reused.
+    pub sampled_at_sequence: u64,
 }
 
 impl PageAccount {
@@ -80,6 +82,7 @@ impl PageAccount {
             nonresident_pages: sample.nonresident_pages,
             unknown_pages: sample.unknown_pages,
             observation_error: sample.error,
+            sampled_at_sequence: sample.sampled_at_sequence,
         }
     }
 
@@ -297,6 +300,13 @@ impl SchedulerObservation {
             nonresident_pages: observation.nonresident_pages,
             unknown_pages: observation.unknown_pages,
             observation_error: 0,
+            sampled_at_sequence: observation
+                .events
+                .iter()
+                .filter_map(|event| event.dispatch_sample)
+                .map(|sample| sample.sampled_at_sequence)
+                .max()
+                .unwrap_or(0),
         };
         let mut provenance = Vec::new();
         if !sampling_enabled {
