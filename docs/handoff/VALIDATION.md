@@ -370,7 +370,7 @@ Not run or not claimed:
 
 ## CPU node-dispatch validation — 2026-10-31
 
-- forgeCORE `cargo test --workspace`: **412 passed, 0 failed, 8 ignored**.
+- forgeCORE `cargo test --workspace`: **413 passed, 0 failed, 8 ignored**.
   New `node_dispatch` tests cover disabled-by-default behavior, installation
   and removal, event drain, overflow, multiple contexts, four-worker
   exactly-once publication, identity fields, and bounded options.

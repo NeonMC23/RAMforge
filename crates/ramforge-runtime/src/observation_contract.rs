@@ -63,6 +63,7 @@ pub struct PageAccount {
     pub resident_pages: u64,
     pub nonresident_pages: u64,
     pub unknown_pages: u64,
+    pub failed_pages: u64,
     pub observation_error: u32,
     /// Event sequence at which the dispatch sample was taken or reused.
     pub sampled_at_sequence: u64,
@@ -81,6 +82,7 @@ impl PageAccount {
             resident_pages: sample.resident_pages,
             nonresident_pages: sample.nonresident_pages,
             unknown_pages: sample.unknown_pages,
+            failed_pages: sample.failed_pages,
             observation_error: sample.error,
             sampled_at_sequence: sample.sampled_at_sequence,
         }
@@ -108,6 +110,7 @@ impl PageAccount {
             .resident_pages
             .checked_add(self.nonresident_pages)
             .and_then(|value| value.checked_add(self.unknown_pages))
+            .and_then(|value| value.checked_add(self.failed_pages))
             .ok_or(ContractError::Overflow("observed page states"))?;
         if observed != self.sampled_pages {
             return Err(ContractError::Invariant(format!(
@@ -154,6 +157,7 @@ pub struct SourceAttribution {
     pub resident_pages: u64,
     pub nonresident_pages: u64,
     pub unknown_pages: u64,
+    pub failed_pages: u64,
     pub skipped_pages: u64,
     pub budget_excluded_pages: u64,
     pub unsampled_pages: u64,
@@ -176,6 +180,7 @@ impl SourceAttribution {
             resident_pages: source.resident_pages,
             nonresident_pages: source.nonresident_pages,
             unknown_pages: source.unknown_pages,
+            failed_pages: source.failed_pages,
             skipped_pages: source.skipped_pages,
             budget_excluded_pages: source.budget_excluded_pages,
             unsampled_pages: source.unsampled_pages,
@@ -201,7 +206,9 @@ impl SourceAttribution {
                 self.name
             )));
         }
-        if self.resident_pages + self.nonresident_pages + self.unknown_pages != self.sampled_pages {
+        if self.resident_pages + self.nonresident_pages + self.unknown_pages + self.failed_pages
+            != self.sampled_pages
+        {
             return Err(ContractError::Invariant(format!(
                 "source '{}' observed states do not match sampled pages",
                 self.name
@@ -299,6 +306,7 @@ impl SchedulerObservation {
             resident_pages: observation.resident_pages,
             nonresident_pages: observation.nonresident_pages,
             unknown_pages: observation.unknown_pages,
+            failed_pages: observation.failed_pages,
             observation_error: 0,
             sampled_at_sequence: observation
                 .events
@@ -329,6 +337,9 @@ impl SchedulerObservation {
         }
         if observation.unknown_pages > 0 {
             provenance.push(ObservationProvenance::Unknown);
+        }
+        if observation.failed_pages > 0 {
+            provenance.push(ObservationProvenance::Failed);
         }
         if observation.sampling_errors > 0
             || observation.requested_pages > 0

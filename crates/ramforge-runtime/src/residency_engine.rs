@@ -1348,6 +1348,7 @@ pub struct NodeDispatchObservation {
     pub resident_pages: u64,
     pub nonresident_pages: u64,
     pub unknown_pages: u64,
+    pub failed_pages: u64,
     pub partial_samples: usize,
     pub sampling_errors: usize,
     pub unsupported_samples: usize,

@@ -2182,6 +2182,7 @@ fn run_forgecore_inference(
             let mut resident_pages = 0u64;
             let mut nonresident_pages = 0u64;
             let mut unknown_pages = 0u64;
+            let mut failed_pages = 0u64;
             let mut partial_samples = 0usize;
             let mut sampling_errors = 0usize;
             let mut unsupported_samples = 0usize;
@@ -2235,6 +2236,7 @@ fn run_forgecore_inference(
                     resident_pages = resident_pages.saturating_add(sample.resident_pages);
                     nonresident_pages = nonresident_pages.saturating_add(sample.nonresident_pages);
                     unknown_pages = unknown_pages.saturating_add(sample.unknown_pages);
+                    failed_pages = failed_pages.saturating_add(sample.failed_pages);
                     if sample.status == PageSampleStatus::Partial {
                         partial_samples += 1;
                     }
@@ -2313,6 +2315,7 @@ fn run_forgecore_inference(
                 resident_pages,
                 nonresident_pages,
                 unknown_pages,
+                failed_pages,
                 partial_samples,
                 sampling_errors,
                 unsupported_samples,
@@ -3571,6 +3574,7 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
         "resident_pages": observation.resident_pages,
         "nonresident_pages": observation.nonresident_pages,
         "unknown_pages": observation.unknown_pages,
+        "failed_pages": observation.failed_pages,
         "partial_samples": observation.partial_samples,
         "sampling_errors": observation.sampling_errors,
         "unsupported_samples": observation.unsupported_samples,
@@ -3615,6 +3619,7 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
                 "resident_pages": source.resident_pages,
                 "nonresident_pages": source.nonresident_pages,
                 "unknown_pages": source.unknown_pages,
+                "failed_pages": source.failed_pages,
                 "skipped_pages": source.skipped_pages,
                 "budget_excluded_pages": source.budget_excluded_pages,
                 "unsampled_pages": source.unsampled_pages,
@@ -3651,6 +3656,7 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
                 "resident_pages": sample.resident_pages,
                 "nonresident_pages": sample.nonresident_pages,
                 "unknown_pages": sample.unknown_pages,
+                "failed_pages": sample.failed_pages,
                 "page_size": sample.page_size,
                 "mapping_id": sample.mapping_id,
                 "mapping_generation": sample.mapping_generation,
