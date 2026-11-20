@@ -85,6 +85,14 @@ snapshot sequence, observed-value invariants, predicted requirements, and
 attribution. Unknown values remain unknown. `from_json` validates after
 deserialization.
 
+### Compatibility
+
+Additive fields remain compatible within schema version 1. Removing or
+changing the meaning of a field, changing a comparison's validity semantics,
+or changing model/config matching rules requires a schema-version increment.
+Consumers must validate after deserialization and must not reuse a calibration
+from an incompatible model, backend, context, or batch configuration.
+
 ### Redaction
 
 The calibration record contains no local paths. `redacted()` is provided for
