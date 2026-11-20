@@ -242,30 +242,18 @@ impl RuntimeCalibration {
     /// and attributable enough to be applied conservatively.
     pub fn evidence(&self) -> CalibrationEvidence {
         let overhead = observed_runtime_overhead(&self.deltas, &self.predicted.kv_cache_bytes);
-        let comparable = self
-            .predicted
-            .model_fingerprint
-            .as_ref()
-            .is_some_and(|fingerprint| !fingerprint.is_empty())
-            && self.runtime.effective_context_tokens.is_some()
-            && overhead.bytes.is_some();
-        let reason = if comparable {
-            None
-        } else {
-            Some(
-                "calibration requires a model fingerprint, effective context, and observed runtime delta"
-                    .to_string(),
-            )
-        };
         CalibrationEvidence {
             model_fingerprint: self.predicted.model_fingerprint.clone(),
             context_tokens: self.runtime.effective_context_tokens,
             batch_tokens: self.runtime.requested_batch_tokens,
             backend: self.runtime.backend.clone(),
             observed_runtime_overhead: overhead,
-            compatibility: crate::calibration_compatibility::CompatibilityClass::Exact,
-            valid: comparable,
-            reason,
+            compatibility:
+                crate::calibration_compatibility::CompatibilityClass::InsufficientEvidence,
+            valid: false,
+            reason: Some(
+                "evidence requires compatibility evaluation against a concrete target".to_string(),
+            ),
         }
     }
 }
@@ -711,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_is_only_valid_for_compatible_configuration() {
+    fn unchecked_evidence_is_not_applicable() {
         let machine = collect_machine_profile(&MachineProfileConfig::default());
         let calibration = build_calibration(
             &machine,
@@ -721,7 +709,7 @@ mod tests {
             attribution(),
         );
         let evidence = calibration.evidence();
-        assert!(evidence.valid);
+        assert!(!evidence.valid);
         let requirements = requirements();
         let mut plan = crate::execution_candidate::ExecutionPlanCandidate {
             schema_version: crate::execution_candidate::EXECUTION_CANDIDATE_SCHEMA_VERSION,
@@ -738,7 +726,7 @@ mod tests {
             assumptions: Vec::new(),
             unknown_information: Vec::new(),
         };
-        assert!(evidence.is_comparable(&requirements, &plan));
+        assert!(!evidence.is_comparable(&requirements, &plan));
         plan.context_tokens = 256;
         assert!(!evidence.is_comparable(&requirements, &plan));
     }
