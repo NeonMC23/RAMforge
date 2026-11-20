@@ -74,7 +74,7 @@ with a reason when exact separation is unavailable.
 - attribution and limitations;
 - `observation_only = true`.
 
-`state_size_bytes` is a native serialization size, not allocated/resident
+`state_serialization_size_bytes` is a native serialization size, not allocated/resident
 memory. KV effective types are not exposed by the pinned native getter; the
 record explicitly says the adapter-default source.
 

@@ -886,7 +886,7 @@ fn run_calibration(
         kv_type_k: "f16".to_string(),
         kv_type_v: "f16".to_string(),
         kv_type_source: "adapter default; native effective-type getter unavailable".to_string(),
-        state_size_bytes: state_size,
+        state_serialization_size_bytes: state_size,
     };
     let calibration = build_calibration(
         &machine,

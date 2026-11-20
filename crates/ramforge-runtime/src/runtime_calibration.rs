@@ -50,7 +50,7 @@ pub struct RuntimeConfiguration {
     pub kv_type_k: String,
     pub kv_type_v: String,
     pub kv_type_source: String,
-    pub state_size_bytes: Option<u64>,
+    pub state_serialization_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -571,7 +571,7 @@ mod tests {
             kv_type_k: "f16".to_string(),
             kv_type_v: "f16".to_string(),
             kv_type_source: "adapter default; native getter unavailable".to_string(),
-            state_size_bytes: None,
+            state_serialization_size_bytes: None,
         }
     }
 

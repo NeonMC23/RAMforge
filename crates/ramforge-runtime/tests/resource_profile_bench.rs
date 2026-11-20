@@ -150,7 +150,7 @@ fn lifecycle_calibration_benchmark() {
         kv_type_k: "f16".to_string(),
         kv_type_v: "f16".to_string(),
         kv_type_source: "fixture".to_string(),
-        state_size_bytes: None,
+        state_serialization_size_bytes: None,
     };
     let stages = [
         LifecycleStage::Baseline,
