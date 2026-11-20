@@ -541,6 +541,36 @@ ramforge machine --storage /var/tmp --benchmark-storage \
 - These values may be page-cache throughput and must not be reported as
   physical device performance.
 
+## Runtime lifecycle calibration benchmark (2026-11-20)
+
+Command:
+
+```sh
+CALIBRATION_BENCH_RUNS=10 sh scripts/runtime-calibration-bench.sh
+```
+
+Synthetic lifecycle fixture, warm/local/uncontrolled, five-run smoke:
+
+| Operation | Median | Min | Max |
+|---|---:|---:|---:|
+| 9 lifecycle snapshots | 2.70 ms | 2.25 ms | 3.41 ms |
+| Calibration build | 0.022 ms | 0.019 ms | 0.038 ms |
+| JSON serialize/deserialize/validate | 1.21 ms | 1.09 ms | 1.52 ms |
+
+Snapshot cost is dominated by `/proc` parsing and device discovery. No
+per-decode polling occurs. These values are not a performance guarantee.
+
+Measured calibration example (SmolLM2-135M Q4_K_M, 256 context, 4 threads,
+no repack):
+
+- model-load RSS delta 126,545,920 B;
+- context-create RSS delta 6,586,368 B;
+- prompt RSS delta 8,364,032 B;
+- decode delta 0 B in measured steps;
+- unload delta -105,639,936 B;
+- loaded model mapping resident 103,669,760 B;
+- predicted KV 5,898,240 B (estimate; context RSS comparison invalid).
+
 ## Caveats
 
 - These are wall-clock observations on one machine, not a throughput guarantee.

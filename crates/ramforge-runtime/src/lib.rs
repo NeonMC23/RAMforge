@@ -53,7 +53,9 @@ pub mod profile;
 pub mod residency;
 pub mod residency_engine;
 pub mod resource_lifetime;
+pub mod runtime_calibration;
 pub mod runtime_config;
+pub mod runtime_measurement;
 pub mod sampling;
 pub mod simd;
 pub mod streaming_model;
@@ -77,17 +79,18 @@ pub use forge_core::{
     TensorMappingInfo, MAX_NODE_DISPATCH_EVENTS,
 };
 pub use execution_candidate::{
-    candidate_plans, compare_plans, evaluate_plan, CandidateRequest, ExecutionPlanCandidate,
-    Feasibility, MappingStrategy, PlanBackend, PlanComparison, PlanEvaluation, PlanProfile,
-    PlanReason, EXECUTION_CANDIDATE_SCHEMA_VERSION,
+    candidate_plans, compare_plans, compare_plans_with_calibration, evaluate_plan,
+    evaluate_plan_with_calibration, CandidateRequest, ExecutionPlanCandidate, Feasibility,
+    MappingStrategy, PlanBackend, PlanComparison, PlanEvaluation, PlanProfile, PlanReason,
+    EXECUTION_CANDIDATE_SCHEMA_VERSION,
 };
 pub use machine_profile::{
     collect_machine_profile, CpuRuntimeSettings, MachineProfile, MachineProfileConfig,
     StorageBenchmarkConfig, StorageProfile, MACHINE_PROFILE_SCHEMA_VERSION,
 };
 pub use model_requirements::{
-    model_requirements, ModelRequirementConfig, ModelRequirements, RequirementBytes,
-    RequirementCertainty, MODEL_REQUIREMENTS_SCHEMA_VERSION,
+    model_file_fingerprint, model_requirements, ModelRequirementConfig, ModelRequirements,
+    RequirementBytes, RequirementCertainty, MODEL_REQUIREMENTS_SCHEMA_VERSION,
 };
 pub use observation_contract::{
     provenance_for_status, ContractError, DispatchEvidence, ObservationProvenance,
@@ -107,6 +110,15 @@ pub use plan_persistence::{
 };
 pub use ramforge_core::{
     CacheError, CacheStats, DataSourceError, GgufError, MemoryError, ParseSizeError,
+};
+pub use runtime_calibration::{
+    build_attribution, build_calibration, CalibrationEvidence, EstimateComparison, MachineIdentity,
+    ModelIdentity, RuntimeCalibration, RuntimeConfiguration, RUNTIME_CALIBRATION_SCHEMA_VERSION,
+};
+pub use runtime_measurement::{
+    capture_snapshot, BackendMemorySnapshot, LifecycleDeltas, LifecycleRecorder, LifecycleStage,
+    MemoryComponent, ModelMappingMemory, ProcessMemorySnapshot, RuntimeAttribution,
+    RuntimeSnapshot, SystemMemorySnapshot, MAX_RUNTIME_SNAPSHOTS,
 };
 pub use runtime_config::{RuntimeConfig, RuntimeConfigError, RuntimeExecutionDevice};
 

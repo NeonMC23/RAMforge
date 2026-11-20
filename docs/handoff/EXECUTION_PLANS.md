@@ -95,6 +95,15 @@ For SmolLM2-135M Q4_K_M on the development machine:
 
 These are local examples, not universal guarantees.
 
+## Calibration integration
+
+`evaluate_plan_with_calibration()` accepts `CalibrationEvidence` from
+`RuntimeCalibration::evidence()`. The observed non-KV lifecycle overhead is
+added only when the model fingerprint, backend, context, and requested batch
+match. Otherwise the result includes `calibration_incomparable` and keeps the
+uncalibrated conservative classification. See
+[RUNTIME_CALIBRATION.md](RUNTIME_CALIBRATION.md).
+
 ## Limits
 
 - No automatic plan selection or switching.

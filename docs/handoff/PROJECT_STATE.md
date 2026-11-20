@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **568 tests, 0 failed, 22 ignored**. The ignored
+  environment variables passes **577 tests, 0 failed, 24 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -91,10 +91,38 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 568 passed, 22
+- forgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 577 passed, 24
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
+
+## Runtime memory accounting and calibration (2026-11-20)
+
+- `LifecycleRecorder` captures bounded snapshots at nine explicit stages and
+  never polls during decode. Snapshots include process RSS/peak/virtual,
+  anonymous/file/shared/private/swap/locked, mapping counts/bytes, model
+  mapping residency, system/cgroup values, and device free/total memory.
+- `RuntimeAttribution` lists overlapping components and leaves exact
+  unattributed memory unknown rather than fabricating a sum. KV is an estimate;
+  compute/graph/backend/staging allocations are explicitly unobservable.
+- `RuntimeCalibration` schema 1 records machine/model identity, runtime
+  configuration, predicted requirements, lifecycle observations, deltas,
+  comparisons, attribution, and limitations. It contains no local paths and
+  validates on serialization round-trip.
+- `ramforge calibrate` emits text or JSON and writes an optional calibration
+  file. `ramforge machine --calibration FILE` consumes compatible evidence.
+- Estimate comparisons separate valid resident-mapping comparisons from
+  invalid KV/RSS comparisons; zero predictions never emit relative percentages.
+- Plan evidence is applied only when model fingerprint, backend, context, and
+  requested batch match. Otherwise `calibration_incomparable` is reported.
+- SmolLM2-135M Q4_K_M, 256 context, 4 threads, no repack: model-load RSS
+  +126,545,920 bytes; context +6,586,368; prompt +8,364,032; decode 0 in the
+  sampled steps; unload -105,639,936. Tensor payload 103,668,480 predicted vs
+  103,669,760 loaded mapping resident. KV estimate 5,898,240; context RSS
+  delta is not a KV measurement.
+- Lifecycle benchmark: 9 snapshots ca. 2.3–3.4 ms per run; calibration build
+  ca. 0.02 ms; JSON round-trip ca. 1.1–1.5 ms. Warm, single-machine.
+- RAMforge tests: 577 passed, 24 ignored.
 
 ## Machine profiles and candidate plans (2026-11-20)
 
@@ -137,7 +165,7 @@
 - Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
   `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
   semantic/removal changes require a version increment.
-- ForgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 568 passed, 22
+- ForgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 577 passed, 24
   ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)

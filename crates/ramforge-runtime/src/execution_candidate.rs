@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::machine_profile::MachineProfile;
 use crate::model_requirements::{ModelRequirements, RequirementBytes};
+use crate::runtime_calibration::CalibrationEvidence;
 
 pub const EXECUTION_CANDIDATE_SCHEMA_VERSION: u32 = 1;
 
@@ -270,6 +271,26 @@ pub fn evaluate_plan(
     requirements: &ModelRequirements,
     plan: &ExecutionPlanCandidate,
 ) -> PlanEvaluation {
+    evaluate_plan_internal(machine, requirements, plan, None)
+}
+
+/// Evaluate with optional calibration evidence. Evidence is applied only when
+/// the model fingerprint, backend, context, and batch all match.
+pub fn evaluate_plan_with_calibration(
+    machine: &MachineProfile,
+    requirements: &ModelRequirements,
+    plan: &ExecutionPlanCandidate,
+    calibration: Option<&CalibrationEvidence>,
+) -> PlanEvaluation {
+    evaluate_plan_internal(machine, requirements, plan, calibration)
+}
+
+fn evaluate_plan_internal(
+    machine: &MachineProfile,
+    requirements: &ModelRequirements,
+    plan: &ExecutionPlanCandidate,
+    calibration: Option<&CalibrationEvidence>,
+) -> PlanEvaluation {
     let mut reasons = Vec::new();
     let mut unknown = plan.unknown_information.clone();
     if let Err(error) = plan.validate() {
@@ -340,8 +361,29 @@ pub fn evaluate_plan(
     }
 
     let feasibility;
-    let estimated_ram = estimate_ram(requirements, plan.mapping);
+    let mut estimated_ram = estimate_ram(requirements, plan.mapping);
     let estimated_vram = estimate_vram(requirements, plan);
+    if let Some(evidence) = calibration {
+        if evidence.is_comparable(requirements, plan) {
+            if evidence.observed_runtime_overhead.bytes.is_some() {
+                estimated_ram = estimated_ram.checked_add(&evidence.observed_runtime_overhead);
+                reasons.push(PlanReason {
+                    code: "calibration_applied".to_string(),
+                    detail: "compatible observed runtime overhead added conservatively".to_string(),
+                });
+            } else {
+                unknown.push("calibration runtime overhead is unavailable".to_string());
+            }
+        } else {
+            reasons.push(PlanReason {
+                code: "calibration_incomparable".to_string(),
+                detail: evidence
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "model/config/backend does not match".to_string()),
+            });
+        }
+    }
     match plan.backend {
         PlanBackend::Cpu => {
             if let Some(budget) = plan.ram_budget_bytes {
@@ -513,6 +555,24 @@ pub fn compare_plans(
     requirements: &ModelRequirements,
     plans: &[ExecutionPlanCandidate],
 ) -> PlanComparison {
+    compare_plans_internal(machine, requirements, plans, None)
+}
+
+pub fn compare_plans_with_calibration(
+    machine: &MachineProfile,
+    requirements: &ModelRequirements,
+    plans: &[ExecutionPlanCandidate],
+    calibration: Option<&CalibrationEvidence>,
+) -> PlanComparison {
+    compare_plans_internal(machine, requirements, plans, calibration)
+}
+
+fn compare_plans_internal(
+    machine: &MachineProfile,
+    requirements: &ModelRequirements,
+    plans: &[ExecutionPlanCandidate],
+    calibration: Option<&CalibrationEvidence>,
+) -> PlanComparison {
     PlanComparison {
         schema_version: EXECUTION_CANDIDATE_SCHEMA_VERSION,
         dimensions: vec![
@@ -531,7 +591,7 @@ pub fn compare_plans(
         ],
         evaluations: plans
             .iter()
-            .map(|plan| evaluate_plan(machine, requirements, plan))
+            .map(|plan| evaluate_plan_internal(machine, requirements, plan, calibration))
             .collect(),
         note: "No single score is produced. Weights or ranking assumptions are not hidden."
             .to_string(),
@@ -546,6 +606,7 @@ mod tests {
     fn requirements(weights: u64, kv: u64, max_context: Option<u64>) -> ModelRequirements {
         ModelRequirements {
             schema_version: crate::model_requirements::MODEL_REQUIREMENTS_SCHEMA_VERSION,
+            model_fingerprint: None,
             model_name: Some("test".to_string()),
             architecture: Some("llama".to_string()),
             quantization: Some("mostly-q4_k".to_string()),
@@ -664,6 +725,51 @@ mod tests {
         gpu_plan.device_id = Some("missing".to_string());
         let gpu = evaluate_plan(&machine, &requirements(1000, 200, Some(4096)), &gpu_plan);
         assert_eq!(gpu.feasibility, Feasibility::Infeasible);
+    }
+
+    #[test]
+    fn compatible_calibration_can_change_feasibility_conservatively() {
+        use crate::runtime_calibration::CalibrationEvidence;
+        let requirements = requirements(1000, 200, Some(4096));
+        let plan = cpu_plan(MappingStrategy::ResidentWeights, Some(1500));
+        let baseline = evaluate_plan(&profile(), &requirements, &plan);
+        assert_eq!(baseline.feasibility, Feasibility::FeasibleWithConstraints);
+        let mut calibrated_requirements = requirements.clone();
+        calibrated_requirements.model_fingerprint = Some("fnv:test".to_string());
+        let evidence = CalibrationEvidence {
+            model_fingerprint: Some("fnv:test".to_string()),
+            context_tokens: Some(512),
+            batch_tokens: Some(1),
+            backend: "cpu".to_string(),
+            observed_runtime_overhead: RequirementBytes::estimated(600, "test overhead"),
+            valid: true,
+            reason: None,
+        };
+        let calibrated = evaluate_plan_with_calibration(
+            &profile(),
+            &calibrated_requirements,
+            &plan,
+            Some(&evidence),
+        );
+        assert_eq!(calibrated.feasibility, Feasibility::Infeasible);
+        assert!(calibrated
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "calibration_applied"));
+        let mismatched = CalibrationEvidence {
+            context_tokens: Some(256),
+            ..evidence
+        };
+        let result = evaluate_plan_with_calibration(
+            &profile(),
+            &calibrated_requirements,
+            &plan,
+            Some(&mismatched),
+        );
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "calibration_incomparable"));
     }
 
     #[test]

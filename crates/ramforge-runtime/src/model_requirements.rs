@@ -126,6 +126,7 @@ impl Default for ModelRequirementConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRequirements {
     pub schema_version: u32,
+    pub model_fingerprint: Option<String>,
     pub model_name: Option<String>,
     pub architecture: Option<String>,
     pub quantization: Option<String>,
@@ -169,6 +170,24 @@ impl ModelRequirements {
     }
 }
 
+/// Stable-enough, non-cryptographic file fingerprint for local comparison.
+/// Reads a bounded header sample and the file size; it is not a security hash.
+pub fn model_file_fingerprint(model: &GgufModel) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(&model.path).ok()?;
+    let mut header = vec![0u8; 64 * 1024];
+    let read = file.read(&mut header).ok()?;
+    header.truncate(read);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in &header {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash ^= model.file_size;
+    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    Some(format!("fnv1a64:{hash:016x}:size={}", model.file_size))
+}
+
 /// Derive requirements from GGUF metadata without reading tensor payloads.
 pub fn model_requirements(model: &GgufModel, config: ModelRequirementConfig) -> ModelRequirements {
     let info = model.info();
@@ -208,6 +227,7 @@ pub fn model_requirements(model: &GgufModel, config: ModelRequirementConfig) -> 
 
     ModelRequirements {
         schema_version: MODEL_REQUIREMENTS_SCHEMA_VERSION,
+        model_fingerprint: model_file_fingerprint(model),
         model_name: info.name.clone(),
         architecture: info.architecture.clone(),
         quantization: info.file_type.map(quantization_label),

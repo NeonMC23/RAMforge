@@ -111,6 +111,14 @@ initial profiles, conservative feasibility, explicit reasons/unknowns, and
 multi-dimensional comparison without a single hidden score. See
 [EXECUTION_PLANS.md](EXECUTION_PLANS.md).
 
+### Runtime calibration
+
+Lifecycle snapshots, attribution, KV comparison limitations, and versioned
+calibration are documented in
+[RUNTIME_CALIBRATION.md](RUNTIME_CALIBRATION.md). Compatible calibration
+evidence can adjust plan feasibility only when model fingerprint, backend,
+context, and batch match.
+
 ## Remaining gaps
 
 1. **Random/read-latency storage characterization.** Only a bounded

@@ -493,6 +493,38 @@ impl ForgeCoreSession {
         self.context.n_ctx()
     }
 
+    /// Effective logical batch limit reported by the live native context.
+    pub fn effective_batch_tokens(&self) -> u32 {
+        self.context.n_batch()
+    }
+
+    /// Effective physical micro-batch size reported by the live context.
+    pub fn effective_ubatch_tokens(&self) -> u32 {
+        self.context.n_ubatch()
+    }
+
+    /// Effective maximum distinct sequences.
+    pub fn effective_sequence_max(&self) -> u32 {
+        self.context.n_seq_max()
+    }
+
+    /// Effective generation thread count.
+    pub fn effective_threads(&self) -> u32 {
+        self.context.n_threads()
+    }
+
+    /// Effective batch thread count.
+    pub fn effective_threads_batch(&self) -> u32 {
+        self.context.n_threads_batch()
+    }
+
+    /// Native serialized state size. This is not allocated or resident memory.
+    pub fn state_size(&mut self) -> Result<u64, ForgeCoreAdapterError> {
+        self.context
+            .state_size()
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
     pub fn lifetime_state(&self) -> Result<ContextLifetimeState, ForgeCoreAdapterError> {
         self.context
             .lifetime_state()
