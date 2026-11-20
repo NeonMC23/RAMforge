@@ -451,6 +451,52 @@ Event storage was fixed at 4,096 entries for drained runs and 65,536 for the
 not-drained run. This is a diagnostic smoke measurement on one machine, not a
 statistically powered benchmark.
 
+## Statistical sampling benchmark (2026-11-20)
+
+Command:
+
+```sh
+FORGE_TEST_MODEL=/models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
+  BENCH_RUNS=7 BENCH_ITERATIONS=5 \
+  sh scripts/residency-sampling-bench.sh
+```
+
+The benchmark creates a fresh context for each independent run, warms up one
+decode, then measures five tiny decodes. It reports median, min, max, Q1, Q3,
+page accounting, cache counters, and the explicit
+`warm-cache-uncontrolled` condition.
+
+SmolLM2-135M-Instruct Q4_K_M, one worker, 35 measurements per configuration:
+
+| Config | Median | Min | Max | Q1–Q3 | Fresh pages | Reused pages | Skipped pages | Budget-excluded |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| disabled | 17.58 ms | 16.30 ms | 21.94 ms | 17.00–18.07 ms | 0 | 0 | 0 | 0 |
+| systematic | 16.92 ms | 16.38 ms | 20.40 ms | 16.62–17.27 ms | 143,360 | 0 | 0 | 577,535 |
+| targeted | 17.62 ms | 16.56 ms | 24.50 ms | 17.00–19.75 ms | 143,360 | 0 | 55,454 | 493,941 |
+| adaptive | 17.48 ms | 16.62 ms | 21.11 ms | 17.12–17.80 ms | 143,360 | 55,454 | 0 | 493,941 |
+
+Every configuration sampled the same fresh-page budget per execution. Adaptive
+also reused 55,454 pages from complete cached ranges, increasing observed
+coverage from 143,360 to 198,814 pages without extra `mincore()` work. Targeted
+skipped 55,454 pages and redeployed the budget; it did not present those pages
+as observations.
+
+The medians are close and the maxima are noisy. No latency improvement is
+claimed. All pages were resident under uncontrolled warm-cache conditions;
+this does not validate cold/nonresident behavior.
+
+Range merging microbenchmark:
+
+```sh
+cd forgeCORE
+FORGE_MICROBENCH_ITERATIONS=100000 \
+  cargo test -p forge-core --lib dispatch_range_merge_microbench -- --ignored --nocapture
+```
+
+Observed on the development machine: about 445 ns per merge of eight synthetic
+ranges in a debug build (6 merged ranges). This is a microbenchmark of the
+merge helper only, not end-to-end dispatch overhead.
+
 ## Caveats
 
 - These are wall-clock observations on one machine, not a throughput guarantee.

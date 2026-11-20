@@ -1326,7 +1326,7 @@ pub struct ExecutionTiming {
 
 /// Diagnostic CPU node-dispatch observations correlated against the model
 /// inventory. Dispatch is not a physical tensor read or residency proof.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeDispatchObservation {
     pub summary: NodeDispatchSummary,
     pub events: Vec<NodeDispatchEvent>,
@@ -1340,6 +1340,9 @@ pub struct NodeDispatchObservation {
     pub requested_pages: u64,
     pub sampled_pages: u64,
     pub unsampled_pages: u64,
+    pub skipped_pages: u64,
+    pub budget_excluded_pages: u64,
+    pub referenced_pages: u64,
     pub budget_total: u64,
     pub budget_remaining: u64,
     pub resident_pages: u64,
@@ -1347,8 +1350,10 @@ pub struct NodeDispatchObservation {
     pub unknown_pages: u64,
     pub partial_samples: usize,
     pub sampling_errors: usize,
+    pub unsupported_samples: usize,
     pub truncated_samples: usize,
     pub sampling_complete: bool,
+    pub sampling_enabled: bool,
     pub sampling_strategy: String,
     pub fresh_sampled_pages: u64,
     pub reused_pages: u64,

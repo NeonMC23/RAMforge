@@ -6,6 +6,8 @@
 
 use std::process::Command;
 
+use ramforge_runtime::SchedulerObservation;
+
 fn ramforge() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ramforge"))
 }
@@ -1152,6 +1154,29 @@ fn node_dispatch_observer_reports_diagnostic_events() {
     assert!(sample["mapping_id"].as_u64().unwrap() < 1_000_000);
     assert!(sample["fresh_sampled_pages"].as_u64().unwrap() > 0);
     assert!(dispatch["cache_skips"].as_u64().is_some());
+    assert_eq!(dispatch["sampling_enabled"], true);
+    assert_eq!(
+        dispatch["requested_pages"].as_u64().unwrap(),
+        dispatch["sampled_pages"].as_u64().unwrap()
+            + dispatch["skipped_pages"].as_u64().unwrap()
+            + dispatch["budget_excluded_pages"].as_u64().unwrap()
+            + dispatch["unsampled_pages"].as_u64().unwrap()
+    );
+    let contract: SchedulerObservation =
+        serde_json::from_value(dispatch["scheduler_observation"].clone())
+            .expect("scheduler observation contract");
+    contract.validate().expect("contract invariants");
+    assert!(contract.observation_only);
+    assert_eq!(contract.schema_version, 1);
+    assert!(contract.sampling_enabled);
+    for evidence in &contract.dispatches {
+        if let Some(sample) = &evidence.sample {
+            sample.validate().expect("dispatch account");
+        }
+        for source in &evidence.sources {
+            source.validate().expect("source attribution");
+        }
+    }
     assert_eq!(
         dispatch["semantics"],
         "CPU node dispatch start; not a tensor read or residency proof"

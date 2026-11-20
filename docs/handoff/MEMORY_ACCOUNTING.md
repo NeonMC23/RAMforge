@@ -256,6 +256,11 @@ budget and accounting. Adaptive cache entries are bounded range observations
 with mapping generation, event-sequence freshness, and explicit reuse and skip
 markers.
 A cached observation is never represented as a fresh `mincore()` result.
+Per-source statistics are derived from the same per-page states; source totals
+are not summed to produce global totals. A shared page contributes once
+globally and may appear in several source attributions. Targeted skips and
+budget-excluded pages are separate from unsampled, unknown, failed, resident,
+and nonresident pages.
 
 ## CPU node-dispatch observation
 

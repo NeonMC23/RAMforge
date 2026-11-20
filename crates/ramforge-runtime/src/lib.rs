@@ -34,6 +34,7 @@ pub mod memory_ledger;
 pub mod memory_report;
 pub mod model;
 pub mod model_executor;
+pub mod observation_contract;
 pub mod ops;
 pub mod orchestration;
 pub mod page_residency;
@@ -68,9 +69,14 @@ pub use crate::forgecore::{
     ForgeCoreModelMetadata, ForgeCoreModelOptions, ForgeCoreSession,
 };
 pub use forge_core::{
-    NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSummary,
-    NodeSamplingStrategy, PageReleaseResult, PageSample, PageSampleStatus, TensorMappingInfo,
-    MAX_NODE_DISPATCH_EVENTS,
+    NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSource,
+    NodeDispatchSummary, NodeSamplingStrategy, PageReleaseResult, PageSample, PageSampleStatus,
+    TensorMappingInfo, MAX_NODE_DISPATCH_EVENTS,
+};
+pub use observation_contract::{
+    provenance_for_status, ContractError, DispatchEvidence, ObservationProvenance,
+    ObservationStrategy, PageAccount, SchedulerObservation, SourceAttribution,
+    MAX_CONTRACT_DISPATCHES, SCHEDULER_OBSERVATION_SCHEMA_VERSION,
 };
 pub use orchestration::{
     OrchestratedRuntime, OrchestrationError, OrchestrationRequest, PlanningSession,

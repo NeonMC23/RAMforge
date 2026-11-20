@@ -53,7 +53,11 @@ and blocks at the observer barrier before releasing workers into the kernel.
 A source that is not a unique file-backed model tensor remains missing or
 unsupported. The event stores each source's validated mapping range for
 attribution and one deduplicated dispatch-level sample with mapping
-generation and truncation. Sampling is disabled at `N=0` (the default), never
+generation and truncation. The native sampler returns one state per sampled
+page, so source resident/nonresident/unknown, fresh/reused, exclusive/shared,
+skipped, and budget-excluded counts come from the same unique-page
+observation. Shared pages appear in multiple source attributions but once in
+global totals. Sampling is disabled at `N=0` (the default), never
 runs in every worker, and never authorizes release or eviction.
 
 ### Deduplication, budgets, and strategies

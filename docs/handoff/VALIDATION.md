@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 532 passed, 0 failed, 19 ignored.
+- `cargo test --workspace`: 538 passed, 0 failed, 19 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -370,11 +370,11 @@ Not run or not claimed:
 
 ## CPU node-dispatch validation — 2026-10-31
 
-- forgeCORE `cargo test --workspace`: **396 passed, 0 failed, 6 ignored**.
+- forgeCORE `cargo test --workspace`: **409 passed, 0 failed, 6 ignored**.
   New `node_dispatch` tests cover disabled-by-default behavior, installation
   and removal, event drain, overflow, multiple contexts, four-worker
   exactly-once publication, identity fields, and bounded options.
-- RAMforge `cargo test --workspace`: **532 passed, 0 failed, 19 ignored**.
+- RAMforge `cargo test --workspace`: **538 passed, 0 failed, 19 ignored**.
   The ignored real-model CLI test verifies `--node-dispatch-observe` JSON with
   attributed and unattributed events, zero identity mismatches, CPU backend,
   and bounded serialization.
@@ -422,7 +422,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          532 passed, 0 failed, 19 ignored
+cargo test --workspace                          538 passed, 0 failed, 19 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

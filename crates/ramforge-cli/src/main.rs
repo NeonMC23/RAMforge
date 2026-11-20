@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use clap::{Parser, Subcommand, ValueEnum};
 use ramforge_core::{
@@ -33,7 +33,7 @@ use ramforge_runtime::residency_engine::{
 use ramforge_runtime::{
     DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
     ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, NodeDispatchOptions,
-    NodeSamplingStrategy, PageSampleStatus,
+    NodeSamplingStrategy, PageSampleStatus, SchedulerObservation,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -2176,11 +2176,15 @@ fn run_forgecore_inference(
             let mut requested_pages = 0u64;
             let mut sampled_pages = 0u64;
             let mut unsampled_pages = 0u64;
+            let mut skipped_pages = 0u64;
+            let mut budget_excluded_pages = 0u64;
+            let mut referenced_pages = 0u64;
             let mut resident_pages = 0u64;
             let mut nonresident_pages = 0u64;
             let mut unknown_pages = 0u64;
             let mut partial_samples = 0usize;
             let mut sampling_errors = 0usize;
+            let mut unsupported_samples = 0usize;
             let mut truncated_samples = 0usize;
             let mut fresh_sampled_pages = 0u64;
             let mut reused_pages = 0u64;
@@ -2213,6 +2217,7 @@ fn run_forgecore_inference(
                     matched.extend(event_matched);
                 }
                 for source in &event.source_samples {
+                    referenced_pages = referenced_pages.saturating_add(source.requested_pages);
                     if event.dispatch_sample.is_some() && source.requested_pages > 0 {
                         sampled_sources += 1;
                     }
@@ -2221,6 +2226,9 @@ fn run_forgecore_inference(
                     requested_pages = requested_pages.saturating_add(sample.requested_pages);
                     sampled_pages = sampled_pages.saturating_add(sample.sampled_pages);
                     unsampled_pages = unsampled_pages.saturating_add(sample.unsampled_pages);
+                    skipped_pages = skipped_pages.saturating_add(sample.skipped_pages);
+                    budget_excluded_pages =
+                        budget_excluded_pages.saturating_add(sample.budget_excluded_pages);
                     fresh_sampled_pages =
                         fresh_sampled_pages.saturating_add(sample.fresh_sampled_pages);
                     reused_pages = reused_pages.saturating_add(sample.reused_pages);
@@ -2236,9 +2244,12 @@ fn run_forgecore_inference(
                             | PageSampleStatus::Unsupported
                             | PageSampleStatus::Stale
                             | PageSampleStatus::Missing
-                            | PageSampleStatus::Unknown
-                    ) {
+                    ) || (sample.status == PageSampleStatus::Unknown && sample.error != 0)
+                    {
                         sampling_errors += 1;
+                    }
+                    if sample.status == PageSampleStatus::Unsupported {
+                        unsupported_samples += 1;
                     }
                     if sample.truncated {
                         truncated_samples += 1;
@@ -2294,6 +2305,9 @@ fn run_forgecore_inference(
                 requested_pages,
                 sampled_pages,
                 unsampled_pages,
+                skipped_pages,
+                budget_excluded_pages,
+                referenced_pages,
                 budget_total: summary.budget_total,
                 budget_remaining: summary.budget_remaining,
                 resident_pages,
@@ -2301,11 +2315,13 @@ fn run_forgecore_inference(
                 unknown_pages,
                 partial_samples,
                 sampling_errors,
+                unsupported_samples,
                 truncated_samples,
                 sampling_complete: sampled_pages > 0
                     && partial_samples == 0
                     && sampling_errors == 0
                     && truncated_samples == 0,
+                sampling_enabled: node_dispatch_sample_pages > 0 && node_dispatch_sample_budget > 0,
                 sampling_strategy: format!("{sampling_strategy:?}").to_lowercase(),
                 fresh_sampled_pages,
                 reused_pages,
@@ -3521,7 +3537,7 @@ fn plan_json_value(plan: &ResidencyPlan) -> serde_json::Value {
 }
 
 fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Value {
-    serde_json::json!({
+    let mut report = serde_json::json!({
         "schema_version": 1,
         "kind": "ramforge.node_dispatch.observation",
         "semantics": "CPU node dispatch start; not a tensor read or residency proof",
@@ -3547,6 +3563,9 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
         "requested_pages": observation.requested_pages,
         "sampled_pages": observation.sampled_pages,
         "unsampled_pages": observation.unsampled_pages,
+        "skipped_pages": observation.skipped_pages,
+        "budget_excluded_pages": observation.budget_excluded_pages,
+        "referenced_pages": observation.referenced_pages,
         "budget_total": observation.budget_total,
         "budget_remaining": observation.budget_remaining,
         "resident_pages": observation.resident_pages,
@@ -3554,8 +3573,10 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
         "unknown_pages": observation.unknown_pages,
         "partial_samples": observation.partial_samples,
         "sampling_errors": observation.sampling_errors,
+        "unsupported_samples": observation.unsupported_samples,
         "truncated_samples": observation.truncated_samples,
         "sampling_complete": observation.sampling_complete,
+        "sampling_enabled": observation.sampling_enabled,
         "sampling_strategy": observation.sampling_strategy,
         "fresh_sampled_pages": observation.fresh_sampled_pages,
         "reused_pages": observation.reused_pages,
@@ -3586,6 +3607,17 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
                 "page_start": source.page_start,
                 "page_end": source.page_end,
                 "requested_pages": source.requested_pages,
+                "exclusive_pages": source.exclusive_pages,
+                "shared_pages": source.shared_pages,
+                "sampled_pages": source.sampled_pages,
+                "fresh_pages": source.fresh_pages,
+                "reused_pages": source.reused_pages,
+                "resident_pages": source.resident_pages,
+                "nonresident_pages": source.nonresident_pages,
+                "unknown_pages": source.unknown_pages,
+                "skipped_pages": source.skipped_pages,
+                "budget_excluded_pages": source.budget_excluded_pages,
+                "unsampled_pages": source.unsampled_pages,
                 "sample": source.sample.map(|sample| serde_json::json!({
                     "requested_pages": sample.requested_pages,
                     "sampled_pages": sample.sampled_pages,
@@ -3612,6 +3644,8 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
                 "requested_pages": sample.requested_pages,
                 "sampled_pages": sample.sampled_pages,
                 "unsampled_pages": sample.unsampled_pages,
+                "skipped_pages": sample.skipped_pages,
+                "budget_excluded_pages": sample.budget_excluded_pages,
                 "fresh_sampled_pages": sample.fresh_sampled_pages,
                 "reused_pages": sample.reused_pages,
                 "resident_pages": sample.resident_pages,
@@ -3631,7 +3665,11 @@ fn node_dispatch_json(observation: &NodeDispatchObservation) -> serde_json::Valu
                 "sampled_at_sequence": sample.sampled_at_sequence,
             })),
         })).collect::<Vec<_>>(),
-    })
+    });
+    if let Ok(contract) = SchedulerObservation::from_observation(observation).to_json() {
+        report["scheduler_observation"] = contract;
+    }
+    report
 }
 
 fn page_snapshot_json(snapshot: &PageResidencySnapshot) -> serde_json::Value {
