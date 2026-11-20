@@ -31,9 +31,11 @@ use ramforge_runtime::residency_engine::{
     ResidencyReport, ResidencySnapshot, ResourceInventory, StagingPlan, StagingResult,
 };
 use ramforge_runtime::{
-    DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
-    ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, NodeDispatchOptions,
-    NodeSamplingStrategy, PageSampleStatus, SchedulerObservation,
+    candidate_plans, collect_machine_profile, compare_plans, model_requirements, CandidateRequest,
+    CpuRuntimeSettings, DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions,
+    ForgeCoreLogits, ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, MachineProfileConfig,
+    ModelRequirementConfig, NodeDispatchOptions, NodeSamplingStrategy, PageSampleStatus,
+    SchedulerObservation, StorageBenchmarkConfig,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -120,6 +122,52 @@ enum Commands {
     },
     /// Show explicit architecture, tokenizer, and quantization capabilities
     Support,
+    /// Inspect CPU, RAM, storage, devices, model requirements, and candidate plans
+    Machine {
+        /// Optional GGUF model to derive requirements and candidate plans
+        #[arg(long)]
+        model: Option<PathBuf>,
+
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Storage path to inspect (repeatable); defaults to the model directory or cwd
+        #[arg(long = "storage")]
+        storage_paths: Vec<PathBuf>,
+
+        /// RAM budget for candidate plans (e.g. 8G)
+        #[arg(long)]
+        ram: Option<String>,
+
+        /// Candidate context size
+        #[arg(long, default_value_t = 2048)]
+        context: u32,
+
+        /// Candidate batch size
+        #[arg(long, default_value_t = 1)]
+        batch: u32,
+
+        /// Candidate CPU thread count (0 = process-visible count)
+        #[arg(long, default_value_t = 0)]
+        threads: u32,
+
+        /// Run a bounded storage read benchmark on the inspected path
+        #[arg(long)]
+        benchmark_storage: bool,
+
+        /// Storage benchmark file size (e.g. 8M)
+        #[arg(long, default_value = "8M")]
+        benchmark_size: String,
+
+        /// Storage benchmark block size (e.g. 64K)
+        #[arg(long, default_value = "64K")]
+        benchmark_block: String,
+
+        /// Storage benchmark repetitions (1-10)
+        #[arg(long, default_value_t = 3)]
+        benchmark_runs: u32,
+    },
     /// Inspect/validate a persisted execution profile
     Profile {
         /// Profile JSON path
@@ -393,6 +441,36 @@ fn main() {
             }
         }
         Commands::Support => output_support(),
+        Commands::Machine {
+            model,
+            json,
+            storage_paths,
+            ram,
+            context,
+            batch,
+            threads,
+            benchmark_storage,
+            benchmark_size,
+            benchmark_block,
+            benchmark_runs,
+        } => {
+            if let Err(error) = run_machine(
+                model,
+                json,
+                storage_paths,
+                ram,
+                context,
+                batch,
+                threads,
+                benchmark_storage,
+                &benchmark_size,
+                &benchmark_block,
+                benchmark_runs,
+            ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Profile {
             path,
             model,
@@ -567,6 +645,205 @@ fn run_inspect(model_path: PathBuf, json_output: bool, max_tensors: usize) -> an
         output_human(&gguf, max_tensors, Some(&model_set));
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_machine(
+    model_path: Option<PathBuf>,
+    json_output: bool,
+    storage_paths: Vec<PathBuf>,
+    ram: Option<String>,
+    context: u32,
+    batch: u32,
+    threads: u32,
+    benchmark_storage: bool,
+    benchmark_size: &str,
+    benchmark_block: &str,
+    benchmark_runs: u32,
+) -> anyhow::Result<()> {
+    let model_set = model_path
+        .as_ref()
+        .map(discover_model_set)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let model = model_set.as_ref().map(|set| set.merged_model());
+    let mut storage_paths = storage_paths;
+    if storage_paths.is_empty() {
+        if let Some(model) = &model {
+            if let Some(parent) = model.path.parent() {
+                storage_paths.push(parent.to_path_buf());
+            }
+        } else {
+            storage_paths.push(std::env::current_dir()?);
+        }
+    }
+    let ram_bytes = ram
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --ram: {error}"))?;
+    let benchmark_bytes = parse_memory_size(benchmark_size)
+        .map_err(|error| anyhow::anyhow!("invalid --benchmark-size: {error}"))?;
+    let benchmark_block_bytes = parse_memory_size(benchmark_block)
+        .map_err(|error| anyhow::anyhow!("invalid --benchmark-block: {error}"))?;
+    let available_threads = std::thread::available_parallelism()
+        .map(|value| value.get() as u32)
+        .unwrap_or(1);
+    let selected_threads = if threads == 0 {
+        available_threads
+    } else {
+        threads
+    };
+    let config = MachineProfileConfig {
+        model_path: model.as_ref().map(|model| model.path.clone()),
+        storage_paths,
+        cpu: CpuRuntimeSettings {
+            selected_threads: Some(selected_threads),
+            user_thread_limit: None,
+        },
+        ram_budget_bytes: ram_bytes,
+        include_storage_benchmark: benchmark_storage,
+        storage_benchmark: StorageBenchmarkConfig {
+            file_size_bytes: benchmark_bytes,
+            block_size_bytes: usize::try_from(benchmark_block_bytes)
+                .map_err(|_| anyhow::anyhow!("benchmark block size exceeds usize"))?,
+            runs: benchmark_runs,
+        },
+    };
+    let profile = collect_machine_profile(&config);
+    profile.validate().map_err(|error| anyhow::anyhow!(error))?;
+    let requirements = model.as_ref().map(|model| {
+        model_requirements(
+            model,
+            ModelRequirementConfig {
+                context_tokens: context,
+                batch_tokens: batch,
+                kv_bytes_per_element: 2,
+            },
+        )
+    });
+    let plans = requirements.as_ref().map(|requirements| {
+        candidate_plans(
+            &profile,
+            requirements,
+            CandidateRequest {
+                context_tokens: context,
+                batch_tokens: batch,
+                ram_budget_bytes: ram_bytes,
+                vram_budget_bytes: None,
+                selected_threads: Some(selected_threads),
+            },
+        )
+    });
+    let comparison = plans.as_ref().and_then(|plans| {
+        requirements
+            .as_ref()
+            .map(|requirements| compare_plans(&profile, requirements, plans))
+    });
+    if json_output {
+        let mut report = serde_json::json!({
+            "schema_version": 1,
+            "kind": "ramforge.machine_profile",
+            "profile": profile.to_json().map_err(|error| anyhow::anyhow!(error))?,
+        });
+        if let Some(requirements) = &requirements {
+            report["model_requirements"] = requirements
+                .to_json()
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        if let Some(plans) = &plans {
+            report["candidate_plans"] =
+                serde_json::to_value(plans).map_err(|error| anyhow::anyhow!(error))?;
+        }
+        if let Some(comparison) = &comparison {
+            report["plan_comparison"] = comparison
+                .to_json()
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "CPU: {} logical, {} available, {} selected",
+        profile
+            .cpu
+            .hardware_logical_cpus
+            .as_ref()
+            .map(u32::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        profile
+            .cpu
+            .available_threads
+            .as_ref()
+            .map(u32::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        selected_threads
+    );
+    if let Some(model) = profile.cpu.model.as_ref() {
+        println!("CPU model: {model}");
+    }
+    println!(
+        "RAM: total={} available={} budget={}",
+        profile
+            .memory
+            .physical_total_bytes
+            .as_ref()
+            .map(u64::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        profile
+            .memory
+            .os_available_bytes
+            .as_ref()
+            .map(u64::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        ram_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    for storage in &profile.storage {
+        println!(
+            "Storage: fs={} kind={:?} capacity={} available={} cache={}",
+            storage
+                .filesystem
+                .as_ref()
+                .map(String::as_str)
+                .unwrap_or("unknown"),
+            storage
+                .storage_kind
+                .as_ref()
+                .map(|kind| format!("{kind:?}"))
+                .unwrap_or_else(|| "unknown".to_string()),
+            storage
+                .capacity_bytes
+                .as_ref()
+                .map(u64::to_string)
+                .unwrap_or_else(|| "unknown".to_string()),
+            storage
+                .available_bytes
+                .as_ref()
+                .map(u64::to_string)
+                .unwrap_or_else(|| "unknown".to_string()),
+            storage
+                .benchmark
+                .as_ref()
+                .map(|benchmark| benchmark.cache_condition.as_str())
+                .unwrap_or("unmeasured")
+        );
+    }
+    println!("Devices: {}", profile.devices.len());
+    if let Some(comparison) = comparison {
+        for evaluation in &comparison.evaluations {
+            println!(
+                "Plan {}: {:?} (RAM {:?}, VRAM {:?})",
+                evaluation.plan_id,
+                evaluation.feasibility,
+                evaluation.estimated_ram.bytes,
+                evaluation.estimated_vram.bytes
+            );
+        }
+        println!("{}", comparison.note);
+    }
     Ok(())
 }
 
