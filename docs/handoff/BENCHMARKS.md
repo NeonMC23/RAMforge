@@ -526,6 +526,21 @@ guarantees. The benchmark excludes storage I/O.
 Storage benchmark (CLI `machine --benchmark-storage`) is likewise bounded and
 labels its cache condition; it never claims physical device throughput.
 
+Example on the development machine:
+
+```sh
+ramforge machine --storage /var/tmp --benchmark-storage \
+  --benchmark-size 8M --benchmark-block 64K --benchmark-runs 3 --json
+```
+
+- Filesystem: btrfs on `dm-0` (253:0), rotational=0, classified solid-state.
+- Median 4.40 GB/s, min 4.31 GB/s, max 4.82 GB/s in two smoke runs
+  (4.12–4.40 GB/s in a later run).
+- `cache_condition = file-cache-drop-requested-unverified`; `physical_claim =
+  false`.
+- These values may be page-cache throughput and must not be reported as
+  physical device performance.
+
 ## Caveats
 
 - These are wall-clock observations on one machine, not a throughput guarantee.

@@ -367,7 +367,8 @@ mod platform {
                 continue;
             }
             let mount_point = unescape_mount(before_fields[4]);
-            if path == mount_point
+            if mount_point == "/"
+                || path == mount_point
                 || path
                     .strip_prefix(&mount_point)
                     .is_some_and(|rest| rest.starts_with('/'))
@@ -581,6 +582,12 @@ mod platform {
         #[test]
         fn mountinfo_unescapes_spaces() {
             assert_eq!(unescape_mount("/mnt/with\\040space"), "/mnt/with space");
+        }
+
+        #[test]
+        fn root_mount_matches_absolute_paths() {
+            let mount = mount_for_path(std::path::Path::new("/var/tmp")).expect("root mount");
+            assert_eq!(mount.mount_point, "/");
         }
 
         #[test]
