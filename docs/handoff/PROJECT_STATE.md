@@ -91,7 +91,7 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 409 passed, 6 ignored. RAMforge tests: 538 passed, 19
+- forgeCORE tests: 411 passed, 8 ignored. RAMforge tests: 538 passed, 19
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.

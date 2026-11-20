@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-forge-core = { git = "https://github.com/NeonMC23/forgeCORE.git", rev = "1cfd919f5cc30cee8e404c302e548ec91b97e481", package = "forge-core" }
+forge-core = { git = "https://github.com/NeonMC23/forgeCORE.git", rev = "592ed49b91527ebd781e573c49b8f5fa861c067a", package = "forge-core" }
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

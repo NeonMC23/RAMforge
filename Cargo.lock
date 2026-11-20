@@ -172,7 +172,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 [[package]]
 name = "forge-core"
 version = "0.1.0"
-source = "git+https://github.com/NeonMC23/forgeCORE.git?rev=1cfd919f5cc30cee8e404c302e548ec91b97e481#1cfd919f5cc30cee8e404c302e548ec91b97e481"
+source = "git+https://github.com/NeonMC23/forgeCORE.git?rev=592ed49b91527ebd781e573c49b8f5fa861c067a#592ed49b91527ebd781e573c49b8f5fa861c067a"
 dependencies = [
  "forge-sys",
  "libc",
@@ -181,7 +181,7 @@ dependencies = [
 [[package]]
 name = "forge-sys"
 version = "0.1.0"
-source = "git+https://github.com/NeonMC23/forgeCORE.git?rev=1cfd919f5cc30cee8e404c302e548ec91b97e481#1cfd919f5cc30cee8e404c302e548ec91b97e481"
+source = "git+https://github.com/NeonMC23/forgeCORE.git?rev=592ed49b91527ebd781e573c49b8f5fa861c067a#592ed49b91527ebd781e573c49b8f5fa861c067a"
 
 [[package]]
 name = "getrandom"
