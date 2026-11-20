@@ -254,10 +254,8 @@ impl MachineProfile {
             .iter()
             .map(StorageProfile::redacted)
             .collect();
-        profile.memory.cgroup.path = Observed::unavailable(
-            "redacted for export",
-            profile.memory.cgroup.path.sequence,
-        );
+        profile.memory.cgroup.path =
+            Observed::unavailable("redacted for export", profile.memory.cgroup.path.sequence);
         profile
     }
 }
@@ -296,16 +294,16 @@ pub fn collect_machine_profile(config: &MachineProfileConfig) -> MachineProfile 
         }
         let mut profile = collect_storage_profile(&path, sequence);
         if config.include_storage_benchmark {
-            if let Some(parent) = profile.local_path.as_deref().map(PathBuf::from) {
-                let directory = parent
-                    .parent()
+            let directory = if path.is_dir() {
+                path.clone()
+            } else {
+                path.parent()
                     .map(PathBuf::from)
-                    .unwrap_or_else(std::env::temp_dir);
-                if let Ok(benchmark) =
-                    run_storage_read_benchmark(&directory, config.storage_benchmark)
-                {
-                    profile.benchmark = Some(benchmark);
-                }
+                    .unwrap_or_else(std::env::temp_dir)
+            };
+            if let Ok(benchmark) = run_storage_read_benchmark(&directory, config.storage_benchmark)
+            {
+                profile.benchmark = Some(benchmark);
             }
         }
         storage.push(profile);
