@@ -1325,7 +1325,143 @@ fn root_help_lists_machine_command() {
         "--benchmark-runs",
         "--json",
         "--export",
+        "--calibration",
     ] {
         assert!(text.contains(flag), "machine help must list {flag}: {text}");
     }
+    let output = ramforge().args(["calibrate", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for flag in [
+        "--ram",
+        "--context",
+        "--threads",
+        "--max-tokens",
+        "--json",
+        "--output",
+        "--no-repack",
+        "--no-prefetch",
+    ] {
+        assert!(
+            text.contains(flag),
+            "calibrate help must list {flag}: {text}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and a native build"]
+fn calibration_records_lifecycle_and_comparisons() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let path =
+        std::env::temp_dir().join(format!("ramforge-calibration-{}.json", std::process::id()));
+    let output = ramforge()
+        .args([
+            "calibrate",
+            &model,
+            "--ram",
+            "1G",
+            "--context",
+            "256",
+            "--threads",
+            "4",
+            "--max-tokens",
+            "2",
+            "--no-repack",
+            "--json",
+            "--output",
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "calibration failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calibration: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("calibration output")).expect("json");
+    assert_eq!(calibration["schema_version"], 1);
+    assert_eq!(calibration["observation_only"], true);
+    let snapshots = calibration["snapshots"].as_array().unwrap();
+    assert!(snapshots.len() >= 8);
+    let stages: Vec<_> = snapshots
+        .iter()
+        .map(|snapshot| snapshot["stage"].as_str().unwrap())
+        .collect();
+    for required in [
+        "baseline",
+        "model_loaded",
+        "context_created",
+        "prompt_processed",
+        "decode_steady",
+        "context_destroyed",
+        "model_unloaded",
+        "final",
+    ] {
+        assert!(
+            stages.contains(&required),
+            "missing stage {required}: {stages:?}"
+        );
+    }
+    assert!(calibration["deltas"]["model_load_rss_bytes"]
+        .as_i64()
+        .is_some());
+    assert!(calibration["deltas"]["context_create_rss_bytes"]
+        .as_i64()
+        .is_some());
+    assert!(calibration["predicted"]["model_fingerprint"]
+        .as_str()
+        .unwrap()
+        .starts_with("fnv1a64:"));
+    assert_eq!(calibration["runtime"]["effective_context_tokens"], 256);
+    assert_eq!(calibration["runtime"]["effective_threads"], 4);
+    let comparisons = calibration["comparisons"].as_array().unwrap();
+    assert!(comparisons.iter().any(|comparison| {
+        comparison["label"] == "tensor_payload_vs_loaded_mapping_resident"
+            && comparison["valid"] == true
+    }));
+    assert!(calibration["attribution"]["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|component| component["component"] == "process_rss"));
+    assert!(calibration["attribution"]["note"]
+        .as_str()
+        .unwrap()
+        .contains("must not be summed"));
+    let serialized = calibration.to_string();
+    assert!(!serialized.contains(&model));
+
+    let plan_output = ramforge()
+        .args([
+            "machine",
+            "--model",
+            &model,
+            "--ram",
+            "200M",
+            "--context",
+            "256",
+            "--calibration",
+            path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        plan_output.status.success(),
+        "calibrated plan failed: {}",
+        String::from_utf8_lossy(&plan_output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&plan_output.stdout).expect("plan json");
+    assert!(plan["plan_comparison"]["evaluations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|evaluation| evaluation["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason["code"] == "calibration_applied")));
+    let _ = std::fs::remove_file(&path);
 }

@@ -31,11 +31,13 @@ use ramforge_runtime::residency_engine::{
     ResidencyReport, ResidencySnapshot, ResourceInventory, StagingPlan, StagingResult,
 };
 use ramforge_runtime::{
-    candidate_plans, collect_machine_profile, compare_plans, model_requirements, CandidateRequest,
-    CpuRuntimeSettings, DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions,
-    ForgeCoreLogits, ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, MachineProfileConfig,
-    ModelRequirementConfig, NodeDispatchOptions, NodeSamplingStrategy, PageSampleStatus,
-    SchedulerObservation, StorageBenchmarkConfig,
+    build_attribution, build_calibration, candidate_plans, collect_machine_profile, compare_plans,
+    compare_plans_with_calibration, model_requirements, CandidateRequest, CpuRuntimeSettings,
+    DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits,
+    ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, LifecycleRecorder, LifecycleStage,
+    MachineProfileConfig, ModelRequirementConfig, NodeDispatchOptions, NodeSamplingStrategy,
+    PageSampleStatus, RuntimeCalibration, RuntimeConfiguration, SchedulerObservation,
+    StorageBenchmarkConfig,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -122,6 +124,51 @@ enum Commands {
     },
     /// Show explicit architecture, tokenizer, and quantization capabilities
     Support,
+    /// Run a controlled lifecycle calibration and compare estimates to observations
+    Calibrate {
+        /// GGUF model file
+        model: PathBuf,
+
+        /// RAM budget used for the calibration record
+        #[arg(long)]
+        ram: String,
+
+        /// Requested context length
+        #[arg(long, default_value_t = 256)]
+        context: u32,
+
+        /// CPU threads
+        #[arg(long, default_value_t = 4)]
+        threads: usize,
+
+        /// Prompt used for prompt-processing measurement
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+
+        /// Number of measured decode steps
+        #[arg(long, default_value_t = 4)]
+        max_tokens: u32,
+
+        /// Disable native CPU weight repacking
+        #[arg(long)]
+        no_repack: bool,
+
+        /// Skip whole-file mmap prefaulting
+        #[arg(long)]
+        no_prefetch: bool,
+
+        /// Print JSON instead of a text summary
+        #[arg(long)]
+        json: bool,
+
+        /// Redact export-only fields (calibration contains no local paths)
+        #[arg(long)]
+        export: bool,
+
+        /// Write the calibration JSON to this path
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Inspect CPU, RAM, storage, devices, model requirements, and candidate plans
     Machine {
         /// Optional GGUF model to derive requirements and candidate plans
@@ -143,6 +190,10 @@ enum Commands {
         /// RAM budget for candidate plans (e.g. 8G)
         #[arg(long)]
         ram: Option<String>,
+
+        /// Optional calibration JSON used as plan evidence when compatible
+        #[arg(long)]
+        calibration: Option<PathBuf>,
 
         /// Candidate context size
         #[arg(long, default_value_t = 2048)]
@@ -445,12 +496,43 @@ fn main() {
             }
         }
         Commands::Support => output_support(),
+        Commands::Calibrate {
+            model,
+            ram,
+            context,
+            threads,
+            prompt,
+            max_tokens,
+            no_repack,
+            no_prefetch,
+            json,
+            export,
+            output,
+        } => {
+            if let Err(error) = run_calibration(
+                model,
+                ram,
+                context,
+                threads,
+                prompt,
+                max_tokens,
+                no_repack,
+                no_prefetch,
+                json,
+                export,
+                output,
+            ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Machine {
             model,
             json,
             export,
             storage_paths,
             ram,
+            calibration,
             context,
             batch,
             threads,
@@ -465,6 +547,7 @@ fn main() {
                 export,
                 storage_paths,
                 ram,
+                calibration,
                 context,
                 batch,
                 threads,
@@ -655,12 +738,230 @@ fn run_inspect(model_path: PathBuf, json_output: bool, max_tensors: usize) -> an
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_calibration(
+    model_path: PathBuf,
+    ram: String,
+    context: u32,
+    threads: usize,
+    prompt: String,
+    max_tokens: u32,
+    no_repack: bool,
+    no_prefetch: bool,
+    json: bool,
+    export: bool,
+    output: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let ram_bytes = parse_memory_size(&ram).map_err(|error| anyhow::anyhow!(error))?;
+    if context == 0 {
+        return Err(anyhow::anyhow!("--context must be greater than zero"));
+    }
+    if threads == 0 {
+        return Err(anyhow::anyhow!("--threads must be greater than zero"));
+    }
+    let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let gguf = model_set.merged_model();
+    let tokenizer = Tokenizer::from_gguf(&gguf).map_err(|error| anyhow::anyhow!(error))?;
+    let tokens = tokenizer.encode(&prompt, true);
+    if tokens.is_empty() {
+        return Err(anyhow::anyhow!("prompt tokenization produced no tokens"));
+    }
+    let requirements = model_requirements(
+        &gguf,
+        ModelRequirementConfig {
+            context_tokens: context,
+            batch_tokens: 1,
+            kv_bytes_per_element: 2,
+        },
+    );
+    let primary_path = model_set.primary_path().to_path_buf();
+    let mut recorder = LifecycleRecorder::new(Some(primary_path.clone()), Some(ram_bytes));
+    recorder.record(LifecycleStage::Baseline);
+    recorder.record(LifecycleStage::ModelInspected);
+
+    let execution = ExecutionConfig {
+        device: DeviceSelection::Cpu,
+        cpu_thread_count: threads,
+        context_length: Some(context),
+        check_tensors: false,
+    };
+    let registry = DeviceRegistry::cpu_only();
+    let mut model_options = ForgeCoreModelOptions {
+        use_extra_bufts: !no_repack,
+        ..ForgeCoreModelOptions::default()
+    };
+    if no_prefetch {
+        model_options = model_options.with_no_prefetch();
+    }
+    let model = ForgeCoreModel::load_for_execution_with_options(
+        &primary_path,
+        execution,
+        &registry,
+        model_options,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    recorder.set_model_instance_id(
+        model
+            .lifetime_state()
+            .map_err(|error| anyhow::anyhow!(error))?
+            .instance_id,
+    );
+    recorder.record(LifecycleStage::ModelLoaded);
+
+    let mut session = model
+        .open_context(ForgeCoreContextOptions {
+            n_ctx: Some(context),
+            n_threads: threads,
+            trace_max_events: None,
+        })
+        .map_err(|error| anyhow::anyhow!(error))?;
+    recorder.set_context_id(
+        session
+            .lifetime_state()
+            .map_err(|error| anyhow::anyhow!(error))?
+            .context_id,
+    );
+    recorder.record(LifecycleStage::ContextCreated);
+    let state_size = session.state_size().ok();
+    let effective_context = session.context_length();
+    let effective_batch = session.effective_batch_tokens();
+    let effective_ubatch = session.effective_ubatch_tokens();
+    let effective_sequences = session.effective_sequence_max();
+    let effective_threads = session.effective_threads();
+    let effective_threads_batch = session.effective_threads_batch();
+
+    session
+        .decode_tokens(&tokens, 0)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    session.synchronize();
+    recorder.record(LifecycleStage::PromptProcessed);
+    let mut position =
+        u32::try_from(tokens.len()).map_err(|_| anyhow::anyhow!("prompt too long"))?;
+    let decode_token = *tokens.last().unwrap_or(&0);
+    for _ in 0..max_tokens {
+        session
+            .decode_tokens(&[decode_token], position)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        session.synchronize();
+        position = position.saturating_add(1);
+    }
+    recorder.record(LifecycleStage::DecodeSteady);
+    drop(session);
+    recorder.clear_context_id();
+    recorder.record(LifecycleStage::ContextDestroyed);
+    drop(model);
+    recorder.record(LifecycleStage::ModelUnloaded);
+    recorder.record(LifecycleStage::Final);
+
+    let machine = collect_machine_profile(&MachineProfileConfig {
+        model_path: Some(primary_path.clone()),
+        ram_budget_bytes: Some(ram_bytes),
+        cpu: CpuRuntimeSettings {
+            selected_threads: Some(u32::try_from(threads).unwrap_or(u32::MAX)),
+            user_thread_limit: None,
+        },
+        ..MachineProfileConfig::default()
+    });
+    machine.validate().map_err(|error| anyhow::anyhow!(error))?;
+    let attribution = build_attribution(recorder.snapshots(), &requirements);
+    let runtime = RuntimeConfiguration {
+        backend: "cpu".to_string(),
+        device_id: Some("cpu".to_string()),
+        load_mode: Some(
+            if no_prefetch {
+                "mmap-no-prefetch"
+            } else {
+                "mmap"
+            }
+            .to_string(),
+        ),
+        weight_repacking: Some(if no_repack { "disabled" } else { "enabled" }.to_string()),
+        requested_context_tokens: Some(context),
+        effective_context_tokens: Some(effective_context),
+        requested_batch_tokens: Some(1),
+        effective_batch_tokens: Some(effective_batch),
+        effective_ubatch_tokens: Some(effective_ubatch),
+        effective_sequence_max: Some(effective_sequences),
+        effective_threads: Some(effective_threads),
+        effective_threads_batch: Some(effective_threads_batch),
+        kv_type_k: "f16".to_string(),
+        kv_type_v: "f16".to_string(),
+        kv_type_source: "adapter default; native effective-type getter unavailable".to_string(),
+        state_size_bytes: state_size,
+    };
+    let calibration = build_calibration(
+        &machine,
+        &requirements,
+        runtime,
+        recorder.snapshots().to_vec(),
+        attribution,
+    );
+    calibration
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let calibration = if export {
+        calibration.redacted()
+    } else {
+        calibration
+    };
+    let json_value = calibration
+        .to_json()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    if let Some(path) = output {
+        std::fs::write(&path, serde_json::to_string_pretty(&json_value)?)?;
+        eprintln!("wrote calibration to {}", path.display());
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&json_value)?);
+        return Ok(());
+    }
+    println!(
+        "Calibration schema {}: {} snapshots, model {}",
+        calibration.schema_version,
+        calibration.snapshots.len(),
+        calibration.model.name.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "Model load RSS delta: {:?} bytes",
+        calibration.deltas.model_load_rss_bytes
+    );
+    println!(
+        "Context create RSS delta: {:?} bytes",
+        calibration.deltas.context_create_rss_bytes
+    );
+    println!(
+        "Prompt RSS delta: {:?} bytes; decode RSS delta: {:?} bytes",
+        calibration.deltas.prompt_rss_bytes, calibration.deltas.decode_rss_bytes
+    );
+    println!(
+        "Predicted tensor bytes: {:?}; KV estimate: {:?}",
+        calibration.predicted.tensor_payload_bytes.bytes,
+        calibration.predicted.kv_cache_bytes.bytes
+    );
+    println!(
+        "Effective context/batch/ubatch: {effective_context}/{effective_batch}/{effective_ubatch}"
+    );
+    for comparison in &calibration.comparisons {
+        println!(
+            "Comparison {}: valid={} predicted={:?} observed={:?} delta={:?}",
+            comparison.label,
+            comparison.valid,
+            comparison.predicted.bytes,
+            comparison.observed.value,
+            comparison.absolute_difference
+        );
+    }
+    println!("{}", calibration.attribution.note);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_machine(
     model_path: Option<PathBuf>,
     json_output: bool,
     export: bool,
     storage_paths: Vec<PathBuf>,
     ram: Option<String>,
+    calibration: Option<PathBuf>,
     context: u32,
     batch: u32,
     threads: u32,
@@ -743,10 +1044,20 @@ fn run_machine(
             },
         )
     });
+    let calibration_evidence = calibration
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .and_then(|value| RuntimeCalibration::from_json(value).ok())
+        .map(|calibration| calibration.evidence());
     let comparison = plans.as_ref().and_then(|plans| {
-        requirements
-            .as_ref()
-            .map(|requirements| compare_plans(&profile, requirements, plans))
+        requirements.as_ref().map(|requirements| {
+            if let Some(evidence) = calibration_evidence.as_ref() {
+                compare_plans_with_calibration(&profile, requirements, plans, Some(evidence))
+            } else {
+                compare_plans(&profile, requirements, plans)
+            }
+        })
     });
     if json_output {
         let exported = if export {
