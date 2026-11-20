@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **590 tests, 0 failed, 24 ignored**. The ignored
+  environment variables passes **605 tests, 0 failed, 29 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -91,10 +91,40 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 590 passed, 24
+- forgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 605 passed, 29
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
+
+## Operational runtime and throughput (2026-11-21)
+
+- `RuntimePlan` schema 1 resolves maximum-performance, balanced, background,
+  and custom profiles into effective CPU context/batch/ubatch/threads/load
+  mode/repacking. Field statuses identify applied, constrained, advisory,
+  unsupported, and unknown settings; the service reads native effective values
+  back after context creation.
+- `InferenceService` provides a real forgeCORE-backed lifecycle:
+  empty/model_loaded/ready/generating/terminated, streaming callbacks,
+  cooperative cancellation, typed errors, unload, and status. One model and one
+  context are owned at a time; a new context drops the previous one first.
+- `ramforge serve --stdio` exposes the service over local JSON-lines with
+  capability, status, generate, session, unload, and cancel commands. It is a
+  local-process transport, not a network server.
+- `ramforge benchmark` measures real generation/decode tokens per second, TTFT,
+  prompt throughput, context creation, model load, RSS, and effective config.
+  SmolLM2-135M Q4_K_M, 256 context, 4 threads, debug build, warm/uncontrolled:
+  generation median 136.87 tok/s (112.58–155.41), decode 171.70 tok/s, TTFT
+  11.40 ms, prompt 423.31 tok/s, context 5.52 ms, load 234.91 ms.
+- `ramforge optimize` runs bounded maximum-performance/balanced/background
+  workloads and returns an advisory measured recommendation. One-run smoke:
+  121.98 / 137.87 / 103.34 tok/s; balanced recommended. No live session is
+  switched automatically.
+- `ramforge storage` assesses capacity/read-only destinations and supports
+  explicit `--copy --destination --yes` verified copies. Source preservation and
+  fingerprint verification are tested; no deletion or throughput claim.
+- `ramforge serve`, `benchmark`, `optimize`, and `storage` are operational CLI
+  clients of runtime modules; no placeholder endpoints were added.
+- RAMforge tests: 605 passed, 29 ignored.
 
 ## Runtime memory accounting and calibration (2026-11-20)
 
@@ -130,7 +160,7 @@
   evidence is rejected.
 - `ramforge machine --calibration` emits per-plan compatibility decisions and
   accepts `--no-repack`, `--no-prefetch`, `--ubatch`, and `--sequences`.
-- RAMforge tests: 590 passed, 24 ignored.
+- RAMforge tests: 605 passed, 29 ignored.
 
 ## Machine profiles and candidate plans (2026-11-20)
 
@@ -173,7 +203,7 @@
 - Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
   `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
   semantic/removal changes require a version increment.
-- ForgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 590 passed, 24
+- ForgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 605 passed, 29
   ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)

@@ -107,6 +107,13 @@ per-plan `calibration_compatibility` result; only `exact` applies evidence.
 evidence is displayed but not applied. See
 [RUNTIME_CALIBRATION.md](RUNTIME_CALIBRATION.md).
 
+## Operational runtime plan
+
+`RuntimePlan` resolves a selected profile into a concrete CPU configuration and
+records applied/constrained/advisory/unsupported/unknown fields. The service
+uses that plan for model loading and context creation and reads effective
+native values back. See [RUNTIME_OPERATIONS.md](RUNTIME_OPERATIONS.md).
+
 ## Limits
 
 - No automatic plan selection or switching.

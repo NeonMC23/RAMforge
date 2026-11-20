@@ -1484,3 +1484,162 @@ fn calibration_records_lifecycle_and_comparisons() {
         .any(|entry| entry["result"]["classification"] == "exact"));
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn root_help_lists_operational_commands() {
+    let output = ramforge().arg("--help").output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for command in [
+        "benchmark",
+        "optimize",
+        "serve",
+        "storage",
+        "calibrate",
+        "machine",
+    ] {
+        assert!(
+            text.contains(command),
+            "root help must list {command}: {text}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and a native build"]
+fn benchmark_reports_measured_generation_throughput() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let output = ramforge()
+        .args([
+            "benchmark",
+            &model,
+            "--profile",
+            "balanced",
+            "--ram",
+            "1G",
+            "--runs",
+            "1",
+            "--warmup",
+            "0",
+            "--max-tokens",
+            "2",
+            "--context",
+            "256",
+            "--threads",
+            "2",
+            "--no-repack",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "benchmark failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(report["schema_version"], 1);
+    assert!(
+        report["median_generation_tokens_per_second"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(report["median_decode_tokens_per_second"].as_f64().is_some());
+    assert_eq!(report["runs"], 1);
+    assert!(report["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str().unwrap().contains("warm")));
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and a native build"]
+fn serve_streams_tokens_and_reports_status() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let mut child = ramforge()
+        .args([
+            "serve",
+            &model,
+            "--profile",
+            "balanced",
+            "--ram",
+            "1G",
+            "--context",
+            "128",
+            "--threads",
+            "2",
+            "--no-repack",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("serve");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        writeln!(stdin, r#"{{"id":1,"command":"status"}}"#).unwrap();
+        writeln!(
+            stdin,
+            r#"{{"id":2,"command":"generate","prompt":"test","max_tokens":2}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("serve output");
+    assert!(
+        output.status.success(),
+        "serve failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(lines
+        .iter()
+        .any(|line| line["event"] == "result" && line["id"] == 1));
+    assert!(lines
+        .iter()
+        .any(|line| line["event"] == "token" && line["id"] == 2));
+    assert!(lines
+        .iter()
+        .any(|line| line["event"] == "done" && line["id"] == 2));
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL"]
+fn storage_copy_is_verified_and_preserves_source() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let destination =
+        std::env::temp_dir().join(format!("ramforge-storage-copy-{}.gguf", std::process::id()));
+    let output = ramforge()
+        .args([
+            "storage",
+            &model,
+            "--copy",
+            "--destination",
+            destination.to_str().unwrap(),
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "storage copy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(report["verified"], true);
+    assert_eq!(report["source_preserved"], true);
+    assert_eq!(
+        std::fs::metadata(&model).unwrap().len(),
+        std::fs::metadata(&destination).unwrap().len()
+    );
+    let _ = std::fs::remove_file(destination);
+}

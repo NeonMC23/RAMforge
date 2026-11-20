@@ -572,6 +572,45 @@ no repack):
 - loaded model mapping resident 103,669,760 B;
 - predicted KV 5,898,240 B (estimate; context RSS comparison invalid).
 
+## Operational generation throughput (2026-11-21)
+
+Command:
+
+```sh
+ramforge benchmark MODEL.gguf --profile balanced --ram 1G \
+  --runs 3 --warmup 1 --max-tokens 4 --context 256 --threads 4 \
+  --no-repack --json
+```
+
+SmolLM2-135M Q4_K_M, debug build, 256 effective context, 4 threads,
+warm/uncontrolled. Three measured runs:
+
+| Metric | Median | Range |
+|---|---:|---:|
+| Generation tokens/s | 136.87 | 112.58–155.41 |
+| Decode tokens/s | 171.70 | — |
+| TTFT | 11.40 ms | — |
+| Prompt tokens/s | 423.31 | — |
+| Context creation | 5.52 ms | — |
+| Model load | 234.91 ms | — |
+
+The benchmark creates a fresh context per measured run. Model load is measured
+once and excluded from generation rate. One run is not a reliable comparison.
+
+`ramforge optimize` one-run profile smoke:
+
+| Profile | Generation tokens/s |
+|---|---:|
+| maximum-performance | 121.98 |
+| balanced | 137.87 |
+| background | 103.34 |
+
+Recommendation was balanced; no live session was changed. These results are
+single-machine, warm, and noisy.
+
+Storage assessment/copy was verified on a 105,454,432-byte model copy. Copy
+correctness is verified; no throughput improvement is implied.
+
 ## Caveats
 
 - These are wall-clock observations on one machine, not a throughput guarantee.

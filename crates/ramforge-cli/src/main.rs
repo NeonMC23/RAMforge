@@ -31,13 +31,15 @@ use ramforge_runtime::residency_engine::{
     ResidencyReport, ResidencySnapshot, ResourceInventory, StagingPlan, StagingResult,
 };
 use ramforge_runtime::{
-    build_attribution, build_calibration, candidate_plans, collect_machine_profile, compare_plans,
-    compare_plans_with_evidence, model_requirements, CandidateRequest, CompatibilityTarget,
-    CpuRuntimeSettings, DeviceRegistry, DeviceSelection, ExecutionConfig, ForgeCoreContextOptions,
-    ForgeCoreLogits, ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession, LifecycleRecorder,
-    LifecycleStage, MachineProfileConfig, ModelRequirementConfig, NodeDispatchOptions,
-    NodeSamplingStrategy, ObservationConditions, Observed, PageSampleStatus, RuntimeCalibration,
-    RuntimeConfiguration, SchedulerObservation, StorageBenchmarkConfig,
+    assess_storage, build_attribution, build_calibration, candidate_plans, collect_machine_profile,
+    compare_plans, compare_plans_with_evidence, copy_model_verified, model_requirements,
+    run_benchmark, run_profile_optimization, serve_stdio, BenchmarkConfig, CandidateRequest,
+    CompatibilityTarget, CpuRuntimeSettings, DeviceRegistry, DeviceSelection, ExecutionConfig,
+    ForgeCoreContextOptions, ForgeCoreLogits, ForgeCoreModel, ForgeCoreModelOptions,
+    ForgeCoreSession, LifecycleRecorder, LifecycleStage, MachineProfileConfig,
+    ModelRequirementConfig, NodeDispatchOptions, NodeSamplingStrategy, ObservationConditions,
+    Observed, OptimizationConfig, PageSampleStatus, RuntimeCalibration, RuntimeConfiguration,
+    RuntimePlan, RuntimeProfileKind, SchedulerObservation, StorageBenchmarkConfig,
     KV_TYPE_SOURCE_ADAPTER_DEFAULT,
 };
 use std::io::{self, Write};
@@ -169,6 +171,158 @@ enum Commands {
         /// Write the calibration JSON to this path
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+    /// Assess model storage destinations or explicitly copy and verify a model
+    Storage {
+        /// Source GGUF model
+        model: PathBuf,
+
+        /// Candidate destination directory (repeatable)
+        #[arg(long = "dest")]
+        destinations: Vec<PathBuf>,
+
+        /// Perform an explicit verified copy
+        #[arg(long)]
+        copy: bool,
+
+        /// Destination path used with --copy
+        #[arg(long, requires = "copy")]
+        destination: Option<PathBuf>,
+
+        /// Confirm the copy operation
+        #[arg(long, requires = "copy")]
+        yes: bool,
+
+        /// Allow replacing an existing destination file
+        #[arg(long, requires = "copy")]
+        overwrite: bool,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare runtime profiles using bounded measured generation
+    Optimize {
+        /// GGUF model file
+        model: PathBuf,
+
+        /// RAM budget used for machine observation
+        #[arg(long)]
+        ram: Option<String>,
+
+        /// Prompt used for every measured run
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+
+        /// Generated tokens per measured run
+        #[arg(long, default_value_t = 4)]
+        max_tokens: u32,
+
+        /// Measured runs per profile (1-3)
+        #[arg(long, default_value_t = 2)]
+        runs: u32,
+
+        /// Warmup runs per profile (0-2)
+        #[arg(long, default_value_t = 1)]
+        warmup: u32,
+
+        /// Context length
+        #[arg(long, default_value_t = 256)]
+        context: u32,
+
+        /// Optional fixed CPU threads (0 = profile-selected)
+        #[arg(long, default_value_t = 0)]
+        threads: u32,
+
+        /// Force repacking disabled for all candidates
+        #[arg(long)]
+        no_repack: bool,
+
+        /// Force mmap-no-prefetch for all candidates
+        #[arg(long)]
+        no_prefetch: bool,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Serve the local inference service over JSON-lines stdin/stdout
+    Serve {
+        /// GGUF model file
+        model: PathBuf,
+
+        /// Runtime profile: maximum-performance, balanced, background, custom
+        #[arg(long, default_value = "balanced")]
+        profile: String,
+
+        /// RAM budget used for machine observation
+        #[arg(long)]
+        ram: Option<String>,
+
+        /// Context length
+        #[arg(long, default_value_t = 256)]
+        context: u32,
+
+        /// CPU threads
+        #[arg(long, default_value_t = 2)]
+        threads: u32,
+
+        /// Disable CPU weight repacking
+        #[arg(long)]
+        no_repack: bool,
+
+        /// Skip whole-file mmap prefaulting
+        #[arg(long)]
+        no_prefetch: bool,
+    },
+    /// Run bounded repeated generation and report measured tokens per second
+    Benchmark {
+        /// GGUF model file
+        model: PathBuf,
+
+        /// Runtime profile: maximum-performance, balanced, background, custom
+        #[arg(long, default_value = "balanced")]
+        profile: String,
+
+        /// RAM budget used for machine observation and plan context
+        #[arg(long)]
+        ram: Option<String>,
+
+        /// Prompt used for every run
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+
+        /// Generated tokens per measured run
+        #[arg(long, default_value_t = 4)]
+        max_tokens: u32,
+
+        /// Measured runs
+        #[arg(long, default_value_t = 3)]
+        runs: u32,
+
+        /// Warmup runs
+        #[arg(long, default_value_t = 1)]
+        warmup: u32,
+
+        /// Context length
+        #[arg(long, default_value_t = 256)]
+        context: u32,
+
+        /// CPU threads
+        #[arg(long, default_value_t = 2)]
+        threads: u32,
+
+        /// Disable CPU weight repacking
+        #[arg(long)]
+        no_repack: bool,
+
+        /// Skip whole-file mmap prefaulting
+        #[arg(long)]
+        no_prefetch: bool,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect CPU, RAM, storage, devices, model requirements, and candidate plans
     Machine {
@@ -543,6 +697,106 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Storage {
+            model,
+            destinations,
+            copy,
+            destination,
+            yes,
+            overwrite,
+            json,
+        } => {
+            if let Err(error) =
+                run_storage(model, destinations, copy, destination, yes, overwrite, json)
+            {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Optimize {
+            model,
+            ram,
+            prompt,
+            max_tokens,
+            runs,
+            warmup,
+            context,
+            threads,
+            no_repack,
+            no_prefetch,
+            json,
+        } => {
+            if let Err(error) = run_optimization(
+                model,
+                ram,
+                prompt,
+                max_tokens,
+                runs,
+                warmup,
+                context,
+                threads,
+                no_repack,
+                no_prefetch,
+                json,
+            ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Serve {
+            model,
+            profile,
+            ram,
+            context,
+            threads,
+            no_repack,
+            no_prefetch,
+        } => {
+            if let Err(error) = run_service_stdio(
+                model,
+                profile,
+                ram,
+                context,
+                threads,
+                no_repack,
+                no_prefetch,
+            ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Benchmark {
+            model,
+            profile,
+            ram,
+            prompt,
+            max_tokens,
+            runs,
+            warmup,
+            context,
+            threads,
+            no_repack,
+            no_prefetch,
+            json,
+        } => {
+            if let Err(error) = run_throughput_benchmark(
+                model,
+                profile,
+                ram,
+                prompt,
+                max_tokens,
+                runs,
+                warmup,
+                context,
+                threads,
+                no_repack,
+                no_prefetch,
+                json,
+            ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Machine {
             model,
             json,
@@ -759,6 +1013,350 @@ fn run_inspect(model_path: PathBuf, json_output: bool, max_tensors: usize) -> an
         output_human(&gguf, max_tensors, Some(&model_set));
     }
 
+    Ok(())
+}
+
+fn run_storage(
+    model_path: PathBuf,
+    destinations: Vec<PathBuf>,
+    copy: bool,
+    destination: Option<PathBuf>,
+    yes: bool,
+    overwrite: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    if copy {
+        if !yes {
+            return Err(anyhow::anyhow!(
+                "explicit --yes is required to copy a model"
+            ));
+        }
+        let destination =
+            destination.ok_or_else(|| anyhow::anyhow!("--destination is required"))?;
+        let report = copy_model_verified(&model_path, &destination, overwrite)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if json {
+            let value = report.to_json().map_err(|error| anyhow::anyhow!(error))?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!(
+                "Copied {} bytes from {} to {}; verified={} source_preserved={}",
+                report.copied_bytes,
+                report.source_path,
+                report.destination_path,
+                report.verified,
+                report.source_preserved
+            );
+            println!("{}", report.notes.join("; "));
+        }
+        return Ok(());
+    }
+    let mut destinations = destinations;
+    if destinations.is_empty() {
+        destinations.push(
+            model_path
+                .parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir),
+        );
+    }
+    let report =
+        assess_storage(&model_path, &destinations, 1).map_err(|error| anyhow::anyhow!(error))?;
+    if json {
+        let value = report.to_json().map_err(|error| anyhow::anyhow!(error))?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!(
+            "Model: {} ({} bytes); source filesystem={:?}",
+            report.model_path, report.model_bytes, report.source.filesystem.value
+        );
+        for assessment in &report.destinations {
+            println!(
+                "Destination {}: available={:?} required={} recommended={} {}",
+                assessment.path,
+                assessment.available_bytes,
+                assessment.required_bytes,
+                assessment.recommended,
+                assessment.reasons.join("; ")
+            );
+        }
+        if let Some(recommended) = &report.recommended_destination {
+            println!("Recommended destination: {recommended}");
+        } else {
+            println!("Recommended destination: none (insufficient or unknown evidence)");
+        }
+        println!("{}", report.limitations.join("; "));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_optimization(
+    model_path: PathBuf,
+    ram: Option<String>,
+    prompt: String,
+    max_tokens: u32,
+    runs: u32,
+    warmup: u32,
+    context: u32,
+    threads: u32,
+    no_repack: bool,
+    no_prefetch: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let ram_bytes = ram
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --ram: {error}"))?;
+    let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let gguf = model_set.merged_model();
+    let requirements = model_requirements(
+        &gguf,
+        ModelRequirementConfig {
+            context_tokens: context,
+            batch_tokens: 1,
+            kv_bytes_per_element: 2,
+        },
+    );
+    let machine = collect_machine_profile(&MachineProfileConfig {
+        model_path: Some(model_path.clone()),
+        ram_budget_bytes: ram_bytes,
+        cpu: CpuRuntimeSettings {
+            selected_threads: Some(if threads == 0 {
+                std::thread::available_parallelism()
+                    .map(|value| value.get() as u32)
+                    .unwrap_or(1)
+            } else {
+                threads
+            }),
+            user_thread_limit: None,
+        },
+        ..MachineProfileConfig::default()
+    });
+    let report = run_profile_optimization(
+        &machine,
+        &requirements,
+        model_path.to_string_lossy().as_ref(),
+        OptimizationConfig {
+            prompt,
+            max_tokens,
+            runs,
+            warmup_runs: warmup,
+            context_tokens: context,
+            threads: (threads != 0).then_some(threads),
+            no_repack: no_repack.then_some(true),
+            load_mode: if no_prefetch {
+                Some("mmap-no-prefetch".to_string())
+            } else {
+                None
+            },
+        },
+    );
+    report.validate().map_err(|error| anyhow::anyhow!(error))?;
+    if json {
+        let value = report.to_json().map_err(|error| anyhow::anyhow!(error))?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("Measured profiles: {}", report.measurements.len());
+        for measurement in &report.measurements {
+            println!(
+                "{}: generation tok/s median={:.2} decode={:?} ttft_ns={:?}",
+                measurement.profile,
+                measurement.benchmark.median_generation_tokens_per_second,
+                measurement.benchmark.median_decode_tokens_per_second,
+                measurement.benchmark.median_time_to_first_token_ns
+            );
+        }
+        if let Some(recommendation) = &report.recommendation {
+            println!(
+                "Recommendation: {} ({:.2} tok/s); {}",
+                recommendation.profile,
+                recommendation.median_generation_tokens_per_second,
+                recommendation.reasons.join("; ")
+            );
+        } else {
+            println!("Recommendation: none (no reliable measurement)");
+        }
+        for failure in &report.failures {
+            println!("Failure: {failure}");
+        }
+        println!("{}", report.limitations.join("; "));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_service_stdio(
+    model_path: PathBuf,
+    profile: String,
+    ram: Option<String>,
+    context: u32,
+    threads: u32,
+    no_repack: bool,
+    no_prefetch: bool,
+) -> anyhow::Result<()> {
+    let ram_bytes = ram
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --ram: {error}"))?;
+    let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let gguf = model_set.merged_model();
+    let requirements = model_requirements(
+        &gguf,
+        ModelRequirementConfig {
+            context_tokens: context,
+            batch_tokens: 1,
+            kv_bytes_per_element: 2,
+        },
+    );
+    let machine = collect_machine_profile(&MachineProfileConfig {
+        model_path: Some(model_path.clone()),
+        ram_budget_bytes: ram_bytes,
+        cpu: CpuRuntimeSettings {
+            selected_threads: Some(threads),
+            user_thread_limit: None,
+        },
+        ..MachineProfileConfig::default()
+    });
+    let plan = RuntimePlan::resolve(
+        &machine,
+        &requirements,
+        model_path.to_string_lossy().as_ref(),
+        parse_runtime_profile(&profile)?,
+        &ramforge_runtime::CustomRuntimeRequest {
+            context_tokens: Some(context),
+            batch_tokens: Some(1),
+            threads: Some(threads),
+            load_mode: Some(
+                if no_prefetch {
+                    "mmap-no-prefetch"
+                } else {
+                    "mmap"
+                }
+                .to_string(),
+            ),
+            no_repack: Some(no_repack),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    let mut service =
+        ramforge_runtime::InferenceService::new(plan).map_err(|error| anyhow::anyhow!(error))?;
+    service.load().map_err(|error| anyhow::anyhow!(error))?;
+    service
+        .create_session()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    serve_stdio(service).map_err(|error| anyhow::anyhow!(error))
+}
+
+fn parse_runtime_profile(value: &str) -> anyhow::Result<RuntimeProfileKind> {
+    match value {
+        "maximum-performance" | "performance" => Ok(RuntimeProfileKind::MaximumPerformance),
+        "balanced" => Ok(RuntimeProfileKind::Balanced),
+        "background" => Ok(RuntimeProfileKind::Background),
+        "custom" => Ok(RuntimeProfileKind::Custom),
+        other => Err(anyhow::anyhow!("unknown runtime profile '{other}'")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_throughput_benchmark(
+    model_path: PathBuf,
+    profile: String,
+    ram: Option<String>,
+    prompt: String,
+    max_tokens: u32,
+    runs: u32,
+    warmup: u32,
+    context: u32,
+    threads: u32,
+    no_repack: bool,
+    no_prefetch: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let ram_bytes = ram
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --ram: {error}"))?;
+    let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let gguf = model_set.merged_model();
+    let requirements = model_requirements(
+        &gguf,
+        ModelRequirementConfig {
+            context_tokens: context,
+            batch_tokens: 1,
+            kv_bytes_per_element: 2,
+        },
+    );
+    let machine = collect_machine_profile(&MachineProfileConfig {
+        model_path: Some(model_path.clone()),
+        ram_budget_bytes: ram_bytes,
+        cpu: CpuRuntimeSettings {
+            selected_threads: Some(threads),
+            user_thread_limit: None,
+        },
+        ..MachineProfileConfig::default()
+    });
+    let plan = RuntimePlan::resolve(
+        &machine,
+        &requirements,
+        model_path.to_string_lossy().as_ref(),
+        parse_runtime_profile(&profile)?,
+        &ramforge_runtime::CustomRuntimeRequest {
+            context_tokens: Some(context),
+            batch_tokens: Some(1),
+            threads: Some(threads),
+            load_mode: Some(
+                if no_prefetch {
+                    "mmap-no-prefetch"
+                } else {
+                    "mmap"
+                }
+                .to_string(),
+            ),
+            no_repack: Some(no_repack),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    let report = run_benchmark(
+        plan,
+        BenchmarkConfig {
+            runs,
+            warmup_runs: warmup,
+            prompt,
+            max_tokens,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    if json {
+        let report_json = report.to_json().map_err(|error| anyhow::anyhow!(error))?;
+        println!("{}", serde_json::to_string_pretty(&report_json)?);
+    } else {
+        println!(
+            "profile={} runs={} max_tokens={}",
+            report.profile, report.runs, report.max_tokens
+        );
+        println!(
+            "generation tok/s median={:.2} min={:.2} max={:.2}",
+            report.median_generation_tokens_per_second,
+            report.min_generation_tokens_per_second,
+            report.max_generation_tokens_per_second
+        );
+        println!(
+            "decode tok/s median={:?}; TTFT median={:?} ns; context create={} ns; model load={} ns",
+            report.median_decode_tokens_per_second,
+            report.median_time_to_first_token_ns,
+            report.median_context_create_ns,
+            report.model_load_ns
+        );
+        println!(
+            "condition={} ({})",
+            report.condition,
+            report.limitations.join("; ")
+        );
+    }
     Ok(())
 }
 

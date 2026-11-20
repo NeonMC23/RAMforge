@@ -17,6 +17,7 @@
 
 pub(crate) mod accounting;
 pub mod backend;
+pub mod benchmark_runner;
 pub mod cgroup;
 pub mod calibration;
 pub mod calibration_compatibility;
@@ -28,6 +29,7 @@ pub mod execution_profile;
 pub mod forgecore;
 pub mod graph_manifest;
 pub mod inference;
+pub mod inference_service;
 pub mod kv_cache;
 pub mod layer;
 pub(crate) mod layer_cache;
@@ -38,8 +40,10 @@ pub mod model;
 pub mod machine_profile;
 pub mod model_executor;
 pub mod model_requirements;
+pub mod model_storage;
 pub mod observation_contract;
 pub mod ops;
+pub mod optimization_loop;
 pub mod orchestration;
 pub mod page_residency;
 pub mod persistent;
@@ -57,7 +61,9 @@ pub mod resource_lifetime;
 pub mod runtime_calibration;
 pub mod runtime_config;
 pub mod runtime_measurement;
+pub mod runtime_plan;
 pub mod sampling;
+pub mod service_server;
 pub mod simd;
 pub mod streaming_model;
 pub mod support;
@@ -79,6 +85,9 @@ pub use forge_core::{
     NodeDispatchSummary, NodeSamplingStrategy, PageReleaseResult, PageSample, PageSampleStatus,
     TensorMappingInfo, MAX_NODE_DISPATCH_EVENTS,
 };
+pub use benchmark_runner::{
+    run_benchmark, BenchmarkConfig, BenchmarkReport, BenchmarkRun, BENCHMARK_SCHEMA_VERSION,
+};
 pub use calibration_compatibility::{
     CalibrationCompatibility, CompatibilityClass, CompatibilityTarget, DimensionResult,
     DimensionStatus, EvidenceUse, CALIBRATION_COMPATIBILITY_SCHEMA_VERSION,
@@ -95,9 +104,17 @@ pub use machine_profile::{
     ObservationState, Observed, Provenance, StorageBenchmarkConfig, StorageProfile,
     MACHINE_PROFILE_SCHEMA_VERSION,
 };
+pub use model_storage::{
+    assess_storage, copy_model_verified, CopyReport, DestinationAssessment, StorageRecommendation,
+    MODEL_STORAGE_SCHEMA_VERSION,
+};
 pub use model_requirements::{
     model_file_fingerprint, model_requirements, ModelRequirementConfig, ModelRequirements,
     RequirementBytes, RequirementCertainty, MODEL_REQUIREMENTS_SCHEMA_VERSION,
+};
+pub use optimization_loop::{
+    run_profile_optimization, OptimizationConfig, OptimizationRecommendation, OptimizationReport,
+    ProfileMeasurement, OPTIMIZATION_SCHEMA_VERSION,
 };
 pub use observation_contract::{
     provenance_for_status, ContractError, DispatchEvidence, ObservationProvenance,
@@ -127,6 +144,15 @@ pub use runtime_measurement::{
     capture_snapshot, BackendMemorySnapshot, LifecycleDeltas, LifecycleRecorder, LifecycleStage,
     MemoryComponent, ModelMappingMemory, ProcessMemorySnapshot, RuntimeAttribution,
     RuntimeSnapshot, SystemMemorySnapshot, MAX_RUNTIME_SNAPSHOTS,
+};
+pub use inference_service::{
+    GenerationOptions, GenerationReport, GenerationStats, InferenceService, ServiceCapabilities,
+    ServiceError, ServiceState, ServiceStatus, INFERENCE_SERVICE_API_VERSION,
+};
+pub use service_server::{serve_stdio, ServiceServerError};
+pub use runtime_plan::{
+    CustomRuntimeRequest, EffectiveRuntimeConfig, FieldStatus, PlanField, RuntimePlan,
+    RuntimeProfileKind, RUNTIME_PLAN_SCHEMA_VERSION,
 };
 pub use runtime_config::{RuntimeConfig, RuntimeConfigError, RuntimeExecutionDevice};
 

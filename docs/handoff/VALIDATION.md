@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 590 passed, 0 failed, 24 ignored.
+- `cargo test --workspace`: 605 passed, 0 failed, 29 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -368,9 +368,24 @@ Not run or not claimed:
   three workloads and slower on short-long, with wide variability; this is not
   a general speedup. Mapping delta was 0 B.')
 
+## Operational runtime validation — 2026-11-21
+
+- `cargo test --workspace --locked`: **605 passed, 0 failed, 29 ignored**.
+- Real inference-service tests: load, context, stream, throughput, cancellation
+  and unload passed.
+- CLI benchmark: median generation 136.87 tok/s (112.58–155.41), decode 171.70,
+  TTFT 11.40 ms, prompt 423.31, context 5.52 ms, load 234.91 ms (debug,
+  warm/uncontrolled).
+- CLI serve: status/token/done JSON-lines events passed.
+- CLI optimize: measured 121.98/137.87/103.34 tok/s for maximum/balanced/
+  background; advisory balanced recommendation.
+- CLI storage: 105,454,432-byte verified copy with source preserved.
+- Only the CPU backend and one physical machine were exercised. GPU, cold-cache,
+  and large-model streaming claims remain unavailable.
+
 ## Runtime calibration validation — 2026-11-20
 
-- `cargo test --workspace --locked`: **590 passed, 0 failed, 24 ignored**.
+- `cargo test --workspace --locked`: **605 passed, 0 failed, 29 ignored**.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 - Ignored calibration CLI test: passed; nine lifecycle stages, mapping
   residency, comparisons, attribution, model fingerprint, and plan evidence.
@@ -389,7 +404,7 @@ Not run or not claimed:
 
 ## Machine profile and candidate plan validation — 2026-11-20
 
-- `cargo test --workspace`: **590 passed, 0 failed, 24 ignored**.
+- `cargo test --workspace`: **605 passed, 0 failed, 29 ignored**.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge machine --model ... --ram 1G --json`: passed; includes CPU,
   memory, storage, device, model requirements, four plans, and comparison.
@@ -411,7 +426,7 @@ Not run or not claimed:
   New `node_dispatch` tests cover disabled-by-default behavior, installation
   and removal, event drain, overflow, multiple contexts, four-worker
   exactly-once publication, identity fields, and bounded options.
-- RAMforge `cargo test --workspace`: **590 passed, 0 failed, 24 ignored**.
+- RAMforge `cargo test --workspace`: **605 passed, 0 failed, 29 ignored**.
   The ignored real-model CLI test verifies `--node-dispatch-observe` JSON with
   attributed and unattributed events, zero identity mismatches, CPU backend,
   and bounded serialization.
@@ -459,7 +474,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          590 passed, 0 failed, 24 ignored
+cargo test --workspace                          605 passed, 0 failed, 29 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 
