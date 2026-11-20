@@ -22,6 +22,7 @@ pub mod calibration;
 pub(crate) mod compute_dispatch;
 pub mod discovery;
 pub mod execution;
+pub mod execution_candidate;
 pub mod execution_profile;
 pub mod forgecore;
 pub mod graph_manifest;
@@ -33,7 +34,9 @@ pub(crate) mod layer_read;
 pub mod memory_ledger;
 pub mod memory_report;
 pub mod model;
+pub mod machine_profile;
 pub mod model_executor;
+pub mod model_requirements;
 pub mod observation_contract;
 pub mod ops;
 pub mod orchestration;
@@ -72,6 +75,19 @@ pub use forge_core::{
     NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSource,
     NodeDispatchSummary, NodeSamplingStrategy, PageReleaseResult, PageSample, PageSampleStatus,
     TensorMappingInfo, MAX_NODE_DISPATCH_EVENTS,
+};
+pub use execution_candidate::{
+    candidate_plans, compare_plans, evaluate_plan, CandidateRequest, ExecutionPlanCandidate,
+    Feasibility, MappingStrategy, PlanBackend, PlanComparison, PlanEvaluation, PlanProfile,
+    PlanReason, EXECUTION_CANDIDATE_SCHEMA_VERSION,
+};
+pub use machine_profile::{
+    collect_machine_profile, CpuRuntimeSettings, MachineProfile, MachineProfileConfig,
+    StorageBenchmarkConfig, StorageProfile, MACHINE_PROFILE_SCHEMA_VERSION,
+};
+pub use model_requirements::{
+    model_requirements, ModelRequirementConfig, ModelRequirements, RequirementBytes,
+    RequirementCertainty, MODEL_REQUIREMENTS_SCHEMA_VERSION,
 };
 pub use observation_contract::{
     provenance_for_status, ContractError, DispatchEvidence, ObservationProvenance,

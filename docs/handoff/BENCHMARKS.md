@@ -497,6 +497,35 @@ Observed on the development machine: about 445 ns per merge of eight synthetic
 ranges in a debug build (6 merged ranges). This is a microbenchmark of the
 merge helper only, not end-to-end dispatch overhead.
 
+## Resource profile and candidate-plan benchmark (2026-11-20)
+
+Command:
+
+```sh
+FORGE_TEST_MODEL=/models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
+  PROFILE_BENCH_RUNS=20 sh scripts/resource-profile-bench.sh
+```
+
+Environment: Linux 7.3.4, Intel i5-11400H (12 threads), btrfs root, `/tmp`
+tmpfs, SmolLM2-135M-Instruct Q4_K_M, 1 GiB candidate budget, 4 selected
+threads, warm/uncontrolled.
+
+Five-run smoke (20-run default is available):
+
+| Operation | Median | Min | Max |
+|---|---:|---:|---:|
+| Profile collection | 1.48–1.58 ms | 1.43 ms | 21.16 ms |
+| JSON serialize + deserialize + validate | 0.32–0.34 ms | 0.31 ms | 0.39 ms |
+| Model requirement derivation | 0.021 ms | 0.019 ms | 0.042 ms |
+| Candidate plans + comparison | 0.059–0.068 ms | 0.051 ms | 0.097 ms |
+
+The collection maximum includes native device discovery and OS reads. These
+are local overhead measurements, not multi-machine validation or performance
+guarantees. The benchmark excludes storage I/O.
+
+Storage benchmark (CLI `machine --benchmark-storage`) is likewise bounded and
+labels its cache condition; it never claims physical device throughput.
+
 ## Caveats
 
 - These are wall-clock observations on one machine, not a throughput guarantee.

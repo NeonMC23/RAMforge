@@ -43,24 +43,75 @@ not introduce a scheduler.
 - An unavailable capability is not the same as a zero value or an unsupported
   backend.
 
-## Gaps for future machine-specific planning
+## Implemented in this milestone
 
-1. **Storage characterization.** No safe, portable observation of storage
-   type, sequential/random throughput, latency, or filesystem behavior.
-2. **CPU capability profile.** No structured SIMD, cache, NUMA, frequency, or
-   heterogeneous-core report.
-3. **GPU/VRAM placement.** Devices are discoverable, but RAMforge's current
-   adapter does not enable non-CPU model placement. VRAM availability and
-   per-backend allocation limits are not modeled.
-4. **Transfer/staging cost model.** Staging exists, but transfer bandwidth and
-   overlap capability are not measured.
-5. **Per-backend buffer semantics.** Host-mapped, device, and repacked buffers
-   are distinguishable in diagnostics, but not yet represented as a unified
-   placement model.
-6. **Cgroup/container memory semantics.** Statistics exist, but hard/soft
-   limits, reclaim behavior, and OOM policy are not part of a planning model.
-7. **Thermal/power constraints.** Not observed.
-8. **Page-cache competition with other processes.** Not attributable.
+### `machine_profile`
+
+- `Observed<T>` with `Known`, `Unavailable`, `Unsupported`, and `Failed`
+  states, provenance, freshness (`Stable`/`Dynamic`), collection sequence, and
+  detail text.
+- Versioned `MachineProfile` (`schema_version = 1`) with CPU, memory, storage,
+  device, and backend sections.
+- Local JSON round-trip and `redacted()` export that removes private paths.
+- `ramforge machine` CLI inspection.
+
+### CPU
+
+Linux collection from `/proc/cpuinfo`, `/proc/self/status`, `/sys`, and cgroup
+v2: architecture, vendor/model, hardware logical CPUs, unique physical cores,
+affinity, process-visible threads, feature flags, SIMD flags, NUMA nodes,
+cache topology, frequency, and cgroup CPU quota.
+
+### Memory
+
+Separate observations for physical total, OS available, swap, process RSS /
+peak / virtual size, configured budget, cgroup limit/current/peak/anon/file/
+mapped/shmem/swap, and PSI pressure. Unavailable cgroup fields stay explicit.
+
+### Storage
+
+Per-path filesystem, filesystem magic, mount point, block device identity,
+rotational/SSD/NVMe/network/memory-backed/virtual classification when
+reliably supported, read-only state, capacity, and available space. A bounded
+file-scoped read benchmark records cache condition and never claims physical
+device throughput.
+
+### Devices and backends
+
+Existing forgeCORE device discovery is mapped into explicit profiles with
+memory total/free observations, capability states, selectability, and backend
+aggregates. Missing GPUs are explicit and do not break CPU plans.
+
+### Model requirements
+
+`ModelRequirements` separates exact file/tensor bytes from estimated KV cache
+and unknown requirements. GGUF file size is never treated as the complete RAM
+requirement, and mapped weights are not assumed resident.
+
+### Candidate plans
+
+`ExecutionPlanCandidate`, `evaluate_plan()`, and `compare_plans()` expose four
+initial profiles, conservative feasibility, explicit reasons/unknowns, and
+multi-dimensional comparison without a single hidden score. See
+[EXECUTION_PLANS.md](EXECUTION_PLANS.md).
+
+## Remaining gaps
+
+1. **Random/read-latency storage characterization.** Only a bounded
+   sequential read benchmark and advisory cache-drop request are implemented.
+2. **GPU/VRAM placement.** Devices are discoverable, but RAMforge's adapter
+   still does not enable non-CPU model placement, and GPU KV/staging placement
+   is not modeled.
+3. **Transfer/staging cost model.** Transfer bandwidth and overlap capability
+   are not measured.
+4. **Per-backend buffer semantics.** Host-mapped, device, and repacked buffers
+   are not yet a unified placement model.
+5. **Cgroup hard/soft limit and reclaim semantics.** Values exist, but a
+   planning model does not yet infer reclaimability or OOM behavior.
+6. **Thermal/power constraints.** Not observed.
+7. **Page-cache competition with other processes.** Not attributable.
+8. **Multi-machine validation.** Only one physical machine and deterministic
+   synthetic fixtures have been exercised.
 
 ## Proposed smallest future interfaces
 
@@ -88,9 +139,18 @@ Planner-facing requirements:
 - Never infer that a model fits because file size is below RAM.
 - Keep plan decisions reproducible from the recorded profile and constraints.
 
+## Validation procedure for future machines
+
+1. Run `ramforge machine --json` with no model to inspect CPU/RAM/storage.
+2. Run it with a representative model and a user budget.
+3. Inspect `plan_comparison` for infeasible/unknown reasons.
+4. Run `scripts/resource-profile-bench.sh` and record the machine, kernel,
+   filesystem, and cache condition.
+5. Repeat on a materially different CPU, container/cgroup, or storage setup.
+
 ## Recommended next step
 
-Complete the observation contract as the stable evidence layer, then add
-storage and CPU resource observations with explicit unknown/unsupported states.
-Do not begin eviction or scheduler policy until those evidence contracts are
-validated on more than one machine.
+Add storage latency/random-read observations and CPU/container fixtures, then
+compare candidate plans against measured execution on a second machine. Do not
+begin eviction or automatic plan switching until the feasibility assumptions
+are validated beyond one machine.
