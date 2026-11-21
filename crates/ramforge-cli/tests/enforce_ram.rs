@@ -1264,7 +1264,8 @@ fn machine_profile_reports_resources_requirements_and_plans() {
     }
 
     let hierarchy = &report["memory_hierarchy"];
-    assert_eq!(hierarchy["schema_version"], 1);
+    assert_eq!(hierarchy["schema_version"], 2);
+    assert!(hierarchy["sampled_at_unix_ms"].as_u64().is_some());
     assert!(hierarchy["host_total_bytes"].as_u64().unwrap() > 0);
     let categories = hierarchy["categories"].as_array().unwrap();
     assert!(categories
@@ -1695,7 +1696,10 @@ fn serve_streams_tokens_and_reports_status() {
         .iter()
         .find(|line| line["event"] == "result" && line["id"] == 4)
         .expect("hierarchy result");
-    assert_eq!(hierarchy["memory_hierarchy"]["schema_version"], 1);
+    assert_eq!(hierarchy["memory_hierarchy"]["schema_version"], 2);
+    assert!(hierarchy["memory_hierarchy"]["sampled_at_unix_ms"]
+        .as_u64()
+        .is_some());
     assert!(hierarchy["placement"]["components"].is_array());
     assert!(hierarchy["feasibility"]["status"].is_string());
     assert!(hierarchy["note"]

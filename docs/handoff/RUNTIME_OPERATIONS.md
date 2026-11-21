@@ -73,8 +73,9 @@ context of 256 in `status`. `capabilities.max_context_tokens` is the planned
 request; `status.effective_context_tokens` is the native readback.
 
 `architecture` returns the GGUF-derived architecture metadata held by the
-resolved plan. `hierarchy` returns a fresh memory-hierarchy observation, the
-plan's placement model, and an f16-assumption feasibility evaluation. It is not
+resolved plan. `hierarchy` returns a fresh memory-hierarchy observation (schema 2, including
+machine collection time and sequence), the plan's placement model, and an
+f16-assumption feasibility evaluation. It is not
 a snapshot captured at model load and does not retain the original `--ram`
 budget; the response states both limitations.
 

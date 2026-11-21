@@ -11,7 +11,7 @@ use crate::machine_profile::MachineProfile;
 use crate::model_requirements::{ModelRequirements, RequirementBytes, RequirementCertainty};
 use crate::runtime_plan::{ExecutionMode, RuntimePlan};
 
-pub const MEMORY_HIERARCHY_SCHEMA_VERSION: u32 = 1;
+pub const MEMORY_HIERARCHY_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +46,8 @@ pub struct MemoryCategoryObservation {
     pub provenance: String,
     pub overlapping: bool,
     pub detail: Option<String>,
+    /// Machine-profile collection time for this observation.
+    pub sampled_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,11 +76,16 @@ pub struct DeviceMemory {
     pub total_bytes: Option<u64>,
     pub free_bytes: Option<u64>,
     pub selectable: bool,
+    /// Native device-snapshot time.
+    pub sampled_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryHierarchy {
     pub schema_version: u32,
+    /// Machine-profile collection time for the whole hierarchy.
+    pub sampled_at_unix_ms: Option<u64>,
+    pub collection_sequence: u64,
     pub host_total_bytes: Option<u64>,
     pub host_available_bytes: Option<u64>,
     pub cgroup_limit_bytes: Option<u64>,
@@ -129,10 +136,13 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
             total_bytes: device.memory_total_bytes.as_ref().copied(),
             free_bytes: device.memory_free_bytes.as_ref().copied(),
             selectable: device.selectable,
+            sampled_at_unix_ms: machine.collected_at_unix_ms,
         })
         .collect();
     MemoryHierarchy {
         schema_version: MEMORY_HIERARCHY_SCHEMA_VERSION,
+        sampled_at_unix_ms: machine.collected_at_unix_ms,
+        collection_sequence: machine.collection_sequence,
         host_total_bytes: machine.memory.physical_total_bytes.as_ref().copied(),
         host_available_bytes: machine.memory.os_available_bytes.as_ref().copied(),
         cgroup_limit_bytes: machine.memory.cgroup.limit_bytes.as_ref().copied(),
@@ -156,6 +166,7 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                 provenance: "OS MemTotal".to_string(),
                 overlapping: false,
                 detail: None,
+                sampled_at_unix_ms: machine.collected_at_unix_ms,
             },
             {
                 let mut non_cpu = machine
@@ -189,6 +200,7 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                     provenance: "native device snapshot".to_string(),
                     overlapping: false,
                     detail: Some(detail),
+                    sampled_at_unix_ms: machine.collected_at_unix_ms,
                 }
             },
             {
@@ -223,6 +235,7 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                     provenance: "native device snapshot".to_string(),
                     overlapping: true,
                     detail: Some(detail),
+                    sampled_at_unix_ms: machine.collected_at_unix_ms,
                 }
             },
             MemoryCategoryObservation {
@@ -234,6 +247,7 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                 detail: Some(
                     "RSS is a process total, not an anonymous allocation category".to_string(),
                 ),
+                sampled_at_unix_ms: machine.collected_at_unix_ms,
             },
             MemoryCategoryObservation {
                 category: MemoryCategory::FileBackedMapping,
@@ -245,6 +259,7 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                     "mapping size is known only after load; resident mapped pages are not tensor use"
                         .to_string(),
                 ),
+                sampled_at_unix_ms: machine.collected_at_unix_ms,
             },
             MemoryCategoryObservation {
                 category: MemoryCategory::KvCache,
@@ -256,6 +271,7 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                     "the estimate depends on context, batch, KV type, and architecture; it is not a native readback"
                         .to_string(),
                 ),
+                sampled_at_unix_ms: machine.collected_at_unix_ms,
             },
             MemoryCategoryObservation {
                 category: MemoryCategory::ComputeGraph,
@@ -266,6 +282,7 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                 detail: Some(
                     "graph and compute workspace may be allocated and freed per decode".to_string(),
                 ),
+                sampled_at_unix_ms: machine.collected_at_unix_ms,
             },
             MemoryCategoryObservation {
                 category: MemoryCategory::BackendBuffers,
@@ -277,6 +294,7 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                     "CPU repacking and backend copies may add buffers not visible to RSS attribution"
                         .to_string(),
                 ),
+                sampled_at_unix_ms: machine.collected_at_unix_ms,
             },
             MemoryCategoryObservation {
                 category: MemoryCategory::Staging,
@@ -288,6 +306,7 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                     "page-level prefetch plans exist separately; no caller-owned tensor/layer staging buffer is implemented"
                         .to_string(),
                 ),
+                sampled_at_unix_ms: machine.collected_at_unix_ms,
             },
             MemoryCategoryObservation {
                 category: MemoryCategory::StorageBacked,
@@ -299,6 +318,7 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                 provenance: "filesystem statvfs".to_string(),
                 overlapping: false,
                 detail: Some("storage availability is not model residency".to_string()),
+                sampled_at_unix_ms: machine.collected_at_unix_ms,
             },
         ],
         notes: vec![
@@ -591,7 +611,8 @@ mod tests {
     fn hierarchy_is_explicit_and_non_double_counting() {
         let machine = collect_machine_profile(&MachineProfileConfig::default());
         let hierarchy = build_memory_hierarchy(&machine);
-        assert_eq!(hierarchy.schema_version, 1);
+        assert_eq!(hierarchy.schema_version, 2);
+        assert!(hierarchy.sampled_at_unix_ms.is_some());
         assert!(hierarchy
             .categories
             .iter()

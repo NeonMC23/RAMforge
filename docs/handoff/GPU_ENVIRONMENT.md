@@ -73,25 +73,88 @@ GPU result is reported as physical validation.
 
 ## Safe follow-up procedure (requires user authorization)
 
-1. Reboot so the loaded NVIDIA kernel module matches the installed 620.70.06
-   userspace package; verify `nvidia-smi` succeeds and reports the RTX 3050.
-2. Install a CUDA toolkit/compiler matching the driver, for example the
-   distribution's `cuda-toolkit` package. This is a system change and was not
-   performed.
-3. Configure a CUDA build in a separate build directory, preserving the pin:
+The audit was repeated on 2026-11-21 after six days of uptime. The driver
+module was still 595.112.07 with 620.70.06 userspace, `nvidia-smi` still
+failed, and `nvcc` was still absent. Nothing below was executed.
+
+### Exact minimal package proposal
+
+The Nobara repository `nobara-nvidia-production` provides CUDA 13.2 packages.
+There is no `cuda-toolkit` package in this repository. The supported
+development meta-package is `cuda-devel`; `cuda-nvcc` is its compiler
+dependency.
+
+Proposed command, after explicit authorization:
+
+```sh
+sudo dnf install cuda-devel cuda-gcc gcc15-c++
+```
+
+- Source: `nobara-nvidia-production`.
+- Versions currently offered: `cuda-devel`/`cuda-nvcc` 13.2.51, `cuda-cccl-devel`
+  13.2.27, `cuda-gcc` 15, `gcc15-c++` 15.3.1.
+- `cuda-devel` pulls the CUDA headers, compiler, cuBLAS/cuFFT/cuRAND/cuSOLVER/
+  cuSPARSE/NPP/NVJITLink/NVJPEG development packages; it is larger than the
+  runtime-only packages already installed. Exact transaction size was not
+  queried because that requires a package-manager transaction.
+- The system GCC is 16.2.1. `cuda-gcc` + `gcc15-c++` provide GCC 15, which is
+  the safer CUDA 13 host compiler. The setup script auto-selects `g++-15` when
+  present.
+- CUDA 13.2 supports the RTX 3050's compute capability 8.6. The installed
+  620.70.06 driver is compatible with CUDA 13.x; the running 595 module is the
+  blocker.
+
+### Driver recovery
+
+The 620.70.06 NVIDIA driver and kernel packages are already installed. A
+reboot is required so the loaded kernel module matches userspace. No package
+change is needed for the driver itself.
+
+1. Reboot (user action).
+2. Verify:
 
    ```sh
-   cmake -S native/src -B native/build-cuda \
-     -DGGML_CUDA=ON -DGGML_CPU=ON -DGGML_CPU_REPACK=ON \
-     -DBUILD_SHARED_LIBS=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
-   cmake --build native/build-cuda -j"$(nproc)"
+   cat /proc/driver/nvidia/version   # expect 620.70.06
+   nvidia-smi                        # expect RTX 3050 and VRAM
    ```
 
-4. Point `FORGE_LLAMA_DIR` at a tree whose `build/bin` contains the CUDA
-   libraries and run the forgeCORE/RAMforge suites.
-5. Validate in this order: backend registration, device enumeration, CPU-only
-   load, small GPU-offload load with native effective-placement readback,
-   real generation, then repeated release benchmarks.
+3. Install the toolkit packages above (user authorization).
+4. Verify:
+
+   ```sh
+   nvcc --version
+   ls /usr/include/cuda.h /usr/include/cuda_runtime.h
+   ```
+
+### CUDA build and validation
+
+The repository now contains a guarded script that performs preflight,
+configure, and build without modifying the pin or the CPU build:
+
+```sh
+cd forgeCORE
+FORGE_LLAMA_DIR=/path/to/native sh scripts/setup-native-cuda.sh --check
+FORGE_LLAMA_DIR=/path/to/native sh scripts/setup-native-cuda.sh
+export FORGE_LLAMA_DIR=/path/to/native
+export FORGE_LLAMA_BUILD_DIR=build-cuda
+```
+
+The script keeps `GGML_CPU=ON`, `GGML_CPU_REPACK=ON`, enables `GGML_CUDA`,
+disables NCCL for the single GPU, targets the reported compute capability, and
+verifies that `libggml-cuda.so` exports `ggml_backend_cuda_reg`.
+
+Then validate in order:
+
+1. `registered_backends()` includes CUDA.
+2. `enumerate_devices()` reports the RTX 3050 with VRAM.
+3. CPU-only inference still works with the CUDA build.
+4. Small offload: effective GPU layer count and per-layer placement readback.
+5. Real generation, streaming, cancellation, unload.
+6. Increasing offload counts up to the model's feasible maximum.
+7. Repeated release benchmarks with reversed order.
+
+A registered CUDA device is not yet proof of inference. Only real generated
+tokens and effective placement readback close the milestone.
 
 ## Non-claims
 

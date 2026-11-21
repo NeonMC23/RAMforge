@@ -75,7 +75,10 @@ validated** in this build. No CUDA/Vulkan/SYCL/Metal test result is claimed.
 ## GPU execution status
 
 - Hardware detected: RTX 3050 Laptop GPU (GA107M).
-- Native GPU backend built: **no** (all GPU backend flags OFF).
+- Native GPU backend built: **no** (all GPU backend flags OFF). A guarded
+  `forgeCORE/scripts/setup-native-cuda.sh` is prepared for a separate
+  `build-cuda` tree; it was not run because `nvidia-smi` and `nvcc` are not
+  usable.
 - CUDA toolkit available: **no** (`nvcc` and headers absent).
 - Driver usable by CUDA: **no** in this session (kernel/userspace mismatch).
 - Physical GPU inference or offload: **not performed**.
@@ -107,7 +110,9 @@ validated. No silent CPU fallback occurs.
 - storage-backed model data.
 
 Categories are explicitly overlapping and are never summed into a fabricated
-total. Placement states are:
+total. Each hierarchy and category carries the machine-profile sampling time;
+each device snapshot carries its own sampling time. Quality is observed,
+estimated, unknown, or unsupported; provenance is recorded separately. Placement states are:
 
 `gpu_resident`, `host_resident`, `file_backed_mapped`, `storage_backed`,
 `staged`, `unknown`. The local service exposes `architecture` and `hierarchy`
