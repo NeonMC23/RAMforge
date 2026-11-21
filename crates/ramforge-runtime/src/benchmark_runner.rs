@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::gpu_observability::GpuObservability;
 use crate::inference_service::{
     GenerationOptions, InferenceService, ServiceError, INFERENCE_SERVICE_API_VERSION,
 };
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 5;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
@@ -58,6 +59,10 @@ pub struct BenchmarkReport {
     /// backend/compute buffers. Still a point-in-time value, not a peak.
     pub device_memory_free_after_warmup_bytes: Option<u64>,
     pub device_memory_free_after_unload_bytes: Option<u64>,
+    /// Native/derived observability snapshots at lifecycle boundaries.
+    pub memory_after_warmup: Option<GpuObservability>,
+    pub memory_after_generation: Option<GpuObservability>,
+    pub memory_after_unload: Option<GpuObservability>,
     pub context_create_ns: Vec<u64>,
     pub runs_detail: Vec<BenchmarkRun>,
     pub median_generation_tokens_per_second: f64,
@@ -179,6 +184,7 @@ pub fn run_benchmark(
         let _ = service.generate(&options, &cancel, |_| Ok(()))?;
     }
     let free_after_warmup = device_free_bytes(&device_id);
+    let memory_after_warmup = Some(service.memory_observability()?);
     let mut runs = Vec::with_capacity(config.runs as usize);
     let mut context_ns = Vec::with_capacity(config.runs as usize);
     for index in 0..config.runs {
@@ -201,8 +207,10 @@ pub fn run_benchmark(
             rss_after_bytes: report.stats.rss_after_bytes,
         });
     }
+    let memory_after_generation = Some(service.memory_observability()?);
     service.unload();
     let free_after_unload = device_free_bytes(&device_id);
+    let memory_after_unload = Some(service.memory_observability()?);
     let mut rates: Vec<f64> = runs
         .iter()
         .map(|run| run.generation_tokens_per_second)
@@ -250,6 +258,9 @@ pub fn run_benchmark(
         device_memory_free_after_load_bytes: free_after_load,
         device_memory_free_after_warmup_bytes: free_after_warmup,
         device_memory_free_after_unload_bytes: free_after_unload,
+        memory_after_warmup,
+        memory_after_generation,
+        memory_after_unload,
         median_context_create_ns: median_u64(&mut context_ns.clone()),
         context_create_ns: context_ns,
         median_decode_tokens_per_second: if decode_rates.is_empty() {

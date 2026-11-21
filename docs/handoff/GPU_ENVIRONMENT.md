@@ -85,13 +85,15 @@ also exercised.
 
 | Mode | Effective layers | Median tok/s | P25–P75 | P95 | Decode tok/s | Prompt tok/s | TTFT |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| CPU | 0 | 240.70 | 234.26–245.45 | 255.32 | 249.12 | 704.4 | 7.15 ms |
-| Hybrid | 8 | 289.13 | 286.92–303.01 | 310.10 | 310.51 | 805.7 | 6.25 ms |
-| GPU | 31 | 484.65 | 460.70–488.73 | 491.16 | 495.54 | 1448.5 | 3.50 ms |
+| CPU | 0 | 252.53 | 238.30–257.28 | 261.10 | 259.74 | 669.6 | 7.51 ms |
+| Hybrid | 8 | 317.56 | 315.53–324.41 | 325.21 | 328.60 | 805.0 | 6.26 ms |
+| GPU | 31 | 488.09 | 486.21–493.36 | 496.39 | 498.69 | 1449.4 | 3.49 ms |
 
-A reverse-order session measured GPU 488.89, hybrid 309.53, CPU 249.62 tok/s,
-reproducing the ordering. Full offload was about 2.0x CPU and hybrid about 1.2x
-for this small model on this laptop GPU. These are single-machine,
+The first validated session measured CPU 240.70, hybrid 289.13, and GPU 484.65;
+a reverse-order session measured CPU 249.62, hybrid 309.53, and GPU 488.89.
+The instrumented session measured 252.53 / 317.56 / 488.09. Instrumentation
+overhead is below the session-to-session noise. Full offload is about 1.9–2.0x
+CPU and hybrid about 1.2–1.3x for this small model. These are single-machine,
 warm/uncontrolled results and are not a universal default.
 
 VRAM snapshot (free bytes):
@@ -105,6 +107,81 @@ The GPU model used about 178 MiB after warmup contexts for full offload and
 about 113 MiB for hybrid. Unload returned near baseline; about 12.6 MiB
 remained in CUDA/driver caches. These are native free-memory snapshots, not
 peak measurements and not exclusive reservations.
+
+## Memory observability (schema 1)
+
+The native context already maintains model/context/compute byte totals per
+backend buffer type. A minimal read-only C bridge exposes them; RAMforge wraps
+the values in a versioned observability schema.
+
+Point-in-time schema-6 benchmark snapshot, after warmup:
+
+| Mode | Buffer | Model bytes | KV/context bytes | Compute bytes |
+|---|---|---:|---:|---:|
+| CPU | CPU_Mapped | 103,668,480 | 0 | 0 |
+| CPU | CPU | 0 | 5,898,240 | 51,512,320 |
+| Hybrid 8 | CUDA0 | 46,928,640 | 1,376,256 | 50,921,472 |
+| Hybrid 8 | CUDA_Host | 0 | 0 | 1,317,888 |
+| Hybrid 8 | CPU_Mapped | 103,666,176 | 0 | 0 |
+| Hybrid 8 | CPU | 0 | 4,521,984 | 0 |
+| GPU 31 | CUDA0 | 103,739,904 | 5,898,240 | 50,921,472 |
+| GPU 31 | CUDA_Host | 0 | 0 | 1,317,888 |
+| GPU 31 | CPU_Mapped | 30,081,024 | 0 | 0 |
+
+Device used (total minus native free) after warmup was about 105.5 MB for CPU,
+218.8 MB for hybrid, and 283.8 MB for full offload. Native CUDA buffer totals
+were about 100.5 MB and 161.9 MB respectively. The remaining ~118–122 MB is
+driver, desktop, and other-process usage; the schema reports it as device-level
+used, not as RAMforge-attributed allocation.
+
+Late in the milestone CPU plans were changed to pass an explicit CPU device
+list. Before that change, a CPU plan in the CUDA build allocated a CUDA compute
+buffer even with zero offloaded layers. The current CPU path registers no CUDA
+buffer and no CUDA compute allocation.
+
+Unsupported metrics are explicit, not zero:
+
+- allocation/deallocation event counters;
+- host-to-device and device-to-host counts, bytes, and duration;
+- per-synchronization duration;
+- peak VRAM;
+- process-attributed device memory;
+- separable driver overhead.
+
+`memory` service snapshots and benchmark reports capture before-load,
+after-load, after-warmup, after-generation, and after-unload points. Repeated
+GPU load/unload cycles released buffers each time; the final free value returned
+to the 3,868,590,080-byte baseline. One transient 76 MB drift was observed while
+the desktop compositor changed usage, so the regression bound is 256 MB.
+
+Observability sampling overhead: 100 snapshots after GPU load took 5.29 ms
+total, about 53 µs per snapshot.
+
+## Larger-model hybrid experiment
+
+Qwen2.5-7B-Instruct Q4_K_M (4,683,073,632 bytes, 28 transformer layers) was run
+with 12 requested layers, 256 context, and 4 CPU threads.
+
+| Metric | Value |
+|---|---|
+| Effective layers | 12 (11 transformer + output) |
+| GPU transformer / CPU transformer | 11 / 17 |
+| CUDA0 model buffer | 2,015,414,272 B |
+| CUDA0 KV | 5,767,168 B |
+| CUDA0 compute | 159,383,552 B |
+| CUDA_Host compute | 7,478,272 B |
+| CPU-mapped model | 2,661,705,728 B |
+| CPU KV | 8,912,896 B |
+| Load time | 2.90 s |
+| Generation | 9.30 tok/s |
+| Prompt throughput | 18.4 tok/s |
+| TTFT | 271.6 ms |
+| Device used | 2,299,133,952 B |
+| Output | ` Paris. Paris is a city in the` |
+
+This was a conservative fit: roughly 2.3 GB device used of 4 GB total, with
+17 transformer layers and 2.66 GB of weights on CPU. It is a correctness and
+fit result, not a throughput recommendation. No VRAM exhaustion test was run.
 
 ## Reproduction
 

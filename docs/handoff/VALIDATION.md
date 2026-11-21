@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 617 passed, 0 failed, 33 ignored.
+- `cargo test --workspace`: 618 passed, 0 failed, 35 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -370,7 +370,7 @@ Not run or not claimed:
 
 ## Operational runtime validation — 2026-11-21
 
-- `cargo test --workspace --locked`: **617 passed, 0 failed, 33 ignored**.
+- `cargo test --workspace --locked`: **618 passed, 0 failed, 35 ignored**.
 - Real inference-service tests: load, context, stream, throughput, cancellation
   and unload passed.
 - CLI benchmark: median generation 136.87 tok/s (112.58–155.41), decode 171.70,
@@ -387,11 +387,21 @@ Not run or not claimed:
   layers 8 (7 transformer + output) and 31 (30 transformer + output), output
   device GPU, real tokens generated. Cancellation, repeated sessions, unload,
   and VRAM release validated.
-- Release comparison: CPU 240.70 tok/s, hybrid 289.13, full GPU 484.65;
-  reverse-order session CPU 249.62, hybrid 309.53, GPU 488.89.
+- Release comparison: first session CPU 240.70 tok/s, hybrid 289.13, full GPU
+  484.65; reverse order CPU 249.62, hybrid 309.53, GPU 488.89; instrumented
+  session CPU 252.53, hybrid 317.56, GPU 488.09.
+- GPU observability schema 1 validated: native CUDA0/CPU_Mapped/CPU buffer
+  model/KV/compute totals, device used, sampling time/sequence; unsupported
+  counters remain explicit.
+- Allocation/deallocation counters, transfer accounting, peak VRAM, process
+  attribution, and synchronization duration were not available and are marked
+  unsupported.
+- Repeated GPU load/unload cycles released buffers and returned to baseline.
+- Larger-model hybrid: Qwen2.5-7B Q4_K_M, 12 effective layers, 9.30 tok/s,
+  coherent output, 2.90 s load.
 - Native effective placement readback is wired through forgeCORE and RAMforge;
   zero-effective GPU loads are rejected. No silent CPU fallback.
-- `RuntimePlan` schema is 2; benchmark schema is 5.
+- `RuntimePlan` schema is 2; benchmark schema is 6.
 - Release-build throughput (latest session): balanced 8 threads 223.04 tok/s
   (P25–P75 218.94–224.91), maximum-performance 4 threads repacked 205.25,
   balanced 4 threads 203.92, background 81.44. Earlier sessions measured
@@ -411,7 +421,7 @@ Not run or not claimed:
 
 ## Runtime calibration validation — 2026-11-20
 
-- `cargo test --workspace --locked`: **617 passed, 0 failed, 33 ignored**.
+- `cargo test --workspace --locked`: **618 passed, 0 failed, 35 ignored**.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 - Ignored calibration CLI test: passed; nine lifecycle stages, mapping
   residency, comparisons, attribution, model fingerprint, and plan evidence.
@@ -430,7 +440,7 @@ Not run or not claimed:
 
 ## Machine profile and candidate plan validation — 2026-11-20
 
-- `cargo test --workspace`: **617 passed, 0 failed, 33 ignored**.
+- `cargo test --workspace`: **618 passed, 0 failed, 35 ignored**.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge machine --model ... --ram 1G --json`: passed; includes CPU,
   memory, storage, device, model requirements, four plans, and comparison.
@@ -452,7 +462,7 @@ Not run or not claimed:
   New `node_dispatch` tests cover disabled-by-default behavior, installation
   and removal, event drain, overflow, multiple contexts, four-worker
   exactly-once publication, identity fields, and bounded options.
-- RAMforge `cargo test --workspace`: **617 passed, 0 failed, 33 ignored**.
+- RAMforge `cargo test --workspace`: **618 passed, 0 failed, 35 ignored**.
   The ignored real-model CLI test verifies `--node-dispatch-observe` JSON with
   attributed and unattributed events, zero identity mismatches, CPU backend,
   and bounded serialization.
@@ -500,7 +510,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          617 passed, 0 failed, 33 ignored
+cargo test --workspace                          618 passed, 0 failed, 35 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

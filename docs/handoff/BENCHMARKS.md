@@ -657,14 +657,16 @@ warmup, warm/uncontrolled. CUDA build: `native/build-cuda`, SM 86.
 
 | Mode | Requested/effective layers | Median tok/s | P25–P75 | P95 | Decode tok/s | Prompt tok/s | TTFT |
 |---|---|---:|---:|---:|---:|---:|---:|
-| CPU | 0 / 0 | 240.70 | 234.26–245.45 | 255.32 | 249.12 | 704.4 | 7.15 ms |
-| Hybrid | 8 / 8 (7 transformer + output) | 289.13 | 286.92–303.01 | 310.10 | 310.51 | 805.7 | 6.25 ms |
-| GPU | 31 / 31 (30 transformer + output) | 484.65 | 460.70–488.73 | 491.16 | 495.54 | 1448.5 | 3.50 ms |
+| CPU | 0 / 0 | 252.53 | 238.30–257.28 | 261.10 | 259.74 | 669.6 | 7.51 ms |
+| Hybrid | 8 / 8 (7 transformer + output) | 317.56 | 315.53–324.41 | 325.21 | 328.60 | 805.0 | 6.26 ms |
+| GPU | 31 / 31 (30 transformer + output) | 488.09 | 486.21–493.36 | 496.39 | 498.69 | 1449.4 | 3.49 ms |
 
-A second session with reversed configuration order measured CPU 249.62,
-hybrid 309.53, and GPU 488.89 tok/s, preserving the ordering. Full offload was
-about 2.0x CPU and hybrid about 1.2x on this small model. This is not a
-universal default; the GPU has 4 GiB VRAM and the model is 135M parameters.
+The first session measured CPU 240.70, hybrid 289.13, and GPU 484.65; the
+reverse-order session measured CPU 249.62, hybrid 309.53, and GPU 488.89. The
+instrumented session is shown above. Instrumentation overhead is below
+session-to-session noise. Full offload is about 1.9–2.0x CPU and hybrid about
+1.2–1.3x on this small model. This is not a universal default; the GPU has
+4 GiB VRAM and the model is 135M parameters.
 
 VRAM free bytes (native snapshots):
 
@@ -687,6 +689,46 @@ transfer/compute overlap were not instrumented.
 
 Reproduction commands are in
 [GPU_ENVIRONMENT.md](GPU_ENVIRONMENT.md#reproduction).
+
+### Memory observability
+
+Benchmark schema 6 embeds native memory snapshots after warmup, after
+generation, and after unload. Native buffer totals after warmup:
+
+| Mode | CUDA0 model | CUDA0 KV | CUDA0 compute | CUDA_Host | CPU_Mapped | CPU |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU | 0 | 0 | 0 | 0 | 103,668,480 | 57,410,560 |
+| Hybrid 8 | 46,928,640 | 1,376,256 | 50,921,472 | 1,317,888 | 103,666,176 | 4,521,984 |
+| GPU 31 | 103,739,904 | 5,898,240 | 50,921,472 | 1,317,888 | 30,081,024 | 0 |
+
+Device used after warmup was 105.5 MB (CPU), 218.8 MB (hybrid), and 283.8 MB
+(full GPU). Native CUDA buffers accounted for about 100.5 MB and 161.9 MB; the
+remaining ~118–122 MB is driver, desktop, or unclassified usage. Categories are
+overlapping and are not summed into a process total.
+
+Allocation/deallocation event counters, transfer counts/bytes/duration,
+synchronization duration, peak VRAM, and process-attributed device memory are
+reported as unsupported, not zero. Observability sampling took about 53 µs per
+snapshot (100 snapshots in 5.29 ms).
+
+### Larger-model hybrid
+
+Qwen2.5-7B-Instruct Q4_K_M, 12 requested GPU layers, 256 context, 4 CPU
+threads, one run:
+
+| Metric | Value |
+|---|---|
+| Effective layers | 12 (11 transformer + output) |
+| CUDA0 model / KV / compute | 2,015,414,272 / 5,767,168 / 159,383,552 B |
+| CPU-mapped model / CPU KV | 2,661,705,728 / 8,912,896 B |
+| Load time | 2.90 s |
+| Generation | 9.30 tok/s |
+| Prompt | 18.4 tok/s |
+| TTFT | 271.6 ms |
+| Device used | 2,299,133,952 B |
+
+This was a conservative fit, not a speed recommendation. No VRAM exhaustion
+test was performed.
 
 ## Caveats
 

@@ -256,6 +256,21 @@ impl ForgeCoreModel {
                 ));
             }
             model_options.gpu_layers = GpuLayers::Cpu;
+            // A CUDA-enabled build still prepares the default device list,
+            // which can allocate CUDA compute buffers even with zero offloaded
+            // layers. Pin the CPU device explicitly so a CPU plan is truly
+            // CPU-only.
+            let native_cpu = forge_core::enumerate_devices()
+                .into_iter()
+                .find(|candidate| candidate.device_type == forge_core::DeviceType::Cpu)
+                .ok_or_else(|| {
+                    ForgeCoreAdapterError::DeviceSelection(
+                        "CPU device disappeared from the native registry".to_string(),
+                    )
+                })?;
+            model_options.split_mode = SplitMode::None;
+            model_options.main_gpu = 0;
+            model_options.devices = Some(vec![native_cpu]);
         } else {
             if device.is_cpu() {
                 return Err(ForgeCoreAdapterError::Configuration(
@@ -356,6 +371,13 @@ impl ForgeCoreModel {
 
     pub fn metadata(&self) -> &ForgeCoreModelMetadata {
         &self.metadata
+    }
+
+    /// Native model-only allocation breakdown. Context/compute fields are zero.
+    pub fn memory_breakdown(&self) -> Result<Vec<forge_core::BufferMemory>, ForgeCoreAdapterError> {
+        self.model
+            .memory_breakdown()
+            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
     }
 
     /// Release resident pages from this model's file-backed mappings.
@@ -557,6 +579,14 @@ impl ForgeCoreSession {
 
     pub fn context_length(&self) -> u32 {
         self.context.n_ctx()
+    }
+
+    /// Native model/context/compute byte breakdown grouped by buffer type.
+    /// Values are a point-in-time native snapshot for this live session.
+    pub fn memory_breakdown(&self) -> Result<Vec<forge_core::BufferMemory>, ForgeCoreAdapterError> {
+        self.context
+            .memory_breakdown()
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
     }
 
     /// Effective logical batch limit reported by the live native context.

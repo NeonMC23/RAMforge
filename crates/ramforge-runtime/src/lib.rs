@@ -27,6 +27,7 @@ pub mod execution;
 pub mod execution_candidate;
 pub mod execution_profile;
 pub mod forgecore;
+pub mod gpu_observability;
 pub mod graph_manifest;
 pub mod inference;
 pub mod inference_service;
@@ -105,6 +106,11 @@ pub use machine_profile::{
     collect_machine_profile, BackendInventory, CpuRuntimeSettings, Freshness, MachineProfile,
     MachineProfileConfig, ObservationState, Observed, Provenance, RegisteredBackend,
     StorageBenchmarkConfig, StorageProfile, MACHINE_PROFILE_SCHEMA_VERSION,
+};
+pub use gpu_observability::{
+    collect_observability, BufferObservation, CounterObservation, DeviceObservation,
+    GpuObservability, MemoryObservation, MemoryObservationState, ObservationScope,
+    ObservationSource, TransferObservation, GPU_OBSERVABILITY_SCHEMA_VERSION,
 };
 pub use memory_hierarchy::{
     build_memory_hierarchy, build_placement_model, build_placement_model_for_plan,

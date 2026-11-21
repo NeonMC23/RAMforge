@@ -119,6 +119,25 @@ pub fn serve_stdio(mut service: InferenceService) -> Result<(), ServiceServerErr
                     "status": service.status(),
                 }),
             )?,
+            "memory" => match service.memory_observability() {
+                Ok(observability) => write_event(
+                    &mut output,
+                    serde_json::json!({
+                        "id": id,
+                        "event": "result",
+                        "gpu_observability": observability,
+                    }),
+                )?,
+                Err(error) => write_event(
+                    &mut output,
+                    serde_json::json!({
+                        "id": id,
+                        "event": "error",
+                        "kind": error_kind(&error),
+                        "error": error.to_string(),
+                    }),
+                )?,
+            },
             "architecture" => write_event(
                 &mut output,
                 serde_json::json!({

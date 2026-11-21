@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::forgecore::{
     ForgeCoreContextOptions, ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession,
 };
+use crate::gpu_observability::{collect_observability, GpuObservability};
 use crate::memory_report::process_rss;
 use crate::runtime_plan::RuntimePlan;
 use crate::sampling::Sampler;
@@ -293,6 +294,14 @@ impl InferenceService {
             rss_bytes: process_rss(),
             errors: self.errors.clone(),
         }
+    }
+
+    /// Point-in-time device and native buffer observability. Device values are
+    /// available without a session; model/context/compute buffers require one.
+    pub fn memory_observability(&self) -> Result<GpuObservability, ServiceError> {
+        let registry = crate::DeviceRegistry::discover();
+        collect_observability(&registry, self.session.as_ref(), self.model.as_ref())
+            .map_err(ServiceError::Execution)
     }
 
     /// Load the model and build the tokenizer. The context is created separately.

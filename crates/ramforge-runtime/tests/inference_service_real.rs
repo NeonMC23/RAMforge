@@ -142,7 +142,15 @@ fn service_cancellation_is_explicit() {
         )
         .unwrap_err();
     assert!(matches!(error, ServiceError::Cancelled));
+    let after_cancel = service
+        .memory_observability()
+        .expect("post-cancel snapshot");
+    assert!(!after_cancel.buffers.is_empty());
     service.unload();
+    let after_unload = service
+        .memory_observability()
+        .expect("post-unload snapshot");
+    assert!(after_unload.buffers.is_empty());
 }
 
 fn gpu_plan(path: &std::path::Path, gpu_layers: u32) -> Option<RuntimePlan> {
@@ -198,6 +206,18 @@ fn service_runs_on_cuda_with_native_placement() {
     let expected_device = plan.effective.device_id.clone();
     let mut service = InferenceService::new(plan).expect("service");
     service.load().expect("GPU model load");
+    let load_only = service
+        .memory_observability()
+        .expect("load-only observability");
+    eprintln!("load_only buffers: {:?}", load_only.buffers);
+    assert!(load_only
+        .buffers
+        .iter()
+        .any(|buffer| buffer.model_bytes > 0));
+    assert!(load_only
+        .buffers
+        .iter()
+        .all(|buffer| buffer.context_bytes == 0));
     service.create_session().expect("session");
     let status = service.status();
     assert_ne!(status.execution_mode, ramforge_runtime::ExecutionMode::Cpu);
@@ -209,6 +229,26 @@ fn service_runs_on_cuda_with_native_placement() {
     assert_eq!(
         status.device_id, expected_device,
         "status device must match the plan"
+    );
+    let observability = service
+        .memory_observability()
+        .expect("memory observability");
+    observability.validate().expect("schema");
+    assert!(observability
+        .devices
+        .iter()
+        .any(|device| device.kind != "cpu" && device.used_bytes.is_some()));
+    assert!(observability
+        .buffers
+        .iter()
+        .any(|buffer| { buffer.device_name.contains("CUDA0") && buffer.model_bytes > 0 }));
+    assert!(observability
+        .observations
+        .iter()
+        .any(|observation| observation.category == "kv_cache"));
+    assert_eq!(
+        observability.transfers.state,
+        ramforge_runtime::MemoryObservationState::Unsupported
     );
     let cancel = AtomicBool::new(false);
     let report = service
@@ -265,5 +305,87 @@ fn service_cancellation_works_on_cuda() {
         )
         .unwrap_err();
     assert!(matches!(error, ServiceError::Cancelled));
+    service.unload();
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and a CUDA native build"]
+fn repeated_gpu_load_unload_does_not_grow_buffers_unboundedly() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let Some(plan) = gpu_plan(&path, 8) else {
+        return;
+    };
+    let mut baseline_free: Option<u64> = None;
+    let mut previous_unload_free: Option<u64> = None;
+    for cycle in 0..3 {
+        let mut service = InferenceService::new(plan.clone()).expect("service");
+        service.load().expect("load");
+        service.create_session().expect("session");
+        let loaded = service.memory_observability().expect("loaded snapshot");
+        let cuda_device = loaded
+            .devices
+            .iter()
+            .find(|device| device.kind != "cpu")
+            .expect("CUDA device");
+        let loaded_free = cuda_device.free_bytes.expect("free");
+        baseline_free.get_or_insert(cuda_device.total_bytes.expect("total"));
+        assert!(loaded.buffers.iter().any(|buffer| buffer.model_bytes > 0));
+        assert!(loaded
+            .observations
+            .iter()
+            .any(|observation| observation.category == "compute_graph"));
+        service.unload();
+        let unloaded = service.memory_observability().expect("unloaded snapshot");
+        assert!(unloaded.buffers.is_empty());
+        let unloaded_free = unloaded
+            .devices
+            .iter()
+            .find(|device| device.kind != "cpu")
+            .and_then(|device| device.free_bytes)
+            .expect("free");
+        assert!(
+            unloaded_free > loaded_free,
+            "cycle {cycle}: unload did not release VRAM ({loaded_free} -> {unloaded_free})"
+        );
+        if let Some(previous) = previous_unload_free {
+            let difference = previous.abs_diff(unloaded_free);
+            assert!(
+                difference < 256 * 1024 * 1024,
+                "cycle {cycle}: free memory drift {difference} bytes"
+            );
+            eprintln!("cycle {cycle}: unload free={unloaded_free}, drift={difference}");
+        }
+        previous_unload_free = Some(unloaded_free);
+    }
+    assert!(baseline_free.is_some());
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and a CUDA native build"]
+fn observability_sampling_overhead_is_bounded() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let Some(plan) = gpu_plan(&path, 8) else {
+        return;
+    };
+    let mut service = InferenceService::new(plan).expect("service");
+    service.load().expect("load");
+    service.create_session().expect("session");
+    let started = std::time::Instant::now();
+    for _ in 0..100 {
+        service.memory_observability().expect("snapshot");
+    }
+    let elapsed = started.elapsed();
+    let average = elapsed / 100;
+    eprintln!("observability: 100 snapshots in {elapsed:?}, average {average:?}");
+    assert!(
+        average < std::time::Duration::from_millis(5),
+        "observability snapshot too slow: {average:?}"
+    );
     service.unload();
 }

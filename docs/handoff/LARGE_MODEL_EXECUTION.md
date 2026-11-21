@@ -108,9 +108,9 @@ accumulation order. No silent CPU fallback occurs.
 - storage capacity/availability;
 - file-backed model mappings;
 - anonymous/process memory;
-- KV cache estimate;
-- compute/graph allocation (unknown);
-- backend buffers (unknown);
+- KV cache (native context breakdown when a session exists);
+- compute/graph allocation (native context breakdown);
+- backend buffers (native breakdown grouped by buffer type);
 - staging (unknown);
 - storage-backed model data.
 
@@ -126,8 +126,30 @@ inspect the same plan-derived architecture, placement, and feasibility data as
 the CLI.
 
 Only confirmed states are evidence-backed. CPU KV placement is host; file-backed
-mmap is confirmed only when repacking is disabled; compute/graph/backend/staging
-remain unknown.
+mmap is confirmed only when repacking is disabled. With CUDA, native buffer
+breakdown identifies CUDA0/CPU_Mapped/CPU_Host model, KV, and compute bytes;
+transfer bytes, allocation event counters, peak VRAM, and process attribution
+remain unsupported.
+
+### Native buffer observability
+
+A read-only native bridge exposes the pinned context's existing
+model/context/compute breakdown per backend buffer type. RAMforge service schema
+1 records device total/free/used, per-buffer model/KV/compute, sampling time and
+sequence, and explicit unsupported metrics. The benchmark embeds after-warmup,
+after-generation, and after-unload snapshots.
+
+Measured SmolLM2-135M examples:
+
+- CPU plan: CPU_Mapped model 103,668,480 B; CPU KV 5,898,240 B; CPU compute
+  51,512,320 B; no CUDA buffer.
+- Hybrid 8: CUDA0 model 46,928,640 B, KV 1,376,256 B, compute 50,921,472 B;
+  CUDA_Host compute 1,317,888 B; CPU_Mapped model 103,666,176 B.
+- Full 31: CUDA0 model 103,739,904 B, KV 5,898,240 B, compute 50,921,472 B;
+  CPU_Mapped model 30,081,024 B.
+
+Device used includes driver/desktop and other-process usage. The native buffer
+sums are not a process total and may leave a substantial unclassified gap.
 
 ## mmap and page-cache behavior
 
@@ -257,6 +279,29 @@ MoE can reduce active weight movement if routing metadata and residency control
 exist. A 30B-active subset at Q4 is still ~17 GB, above many consumer VRAM
 working sets once KV and compute are included. Without native routing-aware
 residency, this is not an implemented strategy.
+
+## Instrumentation implications for staging and MoE
+
+Evidence available today:
+
+- Exact native model/KV/compute buffer sizes per buffer type and device.
+- Load-time and post-warmup snapshots; load/unload lifecycle boundaries.
+- Buffer ownership remains inside `llama_model`/`llama_context`; there is no
+  public per-layer allocate/release API.
+- There is no public layer-boundary pause, transfer scheduling, eviction, or
+  rollback hook. The scheduler owns graph execution and buffer lifetimes.
+
+Therefore the current native API is **not sufficient** for controlled
+layer/tensor staging. A minimal needed hook would provide: layer-boundary
+synchronization, caller-owned bounded staging buffers, explicit ownership and
+invalidation, transfer/compute scheduling, cancellation, and rollback. The new
+observability is enough to budget and validate such a design, not to implement
+it.
+
+For MoE, there is still no active-expert observation or routing metadata in the
+safe API. Buffer totals cannot distinguish shared from routed expert storage, so
+they are insufficient for selective expert residency. Native routing/expert
+metadata remains required.
 
 ## What works today
 

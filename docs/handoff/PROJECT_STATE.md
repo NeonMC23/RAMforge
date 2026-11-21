@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **617 tests, 0 failed, 33 ignored**. The ignored
+  environment variables passes **618 tests, 0 failed, 35 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -91,7 +91,7 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 415 passed, 10 ignored. RAMforge tests: 617 passed, 33
+- forgeCORE tests: 415 passed, 10 ignored. RAMforge tests: 618 passed, 35
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
@@ -146,16 +146,26 @@
 - Effective placement: requested 8 -> effective 8 (7 transformer + output);
   requested 31 -> effective 31 (30 transformer + output). `n_gpu_layers`
   includes the output layer.
-- Release throughput (same workload): CPU 240.70 tok/s, hybrid 289.13, full GPU
-  484.65; reverse-order session CPU 249.62, hybrid 309.53, GPU 488.89.
-- VRAM after warmup: full offload used about 178 MiB; hybrid about 113 MiB.
-  Unload returned near baseline with about 12.6 MiB retained.
+- Release throughput: first session CPU 240.70, hybrid 289.13, GPU 484.65;
+  reverse order CPU 249.62, hybrid 309.53, GPU 488.89; instrumented session CPU
+  252.53, hybrid 317.56, GPU 488.09 (P95 261.10/325.21/496.39).
+- Memory observability schema 1: native per-buffer model/KV/compute totals,
+  device total/free/used, timestamps and sequence. Full GPU: CUDA0 model
+  103,739,904 B, KV 5,898,240 B, compute 50,921,472 B; hybrid: CUDA0 model
+  46,928,640 B, KV 1,376,256 B, compute 50,921,472 B.
+- CPU plans in the CUDA build explicitly select the CPU device and allocate no
+  CUDA buffer.
+- Allocation/deallocation event counters, transfer bytes/duration, peak VRAM,
+  process attribution, and synchronization duration are explicitly unsupported.
+- Larger-model hybrid: Qwen2.5-7B Q4_K_M, 12 layers (11 transformer + output),
+  CUDA0 model 2,015,414,272 B, CPU-mapped 2,661,705,728 B, 9.30 tok/s,
+  coherent output, 2.90 s load.
 - GPU load/placement failure is explicit; no silent CPU fallback occurs.
 - Out-of-core re-verification: 13.13 GB GPT-NeoX-20B Q4_K_M under an 8 GiB
   cgroup with `--no-repack --no-prefetch` produced one token, exit 0, 10.877 s
   wall, 9661 `max` events, and 0 OOM kills. Page release/prefetch/staging is
   OS paging over existing mappings, not tensor streaming.
-- RAMforge tests: 617 passed, 33 ignored.
+- RAMforge tests: 618 passed, 35 ignored.
 
 ## Runtime memory accounting and calibration (2026-11-20)
 
@@ -191,7 +201,7 @@
   evidence is rejected.
 - `ramforge machine --calibration` emits per-plan compatibility decisions and
   accepts `--no-repack`, `--no-prefetch`, `--ubatch`, and `--sequences`.
-- RAMforge tests: 617 passed, 33 ignored.
+- RAMforge tests: 618 passed, 35 ignored.
 
 ## Machine profiles and candidate plans (2026-11-20)
 
@@ -234,7 +244,7 @@
 - Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
   `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
   semantic/removal changes require a version increment.
-- ForgeCORE tests: 415 passed, 10 ignored. RAMforge tests: 617 passed, 33
+- ForgeCORE tests: 415 passed, 10 ignored. RAMforge tests: 618 passed, 35
   ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)

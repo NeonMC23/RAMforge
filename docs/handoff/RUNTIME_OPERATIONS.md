@@ -89,8 +89,22 @@ Commands:
 {"id":5,"command":"unload"}
 {"id":6,"command":"architecture"}
 {"id":7,"command":"hierarchy"}
+{"id":8,"command":"memory"}
 {"command":"cancel"}
 ```
+
+`memory` returns the versioned GPU observability schema:
+
+- device total/free/used bytes with timestamps and native provenance;
+- per-buffer model, KV/context, and compute bytes;
+- overlapping category flags;
+- session buffer totals;
+- explicit unsupported allocation/deallocation counters and transfer metrics.
+
+It works before a context exists (model-only buffers), after a session is
+created (KV and compute), after cancellation, and after unload (device-only,
+empty buffers). CPU-only plans explicitly pin the CPU device, so a CUDA build
+does not allocate CUDA compute buffers for a CPU plan.
 
 Generation events:
 
@@ -133,8 +147,10 @@ See [GPU_ENVIRONMENT.md](GPU_ENVIRONMENT.md) for validated results and
 limitations.
 
 With CUDA, `status` reports `execution_mode=gpu` for full offload or `hybrid`
-for partial offload; the benchmark report includes VRAM snapshots before load,
-after load, after warmup contexts, and after unload.
+for partial offload. Benchmark schema 6 includes VRAM snapshots before load,
+after load, after warmup, after generation, and after unload, plus native buffer
+breakdowns. Allocation event counters, transfer bytes/duration, synchronization
+duration, and peak VRAM are explicitly unsupported.
 
 ## Throughput benchmark
 
@@ -150,8 +166,10 @@ after load, after warmup contexts, and after unload.
 - RSS before/after generation
 - effective native configuration
 - requested/effective GPU layers, GPU/CPU transformer-layer counts, output device
-- device free-memory snapshots before load, after load, after warmup, and after
-  unload
+- device free-memory snapshots before load, after load, after warmup, after
+  generation, and after unload
+- native buffer model/KV/compute breakdowns and versioned GPU observability
+  snapshots
 
 Generation throughput and prompt throughput are separate. A single run is not
 presented as a reliable comparison.

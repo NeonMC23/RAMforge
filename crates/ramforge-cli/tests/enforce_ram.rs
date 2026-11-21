@@ -1600,7 +1600,7 @@ fn benchmark_reports_measured_generation_throughput() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 5);
+    assert_eq!(report["schema_version"], 6);
     assert_eq!(report["plan"]["effective"]["backend"], "cpu");
     assert_eq!(report["effective_gpu_layers"], 0);
     assert_eq!(report["device_id"], "cpu");
@@ -1625,6 +1625,17 @@ fn benchmark_reports_measured_generation_throughput() {
     assert!(p25 <= median && median <= p75);
     assert!((p75 - p25 - iqr).abs() < 1e-9);
     assert!(report["model_load_ns"].as_u64().unwrap() > 0);
+    let memory = &report["memory_after_generation"];
+    assert_eq!(memory["schema_version"], 1);
+    assert!(!memory["buffers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        memory["transfers"]["state"], "unsupported",
+        "transfers must not be fabricated"
+    );
+    assert!(report["memory_after_unload"]["buffers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert_eq!(report["runs"], 1);
     assert_eq!(report["runs_detail"].as_array().unwrap().len(), 1);
     assert!(report["limitations"]
@@ -1670,6 +1681,7 @@ fn serve_streams_tokens_and_reports_status() {
         .unwrap();
         writeln!(stdin, r#"{{"id":3,"command":"architecture"}}"#).unwrap();
         writeln!(stdin, r#"{{"id":4,"command":"hierarchy"}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":5,"command":"memory"}}"#).unwrap();
     }
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("serve output");
@@ -1716,6 +1728,19 @@ fn serve_streams_tokens_and_reports_status() {
         .as_str()
         .unwrap()
         .contains("fresh OS observation"));
+    let memory = lines
+        .iter()
+        .find(|line| line["event"] == "result" && line["id"] == 5)
+        .expect("memory result");
+    assert_eq!(memory["gpu_observability"]["schema_version"], 1);
+    assert_eq!(
+        memory["gpu_observability"]["transfers"]["state"],
+        "unsupported"
+    );
+    assert!(!memory["gpu_observability"]["devices"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -1808,25 +1833,37 @@ fn cuda_benchmark_reports_native_placement_and_memory() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 5);
+    assert_eq!(report["schema_version"], 6);
     assert_ne!(report["device_id"], "cpu");
     assert_eq!(report["requested_gpu_layers"], 8);
     let effective = report["effective_gpu_layers"].as_u64().expect("readback");
     assert!(effective >= 1, "no effective GPU layers: {report}");
     assert!(report["gpu_transformer_layers"].as_u64().unwrap() >= 1);
     assert_eq!(report["output_device_type"], "gpu");
-    let before = report["device_memory_free_before_bytes"].as_u64().unwrap();
     let after_load = report["device_memory_free_after_load_bytes"]
         .as_u64()
         .unwrap();
     let after_unload = report["device_memory_free_after_unload_bytes"]
         .as_u64()
         .unwrap();
-    assert!(after_load < before, "model load did not consume VRAM");
     assert!(
         after_unload > after_load,
         "unload did not release VRAM: {after_load} -> {after_unload}"
     );
+    let memory = &report["memory_after_generation"];
+    assert_eq!(memory["schema_version"], 1);
+    assert!(memory["buffers"].as_array().unwrap().iter().any(|buffer| {
+        buffer["device_name"]
+            .as_str()
+            .unwrap_or("")
+            .contains("CUDA0")
+            && buffer["model_bytes"].as_u64().unwrap_or(0) > 0
+    }));
+    assert!(memory["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|observation| observation["category"] == "kv_cache"));
     assert!(
         report["runs_detail"][0]["generated_tokens"]
             .as_u64()
