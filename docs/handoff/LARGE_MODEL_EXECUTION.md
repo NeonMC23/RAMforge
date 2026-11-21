@@ -295,17 +295,14 @@ Evidence available today:
 
 - Exact native model/KV/compute buffer sizes per buffer type and device.
 - Load-time and post-warmup snapshots; load/unload lifecycle boundaries.
-- Buffer ownership remains inside `llama_model`/`llama_context`; there is no
-  public per-layer allocate/release API.
-- There is no public layer-boundary pause, transfer scheduling, eviction, or
-  rollback hook. The scheduler owns graph execution and buffer lifetimes.
-
-Therefore the current native API is **not sufficient** for controlled
-layer/tensor staging. A minimal needed hook would provide: layer-boundary
-synchronization, caller-owned bounded staging buffers, explicit ownership and
-invalidation, transfer/compute scheduling, cancellation, and rollback. The new
-observability is enough to budget and validate such a design, not to implement
-it.
+- Per-layer CUDA staging, exact byte preflight, graph-source substitution,
+  graph/scheduler invalidation, eviction and lifecycle counters are implemented
+  in the pinned native tree.
+- Dynamic replacement between executions is validated. Staged sources cannot be
+  replaced while a graph or execution can still reference them.
+- There is still no per-layer execution boundary, double-buffered consume point,
+  transfer/compute overlap, or allocation-capacity reuse. The scheduler still
+  owns whole-graph execution and compute-buffer lifetimes.
 
 For MoE, there is still no active-expert observation or routing metadata in the
 safe API. Buffer totals cannot distinguish shared from routed expert storage, so
@@ -327,13 +324,18 @@ metadata remains required.
 - Bounded profile comparison, architecture metadata, memory hierarchy, and
   placement reporting.
 - Storage assessment and verified copy.
-- Honest unsupported/unknown reporting for GPU execution and tensor streaming.
+- Same-context staged layer eviction and replacement with transactional
+  rollback and explicit lifecycle counters.
+- Honest unsupported/unknown reporting for GPU execution, capacity reuse and
+  transfer/compute overlap.
 
 ## Required next native work
 
 - Expose per-layer/device allocation sizes and richer allocation failures.
-- Add a native layer/tensor staging API with bounded buffers, transfer/compute
-  overlap, synchronization, and eviction rules.
+- Add a per-layer execution boundary (or scheduler-integrated prefetch hook) with
+  event-guarded double buffering for genuine transfer/compute overlap.
+- Add safe staged-allocation capacity reuse that proves tensor inventory and
+  layout compatibility before remapping views.
 - Add MoE routing/expert residency metadata and control.
 - Expose anonymous/backend buffer accounting and safe reclamation.
 - Measure bandwidth, working-set, and page-fault behavior under additional

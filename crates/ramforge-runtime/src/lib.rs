@@ -165,7 +165,8 @@ pub use runtime_measurement::{
 };
 pub use inference_service::{
     GenerationOptions, GenerationReport, GenerationStats, InferenceService, ServiceCapabilities,
-    ServiceError, ServiceState, ServiceStatus, INFERENCE_SERVICE_API_VERSION,
+    ServiceError, ServiceState, ServiceStatus, StagedLayerStatus, StagingLifecycleStatus,
+    INFERENCE_SERVICE_API_VERSION,
 };
 pub use service_server::{serve_stdio, ServiceServerError};
 pub use staging_plan::{

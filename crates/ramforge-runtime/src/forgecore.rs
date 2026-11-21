@@ -636,6 +636,14 @@ impl ForgeCoreSession {
         self.options
     }
 
+    /// Clear the KV cache while keeping the context and any staged layer
+    /// allocations alive. Native memory objects are owned by the context.
+    pub fn clear_kv(&mut self) {
+        if let Some(mut memory) = self.context.memory() {
+            memory.clear(true);
+        }
+    }
+
     pub fn context_length(&self) -> u32 {
         self.context.n_ctx()
     }
@@ -644,6 +652,44 @@ impl ForgeCoreSession {
     pub fn stage_layer_cuda(&self, layer: u32) -> Result<(), ForgeCoreAdapterError> {
         self.context
             .stage_layer_cuda(layer)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    /// Quiesce outstanding work and invalidate cached graph results and
+    /// scheduler mappings before staged sources change.
+    pub fn invalidate_graph(&self) -> Result<(), ForgeCoreAdapterError> {
+        self.context
+            .invalidate_graph()
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    /// Release one staged layer after verified invalidation.
+    pub fn evict_layer_cuda(&self, layer: u32) -> Result<(), ForgeCoreAdapterError> {
+        self.context
+            .evict_layer_cuda(layer)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn staging_state(
+        &self,
+    ) -> Result<forge_core::StagingLifecycleState, ForgeCoreAdapterError> {
+        self.context
+            .staging_state()
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn staged_layer_count(&self) -> Result<u32, ForgeCoreAdapterError> {
+        self.context
+            .staged_layer_count()
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn staged_layer_at(
+        &self,
+        index: u32,
+    ) -> Result<forge_core::StagedLayerInfo, ForgeCoreAdapterError> {
+        self.context
+            .staged_layer_at(index)
             .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
     }
 

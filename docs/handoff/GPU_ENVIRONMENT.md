@@ -213,8 +213,9 @@ The real graph consumed independent staged CUDA layer tensors:
   269.04, full GPU 492.19. Single-layer staging is architectural evidence, not a
   throughput win.
 
-Staged layers are static for the context lifetime; no eviction, reuse, or
-overlap is implemented. See
+At the single-layer milestone, staged layers were static for the context
+lifetime. Dynamic eviction and replacement are covered below; capacity reuse and
+overlap remain unsupported. See
 [STAGING_ARCHITECTURE.md](STAGING_ARCHITECTURE.md).
 
 ## Multi-layer budgeted residency
@@ -225,10 +226,32 @@ overlap is implemented. See
 - Explicit 1M request: rejected as a set before allocation.
 - Qwen2.5-7B auto budget 1G: layers 0–6, 989,857,792 B, 21 layers rejected,
   4.40 tok/s, TTFT 329.2 ms.
-- Same-session SmolLM2 comparison: CPU 225.34 tok/s, 2 staged layers 204.30,
-  full GPU 483.15. Two staged layers introduced scheduler-copy overhead on this
-  small model; this is not a throughput win.
-- Eviction/reuse and transfer/compute overlap remain unsupported.
+- Same-session SmolLM2 comparison from the static-residency milestone: CPU
+  225.34 tok/s, 2 staged layers 204.30, full GPU 483.15. Two staged layers
+  introduced scheduler-copy overhead on this small model; this is not a
+  throughput win.
+
+## Dynamic same-context residency
+
+- SmolLM2 layers 0+1 were replaced by 1+2 in one live context: layer 0 evicted,
+  layer 1 kept, layer 2 allocated and transferred.
+- Five measured replacement cycles: invalidation median 0.019 ms, eviction
+  0.137 ms, staging 3.028 ms, total 3.188 ms (P25 3.063, P75 3.272, P95
+  3.491 ms).
+- Resident selection alternated cleanly across five cycles; native counters
+  ended at 5 invalidations, 5 releases, 7 allocations, 0 reuse.
+- Corrupting `blk.1.attn_q.weight` after replacement changed logits by 10.25
+  with 9 substitutions.
+- Qwen2.5-7B replaced layers 0–6 (989,857,792 B) with 7–13 (953,903,104 B) and
+  back in one context, about 2.0 s per replacement, coherent output throughout.
+- Allocation capacity reuse and transfer/compute overlap remain unsupported.
+
+The controlled throughput numbers above were collected on a host under heavy
+external CPU load (load average about 12 on 12 threads). Absolute values are
+therefore lower than earlier clean-session measurements and must not be compared
+across sessions. All modes were measured under the same conditions; the relative
+ordering (full GPU > CPU > two staged layers in that loaded session) is reported
+as observed, not as a staging benefit.
 
 ## Reproduction
 

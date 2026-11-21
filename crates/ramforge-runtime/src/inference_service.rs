@@ -23,7 +23,7 @@ use crate::staging::{Engine, MemoryType, StagingError};
 use crate::staging_plan::{StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest};
 use ramforge_core::{discover_model_set, Tokenizer};
 
-pub const INFERENCE_SERVICE_API_VERSION: u32 = 1;
+pub const INFERENCE_SERVICE_API_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +96,32 @@ pub struct StagedLayerStatus {
     pub graph_substitutions: u64,
 }
 
+/// Native staged-residency lifecycle snapshot. Counters are native facts, not
+/// RAMforge policy estimates. `reuse_count` stays zero while capacity reuse is
+/// unsupported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingLifecycleStatus {
+    pub graph_phase: String,
+    pub graph_invalidated: bool,
+    pub resident_layers: Vec<u32>,
+    pub resident_bytes: u64,
+    pub allocation_count: u64,
+    pub release_count: u64,
+    pub reuse_count: u64,
+    pub staging_failures: u64,
+    pub graph_invalidation_count: u64,
+    pub graph_rebuild_count: u64,
+    pub scheduler_reset_count: u64,
+    pub graph_build_ns: u64,
+    pub last_graph_build_ns: u64,
+    pub invalidation_failures: u64,
+    pub quiescence_wait_ns: u64,
+    pub last_quiescence_wait_ns: u64,
+    pub eviction_supported: bool,
+    pub allocation_reuse_supported: bool,
+    pub transfer_compute_overlap_supported: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceStatus {
     pub api_version: u32,
@@ -117,6 +143,7 @@ pub struct ServiceStatus {
     pub output_device_type: Option<String>,
     pub staged_layers: Vec<StagedLayerStatus>,
     pub staging_plan: Option<StagingPlan>,
+    pub staging_lifecycle: Option<StagingLifecycleStatus>,
     pub model_instance_id: Option<u64>,
     pub context_id: Option<u64>,
     pub rss_bytes: Option<u64>,
@@ -184,6 +211,10 @@ pub enum ServiceError {
     Context(String),
     Execution(String),
     UnsupportedExecution(String),
+    Replacement {
+        message: String,
+        rolled_back: bool,
+    },
     Cancelled,
     Sink(String),
 }
@@ -204,6 +235,19 @@ impl std::fmt::Display for ServiceError {
             Self::Execution(message) => write!(formatter, "execution: {message}"),
             Self::UnsupportedExecution(message) => {
                 write!(formatter, "unsupported execution: {message}")
+            }
+            Self::Replacement {
+                message,
+                rolled_back,
+            } => {
+                if *rolled_back {
+                    write!(formatter, "replacement failed and rolled back: {message}")
+                } else {
+                    write!(
+                        formatter,
+                        "replacement failed and rollback failed: {message}"
+                    )
+                }
             }
             Self::Cancelled => formatter.write_str("generation cancelled"),
             Self::Sink(message) => write!(formatter, "stream sink: {message}"),
@@ -336,6 +380,7 @@ impl InferenceService {
                 .map(|model| model.metadata().output_device_type.clone()),
             staged_layers: self.current_staged_status(),
             staging_plan: self.staging_plan.clone(),
+            staging_lifecycle: self.staging_lifecycle(),
             model_instance_id: model_id,
             context_id,
             rss_bytes: process_rss(),
@@ -576,57 +621,180 @@ impl InferenceService {
         })?;
         let mut statuses = Vec::with_capacity(self.staged_layers.len());
         for layer in &self.staged_layers {
-            session
-                .stage_layer_cuda(*layer)
-                .map_err(|error| ServiceError::Execution(error.to_string()))?;
-            let count = session
-                .staged_tensor_count(*layer)
-                .map_err(|error| ServiceError::Execution(error.to_string()))?;
-            let mut tensors = Vec::with_capacity(count as usize);
-            for index in 0..count {
-                tensors.push(
-                    session
-                        .staged_tensor_info(*layer, index)
-                        .map_err(|error| ServiceError::Execution(error.to_string()))?,
-                );
-            }
-            let total: u64 = tensors.iter().map(|tensor| tensor.bytes).sum();
-            let mut host = engine
-                .allocate(MemoryType::PinnedHost, total)
-                .map_err(|error| ServiceError::Execution(error.to_string()))?;
-            let mut offset = 0u64;
-            for tensor in &tensors {
-                let length = usize::try_from(tensor.bytes).map_err(|_| {
-                    ServiceError::Execution("staged tensor is too large".to_string())
-                })?;
-                let mut bytes = vec![0u8; length];
-                model
-                    .read_tensor_bytes(&tensor.name, 0, &mut bytes)
-                    .map_err(|error| ServiceError::Execution(error.to_string()))?;
-                host.write_host(offset, &bytes)
-                    .map_err(|error| ServiceError::Execution(error.to_string()))?;
-                engine
-                    .submit_to_device_ptr(&host, offset, tensor.device_ptr, tensor.bytes)
-                    .map_err(|error| ServiceError::Execution(error.to_string()))?;
-                engine
-                    .wait()
-                    .map_err(|error| ServiceError::Execution(error.to_string()))?;
-                offset += tensor.bytes;
-            }
-            host.release()
-                .map_err(|error| ServiceError::Execution(error.to_string()))?;
-            let info = session
-                .staged_layer_info(*layer)
-                .map_err(|error| ServiceError::Execution(error.to_string()))?;
-            statuses.push(StagedLayerStatus {
-                layer: *layer,
-                tensor_count: info.tensor_count,
-                device_bytes: info.device_bytes,
-                graph_substitutions: info.graph_substitutions,
-            });
+            statuses.push(stage_layer_data(model, session, engine, *layer)?);
         }
         self.staging_status = statuses;
         Ok(())
+    }
+
+    /// Transactional same-context replacement of the staged layer selection.
+    ///
+    /// The sequence is: plan against current residency, invalidate the graph
+    /// and scheduler (quiescing outstanding work), evict removed layers, stage
+    /// added layers, then leave the context invalidated so the next decode
+    /// rebuilds against the new selection. The old selection is restored if a
+    /// stage fails. If restoration also fails the service fails closed.
+    pub fn replace_staged_layers(
+        &mut self,
+        request: StagingRequest,
+    ) -> Result<StagingPlan, ServiceError> {
+        if self.state != ServiceState::Ready {
+            return Err(ServiceError::InvalidState {
+                expected: "ready".to_string(),
+                actual: self.state,
+            });
+        }
+        let registry = crate::DeviceRegistry::discover();
+        let mut plan = {
+            let session = self
+                .session
+                .as_ref()
+                .ok_or_else(|| ServiceError::InvalidState {
+                    expected: "context ready".to_string(),
+                    actual: self.state,
+                })?;
+            self.build_staging_plan_for(session, &registry, &request)?
+        };
+        self.staging_plan = Some(plan.clone());
+        if plan.state == StagingPlanState::Rejected || plan.state == StagingPlanState::Unknown {
+            return Err(ServiceError::Configuration(format!(
+                "staged replacement rejected: {}",
+                serde_json::to_string(&plan)
+                    .unwrap_or_else(|_| "plan serialization failed".to_string())
+            )));
+        }
+        let old_layers = plan.current_resident_layers.clone();
+        if plan.evicted_layers.is_empty() && plan.newly_staged_layers.is_empty() {
+            self.staged_layers = plan.accepted_layers.clone();
+            self.staging_request = request;
+            self.staging_status = self.current_staged_status();
+            return Ok(plan);
+        }
+
+        type ReplacementOutcome = (Vec<StagedLayerStatus>, u64, u64, u64, u64);
+        let outcome: Result<ReplacementOutcome, (String, bool, Vec<StagedLayerStatus>)> = {
+            let model = self
+                .model
+                .as_ref()
+                .ok_or_else(|| ServiceError::InvalidState {
+                    expected: "model loaded".to_string(),
+                    actual: self.state,
+                })?;
+            let session = self
+                .session
+                .as_ref()
+                .ok_or_else(|| ServiceError::InvalidState {
+                    expected: "context ready".to_string(),
+                    actual: self.state,
+                })?;
+            let engine = self.staging_engine.as_ref().ok_or_else(|| {
+                ServiceError::Execution("staging engine is not initialized".to_string())
+            })?;
+
+            let total_started = Instant::now();
+            let mut failure: Option<String> = None;
+
+            let invalidation_started = Instant::now();
+            if let Err(error) = session.invalidate_graph() {
+                failure = Some(format!("graph invalidation failed: {error}"));
+            }
+            let invalidation_ns = duration_ns(invalidation_started.elapsed());
+
+            let mut staged_now: Vec<u32> = Vec::new();
+            let eviction_started = Instant::now();
+            if failure.is_none() {
+                for layer in &plan.evicted_layers {
+                    if let Err(error) = session.evict_layer_cuda(*layer) {
+                        failure = Some(format!("evict layer {layer}: {error}"));
+                        break;
+                    }
+                }
+            }
+            let eviction_ns = duration_ns(eviction_started.elapsed());
+
+            let staging_started = Instant::now();
+            if failure.is_none() {
+                for layer in &plan.newly_staged_layers {
+                    match stage_layer_data(model, session, engine, *layer) {
+                        Ok(_) => staged_now.push(*layer),
+                        Err(error) => {
+                            failure = Some(format!("stage layer {layer}: {error}"));
+                            break;
+                        }
+                    }
+                }
+            }
+            let staging_ns = duration_ns(staging_started.elapsed());
+            let total_ns = duration_ns(total_started.elapsed());
+
+            match failure {
+                None => Ok((
+                    statuses_for_layers(session, &plan.accepted_layers),
+                    invalidation_ns,
+                    eviction_ns,
+                    staging_ns,
+                    total_ns,
+                )),
+                Some(message) => {
+                    // Roll back to the previous selection: release partial new
+                    // layers first, then re-stage every missing old layer.
+                    for layer in &staged_now {
+                        let _ = session.evict_layer_cuda(*layer);
+                    }
+                    let mut rollback_errors = Vec::new();
+                    for layer in &old_layers {
+                        if session.staged_layer_info(*layer).is_ok() {
+                            continue;
+                        }
+                        if let Err(error) = stage_layer_data(model, session, engine, *layer) {
+                            rollback_errors.push(format!("restage layer {layer}: {error}"));
+                        }
+                    }
+                    let restored = statuses_for_layers(session, &old_layers);
+                    if rollback_errors.is_empty() {
+                        Err((message, true, restored))
+                    } else {
+                        Err((
+                            format!("{message}; rollback failed: {}", rollback_errors.join("; ")),
+                            false,
+                            restored,
+                        ))
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            Ok((statuses, invalidation_ns, eviction_ns, staging_ns, total_ns)) => {
+                plan.replacement_invalidation_ns = Some(invalidation_ns);
+                plan.replacement_eviction_ns = Some(eviction_ns);
+                plan.replacement_staging_ns = Some(staging_ns);
+                plan.replacement_total_ns = Some(total_ns);
+                self.staged_layers = plan.accepted_layers.clone();
+                self.staging_request = request;
+                self.staging_status = statuses;
+                self.staging_plan = Some(plan.clone());
+                Ok(plan)
+            }
+            Err((message, true, restored)) => {
+                self.staged_layers = old_layers;
+                self.staging_status = restored;
+                Err(ServiceError::Replacement {
+                    message,
+                    rolled_back: true,
+                })
+            }
+            Err((message, false, _)) => {
+                self.staged_layers.clear();
+                self.staging_status.clear();
+                self.state = ServiceState::Failed;
+                self.errors.push(message.clone());
+                Err(ServiceError::Replacement {
+                    message,
+                    rolled_back: false,
+                })
+            }
+        }
     }
 
     fn build_staging_plan(
@@ -634,36 +802,69 @@ impl InferenceService {
         session: &crate::ForgeCoreSession,
         registry: &crate::DeviceRegistry,
     ) -> Result<StagingPlan, ServiceError> {
+        self.build_staging_plan_for(session, registry, &self.staging_request)
+    }
+
+    fn build_staging_plan_for(
+        &self,
+        session: &crate::ForgeCoreSession,
+        registry: &crate::DeviceRegistry,
+        request: &StagingRequest,
+    ) -> Result<StagingPlan, ServiceError> {
         let layer_count = session.model().metadata().layer_count;
         let observed_free = registry
             .devices()
             .iter()
             .find(|device| !device.is_cpu() && device.selectable)
             .and_then(|device| device.memory_free.bytes());
-        let margin = self.staging_request.safety_margin_bytes;
+        let margin = request.safety_margin_bytes;
         let device_limit = observed_free.map(|free| free.saturating_sub(margin));
-        let effective_budget = match (self.staging_request.budget_bytes, device_limit) {
+        let effective_budget = match (request.budget_bytes, device_limit) {
             (Some(configured), Some(device)) => Some(configured.min(device)),
             (Some(configured), None) => Some(configured),
             (None, Some(device)) => Some(device),
             (None, None) => None,
         };
+
+        let current: Vec<(u32, u64)> = (0..session.staged_layer_count().unwrap_or(0))
+            .filter_map(|index| {
+                session
+                    .staged_layer_at(index)
+                    .ok()
+                    .map(|info| (info.layer, info.device_bytes))
+            })
+            .collect();
+        let current_layers: Vec<u32> = current.iter().map(|(layer, _)| *layer).collect();
+        let current_bytes: u64 = current.iter().map(|(_, bytes)| *bytes).sum();
+
         let Some(effective_budget) = effective_budget else {
             return Ok(StagingPlan {
                 schema_version: crate::staging_plan::STAGING_PLAN_SCHEMA_VERSION,
-                requested_layers: self.staging_request.layers.clone(),
-                auto_selected: self.staging_request.auto,
-                configured_budget_bytes: self.staging_request.budget_bytes,
+                requested_layers: request.layers.clone(),
+                auto_selected: request.auto,
+                configured_budget_bytes: request.budget_bytes,
                 effective_budget_bytes: None,
                 observed_free_device_bytes: observed_free,
                 safety_margin_bytes: margin,
-                existing_staged_bytes: 0,
+                existing_staged_bytes: current_bytes,
                 planned_bytes: 0,
                 available_bytes_after_plan: None,
+                current_resident_layers: current_layers,
+                current_resident_bytes: current_bytes,
+                kept_layers: Vec::new(),
+                evicted_layers: Vec::new(),
+                newly_staged_layers: Vec::new(),
+                reclaimable_bytes: 0,
+                required_new_bytes: 0,
+                temporary_headroom_bytes: 0,
+                replacement_invalidation_ns: None,
+                replacement_eviction_ns: None,
+                replacement_staging_ns: None,
+                replacement_total_ns: None,
                 layers: Vec::new(),
                 accepted_layers: Vec::new(),
                 rejected_layers: Vec::new(),
-                eviction_supported: false,
+                eviction_supported: true,
                 allocation_reuse_supported: false,
                 transfer_compute_overlap_supported: false,
                 state: StagingPlanState::Unknown,
@@ -672,10 +873,11 @@ impl InferenceService {
                 ],
             });
         };
-        let candidates: Vec<u32> = if self.staging_request.auto {
+
+        let candidates: Vec<u32> = if request.auto {
             (0..layer_count).collect()
         } else {
-            self.staging_request.layers.clone()
+            request.layers.clone()
         };
         let mut layers = Vec::new();
         let mut accepted_layers = Vec::new();
@@ -714,7 +916,7 @@ impl InferenceService {
                 });
             }
         }
-        if !self.staging_request.auto && !rejected_layers.is_empty() {
+        if !request.auto && !rejected_layers.is_empty() {
             planned_bytes = 0;
             for layer_plan in &mut layers {
                 if layer_plan.accepted {
@@ -735,32 +937,87 @@ impl InferenceService {
         } else {
             StagingPlanState::Partial
         };
+
+        let bytes_for = |layer: u32| {
+            layers
+                .iter()
+                .find(|entry| entry.layer == layer)
+                .and_then(|entry| entry.bytes)
+        };
+        let kept_layers: Vec<u32> = accepted_layers
+            .iter()
+            .copied()
+            .filter(|layer| current_layers.contains(layer))
+            .collect();
+        let evicted_layers: Vec<u32> = current_layers
+            .iter()
+            .copied()
+            .filter(|layer| !accepted_layers.contains(layer))
+            .collect();
+        let newly_staged_layers: Vec<u32> = accepted_layers
+            .iter()
+            .copied()
+            .filter(|layer| !current_layers.contains(layer))
+            .collect();
+        let reclaimable_bytes: u64 = current
+            .iter()
+            .filter(|(layer, _)| evicted_layers.contains(layer))
+            .map(|(_, bytes)| *bytes)
+            .sum();
+        let required_new_bytes: u64 = newly_staged_layers
+            .iter()
+            .filter_map(|layer| bytes_for(*layer))
+            .sum();
+
+        let mut notes = vec![
+            "budget applies only to RAMforge-owned staged CUDA allocations".to_string(),
+            "observed free device memory is not a reservation against other processes"
+                .to_string(),
+            "replacement uses invalidate -> evict -> allocate; old allocations are released before new ones are created"
+                .to_string(),
+            "allocations are freed on eviction; capacity reuse is not implemented"
+                .to_string(),
+            "graph substitutions for the new selection are reported after the next execution"
+                .to_string(),
+        ];
+        if !evicted_layers.is_empty() {
+            notes.push(
+                "temporary headroom is zero for this sequence because new allocations occur after eviction"
+                    .to_string(),
+            );
+        }
+
         Ok(StagingPlan {
             schema_version: crate::staging_plan::STAGING_PLAN_SCHEMA_VERSION,
-            requested_layers: self.staging_request.layers.clone(),
-            auto_selected: self.staging_request.auto,
-            configured_budget_bytes: self.staging_request.budget_bytes,
+            requested_layers: request.layers.clone(),
+            auto_selected: request.auto,
+            configured_budget_bytes: request.budget_bytes,
             effective_budget_bytes: Some(effective_budget),
             observed_free_device_bytes: observed_free,
             safety_margin_bytes: margin,
-            existing_staged_bytes: 0,
+            existing_staged_bytes: current_bytes,
             planned_bytes,
             available_bytes_after_plan: Some(effective_budget.saturating_sub(planned_bytes)),
+            current_resident_layers: current_layers,
+            current_resident_bytes: current_bytes,
+            kept_layers,
+            evicted_layers,
+            newly_staged_layers,
+            reclaimable_bytes,
+            required_new_bytes,
+            temporary_headroom_bytes: 0,
+            replacement_invalidation_ns: None,
+            replacement_eviction_ns: None,
+            replacement_staging_ns: None,
+            replacement_total_ns: None,
             layers,
             accepted_layers,
             rejected_layers,
-            eviction_supported: false,
+            eviction_supported: true,
             allocation_reuse_supported: false,
             transfer_compute_overlap_supported: false,
             state,
-            notes: vec![
-                "budget applies only to RAMforge-owned staged CUDA allocations".to_string(),
-                "observed free device memory is not a reservation against other processes"
-                    .to_string(),
-                "staged layers are static for the context lifetime; eviction/reuse unsupported"
-                    .to_string(),
-                "graph substitutions are reported after execution".to_string(),
-            ],
+            notes,
         })
     }
 
@@ -786,6 +1043,36 @@ impl InferenceService {
                 .collect();
         }
         self.staging_status.clone()
+    }
+
+    /// Native lifecycle/counter snapshot for the live context, if any.
+    pub fn staging_lifecycle(&self) -> Option<StagingLifecycleStatus> {
+        let session = self.session.as_ref()?;
+        let state = session.staging_state().ok()?;
+        let resident_layers = (0..state.resident_layers)
+            .filter_map(|index| session.staged_layer_at(index).ok().map(|info| info.layer))
+            .collect();
+        Some(StagingLifecycleStatus {
+            graph_phase: state.graph_phase.name().to_string(),
+            graph_invalidated: state.graph_invalidated,
+            resident_layers,
+            resident_bytes: state.resident_bytes,
+            allocation_count: state.allocation_count,
+            release_count: state.release_count,
+            reuse_count: state.reuse_count,
+            staging_failures: state.staging_failures,
+            graph_invalidation_count: state.graph_invalidation_count,
+            graph_rebuild_count: state.graph_rebuild_count,
+            scheduler_reset_count: state.scheduler_reset_count,
+            graph_build_ns: state.graph_build_ns,
+            last_graph_build_ns: state.last_graph_build_ns,
+            invalidation_failures: state.invalidation_failures,
+            quiescence_wait_ns: state.quiescence_wait_ns,
+            last_quiescence_wait_ns: state.last_quiescence_wait_ns,
+            eviction_supported: state.eviction_supported,
+            allocation_reuse_supported: state.allocation_reuse_supported,
+            transfer_compute_overlap_supported: state.transfer_compute_overlap_supported,
+        })
     }
 
     /// Generate tokens, streaming decoded text into `sink`.
@@ -837,6 +1124,9 @@ impl InferenceService {
                 session.context_length()
             )));
         }
+        // Generation is repeatable within one live context: clear only the KV
+        // cache, never staged weight allocations.
+        session.clear_kv();
         self.state = ServiceState::Generating;
         let rss_before = process_rss();
         let prompt_started = Instant::now();
@@ -959,6 +1249,104 @@ impl InferenceService {
         self.staging_plan = None;
         self.state = ServiceState::Terminated;
     }
+}
+
+fn statuses_for_layers(
+    session: &crate::ForgeCoreSession,
+    layers: &[u32],
+) -> Vec<StagedLayerStatus> {
+    layers
+        .iter()
+        .filter_map(|layer| {
+            session
+                .staged_layer_info(*layer)
+                .ok()
+                .map(|info| StagedLayerStatus {
+                    layer: *layer,
+                    tensor_count: info.tensor_count,
+                    device_bytes: info.device_bytes,
+                    graph_substitutions: info.graph_substitutions,
+                })
+        })
+        .collect()
+}
+
+/// Allocate one native staged layer, copy its weights from the model and return
+/// the live native metadata. On error the caller is responsible for releasing a
+/// partially staged layer (native allocation is reclaimed by the context even if
+/// the transfer fails).
+fn stage_layer_data(
+    model: &ForgeCoreModel,
+    session: &crate::ForgeCoreSession,
+    engine: &Engine,
+    layer: u32,
+) -> Result<StagedLayerStatus, ServiceError> {
+    // Deterministic fault injection for debug/test builds only. Release builds
+    // ignore these variables; no production path depends on them.
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var("RAMFORGE_TEST_FAIL_STAGE_ALL").as_deref() == Ok("1") {
+            return Err(ServiceError::Execution(
+                "injected staging failure (all layers)".to_string(),
+            ));
+        }
+        if std::env::var("RAMFORGE_TEST_FAIL_STAGE_LAYER")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            == Some(layer)
+        {
+            return Err(ServiceError::Execution(format!(
+                "injected staging failure (layer {layer})"
+            )));
+        }
+    }
+    session
+        .stage_layer_cuda(layer)
+        .map_err(|error| ServiceError::Execution(error.to_string()))?;
+    let count = session
+        .staged_tensor_count(layer)
+        .map_err(|error| ServiceError::Execution(error.to_string()))?;
+    let mut tensors = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        tensors.push(
+            session
+                .staged_tensor_info(layer, index)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?,
+        );
+    }
+    let total: u64 = tensors.iter().map(|tensor| tensor.bytes).sum();
+    let mut host = engine
+        .allocate(MemoryType::PinnedHost, total)
+        .map_err(|error| ServiceError::Execution(error.to_string()))?;
+    let mut offset = 0u64;
+    for tensor in &tensors {
+        let length = usize::try_from(tensor.bytes)
+            .map_err(|_| ServiceError::Execution("staged tensor is too large".to_string()))?;
+        let mut bytes = vec![0u8; length];
+        model
+            .read_tensor_bytes(&tensor.name, 0, &mut bytes)
+            .map_err(|error| ServiceError::Execution(error.to_string()))?;
+        host.write_host(offset, &bytes)
+            .map_err(|error| ServiceError::Execution(error.to_string()))?;
+        engine
+            .submit_to_device_ptr(&host, offset, tensor.device_ptr, tensor.bytes)
+            .map_err(|error| ServiceError::Execution(error.to_string()))?;
+        engine
+            .wait()
+            .map_err(|error| ServiceError::Execution(error.to_string()))?;
+        offset += tensor.bytes;
+    }
+    host.release()
+        .map_err(|error| ServiceError::Execution(error.to_string()))?;
+    let info = session
+        .staged_layer_info(layer)
+        .map_err(|error| ServiceError::Execution(error.to_string()))?;
+    Ok(StagedLayerStatus {
+        layer,
+        tensor_count: info.tensor_count,
+        device_bytes: info.device_bytes,
+        graph_substitutions: info.graph_substitutions,
+    })
 }
 
 fn duration_ns(duration: Duration) -> u64 {

@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 use crate::gpu_observability::GpuObservability;
 use crate::inference_service::StagedLayerStatus;
 use crate::inference_service::{
-    GenerationOptions, InferenceService, ServiceError, INFERENCE_SERVICE_API_VERSION,
+    GenerationOptions, InferenceService, ServiceError, StagingLifecycleStatus,
+    INFERENCE_SERVICE_API_VERSION,
 };
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 8;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
@@ -67,6 +68,7 @@ pub struct BenchmarkReport {
     /// Staged layer readback after generation, including graph substitutions.
     pub staged_layers: Vec<StagedLayerStatus>,
     pub staging_plan: Option<crate::staging_plan::StagingPlan>,
+    pub staging_lifecycle: Option<StagingLifecycleStatus>,
     pub context_create_ns: Vec<u64>,
     pub runs_detail: Vec<BenchmarkRun>,
     pub median_generation_tokens_per_second: f64,
@@ -230,6 +232,7 @@ pub fn run_benchmark(
     let status_after_generation = service.status();
     let staged_layers = status_after_generation.staged_layers;
     let staging_plan = status_after_generation.staging_plan;
+    let staging_lifecycle = status_after_generation.staging_lifecycle;
     service.unload();
     let free_after_unload = device_free_bytes(&device_id);
     let memory_after_unload = Some(service.memory_observability()?);
@@ -285,6 +288,7 @@ pub fn run_benchmark(
         memory_after_unload,
         staged_layers,
         staging_plan,
+        staging_lifecycle,
         median_context_create_ns: median_u64(&mut context_ns.clone()),
         context_create_ns: context_ns,
         median_decode_tokens_per_second: if decode_rates.is_empty() {

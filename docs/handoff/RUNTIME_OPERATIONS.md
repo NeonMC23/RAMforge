@@ -188,11 +188,56 @@ partial. `status.staging_plan` reports configured/effective budget, observed
 free VRAM, planned bytes, accepted/rejected layers, and
 `exact`/`partial`/`rejected`/`unknown` state.
 
-Staged layers are static for the context lifetime. The plan explicitly reports
-`eviction_supported=false`, `allocation_reuse_supported=false`, and
-`transfer_compute_overlap_supported=false`. There is no per-token replacement.
-A failure is explicit; the service does not fall back to CPU or normal GPU
-placement.
+The plan reports `eviction_supported=true`,
+`allocation_reuse_supported=false`, and
+`transfer_compute_overlap_supported=false`. An evicted layer's CUDA buffer is
+freed; later staging allocates a new buffer rather than reusing capacity.
+
+### Same-context staged replacement
+
+`ramforge staging-cycle MODEL` validates and exercises dynamic replacement in
+one live context:
+
+```text
+ramforge staging-cycle MODEL \
+  --staged-layer 0 --staged-layer 1 \
+  --replace-layer 1 --replace-layer 2 \
+  --staged-budget 20M --cycles 2 --max-tokens 8 --json
+```
+
+Flags:
+
+- `--staged-layer N` / `--staged-auto`: initial selection;
+- `--replace-layer N` (repeatable): replacement selection;
+- `--cycles N`: alternate replacement and initial selections in the same
+  context;
+- `--staged-budget`, `--staged-margin`: budget policy shared by every cycle;
+- `--json`: full plans, statuses, timings and native lifecycle counters.
+
+Replacement sequence:
+
+1. build an exact replacement plan from current residency and effective budget;
+2. reject an unfitting explicit set before mutation;
+3. invalidate the graph and scheduler (quiesces outstanding backend work);
+4. evict removed layers;
+5. allocate, fill and wait for each added layer;
+6. leave the graph invalidated; the next generation rebuilds and substitutes
+   the new selection.
+
+If staging fails, RAMforge evicts partial new layers and re-stages the previous
+selection. A successful rollback raises a `rolled_back` replacement error and
+keeps the context usable. If rollback also fails, the service enters `failed`
+and rejects generation.
+
+`status.staging_lifecycle` reports the native graph phase, whether no cached
+graph can consume the staged sources, resident layers/bytes, allocation,
+release, reuse, invalidation, rebuild and scheduler-reset counts, quiescence and
+graph-build durations, and the supported capability flags. Counters are native
+facts; budget planning remains RAMforge policy.
+
+Staged weights are loaded once per layer and remain static between replacements.
+There is no per-token streaming. A failure is explicit; the service does not
+fall back to CPU or normal GPU placement.
 
 ## Throughput benchmark
 

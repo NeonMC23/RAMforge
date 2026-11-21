@@ -1,7 +1,7 @@
 # Controlled GPU staging architecture (investigation)
 
-Status: **multi-layer static GPU residency validated; dynamic eviction and
-transfer/compute overlap remain unsupported.**
+Status: **dynamic same-context eviction and replacement validated; allocation
+capacity reuse and transfer/compute overlap remain unsupported.**
 
 This document traces the pinned llama.cpp/ggml execution path, identifies safe
 native extension points, measures the relevant transfer/storage limits, and
@@ -393,16 +393,16 @@ CUDA layer allocation was consumed by the real graph.
 
 ### Current limits
 
-- Staged layers are static for the context lifetime; no eviction or per-token
-  replacement.
-- No double buffering or transfer/compute overlap.
+- At the single-layer milestone, staged layers were static for the context
+  lifetime. Dynamic invalidation, eviction and replacement are implemented
+  later in this document.
+- No double buffering or transfer/compute overlap (still unsupported).
 - CPU KV and CPU residual tensors cause scheduler copies around staged layers.
-- Aggressive multi-layer staging must be benchmarked; current evidence is
-  single-layer only.
+- Multi-layer and budgeted staging are validated in the next section.
 - Staged tensors are allocated through the context CUDA backend, not the
   staging engine; the engine transfers into their exposed device pointers.
-- No durable staging-state machine beyond context lifetime; cancellation and
-  unload destroy staged buffers safely with the context.
+- Graph lifecycle phases and counters are now exposed; cancellation and unload
+  still destroy staged buffers safely with the context.
 
 ## Multi-layer budgeted residency (implemented)
 
@@ -429,7 +429,7 @@ Plan states:
 - planned bytes;
 - accepted and rejected layers;
 - exact/estimated/partial/rejected/unknown state;
-- `eviction_supported=false`;
+- `eviction_supported=true`;
 - `allocation_reuse_supported=false`;
 - `transfer_compute_overlap_supported=false`.
 
@@ -456,36 +456,128 @@ Qwen2.5-7B Q4_K_M, auto budget 1G:
 - 4.40 tok/s, TTFT 329.2 ms, load 2.73 s;
 - generated ` Paris. Which of` for a 4-token request.
 
-### Eviction and reuse blocker
+## Graph lifecycle and invalidation contract (implemented)
 
-Staged tensors are referenced by graph nodes and the reused graph result until
-the context is destroyed or the graph is rebuilt. There is no proven native
-operation that invalidates all scheduler/graph references while retaining the
-context. Therefore staged allocations are context-lifetime static:
+### Lifecycle audit
 
-- no eviction API;
-- no allocation reuse;
-- no release-after-execution.
+- `llama_context::process_ubatch` either reuses the previous `llm_graph_result`
+  or resets it and calls `model.build_graph`.
+- `llm_graph_result::reset()` destroys and reinitializes its `ggml_context` and
+  graph. Every graph node and every substituted `src` pointer lives in that
+  context, so resetting it removes all cached graph references to staged
+  tensors.
+- `gf_res_prev_active` is the reusable graph marker. It is set only after a
+  graph is allocated and cleared by reset paths.
+- `ggml_backend_sched_reset()` clears the scheduler hash table, backend-id and
+  copy tables, and allocation state. `ggml_backend_sched_split_graph()` rebuilds
+  the scheduler-owned split context on the next allocation; split inputs are not
+  read while `n_splits == 0`.
+- `synchronize()` waits on every scheduler backend and releases the execution
+  gate. It is the narrowest existing quiescence operation; no device-wide
+  synchronization is added.
+- The reserve graph (`gf_res_reserve`) is built without staged substitution and
+  therefore never references staged buffers.
 
-This is explicit in every plan (`eviction_supported=false`).
+### Native contract
+
+`llama_context_invalidate_graph()` performs, in order:
+
+1. mark the graph `invalidating`;
+2. quiesce with `synchronize()` (backend synchronization plus execution gate);
+3. clear `gf_res_prev_active` and reset every cached graph result;
+4. `ggml_backend_sched_reset()` to drop scheduler mappings/copies;
+5. mark the graph `invalidated` and record that no cached graph can consume the
+   current staged sources.
+
+`llama_context_evict_layer_cuda(layer)` refuses with a typed `busy` result if
+any graph is active, execution is in flight, or invalidation has not completed.
+After success it erases the owning `ggml_context` and CUDA buffer. Duplicate
+eviction returns `not_staged`.
+
+`llama_context_stage_layer_cuda()` likewise refuses when a cached graph may
+reference staged sources.
+
+The state is exposed through `llama_context_staging_state()` and resident
+layers through `llama_context_staged_layer_count/at()`.
+
+### Lifecycle states
+
+Graph phases: `idle`, `building`, `prepared`, `executing`,
+`completion_pending`, `quiescing`, `invalidating`, `invalidated`, `rebuilding`,
+`failed`, `destroying`.
+
+Layer states are represented by allocation/eviction operations and native
+counters: unallocated, allocated/filling (RAMforge transfer), resident,
+referenced by graph, execution in flight, quiescent, evicting, released, failed.
+Only invalidation plus quiescence permits the evicting/released transition while
+the context remains alive.
+
+### Dynamic replacement and rollback
+
+RAMforge replacement is transactional:
+
+1. build a plan from current resident layers, exact native per-layer bytes, the
+   effective budget and observed free memory;
+2. reject an unfitting explicit set before touching the context;
+3. invalidate the graph and scheduler;
+4. evict layers not in the accepted set;
+5. stage newly accepted layers by allocating, copying exact tensor bytes and
+   waiting for each transfer;
+6. leave the context invalidated so the next decode rebuilds the graph and
+   substitutes the new sources.
+
+On a staging failure, newly staged layers are evicted and every missing old
+layer is re-staged. If rollback succeeds, the old selection and context remain
+usable. If rollback also fails, the service enters `failed` and rejects further
+generation. A rejected plan never mutates residency.
+
+### Allocation reuse
+
+Not implemented. Eviction frees the CUDA buffer. Reusing capacity would require
+proving identical tensor inventory, type, shape and alignment for the incoming
+layer and remapping every staged tensor view; this milestone does not fake it.
+`reuse_count` is always 0 and plans report
+`allocation_reuse_supported=false`.
+
+### Dynamic evidence
+
+SmolLM2-135M, one live context, layers 0+1 replaced by 1+2:
+
+- evicted layer 0, kept layer 1, staged layer 2;
+- plan `exact`, 5,197,928 B planned, 2,326,964 B reclaimed, 2,329,268 B newly
+  allocated;
+- replacement: invalidation 0.019 ms, eviction 0.137 ms, staging 3.028 ms,
+  total 3.188 ms (medians over five cycles);
+- generated text coherent and stable across cycles;
+- five alternating cycles: invalidation count 5, release count 5, allocation
+  count 7, reuse count 0, resident layers stable;
+- corruption of `blk.1.attn_q.weight` after replacement changed logits by
+  10.25 with 9 substitutions, proving the replacement tensors are consumed.
+
+Qwen2.5-7B Q4_K_M, one live context:
+
+- initial layers 0–6: 989,857,792 B;
+- replaced with layers 7–13: 953,903,104 B;
+- 7 evictions, 7 allocations, replacement about 2.0 s;
+- replaced back to layers 0–6 in about 2.0 s;
+- coherent output throughout.
 
 ### Transfer/compute overlap blocker
 
-The staging path prepares all selected layers before graph execution. The graph
-is then executed as a whole by the scheduler. There is no native per-layer
-execution boundary or double-buffered consume point, and the public CUDA copies
-are synchronous. Asynchronous submission alone is not overlap.
+Staging still completes before whole-graph execution. There is no native
+per-layer execution boundary or double-buffered scheduler consume point, and
+the public CUDA copies are synchronous. Dynamic replacement happens between
+executions, not during them. Asynchronous submission alone is not overlap.
 
 Overlap therefore remains unsupported and unmeasured.
 
 ## Decision
 
-**MULTI-LAYER GPU RESIDENCY VALIDATED — DYNAMIC EVICTION STILL UNSUPPORTED.**
+**DYNAMIC GPU RESIDENCY VALIDATED — ALLOCATION REUSE NOT YET SUPPORTED.**
 
-Multiple independently allocated CUDA layers were consumed by the real graph
-with positive substitutions per layer, matching text, exact budget accounting,
-explicit all-or-nothing rejection, and auto-selection with partial plans.
+The native invalidation contract was established from the actual graph and
+scheduler implementation, exercised physically, and used to evict and replace
+staged layers in one live context for SmolLM2 and Qwen2.5-7B.
 
-Eviction/reuse and transfer/compute overlap are not implemented. Staged
-allocations are static for the context lifetime. Do not describe this as dynamic
-streaming or overlap.
+Allocation capacity reuse and transfer/compute overlap are not implemented. Do
+not describe this as streaming or overlap.

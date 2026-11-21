@@ -46,6 +46,7 @@ use ramforge_runtime::{
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -361,6 +362,75 @@ enum Commands {
         /// Safety margin subtracted from observed free VRAM (default 256M)
         #[arg(long)]
         staged_margin: Option<String>,
+
+        /// Disable CPU weight repacking
+        #[arg(long)]
+        no_repack: bool,
+
+        /// Skip whole-file mmap prefaulting
+        #[arg(long)]
+        no_prefetch: bool,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate same-context staged layer eviction and replacement
+    StagingCycle {
+        /// GGUF model file
+        model: PathBuf,
+
+        /// Runtime profile: maximum-performance, balanced, background, custom
+        #[arg(long, default_value = "balanced")]
+        profile: String,
+
+        /// RAM budget used for machine observation
+        #[arg(long)]
+        ram: Option<String>,
+
+        /// Context length
+        #[arg(long, default_value_t = 128)]
+        context: u32,
+
+        /// CPU threads (0 = profile-selected)
+        #[arg(long, default_value_t = 0)]
+        threads: u32,
+
+        /// Execution device for the staged context (CPU plan plus CUDA staging backend)
+        #[arg(long, default_value = "cpu")]
+        device: String,
+
+        /// Initial explicit staged layer set (repeatable)
+        #[arg(long = "staged-layer", value_name = "N")]
+        staged_layers: Vec<u32>,
+
+        /// Replacement staged layer set (repeatable)
+        #[arg(long = "replace-layer", value_name = "N")]
+        replace_layers: Vec<u32>,
+
+        /// Hard staged-VRAM budget shared by the initial and replacement sets
+        #[arg(long)]
+        staged_budget: Option<String>,
+
+        /// Automatically select the initial set within the staged budget
+        #[arg(long)]
+        staged_auto: bool,
+
+        /// Safety margin subtracted from observed free VRAM (default 256M)
+        #[arg(long)]
+        staged_margin: Option<String>,
+
+        /// Replacement cycles (alternates replacement and initial sets)
+        #[arg(long, default_value_t = 1)]
+        cycles: u32,
+
+        /// Prompt for every generation
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+
+        /// Generated tokens per generation
+        #[arg(long, default_value_t = 8)]
+        max_tokens: u32,
 
         /// Disable CPU weight repacking
         #[arg(long)]
@@ -884,6 +954,48 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::StagingCycle {
+            model,
+            profile,
+            ram,
+            context,
+            threads,
+            device,
+            staged_layers,
+            replace_layers,
+            staged_budget,
+            staged_auto,
+            staged_margin,
+            cycles,
+            prompt,
+            max_tokens,
+            no_repack,
+            no_prefetch,
+            json,
+        } => {
+            if let Err(error) = run_staging_cycle(
+                model,
+                profile,
+                ram,
+                context,
+                threads,
+                device,
+                staged_layers,
+                replace_layers,
+                staged_budget,
+                staged_auto,
+                staged_margin,
+                cycles,
+                prompt,
+                max_tokens,
+                no_repack,
+                no_prefetch,
+                json,
+            ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
         Commands::StagingProbe { model, layer, json } => {
             if let Err(error) = run_staging_probe(model, layer, json) {
                 eprintln!("Error: {error}");
@@ -1275,6 +1387,203 @@ fn run_optimization(
             println!("Failure: {failure}");
         }
         println!("{}", report.limitations.join("; "));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cycle_generate(
+    service: &mut ramforge_runtime::InferenceService,
+    prompt: &str,
+    max_tokens: u32,
+) -> anyhow::Result<ramforge_runtime::GenerationReport> {
+    let cancel = AtomicBool::new(false);
+    service
+        .generate(
+            &ramforge_runtime::GenerationOptions {
+                prompt: prompt.to_string(),
+                max_tokens,
+                ..Default::default()
+            },
+            &cancel,
+            |_| Ok(()),
+        )
+        .map_err(|error| anyhow::anyhow!(error))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_staging_cycle(
+    model_path: PathBuf,
+    profile: String,
+    ram: Option<String>,
+    context: u32,
+    threads: u32,
+    device: String,
+    staged_layers: Vec<u32>,
+    replace_layers: Vec<u32>,
+    staged_budget: Option<String>,
+    staged_auto: bool,
+    staged_margin: Option<String>,
+    cycles: u32,
+    prompt: String,
+    max_tokens: u32,
+    no_repack: bool,
+    no_prefetch: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    if staged_layers.is_empty() && !staged_auto {
+        anyhow::bail!("staging-cycle requires --staged-layer or --staged-auto");
+    }
+    if replace_layers.is_empty() {
+        anyhow::bail!("staging-cycle requires at least one --replace-layer");
+    }
+    let ram_bytes = ram
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --ram: {error}"))?;
+    let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let gguf = model_set.merged_model();
+    let requirements = model_requirements(
+        &gguf,
+        ModelRequirementConfig {
+            context_tokens: context,
+            batch_tokens: 1,
+            kv_bytes_per_element: 2,
+        },
+    );
+    let machine = collect_machine_profile(&MachineProfileConfig {
+        model_path: Some(model_path.clone()),
+        ram_budget_bytes: ram_bytes,
+        cpu: CpuRuntimeSettings {
+            selected_threads: (threads != 0).then_some(threads),
+            user_thread_limit: None,
+        },
+        ..MachineProfileConfig::default()
+    });
+    let plan = RuntimePlan::resolve(
+        &machine,
+        &requirements,
+        model_path.to_string_lossy().as_ref(),
+        parse_runtime_profile(&profile)?,
+        &ramforge_runtime::CustomRuntimeRequest {
+            context_tokens: Some(context),
+            batch_tokens: Some(1),
+            threads: (threads != 0).then_some(threads),
+            load_mode: Some(
+                if no_prefetch {
+                    "mmap-no-prefetch"
+                } else {
+                    "mmap"
+                }
+                .to_string(),
+            ),
+            no_repack: Some(no_repack),
+            device: Some(device),
+            gpu_layers: Some(0),
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    let staged_budget_bytes = staged_budget
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --staged-budget: {error}"))?;
+    let staged_margin_bytes = staged_margin
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --staged-margin: {error}"))?
+        .unwrap_or(ramforge_runtime::DEFAULT_STAGING_SAFETY_MARGIN_BYTES);
+
+    let initial_request = ramforge_runtime::StagingRequest {
+        layers: staged_layers,
+        budget_bytes: staged_budget_bytes,
+        auto: staged_auto,
+        safety_margin_bytes: staged_margin_bytes,
+    };
+    let mut service = ramforge_runtime::InferenceService::new(plan)
+        .map_err(|error| anyhow::anyhow!(error))?
+        .with_staging_request(initial_request);
+    service.load().map_err(|error| anyhow::anyhow!(error))?;
+    service
+        .create_session()
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+    let initial_report = cycle_generate(&mut service, &prompt, max_tokens)?;
+    let initial_status = service.status();
+    let initial_layers: Vec<u32> = initial_status
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    if initial_layers.is_empty() {
+        anyhow::bail!("initial staging produced no resident layers");
+    }
+
+    if !json {
+        println!(
+            "initial: staged={:?} tokens={} text={:?}",
+            initial_layers, initial_report.stats.generated_tokens, initial_report.text
+        );
+    }
+
+    let mut cycle_reports = Vec::new();
+    for index in 0..cycles {
+        let target_layers = if index % 2 == 0 {
+            replace_layers.clone()
+        } else {
+            initial_layers.clone()
+        };
+        let request = ramforge_runtime::StagingRequest {
+            layers: target_layers.clone(),
+            budget_bytes: staged_budget_bytes,
+            auto: false,
+            safety_margin_bytes: staged_margin_bytes,
+        };
+        let started = Instant::now();
+        let replacement_plan = service
+            .replace_staged_layers(request)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let replacement_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let report = cycle_generate(&mut service, &prompt, max_tokens)?;
+        let status = service.status();
+        let resident: Vec<u32> = status
+            .staged_layers
+            .iter()
+            .map(|layer| layer.layer)
+            .collect();
+        if !json {
+            println!(
+                "cycle {}: target={:?} resident={:?} plan={:?} replacement_ms={:.2} tokens={} text={:?}",
+                index,
+                target_layers,
+                resident,
+                replacement_plan.state,
+                replacement_ns as f64 / 1_000_000.0,
+                report.stats.generated_tokens,
+                report.text
+            );
+        }
+        cycle_reports.push(serde_json::json!({
+            "cycle": index,
+            "target_layers": target_layers,
+            "replacement_plan": replacement_plan,
+            "replacement_ns": replacement_ns,
+            "report": report,
+            "status": status,
+        }));
+    }
+
+    if json {
+        let output = serde_json::json!({
+            "schema_version": 1,
+            "initial_layers": initial_layers,
+            "initial_report": initial_report,
+            "initial_status": initial_status,
+            "cycles": cycle_reports,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
     }
     Ok(())
 }

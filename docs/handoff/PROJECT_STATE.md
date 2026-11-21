@@ -91,7 +91,7 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 421 passed, 14 ignored. RAMforge tests: 618 passed, 37
+- forgeCORE tests: 421 passed, 16 ignored. RAMforge tests: 618 passed, 40
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
@@ -179,16 +179,23 @@
   18 substitutions/layer), exact budget plans, explicit 1M rejection, auto
   selection within 10M/1G budgets. Qwen2.5-7B auto 1G staged 7 layers
   (989,857,792 B, 4.40 tok/s).
-- Eviction/reuse and transfer/compute overlap are explicitly unsupported;
-  staged allocations are context-lifetime static.
-- Decision: MULTI-LAYER GPU RESIDENCY VALIDATED — DYNAMIC EVICTION STILL
-  UNSUPPORTED.
+- Dynamic same-context residency validated: the native invalidation contract
+  quiesces backends, destroys cached graph results and resets scheduler
+  mappings; staged layers can then be evicted and replaced. SmolLM2 replaced
+  layers 0+1 with 1+2 (invalidation 0.019 ms, eviction 0.137 ms, staging
+  3.028 ms, total 3.188 ms median over five cycles; corruption of the
+  replacement layer changed logits by 10.25). Qwen2.5-7B replaced layers 0-6
+  with 7-13 and back in one context (~2.0 s each), coherent output.
+- Allocation capacity reuse and transfer/compute overlap remain unsupported and
+  are reported explicitly. Staged weights are static between replacements.
+- Decision: DYNAMIC GPU RESIDENCY VALIDATED — ALLOCATION REUSE NOT YET
+  SUPPORTED.
 - GPU load/placement failure is explicit; no silent CPU fallback occurs.
 - Out-of-core re-verification: 13.13 GB GPT-NeoX-20B Q4_K_M under an 8 GiB
   cgroup with `--no-repack --no-prefetch` produced one token, exit 0, 10.877 s
   wall, 9661 `max` events, and 0 OOM kills. Page release/prefetch/staging is
   OS paging over existing mappings, not tensor streaming.
-- RAMforge tests: 618 passed, 37 ignored.
+- RAMforge tests: 618 passed, 40 ignored.
 
 ## Runtime memory accounting and calibration (2026-11-20)
 
@@ -224,7 +231,7 @@
   evidence is rejected.
 - `ramforge machine --calibration` emits per-plan compatibility decisions and
   accepts `--no-repack`, `--no-prefetch`, `--ubatch`, and `--sequences`.
-- RAMforge tests: 618 passed, 37 ignored.
+- RAMforge tests: 618 passed, 40 ignored.
 
 ## Machine profiles and candidate plans (2026-11-20)
 
@@ -267,7 +274,7 @@
 - Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
   `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
   semantic/removal changes require a version increment.
-- ForgeCORE tests: 421 passed, 14 ignored. RAMforge tests: 618 passed, 37
+- ForgeCORE tests: 421 passed, 16 ignored. RAMforge tests: 618 passed, 40
   ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)
