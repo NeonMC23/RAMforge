@@ -4,9 +4,9 @@
 //! policy; ForgeCore owns model loading, context state, batch construction,
 //! decode, device discovery, and native logits extraction. No llama.cpp/ggml
 //! symbols or numerical model operations belong here. Current ForgeCore also
-//! exposes static model offload options, but this adapter deliberately binds
-//! only CPU execution in this refresh; non-CPU selection remains an explicit
-//! error rather than an implicit fallback.
+//! exposes static model offload options. This adapter now supports explicit
+//! CPU or GPU model loading; every GPU request is verified by native effective
+//! placement readback and never falls back silently to CPU.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use forge_core::{
     BatchBuilder, Context, ContextLifetimeState, ContextTraceOptions, GpuLayers, Model,
     ModelLifetimeState, ModelLoadMode, ModelOptions, NodeDispatchEvent, NodeDispatchOptions,
-    NodeDispatchSummary, PageReleaseResult, ResidencyError, TensorMappingInfo, TraceEvent,
-    TraceSummary,
+    NodeDispatchSummary, PageReleaseResult, ResidencyError, SplitMode, TensorMappingInfo,
+    TraceEvent, TraceSummary,
 };
 
 use crate::execution::{
@@ -72,6 +72,10 @@ fn map_residency_error(error: ResidencyError) -> ForgeCoreAdapterError {
 pub struct ForgeCoreModelOptions {
     /// Ask libllama to validate tensor payloads while loading.
     pub check_tensors: bool,
+    /// Offloaded transformer layers. `0` keeps the model on CPU.
+    pub gpu_layers: u32,
+    /// Native registry index of the GPU device; required when `gpu_layers > 0`.
+    pub gpu_device_index: Option<usize>,
     /// How the model file is mapped. The adapter defaults to an explicit
     /// file-backed mapping so weight residency stays reclaimable by the OS.
     pub load_mode: ModelLoadMode,
@@ -85,6 +89,8 @@ impl Default for ForgeCoreModelOptions {
     fn default() -> Self {
         Self {
             check_tensors: false,
+            gpu_layers: 0,
+            gpu_device_index: None,
             load_mode: ModelLoadMode::Mmap,
             use_extra_bufts: true,
         }
@@ -114,8 +120,12 @@ pub struct ForgeCoreModelMetadata {
     pub kv_head_count: u32,
     pub load_mode: ModelLoadMode,
     pub use_extra_bufts: bool,
-    /// Effective non-CPU layers reported by the native model after load.
+    /// Effective non-CPU layers (transformer + output) reported after load.
     pub effective_gpu_layers: u32,
+    /// Transformer layers assigned to non-CPU devices.
+    pub gpu_transformer_layers: u32,
+    /// Transformer layers retained on CPU.
+    pub cpu_transformer_layers: u32,
     /// Effective output-layer device type label.
     pub output_device_type: String,
     pub description: String,
@@ -221,11 +231,9 @@ impl ForgeCoreModel {
             }
             Err(error) => return Err(ForgeCoreAdapterError::Configuration(error.to_string())),
         };
-        if !selected.info().is_cpu()
-            || selected.info().capabilities.model_execution != CapabilityState::Supported
-        {
+        if selected.info().capabilities.model_execution != CapabilityState::Supported {
             return Err(ForgeCoreAdapterError::UnsupportedDevice(format!(
-                "selected {} ({}) is not enabled by RAMforge's current ForgeCore adapter; no CPU fallback",
+                "selected {} ({}) is not enabled by RAMforge's ForgeCore adapter; no CPU fallback",
                 selected.info().kind,
                 selected.info().id
             )));
@@ -241,10 +249,37 @@ impl ForgeCoreModel {
     ) -> Result<Self, ForgeCoreAdapterError> {
         let path = path.as_ref().to_path_buf();
         let mut model_options = ModelOptions::default();
-        // Current ForgeCore exposes static offload options. Keep this adapter's
-        // CPU-only contract explicit rather than relying on a default that
-        // could change as the public API grows.
-        model_options.gpu_layers = GpuLayers::Cpu;
+        if options.gpu_layers == 0 {
+            if options.gpu_device_index.is_some() {
+                return Err(ForgeCoreAdapterError::Configuration(
+                    "GPU device selected with zero offloaded layers".to_string(),
+                ));
+            }
+            model_options.gpu_layers = GpuLayers::Cpu;
+        } else {
+            if device.is_cpu() {
+                return Err(ForgeCoreAdapterError::Configuration(
+                    "GPU layers requested on a CPU device".to_string(),
+                ));
+            }
+            let index = options.gpu_device_index.ok_or_else(|| {
+                ForgeCoreAdapterError::Configuration(
+                    "GPU layers requested without a native device index".to_string(),
+                )
+            })?;
+            let native_device = forge_core::enumerate_devices()
+                .into_iter()
+                .find(|candidate| candidate.index == index)
+                .ok_or_else(|| {
+                    ForgeCoreAdapterError::DeviceSelection(format!(
+                        "GPU registry index {index} is no longer available"
+                    ))
+                })?;
+            model_options.gpu_layers = GpuLayers::Count(options.gpu_layers);
+            model_options.split_mode = SplitMode::None;
+            model_options.main_gpu = 0;
+            model_options.devices = Some(vec![native_device]);
+        }
         model_options.check_tensors = options.check_tensors;
         model_options.load_mode = options.load_mode;
         model_options.use_extra_bufts = Some(options.use_extra_bufts);
@@ -280,6 +315,8 @@ impl ForgeCoreModel {
             effective_gpu_layers: model
                 .effective_gpu_layers()
                 .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))?,
+            gpu_transformer_layers: 0,
+            cpu_transformer_layers: 0,
             output_device_type: format!(
                 "{:?}",
                 model
@@ -288,6 +325,21 @@ impl ForgeCoreModel {
             )
             .to_ascii_lowercase(),
         };
+
+        let layer_count = metadata.layer_count;
+        let mut gpu_transformer_layers = 0u32;
+        for layer in 0..layer_count {
+            let device_type = model
+                .layer_device_type(layer)
+                .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))?;
+            if !matches!(device_type, forge_core::DeviceType::Cpu) {
+                gpu_transformer_layers += 1;
+            }
+        }
+        let cpu_transformer_layers = layer_count.saturating_sub(gpu_transformer_layers);
+        let mut metadata = metadata;
+        metadata.gpu_transformer_layers = gpu_transformer_layers;
+        metadata.cpu_transformer_layers = cpu_transformer_layers;
 
         Ok(Self {
             model,
@@ -727,6 +779,8 @@ mod tests {
                 load_mode: ModelLoadMode::MmapNoPrefetch,
                 use_extra_bufts: false,
                 effective_gpu_layers: 0,
+                gpu_transformer_layers: 0,
+                cpu_transformer_layers: 0,
                 output_device_type: "cpu".to_string(),
                 description: String::new(),
             }

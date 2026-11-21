@@ -649,6 +649,45 @@ Percentiles use the nearest-rank method. They describe dispersion in this
 session; they are not confidence intervals. No cold-cache, GPU, or large-model
 claim follows from this matrix.
 
+## GPU and hybrid release comparison (2026-11-21)
+
+Same model, prompt, context, token count, build, and CPU thread count. Release
+build, SmolLM2-135M Q4_K_M, 256 context, 32 generated tokens, 5 runs + 1
+warmup, warm/uncontrolled. CUDA build: `native/build-cuda`, SM 86.
+
+| Mode | Requested/effective layers | Median tok/s | P25–P75 | P95 | Decode tok/s | Prompt tok/s | TTFT |
+|---|---|---:|---:|---:|---:|---:|---:|
+| CPU | 0 / 0 | 240.70 | 234.26–245.45 | 255.32 | 249.12 | 704.4 | 7.15 ms |
+| Hybrid | 8 / 8 (7 transformer + output) | 289.13 | 286.92–303.01 | 310.10 | 310.51 | 805.7 | 6.25 ms |
+| GPU | 31 / 31 (30 transformer + output) | 484.65 | 460.70–488.73 | 491.16 | 495.54 | 1448.5 | 3.50 ms |
+
+A second session with reversed configuration order measured CPU 249.62,
+hybrid 309.53, and GPU 488.89 tok/s, preserving the ordering. Full offload was
+about 2.0x CPU and hybrid about 1.2x on this small model. This is not a
+universal default; the GPU has 4 GiB VRAM and the model is 135M parameters.
+
+VRAM free bytes (native snapshots):
+
+| Mode | Before load | After load | After warmup | After unload |
+|---|---:|---:|---:|---:|
+| Hybrid 8 | 3,868,590,080 | 3,820,355,584 | 3,755,343,872 | 3,860,201,472 |
+| GPU 31 | 3,868,590,080 | 3,763,732,480 | 3,690,332,160 | 3,856,007,168 |
+
+Full offload used about 178 MiB after warmup; hybrid about 113 MiB. Free memory
+is a point-in-time observation, not a reservation or a peak.
+
+`n_gpu_layers` includes the output layer: requesting `N` on this 30-layer model
+offloads `N-1` transformer layers plus the output layer. Native readback
+confirmed 7/30 and 30/30 transformer layers for the two GPU configurations.
+
+CPU and GPU greedy outputs share the first token (` Paris`) but may diverge
+afterward because quantized accumulation order differs between backends. Both
+are coherent. Transfer volume, transfer time, GPU utilization, and
+transfer/compute overlap were not instrumented.
+
+Reproduction commands are in
+[GPU_ENVIRONMENT.md](GPU_ENVIRONMENT.md#reproduction).
+
 ## Caveats
 
 - These are wall-clock observations on one machine, not a throughput guarantee.

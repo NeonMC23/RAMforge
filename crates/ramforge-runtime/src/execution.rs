@@ -6,19 +6,18 @@
 //! the current ForgeCore adapter can actually consume.
 //!
 //! The verified ForgeCore revision exposes safe device enumeration and static
-//! model-load/offload options. RAMforge intentionally does not enable those
-//! non-CPU options in this refresh: non-CPU devices are discoverable when the
-//! native build exposes them, but remain non-selectable by this adapter. No
-//! CPU fallback is performed.
+//! model-load/offload options. RAMforge enables a CUDA device only when the
+//! native registry actually provides it; a requested GPU never falls back to
+//! CPU implicitly.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
-use forge_core::{enumerate_devices, DeviceInfo as ForgeDeviceInfo, DeviceType};
-use ramforge_core::{
-    BackendId, ByteMeasurement, DeviceId, MeasurementProvenance, MemoryDomain,
+use forge_core::{
+    enumerate_devices, supports_gpu_offload, DeviceInfo as ForgeDeviceInfo, DeviceType,
 };
+use ramforge_core::{BackendId, ByteMeasurement, DeviceId, MeasurementProvenance, MemoryDomain};
 
 /// Execution/device kind reported by the safe ForgeCore registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -250,7 +249,9 @@ pub enum DeviceSelectionError {
 impl fmt::Display for DeviceSelectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidSyntax(message) => write!(formatter, "invalid device selection: {message}"),
+            Self::InvalidSyntax(message) => {
+                write!(formatter, "invalid device selection: {message}")
+            }
             Self::CpuUnavailable => formatter.write_str("CPU device is unavailable"),
             Self::BackendDeviceUnavailable { backend, index } => write!(
                 formatter,
@@ -314,7 +315,10 @@ impl DeviceRegistry {
         self.devices.iter().find(|device| &device.id == id)
     }
 
-    pub fn select(&self, selection: &DeviceSelection) -> Result<SelectedDevice, DeviceSelectionError> {
+    pub fn select(
+        &self,
+        selection: &DeviceSelection,
+    ) -> Result<SelectedDevice, DeviceSelectionError> {
         let info = match selection {
             DeviceSelection::Cpu => self
                 .devices
@@ -424,8 +428,12 @@ pub enum ExecutionConfigError {
 impl fmt::Display for ExecutionConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ZeroCpuThreads => formatter.write_str("CPU thread count must be greater than zero"),
-            Self::ZeroContextLength => formatter.write_str("context length must be greater than zero"),
+            Self::ZeroCpuThreads => {
+                formatter.write_str("CPU thread count must be greater than zero")
+            }
+            Self::ZeroContextLength => {
+                formatter.write_str("context length must be greater than zero")
+            }
             Self::DeviceSelection(error) => error.fmt(formatter),
         }
     }
@@ -458,6 +466,13 @@ fn cpu_device_info() -> DeviceInfo {
 }
 
 fn device_info_from_forgecore(info: ForgeDeviceInfo) -> DeviceInfo {
+    device_info_from_forgecore_with_offload(info, supports_gpu_offload())
+}
+
+fn device_info_from_forgecore_with_offload(
+    info: ForgeDeviceInfo,
+    gpu_offload_available: bool,
+) -> DeviceInfo {
     let kind = DeviceKind::from_forgecore(info.device_type);
     let component = stable_component(&info.name);
     let backend_id = if kind == DeviceKind::Cpu {
@@ -470,7 +485,9 @@ fn device_info_from_forgecore(info: ForgeDeviceInfo) -> DeviceInfo {
     } else {
         DeviceId::new(format!(
             "forgecore/{}/{}/{}",
-            kind.label(), info.index, component
+            kind.label(),
+            info.index,
+            component
         ))
     };
     let memory_reporting = if info.memory_total > 0 || info.memory_free > 0 {
@@ -478,20 +495,26 @@ fn device_info_from_forgecore(info: ForgeDeviceInfo) -> DeviceInfo {
     } else {
         CapabilityState::Unknown
     };
-    let model_execution = if kind == DeviceKind::Cpu {
+    let native_gpu = matches!(
+        kind,
+        DeviceKind::Gpu | DeviceKind::IntegratedGpu | DeviceKind::Accelerator
+    ) && gpu_offload_available;
+    let model_execution = if kind == DeviceKind::Cpu || native_gpu {
         CapabilityState::Supported
     } else {
         CapabilityState::Unsupported
     };
-    let (selectable, reason) = if kind == DeviceKind::Cpu {
+    let static_offload = if native_gpu {
+        CapabilityState::Supported
+    } else {
+        CapabilityState::Unsupported
+    };
+    let (selectable, reason) = if kind == DeviceKind::Cpu || native_gpu {
         (true, None)
     } else {
         (
             false,
-            Some(
-                "RAMforge does not enable non-CPU model binding in this refresh"
-                    .to_string(),
-            ),
+            Some("native GPU offload support is not available for this device".to_string()),
         )
     };
     DeviceInfo {
@@ -507,7 +530,7 @@ fn device_info_from_forgecore(info: ForgeDeviceInfo) -> DeviceInfo {
         capabilities: DeviceCapabilities {
             backend_initialization: CapabilityState::Supported,
             model_execution,
-            static_model_offload: CapabilityState::Unsupported,
+            static_model_offload: static_offload,
             memory_reporting,
             cpu_thread_configuration: if kind == DeviceKind::Cpu {
                 CapabilityState::Supported
@@ -559,14 +582,17 @@ mod tests {
     }
 
     fn gpu() -> DeviceInfo {
-        device_info_from_forgecore(ForgeDeviceInfo {
-            index: 3,
-            name: "CUDA0".to_string(),
-            description: "test CUDA device".to_string(),
-            device_type: DeviceType::Gpu,
-            memory_free: 4096,
-            memory_total: 8192,
-        })
+        device_info_from_forgecore_with_offload(
+            ForgeDeviceInfo {
+                index: 3,
+                name: "CUDA0".to_string(),
+                description: "test CUDA device".to_string(),
+                device_type: DeviceType::Gpu,
+                memory_free: 4096,
+                memory_total: 8192,
+            },
+            true,
+        )
     }
 
     #[test]
@@ -585,7 +611,10 @@ mod tests {
         let right = gpu();
         assert_eq!(left.id, right.id);
         assert_eq!(left.backend_id, right.backend_id);
-        assert_eq!(left.accounting_domain(), MemoryDomain::Device(left.id.clone()));
+        assert_eq!(
+            left.accounting_domain(),
+            MemoryDomain::Device(left.id.clone())
+        );
     }
 
     #[test]
@@ -593,8 +622,12 @@ mod tests {
         let gpu = gpu();
         assert_eq!(gpu.memory_total.bytes(), Some(8192));
         assert_eq!(gpu.memory_free.bytes(), Some(4096));
-        assert_eq!(gpu.capabilities.model_execution, CapabilityState::Unsupported);
-        assert!(!gpu.selectable);
+        assert_eq!(gpu.capabilities.model_execution, CapabilityState::Supported);
+        assert_eq!(
+            gpu.capabilities.static_model_offload,
+            CapabilityState::Supported
+        );
+        assert!(gpu.selectable);
         assert!(cpu().memory_total.is_unknown());
     }
 
@@ -609,10 +642,29 @@ mod tests {
             DeviceSelectionError::DeviceIdUnavailable(DeviceId::new("missing"))
         );
         let gpu_info = gpu();
-        let error = registry
+        let selected = registry
             .select(&DeviceSelection::ById(gpu_info.id.clone()))
+            .expect("registered GPU is selectable");
+        assert_eq!(selected.info().kind, DeviceKind::Gpu);
+        let unsupported = device_info_from_forgecore_with_offload(
+            ForgeDeviceInfo {
+                index: 3,
+                name: "CUDA0".to_string(),
+                description: "unavailable CUDA device".to_string(),
+                device_type: DeviceType::Gpu,
+                memory_free: 4096,
+                memory_total: 8192,
+            },
+            false,
+        );
+        let unavailable_registry = DeviceRegistry::from_devices(vec![cpu(), unsupported.clone()]);
+        let error = unavailable_registry
+            .select(&DeviceSelection::ById(unsupported.id))
             .unwrap_err();
-        assert!(matches!(error, DeviceSelectionError::DeviceNotSelectable { .. }));
+        assert!(matches!(
+            error,
+            DeviceSelectionError::DeviceNotSelectable { .. }
+        ));
         let error = registry
             .select(&DeviceSelection::BackendIndex {
                 backend: gpu_info.backend_id,
@@ -627,9 +679,14 @@ mod tests {
 
     #[test]
     fn selection_syntax_is_explicit() {
-        assert_eq!("cpu".parse::<DeviceSelection>().unwrap(), DeviceSelection::Cpu);
         assert_eq!(
-            "id:forgecore/gpu/3/cuda0".parse::<DeviceSelection>().unwrap(),
+            "cpu".parse::<DeviceSelection>().unwrap(),
+            DeviceSelection::Cpu
+        );
+        assert_eq!(
+            "id:forgecore/gpu/3/cuda0"
+                .parse::<DeviceSelection>()
+                .unwrap(),
             DeviceSelection::ById(DeviceId::new("forgecore/gpu/3/cuda0"))
         );
         assert_eq!(
@@ -663,7 +720,10 @@ mod tests {
             memory_free: 0,
             memory_total: 0,
         });
-        assert_eq!(info.capabilities.model_execution, CapabilityState::Unsupported);
+        assert_eq!(
+            info.capabilities.model_execution,
+            CapabilityState::Unsupported
+        );
         assert!(!info.selectable);
         assert_eq!(info.accounting_domain(), MemoryDomain::Unknown);
     }

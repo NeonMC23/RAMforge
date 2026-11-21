@@ -8,7 +8,8 @@ estimates and proposed extensions.
 
 Audited pin: `7fe450e19305b828c199d602c23a8337aaa1f03b`.
 
-Build flags from the actual CMake cache:
+Build flags from the CPU build's CMake cache (the separate CUDA build is
+described below):
 
 | Capability | Build state | Evidence |
 |---|---|---|
@@ -32,9 +33,9 @@ checkout; the page APIs are local patches):
 | Device properties and memory | available | `ggml/src/ggml-backend.cpp:589–599` |
 | Dynamic backend loading code | present, build OFF | `ggml/src/ggml-backend-reg.cpp:574` |
 | mmap / no-prefetch load modes | available | `src/llama-model-loader.cpp:559,830`; `src/llama-mmap.cpp:472` |
-| GPU offload parameters | API present, backend not built | `include/llama.h:322–332` |
+| GPU offload parameters | API present; CUDA built in `build-cuda` | `include/llama.h:322–332`; `GGML_CUDA=ON` |
 | Effective layer/output placement readback | available (patch) | `llama_model_effective_gpu_layers`, `llama_model_layer_device_type`, `llama_model_output_device_type` |
-| Tensor split / multi-device | API present, backend not built | `src/llama-model.cpp:1208` |
+| Tensor split / multi-device | API present; single-device validated | `src/llama-model.cpp:1208` |
 | File-backed tensor mapping metadata | available (patch) | `include/llama.h:665–666`; `src/llama-model.cpp:3285–3292` |
 | Page residency sampling | available on Linux | `include/llama.h:691`; `src/llama-model.cpp:3259` |
 | Model/tensor page release | available on Linux | `include/llama.h:552,675`; `src/llama-model.cpp:3278,3300` |
@@ -44,11 +45,11 @@ checkout; the page APIs are local patches):
 | Anonymous/backend buffer eviction | unsupported | no public API |
 | Context padding | observed | `src/llama-context.cpp:291` (`GGML_PAD(n_ctx, 256)`) |
 
-Runtime device registry on the development machine contains one CPU device.
-No GPU device is selectable in the current process. The physical machine does
-contain an NVIDIA RTX 3050 Laptop GPU, but CUDA is blocked: the loaded kernel
-module is 595.112.07 while userspace is 620.70.06, and no CUDA compiler/toolkit
-is installed. See [GPU_ENVIRONMENT.md](GPU_ENVIRONMENT.md).
+With `FORGE_LLAMA_BUILD_DIR=build-cuda`, the runtime registry contains CUDA
+(one device) and CPU (one device). CUDA0 is an NVIDIA GeForce RTX 3050 Laptop
+GPU with 3,974,103,040 bytes total VRAM and about 3.87 GB free at audit time.
+The driver is 620.70.06, the toolkit is 13.2.51, and the CUDA build contains
+SM 86 cubins. See [GPU_ENVIRONMENT.md](GPU_ENVIRONMENT.md).
 
 ### forgeCORE surface
 
@@ -64,34 +65,38 @@ Available and safe:
 
 Current RAMforge operational adapter:
 
-- uses CPU-only model execution;
-- records GPU offload as unsupported for the verified build;
-- never infers effective GPU placement from a requested layer count;
-- keeps CPU execution fully functional without a GPU.
+- supports explicit CPU or GPU model loading;
+- verifies every GPU request through native effective-placement readback;
+- records GPU transformer-layer and output-layer placement separately;
+- rejects a zero-effective-layer result instead of claiming GPU execution;
+- keeps CPU execution fully functional with or without a CUDA build;
+- never falls back silently to CPU.
 
-GPU offload exists in the safe forgeCORE model options but is **not physically
-validated** in this build. No CUDA/Vulkan/SYCL/Metal test result is claimed.
+CUDA generation, hybrid generation, streaming, cancellation, unload, and VRAM
+release were physically validated on the RTX 3050. No Vulkan/SYCL/OpenCL/Metal
+test result is claimed.
 
 ## GPU execution status
 
-- Hardware detected: RTX 3050 Laptop GPU (GA107M).
-- Native GPU backend built: **no** (all GPU backend flags OFF). A guarded
-  `forgeCORE/scripts/setup-native-cuda.sh` is prepared for a separate
-  `build-cuda` tree; it was not run because `nvidia-smi` and `nvcc` are not
-  usable.
-- CUDA toolkit available: **no** (`nvcc` and headers absent).
-- Driver usable by CUDA: **no** in this session (kernel/userspace mismatch).
-- Physical GPU inference or offload: **not performed**.
-- Claimed effective GPU layers: **none**; CPU loads report zero through native
-  readback.
+- Hardware: RTX 3050 Laptop GPU (GA107M), compute capability 8.6, 4 GiB VRAM.
+- Native CUDA backend: built in `build-cuda`, SM 86, registration symbol
+  present.
+- Runtime: CUDA backend registered, CUDA0 enumerated, offload available.
+- Physical inference: **verified**. CPU, hybrid, and full-GPU generation
+  produced tokens; cancellation, repeated sessions, unload, and VRAM release
+  were exercised.
+- Effective placement: native readback confirmed 8 requested -> 8 effective
+  (7 transformer + output) and 31 requested -> 31 effective (30 transformer +
+  output).
+- VRAM: about 178 MiB used after warmup for full offload of the 135M model;
+  about 113 MiB for the 8-layer hybrid.
+- Release throughput: CPU 240.70 tok/s, hybrid 289.13, full GPU 484.65 for the
+  same 32-token workload. A reverse-order session reproduced the ordering.
 
-RAMforge now records registered backends, `gpu_offload_available`, and device
-memory in the machine profile. GPU execution requests (`--device auto` or
-`--gpu-layers N`) fail with an explicit error when no GPU backend/device is
-registered; they are never converted into a CPU plan. Plans can represent
-`cpu`, `gpu`, and `hybrid` modes and mark placement fields advisory, but the
-service rejects non-CPU plans because no physical GPU load path has been
-validated. No silent CPU fallback occurs.
+Upstream counts the output layer in `n_gpu_layers`; for this 30-layer model,
+requesting `N` offloads `N-1` transformer layers plus the output layer.
+CPU/GPU greedy text can diverge after the shared prefix due to quantized
+accumulation order. No silent CPU fallback occurs.
 
 ## Memory hierarchy
 
@@ -260,8 +265,10 @@ residency, this is not an implemented strategy.
   execution of a 13.13 GB model under an 8 GiB cgroup cap.
 - Bounded page release, page-residency sampling, and prefetch hints with
   quiescence gates and explicit unknown states.
-- Registered-backend inventory and explicit GPU-unavailable reporting.
-- Native effective layer/output placement readback (zero GPU layers on CPU).
+- Registered-backend inventory, CUDA discovery, and VRAM reporting.
+- Physical CPU, hybrid, and full-GPU inference on the RTX 3050.
+- Native effective transform/output layer placement readback (non-zero GPU
+  layers verified after load).
 - Effective CPU configuration and throughput measurement.
 - Bounded profile comparison, architecture metadata, memory hierarchy, and
   placement reporting.
@@ -270,8 +277,7 @@ residency, this is not an implemented strategy.
 
 ## Required next native work
 
-- Build and validate a GPU backend on compatible hardware.
-- Expose effective GPU layer/device placement and allocation failures.
+- Expose per-layer/device allocation sizes and richer allocation failures.
 - Add a native layer/tensor staging API with bounded buffers, transfer/compute
   overlap, synchronization, and eviction rules.
 - Add MoE routing/expert residency metadata and control.

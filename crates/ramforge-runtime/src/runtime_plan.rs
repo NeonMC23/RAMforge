@@ -395,7 +395,7 @@ impl RuntimePlan {
         }
         if execution_mode != ExecutionMode::Cpu {
             warnings.push(
-                "GPU/hybrid placement is planning-only: the current service rejects GPU plans until a physical backend and effective-placement readback are validated"
+                "GPU/hybrid placement is requested; native effective placement must be confirmed after load"
                     .to_string(),
             );
         } else if machine.devices.iter().any(|device| device.kind != "cpu") {
@@ -565,7 +565,7 @@ mod tests {
             name: "Synthetic GPU".to_string(),
             description: "test fixture".to_string(),
             available: true,
-            selectable: false,
+            selectable: true,
             memory_total_bytes: crate::machine_profile::Observed::known(
                 8 * 1024 * 1024 * 1024,
                 crate::machine_profile::Provenance::NativeBackend,
@@ -583,7 +583,7 @@ mod tests {
             static_model_offload: "supported".to_string(),
             memory_reporting: "supported".to_string(),
             cpu_thread_configuration: "unsupported".to_string(),
-            unavailable_reason: Some("synthetic fixture".to_string()),
+            unavailable_reason: None,
         });
         let mut requirements = requirements(Some(4096));
         requirements.architecture_info = Some(crate::model_architecture::ModelArchitecture {
@@ -606,7 +606,7 @@ mod tests {
             "/m",
             RuntimeProfileKind::Custom,
             &CustomRuntimeRequest {
-                device: Some("auto".to_string()),
+                device: Some("forgecore/gpu/0/synthetic".to_string()),
                 gpu_layers: Some(2),
                 ..CustomRuntimeRequest::default()
             },
@@ -622,7 +622,7 @@ mod tests {
         assert!(plan
             .warnings
             .iter()
-            .any(|warning| warning.contains("planning-only")));
+            .any(|warning| warning.contains("native effective placement")));
     }
 
     #[test]

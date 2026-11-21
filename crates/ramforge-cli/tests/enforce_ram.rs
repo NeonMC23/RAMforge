@@ -1261,6 +1261,13 @@ fn machine_profile_reports_resources_requirements_and_plans() {
     );
     if readiness["gpu_offload_available"] == false {
         assert_eq!(readiness["gpu_execution"], false);
+    } else {
+        let selectable_gpu = readiness["gpu_devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["selectable"] == true);
+        assert_eq!(readiness["gpu_execution"], selectable_gpu);
     }
 
     let hierarchy = &report["memory_hierarchy"];
@@ -1593,8 +1600,11 @@ fn benchmark_reports_measured_generation_throughput() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 5);
     assert_eq!(report["plan"]["effective"]["backend"], "cpu");
+    assert_eq!(report["effective_gpu_layers"], 0);
+    assert_eq!(report["device_id"], "cpu");
+    assert!(report["output_device_type"].is_string());
     assert_eq!(report["plan"]["effective"]["execution_mode"], "cpu");
     assert_eq!(report["plan"]["effective"]["gpu_layers"], 0);
     assert!(report["plan"]["effective"]["threads"].as_u64().unwrap() > 0);
@@ -1748,6 +1758,80 @@ fn gpu_request_fails_explicitly_when_backend_is_unavailable() {
     assert!(
         stderr.contains("no GPU backend") || stderr.contains("GPU execution unavailable"),
         "failure must explain backend unavailability: {stderr}"
+    );
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and a CUDA native build"]
+fn cuda_benchmark_reports_native_placement_and_memory() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let machine = ramforge()
+        .args(["machine", "--model", &model, "--json"])
+        .output()
+        .unwrap();
+    assert!(machine.status.success());
+    let profile: serde_json::Value = serde_json::from_slice(&machine.stdout).expect("json");
+    if profile["execution_readiness"]["gpu_execution"] != true {
+        println!("SKIP: no selectable CUDA device");
+        return;
+    }
+    let output = ramforge()
+        .args([
+            "benchmark",
+            &model,
+            "--profile",
+            "balanced",
+            "--ram",
+            "1G",
+            "--runs",
+            "1",
+            "--warmup",
+            "0",
+            "--max-tokens",
+            "8",
+            "--context",
+            "128",
+            "--threads",
+            "2",
+            "--no-repack",
+            "--device",
+            "auto",
+            "--gpu-layers",
+            "8",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "CUDA benchmark failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(report["schema_version"], 5);
+    assert_ne!(report["device_id"], "cpu");
+    assert_eq!(report["requested_gpu_layers"], 8);
+    let effective = report["effective_gpu_layers"].as_u64().expect("readback");
+    assert!(effective >= 1, "no effective GPU layers: {report}");
+    assert!(report["gpu_transformer_layers"].as_u64().unwrap() >= 1);
+    assert_eq!(report["output_device_type"], "gpu");
+    let before = report["device_memory_free_before_bytes"].as_u64().unwrap();
+    let after_load = report["device_memory_free_after_load_bytes"]
+        .as_u64()
+        .unwrap();
+    let after_unload = report["device_memory_free_after_unload_bytes"]
+        .as_u64()
+        .unwrap();
+    assert!(after_load < before, "model load did not consume VRAM");
+    assert!(
+        after_unload > after_load,
+        "unload did not release VRAM: {after_load} -> {after_unload}"
+    );
+    assert!(
+        report["runs_detail"][0]["generated_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
     );
 }
 

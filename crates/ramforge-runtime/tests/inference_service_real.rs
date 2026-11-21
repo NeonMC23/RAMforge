@@ -144,3 +144,126 @@ fn service_cancellation_is_explicit() {
     assert!(matches!(error, ServiceError::Cancelled));
     service.unload();
 }
+
+fn gpu_plan(path: &std::path::Path, gpu_layers: u32) -> Option<RuntimePlan> {
+    let model_set = ramforge_core::discover_model_set(path).expect("model set");
+    let gguf = model_set.merged_model();
+    let requirements = model_requirements(
+        &gguf,
+        ModelRequirementConfig {
+            context_tokens: 128,
+            batch_tokens: 1,
+            kv_bytes_per_element: 2,
+        },
+    );
+    let machine = collect_machine_profile(&MachineProfileConfig::default());
+    if !machine
+        .devices
+        .iter()
+        .any(|device| device.kind != "cpu" && device.selectable)
+    {
+        eprintln!("SKIP: no selectable CUDA device");
+        return None;
+    }
+    Some(
+        RuntimePlan::resolve(
+            &machine,
+            &requirements,
+            path.to_string_lossy().as_ref(),
+            RuntimeProfileKind::Custom,
+            &CustomRuntimeRequest {
+                context_tokens: Some(128),
+                batch_tokens: Some(1),
+                threads: Some(2),
+                load_mode: Some("mmap".to_string()),
+                no_repack: Some(true),
+                device: Some("auto".to_string()),
+                gpu_layers: Some(gpu_layers),
+            },
+        )
+        .expect("GPU plan"),
+    )
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and a CUDA native build"]
+fn service_runs_on_cuda_with_native_placement() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let Some(plan) = gpu_plan(&path, 8) else {
+        return;
+    };
+    let expected_device = plan.effective.device_id.clone();
+    let mut service = InferenceService::new(plan).expect("service");
+    service.load().expect("GPU model load");
+    service.create_session().expect("session");
+    let status = service.status();
+    assert_ne!(status.execution_mode, ramforge_runtime::ExecutionMode::Cpu);
+    assert_eq!(status.requested_gpu_layers, Some(8));
+    let effective = status.effective_gpu_layers.expect("readback");
+    assert!(effective >= 1, "expected GPU layers, got {effective}");
+    assert!(status.gpu_transformer_layers.unwrap() >= 1);
+    assert_eq!(status.output_device_type.as_deref(), Some("gpu"));
+    assert_eq!(
+        status.device_id, expected_device,
+        "status device must match the plan"
+    );
+    let cancel = AtomicBool::new(false);
+    let report = service
+        .generate(
+            &GenerationOptions {
+                prompt: "The capital of France is".to_string(),
+                max_tokens: 4,
+                temperature: 0.0,
+                top_k: None,
+                top_p: None,
+            },
+            &cancel,
+            |_| Ok(()),
+        )
+        .expect("GPU generation");
+    assert!(report.stats.generated_tokens > 0);
+    assert!(report.stats.generation_tokens_per_second > 0.0);
+    eprintln!(
+        "cuda_generation requested=8 effective={} gpu_transformer={} tps={:.2}",
+        effective,
+        status.gpu_transformer_layers.unwrap(),
+        report.stats.generation_tokens_per_second
+    );
+    service.unload();
+    assert!(service.status().effective_gpu_layers.is_none());
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and a CUDA native build"]
+fn service_cancellation_works_on_cuda() {
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let Some(plan) = gpu_plan(&path, 8) else {
+        return;
+    };
+    let mut service = InferenceService::new(plan).expect("service");
+    service.load().expect("GPU model load");
+    service.create_session().expect("session");
+    let cancel = AtomicBool::new(false);
+    let error = service
+        .generate(
+            &GenerationOptions {
+                prompt: "Write a detailed essay about the history of computing.".to_string(),
+                max_tokens: 512,
+                ..GenerationOptions::default()
+            },
+            &cancel,
+            |_| {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServiceError::Cancelled));
+    service.unload();
+}

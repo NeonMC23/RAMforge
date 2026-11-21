@@ -22,7 +22,7 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 >
 > **Milestone 6.1 Baseline (Correctness & Accounting Fixes):** `generate()` is cleanly repeatable on one engine (explicit KV reset + failure-proof budget); RoPE uses the correct llama/qwen2 **half-split** pair convention; F16/BF16 resident RAM is booked at its true decoded size (4 B/elem, with a 3×-file-byte load transient); qwen2 Q/K/V biases are loaded, budgeted, validated (all-or-none + exact shape), and applied after the projections. The historical M6.1 baseline was verified by 132 synthetic tests; current validation is summarized below.
 >
-> **GPU milestone status (2026-11-21):** The physical RTX 3050 Laptop GPU is detected, but CUDA execution is blocked. The running NVIDIA kernel module is 595.112.07 while userspace is 620.70.06 (reboot pending), and `nvcc`/CUDA development headers are not installed. The native build remains CPU-only. RAMforge now reports registered backends and GPU availability, performs native effective-placement readback, and rejects non-CPU requests explicitly with no silent fallback. A detected GPU is not claimed as usable. A guarded `forgeCORE/scripts/setup-native-cuda.sh` and `FORGE_LLAMA_BUILD_DIR=build-cuda` path are prepared for the authorized recovery. See [GPU_ENVIRONMENT.md](docs/handoff/GPU_ENVIRONMENT.md) and [LARGE_MODEL_EXECUTION.md](docs/handoff/LARGE_MODEL_EXECUTION.md).
+> **GPU milestone status (2026-11-21):** CUDA is compiled and physically validated on the RTX 3050 Laptop GPU (SM 86, 4 GiB VRAM, driver 620.70.06, CUDA 13.2.51). The CUDA backend registers, CUDA0 is enumerated, and real token generation succeeds with CPU, hybrid, and full-GPU placement. Native readback confirmed 8 effective layers (7 transformer + output) and 31 effective layers (30 transformer + output). Release measurements: CPU 240.70 tok/s, hybrid 289.13, full GPU 484.65 on the same 32-token workload; a reverse-order session reproduced the ordering. GPU load/placement failure is explicit with no silent CPU fallback. See [GPU_ENVIRONMENT.md](docs/handoff/GPU_ENVIRONMENT.md) and [LARGE_MODEL_EXECUTION.md](docs/handoff/LARGE_MODEL_EXECUTION.md).
 
 > **Milestone 6 Status (Managed Out-of-Core Path):** The legacy inference path charges its named, RAMforge-managed allocations via scoped accounting helpers; the cache is budget-charged per entry; matrix layout is the explicit GGML/GGUF convention (no orientation guessing, no full-F32 fallbacks); logits use a single budget-charged buffer with a budget-aware chunked streamed projection; the KV cache grows chunk-wise without prefix copies; the F32 matvec hot path uses AVX2/rayon. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented. This ledger is not a process-RSS or OS-memory cap; allocator overhead, native/dependency allocations, page cache, and some legacy returned buffers remain outside it.
 
@@ -725,7 +725,7 @@ swap configuration was changed.
   Qwen2.5-Coder-32B. DeepSeek-Coder-V2-Lite is a 10,364,416,768 B
   `deepseek2` model that inspects/plans but is not in the validated forgeCORE
   execution registry. The 32B model was not attempted without a measured plan.
-- GPU/VRAM execution remains out of scope.
+- CUDA GPU execution is validated for the forgeCORE adapter; the legacy executor remains CPU-only.
 
 ## Architecture and quantization matrix
 
@@ -1091,7 +1091,7 @@ crates/
 - Missing tensors → "missing tensor 'blk.0.attn_q.weight'"
 - Budget too small → "RAM budget too small for layer..."
 
-**CPU-only in this build:** The pinned native build registers only the CPU backend; the forgeCORE adapter binds CPU. The machine has an NVIDIA GPU, but CUDA is blocked by a kernel/userspace driver mismatch and a missing toolkit, so no GPU execution is claimed. See [GPU_ENVIRONMENT.md](docs/handoff/GPU_ENVIRONMENT.md).
+**CUDA build:** The default `native/build` remains CPU-only. The separate `native/build-cuda` registers CUDA and CPU; the forgeCORE adapter supports explicit CPU, GPU, or hybrid loading with native placement verification. See [GPU_ENVIRONMENT.md](docs/handoff/GPU_ENVIRONMENT.md) for validated results and reproduction commands.
 
 ## Testing
 
@@ -1107,7 +1107,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **617 tests, 0 failed, 30 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **617 tests, 0 failed, 33 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

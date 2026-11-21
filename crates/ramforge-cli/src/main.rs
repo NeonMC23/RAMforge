@@ -1837,9 +1837,18 @@ fn run_machine(
                 .to_json()
                 .map_err(|error| anyhow::anyhow!(error))?;
         }
+        let gpu_selectable = profile
+            .devices
+            .iter()
+            .any(|device| device.kind != "cpu" && device.selectable);
         report["execution_readiness"] = serde_json::json!({
             "cpu_execution": true,
-            "gpu_execution": false,
+            "gpu_execution": gpu_selectable,
+            "gpu_execution_reason": if gpu_selectable {
+                "a registered GPU device is selectable; effective placement is verified after load"
+            } else {
+                "no selectable GPU device is registered in this process"
+            },
             "selected_device": "cpu",
             "gpu_offload_available": profile.backend_inventory.gpu_offload_available,
             "registered_backends": profile.backend_inventory.registered,

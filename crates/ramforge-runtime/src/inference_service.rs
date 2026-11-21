@@ -57,8 +57,22 @@ impl ServiceCapabilities {
             multiple_sessions: false,
             concurrent_generation: false,
             max_context_tokens: Some(plan.effective.context_tokens),
-            execution_modes: vec!["cpu".to_string()],
-            gpu_execution: false,
+            execution_modes: {
+                let registry = crate::DeviceRegistry::discover();
+                if registry
+                    .devices()
+                    .iter()
+                    .any(|device| !device.is_cpu() && device.selectable)
+                {
+                    vec!["cpu".to_string(), "gpu".to_string(), "hybrid".to_string()]
+                } else {
+                    vec!["cpu".to_string()]
+                }
+            },
+            gpu_execution: crate::DeviceRegistry::discover()
+                .devices()
+                .iter()
+                .any(|device| !device.is_cpu() && device.selectable),
             notes: vec![
                 "One session at a time; cancellation is checked between token decodes.".to_string(),
                 "No ownership or eviction authorization is exposed.".to_string(),
@@ -82,7 +96,12 @@ pub struct ServiceStatus {
     pub effective_sequence_max: Option<u32>,
     pub architecture: Option<crate::model_architecture::ModelArchitecture>,
     pub execution_mode: crate::runtime_plan::ExecutionMode,
+    pub device_id: String,
+    pub requested_gpu_layers: Option<u32>,
     pub effective_gpu_layers: Option<u32>,
+    pub gpu_transformer_layers: Option<u32>,
+    pub cpu_transformer_layers: Option<u32>,
+    pub output_device_type: Option<String>,
     pub model_instance_id: Option<u64>,
     pub context_id: Option<u64>,
     pub rss_bytes: Option<u64>,
@@ -251,10 +270,24 @@ impl InferenceService {
                 .map(ForgeCoreSession::effective_sequence_max),
             architecture: self.plan.architecture.clone(),
             execution_mode: self.plan.effective.execution_mode,
+            device_id: self.plan.effective.device_id.clone(),
+            requested_gpu_layers: self.plan.requested_gpu_layers,
             effective_gpu_layers: self
                 .model
                 .as_ref()
                 .map(|model| model.metadata().effective_gpu_layers),
+            gpu_transformer_layers: self
+                .model
+                .as_ref()
+                .map(|model| model.metadata().gpu_transformer_layers),
+            cpu_transformer_layers: self
+                .model
+                .as_ref()
+                .map(|model| model.metadata().cpu_transformer_layers),
+            output_device_type: self
+                .model
+                .as_ref()
+                .map(|model| model.metadata().output_device_type.clone()),
             model_instance_id: model_id,
             context_id,
             rss_bytes: process_rss(),
@@ -273,26 +306,38 @@ impl InferenceService {
                 })
             }
         }
-        if self.plan.effective.execution_mode != crate::runtime_plan::ExecutionMode::Cpu {
-            return Err(ServiceError::UnsupportedExecution(format!(
-                "plan requests {:?} execution; this service has no physically validated GPU load path and does not silently fall back to CPU",
-                self.plan.effective.execution_mode
-            )));
-        }
         let path = PathBuf::from(&self.plan.model_path);
         let model_set =
             discover_model_set(&path).map_err(|error| ServiceError::Model(error.to_string()))?;
         let gguf = model_set.merged_model();
         let tokenizer = Tokenizer::from_gguf(&gguf).map_err(ServiceError::Tokenizer)?;
         let registry = crate::DeviceRegistry::discover();
+        let requested_device =
+            if self.plan.effective.execution_mode == crate::runtime_plan::ExecutionMode::Cpu {
+                crate::DeviceSelection::Cpu
+            } else {
+                crate::DeviceSelection::by_id(self.plan.effective.device_id.clone())
+            };
+        let selected = registry.select(&requested_device).map_err(|error| {
+            ServiceError::UnsupportedExecution(format!(
+                "requested device {} is not selectable: {error}",
+                self.plan.effective.device_id
+            ))
+        })?;
         let execution = crate::ExecutionConfig {
-            device: crate::DeviceSelection::Cpu,
+            device: requested_device,
             cpu_thread_count: self.plan.effective.threads as usize,
             context_length: Some(self.plan.effective.context_tokens),
             check_tensors: false,
         };
         let mut options = ForgeCoreModelOptions {
             use_extra_bufts: self.plan.effective.weight_repacking,
+            gpu_layers: self.plan.effective.gpu_layers,
+            gpu_device_index: if self.plan.effective.gpu_layers > 0 {
+                selected.info().registry_index
+            } else {
+                None
+            },
             ..ForgeCoreModelOptions::default()
         };
         if self.plan.effective.load_mode == "mmap-no-prefetch" {
@@ -305,6 +350,26 @@ impl InferenceService {
             options,
         )
         .map_err(|error| ServiceError::Model(error.to_string()))?;
+        let effective_gpu_layers = model.metadata().effective_gpu_layers;
+        if self.plan.effective.gpu_layers > 0 && effective_gpu_layers == 0 {
+            return Err(ServiceError::UnsupportedExecution(format!(
+                "GPU layers were requested but native placement readback reports zero offloaded layers; refusing to claim GPU execution (requested={}, effective={effective_gpu_layers})",
+                self.plan.effective.gpu_layers
+            )));
+        }
+        if self.plan.effective.gpu_layers == 0 && effective_gpu_layers != 0 {
+            return Err(ServiceError::UnsupportedExecution(format!(
+                "CPU plan unexpectedly reports {effective_gpu_layers} offloaded layers"
+            )));
+        }
+        if self.plan.effective.gpu_layers > 0
+            && effective_gpu_layers < self.plan.effective.gpu_layers
+        {
+            self.errors.push(format!(
+                "requested {} GPU layers but native placement reports {effective_gpu_layers}",
+                self.plan.effective.gpu_layers
+            ));
+        }
         self.tokenizer = Some(tokenizer);
         self.model = Some(model);
         self.state = ServiceState::ModelLoaded;
@@ -609,7 +674,12 @@ mod tests {
         plan.effective.backend = "hybrid".to_string();
         let mut service = InferenceService::new(plan).expect("service");
         let error = service.load().unwrap_err();
-        assert!(matches!(error, ServiceError::UnsupportedExecution(_)));
+        assert!(matches!(
+            error,
+            ServiceError::UnsupportedExecution(_)
+                | ServiceError::Configuration(_)
+                | ServiceError::Model(_)
+        ));
         assert_eq!(service.state(), ServiceState::Empty);
     }
 

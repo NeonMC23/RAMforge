@@ -13,7 +13,7 @@ use crate::inference_service::{
 };
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 2;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
@@ -44,6 +44,20 @@ pub struct BenchmarkReport {
     pub runs: u32,
     pub warmup_runs: u32,
     pub model_load_ns: u64,
+    pub device_id: String,
+    pub requested_gpu_layers: Option<u32>,
+    /// Native placement readback after model load.
+    pub effective_gpu_layers: Option<u32>,
+    pub gpu_transformer_layers: Option<u32>,
+    pub cpu_transformer_layers: Option<u32>,
+    pub output_device_type: Option<String>,
+    /// Native free-memory snapshots for the selected device.
+    pub device_memory_free_before_bytes: Option<u64>,
+    pub device_memory_free_after_load_bytes: Option<u64>,
+    /// Free device memory after warmup contexts were created; includes
+    /// backend/compute buffers. Still a point-in-time value, not a peak.
+    pub device_memory_free_after_warmup_bytes: Option<u64>,
+    pub device_memory_free_after_unload_bytes: Option<u64>,
     pub context_create_ns: Vec<u64>,
     pub runs_detail: Vec<BenchmarkRun>,
     pub median_generation_tokens_per_second: f64,
@@ -51,7 +65,9 @@ pub struct BenchmarkReport {
     pub max_generation_tokens_per_second: f64,
     pub p25_generation_tokens_per_second: f64,
     pub p75_generation_tokens_per_second: f64,
+    pub p95_generation_tokens_per_second: f64,
     pub iqr_generation_tokens_per_second: f64,
+    pub median_prompt_tokens_per_second: Option<f64>,
     pub median_decode_tokens_per_second: Option<f64>,
     pub median_time_to_first_token_ns: Option<u64>,
     pub median_context_create_ns: u64,
@@ -77,7 +93,8 @@ impl BenchmarkReport {
             <= self.p25_generation_tokens_per_second
             && self.p25_generation_tokens_per_second <= self.median_generation_tokens_per_second
             && self.median_generation_tokens_per_second <= self.p75_generation_tokens_per_second
-            && self.p75_generation_tokens_per_second <= self.max_generation_tokens_per_second;
+            && self.p75_generation_tokens_per_second <= self.p95_generation_tokens_per_second
+            && self.p95_generation_tokens_per_second <= self.max_generation_tokens_per_second;
         if !ordered {
             return Err("generation throughput statistics are not ordered".to_string());
         }
@@ -140,10 +157,15 @@ pub fn run_benchmark(
     let profile = format!("{:?}", plan.profile).to_ascii_lowercase();
     let model_path = plan.model_path.clone();
     let plan_snapshot = plan.clone();
+    let device_id = plan_snapshot.effective.device_id.clone();
+    let requested_gpu_layers = plan_snapshot.requested_gpu_layers;
+    let free_before = device_free_bytes(&device_id);
     let mut service = InferenceService::new(plan)?;
     let load_started = Instant::now();
     service.load()?;
     let model_load_ns = duration_ns(load_started.elapsed());
+    let load_status = service.status();
+    let free_after_load = device_free_bytes(&device_id);
     let options = GenerationOptions {
         prompt: config.prompt.clone(),
         max_tokens: config.max_tokens,
@@ -156,6 +178,7 @@ pub fn run_benchmark(
         service.create_session()?;
         let _ = service.generate(&options, &cancel, |_| Ok(()))?;
     }
+    let free_after_warmup = device_free_bytes(&device_id);
     let mut runs = Vec::with_capacity(config.runs as usize);
     let mut context_ns = Vec::with_capacity(config.runs as usize);
     for index in 0..config.runs {
@@ -179,6 +202,7 @@ pub fn run_benchmark(
         });
     }
     service.unload();
+    let free_after_unload = device_free_bytes(&device_id);
     let mut rates: Vec<f64> = runs
         .iter()
         .map(|run| run.generation_tokens_per_second)
@@ -187,18 +211,24 @@ pub fn run_benchmark(
         .iter()
         .filter_map(|run| run.decode_tokens_per_second)
         .collect();
+    let mut prompt_rates: Vec<f64> = runs
+        .iter()
+        .map(|run| run.prompt_tokens_per_second)
+        .collect();
     let mut ttfts: Vec<u64> = runs
         .iter()
         .filter_map(|run| run.time_to_first_token_ns)
         .collect();
     rates.sort_by(|left, right| left.total_cmp(right));
     decode_rates.sort_by(|left, right| left.total_cmp(right));
+    prompt_rates.sort_by(|left, right| left.total_cmp(right));
     ttfts.sort_unstable();
     let median = median_f64(&rates);
     let min = rates.first().copied().unwrap_or(0.0);
     let max = rates.last().copied().unwrap_or(0.0);
     let p25 = percentile_f64(&rates, 1, 4).unwrap_or(median);
     let p75 = percentile_f64(&rates, 3, 4).unwrap_or(median);
+    let p95 = percentile_f64(&rates, 95, 100).unwrap_or(max);
     let report = BenchmarkReport {
         schema_version: BENCHMARK_SCHEMA_VERSION,
         api_version: INFERENCE_SERVICE_API_VERSION,
@@ -210,6 +240,16 @@ pub fn run_benchmark(
         runs: config.runs,
         warmup_runs: config.warmup_runs,
         model_load_ns,
+        device_id,
+        requested_gpu_layers,
+        effective_gpu_layers: load_status.effective_gpu_layers,
+        gpu_transformer_layers: load_status.gpu_transformer_layers,
+        cpu_transformer_layers: load_status.cpu_transformer_layers,
+        output_device_type: load_status.output_device_type,
+        device_memory_free_before_bytes: free_before,
+        device_memory_free_after_load_bytes: free_after_load,
+        device_memory_free_after_warmup_bytes: free_after_warmup,
+        device_memory_free_after_unload_bytes: free_after_unload,
         median_context_create_ns: median_u64(&mut context_ns.clone()),
         context_create_ns: context_ns,
         median_decode_tokens_per_second: if decode_rates.is_empty() {
@@ -228,7 +268,13 @@ pub fn run_benchmark(
         max_generation_tokens_per_second: max,
         p25_generation_tokens_per_second: p25,
         p75_generation_tokens_per_second: p75,
+        p95_generation_tokens_per_second: p95,
         iqr_generation_tokens_per_second: (p75 - p25).max(0.0),
+        median_prompt_tokens_per_second: if prompt_rates.is_empty() {
+            None
+        } else {
+            Some(median_f64(&prompt_rates))
+        },
         condition: "warm-uncontrolled".to_string(),
         limitations: vec![
             "Single-machine warm observation; no cold-cache claim.".to_string(),
@@ -252,6 +298,17 @@ fn median_f64(sorted: &[f64]) -> f64 {
     } else {
         sorted[sorted.len() / 2]
     }
+}
+
+fn device_free_bytes(device_id: &str) -> Option<u64> {
+    if device_id == "cpu" {
+        return None;
+    }
+    crate::DeviceRegistry::discover()
+        .devices()
+        .iter()
+        .find(|device| device.id.as_str() == device_id)
+        .and_then(|device| device.memory_free.bytes())
 }
 
 fn percentile_f64(sorted: &[f64], numerator: usize, denominator: usize) -> Option<f64> {
@@ -309,6 +366,7 @@ mod tests {
         let values = [96.17, 102.43, 102.80, 102.98, 103.02];
         assert_eq!(percentile_f64(&values, 1, 4), Some(102.43));
         assert_eq!(percentile_f64(&values, 3, 4), Some(102.98));
+        assert_eq!(percentile_f64(&values, 95, 100), Some(103.02));
         assert_eq!(percentile_f64(&[7.0], 1, 4), Some(7.0));
         assert_eq!(percentile_f64(&[7.0], 3, 4), Some(7.0));
         assert_eq!(percentile_f64(&[], 1, 4), None);

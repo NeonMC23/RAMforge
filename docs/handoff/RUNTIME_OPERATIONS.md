@@ -105,9 +105,12 @@ A cancel line sets a shared atomic flag; the generation loop observes it
 between token decodes. The transport is local-process only. It does not expose
 authentication or network access.
 
-`status` includes `execution_mode` and `effective_gpu_layers` (native readback
-after load). `capabilities` includes `execution_modes` and `gpu_execution`. On
-the verified CPU-only build these report `cpu`, zero, `["cpu"]`, and `false`.
+`status` includes `execution_mode`, `device_id`, requested and effective GPU
+layers, GPU/CPU transformer-layer counts, and output-device type. All effective
+values come from native placement readback after load. `capabilities` includes
+`execution_modes` and `gpu_execution`; with the CUDA build these report
+`["cpu","gpu","hybrid"]` and `true`. Without CUDA they report `["cpu"]` and
+`false`.
 
 ### GPU requests
 
@@ -116,11 +119,22 @@ the verified CPU-only build these report `cpu`, zero, `["cpu"]`, and `false`.
 - `--device cpu|auto|<device-id>` (default `cpu`)
 - `--gpu-layers N` (default `0`)
 
-Plans can represent CPU, GPU, and hybrid modes. If no GPU backend/device is
-registered, a non-CPU request fails before model load with an explicit error
-and **no CPU fallback**. If a GPU plan is ever constructed, the service rejects
-it rather than pretending to execute on CPU. See
-[GPU_ENVIRONMENT.md](GPU_ENVIRONMENT.md) for the current environment blockers.
+Plans represent CPU, GPU, and hybrid modes. With the CUDA build,
+`--device auto --gpu-layers N` selects CUDA0 and loads with native readback:
+the service refuses to report success if the effective layer count is zero.
+`n_gpu_layers` includes the output layer; for SmolLM2-135M (30 transformer
+layers), requesting 8 yields 7 GPU transformer layers plus the GPU output
+layer, and requesting 31 offloads all 30 transformer layers plus output.
+
+If no GPU backend/device is registered, a non-CPU request fails before model
+load with an explicit error and **no CPU fallback**. GPU load or placement
+failure is returned as an error; the service never silently retries on CPU.
+See [GPU_ENVIRONMENT.md](GPU_ENVIRONMENT.md) for validated results and
+limitations.
+
+With CUDA, `status` reports `execution_mode=gpu` for full offload or `hybrid`
+for partial offload; the benchmark report includes VRAM snapshots before load,
+after load, after warmup contexts, and after unload.
 
 ## Throughput benchmark
 
@@ -135,6 +149,9 @@ it rather than pretending to execute on CPU. See
 - generated token count and stop reason
 - RSS before/after generation
 - effective native configuration
+- requested/effective GPU layers, GPU/CPU transformer-layer counts, output device
+- device free-memory snapshots before load, after load, after warmup, and after
+  unload
 
 Generation throughput and prompt throughput are separate. A single run is not
 presented as a reliable comparison.
@@ -174,8 +191,9 @@ claimed. Only within-session comparisons are treated as evidence.
 - `memory_hierarchy`: host, cgroup, storage, device total/free, KV, mapping,
   backend-buffer, and staging categories without double counting.
 
-A detected device is not a selectable device. GPU devices remain unselectable
-until a CUDA build and physical offload validation exist.
+A detected device is not automatically a selectable device. With the validated
+CUDA build, CUDA0 is selectable; with a CPU-only build it is not registered at
+all. `execution_readiness.gpu_execution` reflects current selectability.
 
 ## Profile optimization loop
 

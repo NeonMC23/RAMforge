@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **617 tests, 0 failed, 30 ignored**. The ignored
+  environment variables passes **617 tests, 0 failed, 33 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -91,7 +91,7 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 415 passed, 9 ignored. RAMforge tests: 617 passed, 30
+- forgeCORE tests: 415 passed, 10 ignored. RAMforge tests: 617 passed, 33
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
@@ -136,25 +136,26 @@
   283.81/267.65 and 269.05/252.02 for balanced 8/4; a final spot check measured
   219.91/229.50. Absolute rates vary by roughly 25% and the 4/8 ranking
   reverses, so no reliable winner between 4 and 8 threads is claimed.
-- GPU environment: RTX 3050 Laptop GPU is present (PCI `01:00.0`), but the
-  loaded kernel module is 595.112.07 while userspace is 620.70.06 (reboot
-  pending), and `nvcc`/CUDA headers are absent. No CUDA build or physical GPU
-  execution was possible.
-- Native audit: CPU backend only in the verified build; CUDA/Vulkan/SYCL/
-  OpenCL/Metal/RPC/dynamic backends are OFF. `registered_backends()` reports
-  only CPU. forgeCORE exposes GPU offload options, but no selectable GPU is
-  present and no GPU placement is claimed.
-- forgeCORE now exposes registered backend names/counts and native effective
-  layer/output placement readback. CPU loads report zero GPU layers; GPU
-  requests in RAMforge fail explicitly with no CPU fallback.
-- `RuntimePlan` schema 2 and service status expose `execution_mode`,
-  `gpu_layers`, and `effective_gpu_layers`. Non-CPU plans are rejected by the
-  service until a physical GPU path is validated.
+- GPU validation: RTX 3050 Laptop GPU (GA107M, SM 86, 4 GiB VRAM), driver/NVML
+  620.70.06, CUDA 13.2.51, host compiler `g++-15`. CUDA build
+  `native/build-cuda` with SM 86 cubins and `ggml_backend_cuda_reg`.
+- Runtime discovery: registered backends are CUDA (1 device) and CPU (1
+  device); CUDA0 reports 3,974,103,040 bytes total and about 3.87 GB free.
+- Physical inference: CPU, hybrid, and full-GPU generation verified; streaming,
+  cancellation, repeated sessions, unload, and VRAM release exercised.
+- Effective placement: requested 8 -> effective 8 (7 transformer + output);
+  requested 31 -> effective 31 (30 transformer + output). `n_gpu_layers`
+  includes the output layer.
+- Release throughput (same workload): CPU 240.70 tok/s, hybrid 289.13, full GPU
+  484.65; reverse-order session CPU 249.62, hybrid 309.53, GPU 488.89.
+- VRAM after warmup: full offload used about 178 MiB; hybrid about 113 MiB.
+  Unload returned near baseline with about 12.6 MiB retained.
+- GPU load/placement failure is explicit; no silent CPU fallback occurs.
 - Out-of-core re-verification: 13.13 GB GPT-NeoX-20B Q4_K_M under an 8 GiB
   cgroup with `--no-repack --no-prefetch` produced one token, exit 0, 10.877 s
   wall, 9661 `max` events, and 0 OOM kills. Page release/prefetch/staging is
   OS paging over existing mappings, not tensor streaming.
-- RAMforge tests: 617 passed, 30 ignored.
+- RAMforge tests: 617 passed, 33 ignored.
 
 ## Runtime memory accounting and calibration (2026-11-20)
 
@@ -190,7 +191,7 @@
   evidence is rejected.
 - `ramforge machine --calibration` emits per-plan compatibility decisions and
   accepts `--no-repack`, `--no-prefetch`, `--ubatch`, and `--sequences`.
-- RAMforge tests: 617 passed, 30 ignored.
+- RAMforge tests: 617 passed, 33 ignored.
 
 ## Machine profiles and candidate plans (2026-11-20)
 
@@ -233,7 +234,7 @@
 - Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
   `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
   semantic/removal changes require a version increment.
-- ForgeCORE tests: 415 passed, 9 ignored. RAMforge tests: 617 passed, 30
+- ForgeCORE tests: 415 passed, 10 ignored. RAMforge tests: 617 passed, 33
   ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)
