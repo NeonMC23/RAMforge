@@ -277,6 +277,10 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         gpu_layers: u32,
 
+        /// Explicit graph-integrated staged layer (repeatable)
+        #[arg(long = "staged-layer", value_name = "N")]
+        staged_layers: Vec<u32>,
+
         /// Disable CPU weight repacking
         #[arg(long)]
         no_repack: bool,
@@ -329,6 +333,10 @@ enum Commands {
         /// Requested GPU-offloaded layers (0 = CPU)
         #[arg(long, default_value_t = 0)]
         gpu_layers: u32,
+
+        /// Explicit graph-integrated staged layer (repeatable)
+        #[arg(long = "staged-layer", value_name = "N")]
+        staged_layers: Vec<u32>,
 
         /// Disable CPU weight repacking
         #[arg(long)]
@@ -782,6 +790,7 @@ fn main() {
             threads,
             device,
             gpu_layers,
+            staged_layers,
             no_repack,
             no_prefetch,
         } => {
@@ -793,6 +802,7 @@ fn main() {
                 threads,
                 device,
                 gpu_layers,
+                staged_layers,
                 no_repack,
                 no_prefetch,
             ) {
@@ -812,6 +822,7 @@ fn main() {
             threads,
             device,
             gpu_layers,
+            staged_layers,
             no_repack,
             no_prefetch,
             json,
@@ -828,6 +839,7 @@ fn main() {
                 threads,
                 device,
                 gpu_layers,
+                staged_layers,
                 no_repack,
                 no_prefetch,
                 json,
@@ -1240,6 +1252,7 @@ fn run_service_stdio(
     threads: u32,
     device: String,
     gpu_layers: u32,
+    staged_layers: Vec<u32>,
     no_repack: bool,
     no_prefetch: bool,
 ) -> anyhow::Result<()> {
@@ -1290,8 +1303,9 @@ fn run_service_stdio(
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;
-    let mut service =
-        ramforge_runtime::InferenceService::new(plan).map_err(|error| anyhow::anyhow!(error))?;
+    let mut service = ramforge_runtime::InferenceService::new(plan)
+        .map_err(|error| anyhow::anyhow!(error))?
+        .with_staged_layers(staged_layers);
     service.load().map_err(|error| anyhow::anyhow!(error))?;
     service
         .create_session()
@@ -1322,6 +1336,7 @@ fn run_throughput_benchmark(
     threads: u32,
     device: String,
     gpu_layers: u32,
+    staged_layers: Vec<u32>,
     no_repack: bool,
     no_prefetch: bool,
     json: bool,
@@ -1380,6 +1395,7 @@ fn run_throughput_benchmark(
             warmup_runs: warmup,
             prompt,
             max_tokens,
+            staged_layers: staged_layers.to_vec(),
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;

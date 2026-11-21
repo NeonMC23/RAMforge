@@ -13,10 +13,13 @@ use serde::{Deserialize, Serialize};
 use crate::forgecore::{
     ForgeCoreContextOptions, ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession,
 };
-use crate::gpu_observability::{collect_observability, GpuObservability};
+use crate::gpu_observability::{
+    collect_observability, GpuObservability, StagingCounters, StagingObservation, StagingState,
+};
 use crate::memory_report::process_rss;
 use crate::runtime_plan::RuntimePlan;
 use crate::sampling::Sampler;
+use crate::staging::{Engine, MemoryType, StagingError};
 use ramforge_core::{discover_model_set, Tokenizer};
 
 pub const INFERENCE_SERVICE_API_VERSION: u32 = 1;
@@ -85,6 +88,14 @@ impl ServiceCapabilities {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedLayerStatus {
+    pub layer: u32,
+    pub tensor_count: u32,
+    pub device_bytes: u64,
+    pub graph_substitutions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceStatus {
     pub api_version: u32,
     pub state: ServiceState,
@@ -103,6 +114,7 @@ pub struct ServiceStatus {
     pub gpu_transformer_layers: Option<u32>,
     pub cpu_transformer_layers: Option<u32>,
     pub output_device_type: Option<String>,
+    pub staged_layers: Vec<StagedLayerStatus>,
     pub model_instance_id: Option<u64>,
     pub context_id: Option<u64>,
     pub rss_bytes: Option<u64>,
@@ -206,6 +218,9 @@ pub struct InferenceService {
     session: Option<ForgeCoreSession>,
     tokenizer: Option<Tokenizer>,
     errors: Vec<String>,
+    staged_layers: Vec<u32>,
+    staging_engine: Option<Engine>,
+    staging_status: Vec<StagedLayerStatus>,
 }
 
 impl InferenceService {
@@ -218,6 +233,9 @@ impl InferenceService {
             session: None,
             tokenizer: None,
             errors: Vec::new(),
+            staged_layers: Vec::new(),
+            staging_engine: None,
+            staging_status: Vec::new(),
         })
     }
 
@@ -231,6 +249,20 @@ impl InferenceService {
 
     pub fn state(&self) -> ServiceState {
         self.state
+    }
+
+    /// Enable explicit graph-integrated staging for the listed layers.
+    /// This is separate from normal CPU/GPU plan modes and never falls back.
+    pub fn with_staged_layers(mut self, layers: Vec<u32>) -> Self {
+        let mut unique = layers;
+        unique.sort_unstable();
+        unique.dedup();
+        self.staged_layers = unique;
+        self
+    }
+
+    pub fn staged_layers(&self) -> &[u32] {
+        &self.staged_layers
     }
 
     pub fn status(&self) -> ServiceStatus {
@@ -289,6 +321,7 @@ impl InferenceService {
                 .model
                 .as_ref()
                 .map(|model| model.metadata().output_device_type.clone()),
+            staged_layers: self.current_staged_status(),
             model_instance_id: model_id,
             context_id,
             rss_bytes: process_rss(),
@@ -300,8 +333,44 @@ impl InferenceService {
     /// available without a session; model/context/compute buffers require one.
     pub fn memory_observability(&self) -> Result<GpuObservability, ServiceError> {
         let registry = crate::DeviceRegistry::discover();
-        collect_observability(&registry, self.session.as_ref(), self.model.as_ref())
-            .map_err(ServiceError::Execution)
+        let mut observability =
+            collect_observability(&registry, self.session.as_ref(), self.model.as_ref())
+                .map_err(ServiceError::Execution)?;
+        if let Some(engine) = self.staging_engine.as_ref() {
+            let stats = engine
+                .stats()
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            observability.staging = StagingObservation {
+                schema_version: 1,
+                state: if stats.in_flight_operations > 0 {
+                    StagingState::InFlight
+                } else {
+                    StagingState::Idle
+                },
+                reason: "staging engine attached; graph-integrated layer mode".to_string(),
+                counters: Some(StagingCounters {
+                    allocation_requests: stats.allocation_requests,
+                    allocation_successes: stats.allocation_successes,
+                    allocation_failures: stats.allocation_failures,
+                    released: stats.released,
+                    current_bytes: stats.current_bytes,
+                    high_water_bytes: stats.high_water_bytes,
+                    transfer_requests: stats.transfer_requests,
+                    transfer_completed: stats.transfer_completed,
+                    transfer_failed: stats.transfer_failed,
+                    transfer_bytes: stats.transfer_bytes,
+                    submit_ns: stats.submit_ns,
+                    wait_ns: stats.wait_ns,
+                    last_duration_ns: stats.last_duration_ns,
+                    total_duration_ns: stats.total_duration_ns,
+                    in_flight_operations: stats.in_flight_operations,
+                    cancellation_requests: stats.cancellation_requests,
+                }),
+                sampled_at_unix_ms: observability.sampled_at_unix_ms,
+                collection_sequence: observability.collection_sequence,
+            };
+        }
+        Ok(observability)
     }
 
     /// Load the model and build the tokenizer. The context is created separately.
@@ -339,6 +408,33 @@ impl InferenceService {
             context_length: Some(self.plan.effective.context_tokens),
             check_tensors: false,
         };
+        let mut staging_engine = None;
+        let mut extra_device_index = None;
+        if !self.staged_layers.is_empty() {
+            if self.plan.effective.execution_mode != crate::runtime_plan::ExecutionMode::Cpu {
+                return Err(ServiceError::UnsupportedExecution(
+                    "staged layers require a CPU plan; GPU/hybrid plans use normal placement"
+                        .to_string(),
+                ));
+            }
+            let gpu = registry
+                .devices()
+                .iter()
+                .find(|device| !device.is_cpu() && device.selectable)
+                .ok_or_else(|| {
+                    ServiceError::UnsupportedExecution(
+                        "staged layers require a selectable CUDA device".to_string(),
+                    )
+                })?;
+            let engine = Engine::new(0).map_err(|error| match error {
+                StagingError::Unsupported(reason) => ServiceError::UnsupportedExecution(format!(
+                    "CUDA staging unavailable: {reason}"
+                )),
+                other => ServiceError::Execution(other.to_string()),
+            })?;
+            extra_device_index = gpu.registry_index;
+            staging_engine = Some(engine);
+        }
         let mut options = ForgeCoreModelOptions {
             use_extra_bufts: self.plan.effective.weight_repacking,
             gpu_layers: self.plan.effective.gpu_layers,
@@ -347,6 +443,7 @@ impl InferenceService {
             } else {
                 None
             },
+            extra_device_index,
             ..ForgeCoreModelOptions::default()
         };
         if self.plan.effective.load_mode == "mmap-no-prefetch" {
@@ -381,6 +478,8 @@ impl InferenceService {
         }
         self.tokenizer = Some(tokenizer);
         self.model = Some(model);
+        self.staging_engine = staging_engine;
+        self.staging_status.clear();
         self.state = ServiceState::ModelLoaded;
         Ok(())
     }
@@ -418,7 +517,112 @@ impl InferenceService {
         }
         self.session = Some(session);
         self.state = ServiceState::Ready;
+        if let Err(error) = self.stage_configured_layers() {
+            self.session = None;
+            self.state = ServiceState::ModelLoaded;
+            return Err(error);
+        }
         Ok(())
+    }
+
+    fn stage_configured_layers(&mut self) -> Result<(), ServiceError> {
+        if self.staged_layers.is_empty() {
+            return Ok(());
+        }
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "model loaded".to_string(),
+                actual: self.state,
+            })?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "context ready".to_string(),
+                actual: self.state,
+            })?;
+        let engine = self.staging_engine.as_ref().ok_or_else(|| {
+            ServiceError::Execution("staging engine is not initialized".to_string())
+        })?;
+        let mut statuses = Vec::with_capacity(self.staged_layers.len());
+        for layer in &self.staged_layers {
+            session
+                .stage_layer_cuda(*layer)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            let count = session
+                .staged_tensor_count(*layer)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            let mut tensors = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                tensors.push(
+                    session
+                        .staged_tensor_info(*layer, index)
+                        .map_err(|error| ServiceError::Execution(error.to_string()))?,
+                );
+            }
+            let total: u64 = tensors.iter().map(|tensor| tensor.bytes).sum();
+            let mut host = engine
+                .allocate(MemoryType::PinnedHost, total)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            let mut offset = 0u64;
+            for tensor in &tensors {
+                let length = usize::try_from(tensor.bytes).map_err(|_| {
+                    ServiceError::Execution("staged tensor is too large".to_string())
+                })?;
+                let mut bytes = vec![0u8; length];
+                model
+                    .read_tensor_bytes(&tensor.name, 0, &mut bytes)
+                    .map_err(|error| ServiceError::Execution(error.to_string()))?;
+                host.write_host(offset, &bytes)
+                    .map_err(|error| ServiceError::Execution(error.to_string()))?;
+                engine
+                    .submit_to_device_ptr(&host, offset, tensor.device_ptr, tensor.bytes)
+                    .map_err(|error| ServiceError::Execution(error.to_string()))?;
+                engine
+                    .wait()
+                    .map_err(|error| ServiceError::Execution(error.to_string()))?;
+                offset += tensor.bytes;
+            }
+            host.release()
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            let info = session
+                .staged_layer_info(*layer)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            statuses.push(StagedLayerStatus {
+                layer: *layer,
+                tensor_count: info.tensor_count,
+                device_bytes: info.device_bytes,
+                graph_substitutions: info.graph_substitutions,
+            });
+        }
+        self.staging_status = statuses;
+        Ok(())
+    }
+
+    fn current_staged_status(&self) -> Vec<StagedLayerStatus> {
+        if self.staged_layers.is_empty() {
+            return Vec::new();
+        }
+        if let Some(session) = self.session.as_ref() {
+            return self
+                .staged_layers
+                .iter()
+                .filter_map(|layer| {
+                    session
+                        .staged_layer_info(*layer)
+                        .ok()
+                        .map(|info| StagedLayerStatus {
+                            layer: *layer,
+                            tensor_count: info.tensor_count,
+                            device_bytes: info.device_bytes,
+                            graph_substitutions: info.graph_substitutions,
+                        })
+                })
+                .collect();
+        }
+        self.staging_status.clone()
     }
 
     /// Generate tokens, streaming decoded text into `sink`.
@@ -588,6 +792,7 @@ impl InferenceService {
         self.session = None;
         self.model = None;
         self.tokenizer = None;
+        self.staging_status.clear();
         self.state = ServiceState::Terminated;
     }
 }

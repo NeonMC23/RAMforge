@@ -76,6 +76,10 @@ pub struct ForgeCoreModelOptions {
     pub gpu_layers: u32,
     /// Native registry index of the GPU device; required when `gpu_layers > 0`.
     pub gpu_device_index: Option<usize>,
+    /// Additional device index exposed to the context without offloading any
+    /// model layers. Used by graph-integrated staging so the context owns a
+    /// CUDA backend for substituted layer tensors.
+    pub extra_device_index: Option<usize>,
     /// How the model file is mapped. The adapter defaults to an explicit
     /// file-backed mapping so weight residency stays reclaimable by the OS.
     pub load_mode: ModelLoadMode,
@@ -91,6 +95,7 @@ impl Default for ForgeCoreModelOptions {
             check_tensors: false,
             gpu_layers: 0,
             gpu_device_index: None,
+            extra_device_index: None,
             load_mode: ModelLoadMode::Mmap,
             use_extra_bufts: true,
         }
@@ -260,17 +265,38 @@ impl ForgeCoreModel {
             // which can allocate CUDA compute buffers even with zero offloaded
             // layers. Pin the CPU device explicitly so a CPU plan is truly
             // CPU-only.
-            let native_cpu = forge_core::enumerate_devices()
-                .into_iter()
+            let native_devices = forge_core::enumerate_devices();
+            let native_cpu = native_devices
+                .iter()
                 .find(|candidate| candidate.device_type == forge_core::DeviceType::Cpu)
+                .cloned()
                 .ok_or_else(|| {
                     ForgeCoreAdapterError::DeviceSelection(
                         "CPU device disappeared from the native registry".to_string(),
                     )
                 })?;
-            model_options.split_mode = SplitMode::None;
+            let mut devices = vec![native_cpu];
+            if let Some(extra) = options.extra_device_index {
+                let extra_device = native_devices
+                    .iter()
+                    .find(|candidate| candidate.index == extra)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ForgeCoreAdapterError::DeviceSelection(format!(
+                            "extra staging device index {extra} is unavailable"
+                        ))
+                    })?;
+                if extra_device.device_type != forge_core::DeviceType::Cpu {
+                    devices.push(extra_device);
+                }
+            }
+            if devices.len() > 1 {
+                model_options.split_mode = SplitMode::Layer;
+            } else {
+                model_options.split_mode = SplitMode::None;
+            }
             model_options.main_gpu = 0;
-            model_options.devices = Some(vec![native_cpu]);
+            model_options.devices = Some(devices);
         } else {
             if device.is_cpu() {
                 return Err(ForgeCoreAdapterError::Configuration(
@@ -612,6 +638,38 @@ impl ForgeCoreSession {
 
     pub fn context_length(&self) -> u32 {
         self.context.n_ctx()
+    }
+
+    /// Allocate independent CUDA storage for one layer (before first graph).
+    pub fn stage_layer_cuda(&self, layer: u32) -> Result<(), ForgeCoreAdapterError> {
+        self.context
+            .stage_layer_cuda(layer)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn staged_layer_info(
+        &self,
+        layer: u32,
+    ) -> Result<forge_core::StagedLayerInfo, ForgeCoreAdapterError> {
+        self.context
+            .staged_layer_info(layer)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn staged_tensor_count(&self, layer: u32) -> Result<u32, ForgeCoreAdapterError> {
+        self.context
+            .staged_tensor_count(layer)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn staged_tensor_info(
+        &self,
+        layer: u32,
+        index: u32,
+    ) -> Result<forge_core::StagedTensorInfo, ForgeCoreAdapterError> {
+        self.context
+            .staged_tensor_info(layer, index)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
     }
 
     /// Native model/context/compute byte breakdown grouped by buffer type.

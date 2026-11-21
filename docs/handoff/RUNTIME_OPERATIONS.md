@@ -121,7 +121,8 @@ between token decodes. The transport is local-process only. It does not expose
 authentication or network access.
 
 `status` includes `execution_mode`, `device_id`, requested and effective GPU
-layers, GPU/CPU transformer-layer counts, and output-device type. All effective
+layers, GPU/CPU transformer-layer counts, output-device type, and
+`staged_layers` (tensor count, device bytes, graph substitutions). All effective
 values come from native placement readback after load. `capabilities` includes
 `execution_modes` and `gpu_execution`; with the CUDA build these report
 `["cpu","gpu","hybrid"]` and `true`. Without CUDA they report `["cpu"]` and
@@ -153,6 +154,31 @@ after load, after warmup, after generation, and after unload, plus native buffer
 breakdowns. Allocation event counters, transfer bytes/duration, synchronization
 duration, and peak VRAM are explicitly unsupported.
 
+### Controlled staged layers
+
+`benchmark` and `serve` accept one or more explicit:
+
+```text
+--staged-layer N
+```
+
+This is a separate execution mode, not a profile and not normal GPU offload:
+
+- the model loads CPU-resident with both CPU and CUDA devices exposed;
+- layer `N` is allocated in an independent CUDA buffer by the native context;
+- forge-staging transfers exact tensor bytes into that allocation;
+- after graph construction, node weight sources are replaced by the staged
+  tensors before scheduler allocation;
+- `status.staged_layers` reports tensor count, device bytes, and a monotonic
+  graph-substitution count. Zero substitutions would mean the graph did not use
+  the staged weights.
+- `inference_consumed_staged_data` is not asserted; substitution counts and
+  logits/outputs are the evidence.
+
+Staged layers are static for the context lifetime. There is no eviction,
+per-token replacement, or transfer/compute overlap. A failure is explicit; the
+service does not fall back to CPU or normal GPU placement.
+
 ## Throughput benchmark
 
 `ramforge benchmark MODEL --profile balanced --runs 3 --warmup 1` measures:
@@ -171,6 +197,8 @@ duration, and peak VRAM are explicitly unsupported.
   generation, and after unload
 - native buffer model/KV/compute breakdowns and versioned GPU observability
   snapshots
+- staged-layer substitution counts when `--staged-layer` is used (benchmark
+  schema 7)
 
 Generation throughput and prompt throughput are separate. A single run is not
 presented as a reliable comparison.

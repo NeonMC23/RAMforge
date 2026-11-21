@@ -154,6 +154,7 @@ pub fn run_profile_optimization(
                     warmup_runs: config.warmup_runs,
                     prompt: config.prompt.clone(),
                     max_tokens: config.max_tokens,
+                    staged_layers: Vec::new(),
                 },
             ) {
                 Ok(benchmark) => measurements.push(ProfileMeasurement {

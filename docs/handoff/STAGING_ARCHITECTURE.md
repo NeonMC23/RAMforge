@@ -1,6 +1,7 @@
 # Controlled GPU staging architecture (investigation)
 
-Status: **architecture and feasibility; no staging engine implemented.**
+Status: **single-layer graph-integrated staged inference validated; no
+multi-layer residency or eviction engine.**
 
 This document traces the pinned llama.cpp/ggml execution path, identifies safe
 native extension points, measures the relevant transfer/storage limits, and
@@ -326,12 +327,93 @@ cargo build --release -p ramforge-cli
 
 The CLI probe intentionally reports `inference_consumed_staged_data=false`.
 
+## Graph-integrated staged inference (implemented)
+
+Selected architecture: **hybrid layer residency with native graph rewrite**.
+
+1. The model is loaded with CPU weights (`gpu_layers=0`) but with both CPU and
+   CUDA devices exposed to the context. No model layer is offloaded by the
+   normal loader.
+2. `llama_context_stage_layer_cuda(layer)` allocates all `blk.N` tensors in an
+   independent CUDA buffer through the context's own CUDA backend. Tensor
+   objects are cloned with the same names, types, shapes, and quantization;
+   no live tensor/buffer pointer is rebound.
+3. Each staged tensor's device pointer and byte size are exposed through a
+   read-only C descriptor.
+4. forge-staging uses the CUDA primary context and writes source bytes directly
+   into those device pointers through its private non-blocking stream/event
+   path. No intermediate llama copy is used.
+5. After a new graph is built and before scheduler allocation,
+   `llama_context::apply_staged_layers` replaces graph node weight sources by
+   exact tensor name. The scheduler then sees CUDA-backed weight tensors.
+6. Substitution counts are reported by layer. This proves the graph referenced
+   the staged allocations, not just that bytes were copied.
+7. Staged buffers are owned by the context and released when the context is
+   destroyed. There is no per-token eviction or buffer reuse yet.
+
+This preserves llama.cpp/ggml graph construction, scheduling, quantized ops,
+and kernels. It does not implement a parallel inference engine.
+
+### SmolLM2-135M staged inference evidence
+
+- Layer 0: 9 tensors, 2,596,608 bytes.
+- Graph substitutions: 9 per graph (18 over warmup + measured graph).
+- Reference/staged argmax: equal (198).
+- Logit cosine similarity: 0.9933.
+- Max logit difference: 8.996 (CUDA vs CPU quantized-kernel accumulation;
+  ranges differed, but argmax was stable).
+- Generated service text matched the CPU baseline:
+  ` Paris. Paris is a city that is`.
+- Corrupting `blk.0.attn_q.weight` in the staged copy changed logits by 2.79,
+  demonstrating that the staged bytes were consumed rather than ignored.
+- Staged allocation was 2,598,964 bytes of CUDA storage.
+
+### Qwen2.5-7B staged inference
+
+- Layer 0: 12 tensors, 149,112,832 bytes.
+- Graph substitutions: 24 over the measured graph.
+- 4 generated tokens, 5.84 tok/s, TTFT 326.4 ms.
+- Model load 2.18 s; remaining 27 layers stayed CPU-resident.
+- This demonstrates one staged layer on a larger model, not 7B staging
+  scalability.
+
+### Performance comparison
+
+Release, same 32-token workload:
+
+| Mode | Median tok/s | P25–P75 | P95 |
+|---|---:|---:|---:|
+| CPU | 265.72 | 262.01–273.77 | 277.77 |
+| Staged layer 0 | 269.04 | 268.67–270.20 | 273.22 |
+| Full GPU (31 layers) | 492.19 | 462.39–496.30 | 500.83 |
+
+Staging one layer on this small model is not a throughput improvement; it is
+within CPU noise. The value is architectural: a bounded, explicitly managed
+CUDA layer allocation was consumed by the real graph.
+
+### Current limits
+
+- Staged layers are static for the context lifetime; no eviction or per-token
+  replacement.
+- No double buffering or transfer/compute overlap.
+- CPU KV and CPU residual tensors cause scheduler copies around staged layers.
+- Aggressive multi-layer staging must be benchmarked; current evidence is
+  single-layer only.
+- Staged tensors are allocated through the context CUDA backend, not the
+  staging engine; the engine transfers into their exposed device pointers.
+- No durable staging-state machine beyond context lifetime; cancellation and
+  unload destroy staged buffers safely with the context.
+
 ## Decision
 
-**TRANSFER PRIMITIVES VALIDATED — GRAPH INTEGRATION STILL REQUIRED.**
+**SINGLE-LAYER STAGED INFERENCE VALIDATED — PERFORMANCE OR SCALABILITY WORK
+REMAINS.**
 
-The staging-buffer lifecycle, asynchronous transfer engine, event completion,
-failure handling, and single-layer transfer/integrity prototype are physically
-validated. The graph still has no safe layer-boundary consume/rebind contract,
-so inference does not consume staged weights. Do not claim controlled inference
-staging or transfer/compute overlap yet.
+The graph consumed staged CUDA weights with positive substitution counts,
+matching argmax, high logit correlation, coherent generated text, and a
+corruption control that changed logits. The transfer engine, ownership,
+counters, and failure behavior are physically validated.
+
+Multi-layer residency, eviction/reuse, overlap, and larger-model scalability
+are not yet validated. Do not claim full controlled staging or transfer/compute
+overlap.

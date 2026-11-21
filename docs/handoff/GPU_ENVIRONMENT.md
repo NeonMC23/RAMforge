@@ -200,6 +200,23 @@ released all buffers. It did **not** feed inference; no graph integration exists
 `ramforge staging-probe MODEL --layer 0 --json` reproduces the transfer-only
 prototype.
 
+## Graph-integrated staged inference
+
+The real graph consumed independent staged CUDA layer tensors:
+
+- SmolLM2 layer 0: 9 tensors, 2,596,608 bytes, 9 substitutions per graph,
+  equal argmax, logit cosine 0.9933, generated text matching the CPU baseline.
+  Corrupting one staged weight changed logits, proving consumption.
+- Qwen2.5-7B layer 0: 12 tensors, 149,112,832 bytes, 24 graph substitutions,
+  5.84 tok/s with the other 27 layers CPU-resident.
+- Release comparison for SmolLM2 (32 tokens): CPU 265.72 tok/s, staged layer 0
+  269.04, full GPU 492.19. Single-layer staging is architectural evidence, not a
+  throughput win.
+
+Staged layers are static for the context lifetime; no eviction, reuse, or
+overlap is implemented. See
+[STAGING_ARCHITECTURE.md](STAGING_ARCHITECTURE.md).
+
 ## Reproduction
 
 ```sh
