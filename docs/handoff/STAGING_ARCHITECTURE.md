@@ -558,7 +558,9 @@ Qwen2.5-7B Q4_K_M, one live context:
 
 - initial layers 0–6: 989,857,792 B;
 - replaced with layers 7–13: 953,903,104 B;
-- 7 evictions, 7 allocations, replacement about 2.0 s;
+- 7 evictions, 7 allocations;
+- invalidation 0.03 ms, eviction 7.84 ms, staging 1,901.56 ms, total
+  1,909.43 ms;
 - replaced back to layers 0–6 in about 2.0 s;
 - coherent output throughout.
 

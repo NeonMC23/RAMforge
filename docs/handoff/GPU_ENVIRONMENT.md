@@ -242,8 +242,10 @@ overlap remain unsupported. See
   ended at 5 invalidations, 5 releases, 7 allocations, 0 reuse.
 - Corrupting `blk.1.attn_q.weight` after replacement changed logits by 10.25
   with 9 substitutions.
-- Qwen2.5-7B replaced layers 0–6 (989,857,792 B) with 7–13 (953,903,104 B) and
-  back in one context, about 2.0 s per replacement, coherent output throughout.
+- Qwen2.5-7B replaced layers 0–6 (989,857,792 B) with 7–13 (953,903,104 B) in
+  one context: invalidation 0.03 ms, eviction 7.84 ms, staging 1,901.56 ms,
+  total 1,909.43 ms. Replacing back to 0–6 took about 2.0 s. Output remained
+  coherent throughout.
 - Allocation capacity reuse and transfer/compute overlap remain unsupported.
 
 The controlled throughput numbers above were collected on a host under heavy
