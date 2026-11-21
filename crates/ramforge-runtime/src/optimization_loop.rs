@@ -155,6 +155,9 @@ pub fn run_profile_optimization(
                     prompt: config.prompt.clone(),
                     max_tokens: config.max_tokens,
                     staged_layers: Vec::new(),
+                    staged_budget_bytes: None,
+                    staged_auto: false,
+                    staged_margin_bytes: crate::staging_plan::DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
                 },
             ) {
                 Ok(benchmark) => measurements.push(ProfileMeasurement {

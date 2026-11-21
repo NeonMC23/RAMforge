@@ -1600,7 +1600,7 @@ fn benchmark_reports_measured_generation_throughput() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 7);
+    assert_eq!(report["schema_version"], 8);
     assert_eq!(report["plan"]["effective"]["backend"], "cpu");
     assert_eq!(report["effective_gpu_layers"], 0);
     assert_eq!(report["device_id"], "cpu");
@@ -1836,10 +1836,16 @@ fn staged_layer_inference_consumes_graph_substitutions() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 7);
+    assert_eq!(report["schema_version"], 8);
     let staged = report["staged_layers"].as_array().expect("staged");
     assert_eq!(staged.len(), 1);
     assert_eq!(staged[0]["layer"], 0);
+    assert_eq!(report["staging_plan"]["state"], "exact");
+    assert_eq!(report["staging_plan"]["eviction_supported"], false);
+    assert_eq!(
+        report["staging_plan"]["transfer_compute_overlap_supported"],
+        false
+    );
     assert!(staged[0]["tensor_count"].as_u64().unwrap() > 0);
     assert!(
         staged[0]["graph_substitutions"].as_u64().unwrap() >= 9,
@@ -1853,6 +1859,138 @@ fn staged_layer_inference_consumes_graph_substitutions() {
     );
     let counters = &report["memory_after_generation"]["staging"]["counters"];
     assert!(counters["transfer_bytes"].as_u64().unwrap() > 0);
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and a CUDA native build"]
+fn multi_layer_staging_respects_budget_and_auto_selection() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let machine = ramforge()
+        .args(["machine", "--model", &model, "--json"])
+        .output()
+        .unwrap();
+    assert!(machine.status.success());
+    let profile: serde_json::Value = serde_json::from_slice(&machine.stdout).expect("json");
+    if profile["execution_readiness"]["gpu_execution"] != true {
+        println!("SKIP: no selectable CUDA device");
+        return;
+    }
+    let output = ramforge()
+        .args([
+            "benchmark",
+            &model,
+            "--profile",
+            "balanced",
+            "--ram",
+            "1G",
+            "--runs",
+            "1",
+            "--warmup",
+            "1",
+            "--max-tokens",
+            "4",
+            "--context",
+            "128",
+            "--threads",
+            "2",
+            "--no-repack",
+            "--staged-layer",
+            "0",
+            "--staged-layer",
+            "1",
+            "--staged-budget",
+            "20M",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "multi-layer staging failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
+    let staged = report["staged_layers"].as_array().unwrap();
+    assert_eq!(staged.len(), 2);
+    for layer in staged {
+        assert!(layer["graph_substitutions"].as_u64().unwrap() >= 9);
+    }
+    assert_eq!(report["staging_plan"]["state"], "exact");
+    assert_eq!(
+        report["staging_plan"]["accepted_layers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let rejected = ramforge()
+        .args([
+            "benchmark",
+            &model,
+            "--runs",
+            "1",
+            "--warmup",
+            "0",
+            "--max-tokens",
+            "2",
+            "--context",
+            "128",
+            "--threads",
+            "2",
+            "--no-repack",
+            "--staged-layer",
+            "0",
+            "--staged-layer",
+            "1",
+            "--staged-budget",
+            "1M",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("staged layer plan rejected") && stderr.contains("rejected"),
+        "budget rejection must be explicit: {stderr}"
+    );
+
+    let auto = ramforge()
+        .args([
+            "benchmark",
+            &model,
+            "--runs",
+            "1",
+            "--warmup",
+            "0",
+            "--max-tokens",
+            "2",
+            "--context",
+            "128",
+            "--threads",
+            "2",
+            "--no-repack",
+            "--staged-auto",
+            "--staged-budget",
+            "10M",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(auto.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&auto.stdout).expect("json");
+    assert!(report["staging_plan"]["auto_selected"].as_bool().unwrap());
+    assert!(
+        report["staging_plan"]["accepted_layers"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 2
+    );
+    assert!(matches!(
+        report["staging_plan"]["state"].as_str(),
+        Some("partial" | "exact")
+    ));
 }
 
 #[test]
@@ -1902,7 +2040,7 @@ fn cuda_benchmark_reports_native_placement_and_memory() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 7);
+    assert_eq!(report["schema_version"], 8);
     assert_ne!(report["device_id"], "cpu");
     assert_eq!(report["requested_gpu_layers"], 8);
     let effective = report["effective_gpu_layers"].as_u64().expect("readback");

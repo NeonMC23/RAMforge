@@ -647,6 +647,12 @@ impl ForgeCoreSession {
             .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
     }
 
+    pub fn staged_layer_bytes(&self, layer: u32) -> Result<u64, ForgeCoreAdapterError> {
+        self.context
+            .staged_layer_bytes(layer)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
     pub fn staged_layer_info(
         &self,
         layer: u32,

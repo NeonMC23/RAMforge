@@ -281,6 +281,18 @@ enum Commands {
         #[arg(long = "staged-layer", value_name = "N")]
         staged_layers: Vec<u32>,
 
+        /// Hard staged-VRAM budget (e.g. 1G); required for --staged-auto
+        #[arg(long)]
+        staged_budget: Option<String>,
+
+        /// Automatically select layers within the staged budget
+        #[arg(long)]
+        staged_auto: bool,
+
+        /// Safety margin subtracted from observed free VRAM (default 256M)
+        #[arg(long)]
+        staged_margin: Option<String>,
+
         /// Disable CPU weight repacking
         #[arg(long)]
         no_repack: bool,
@@ -337,6 +349,18 @@ enum Commands {
         /// Explicit graph-integrated staged layer (repeatable)
         #[arg(long = "staged-layer", value_name = "N")]
         staged_layers: Vec<u32>,
+
+        /// Hard staged-VRAM budget (e.g. 1G); required for --staged-auto
+        #[arg(long)]
+        staged_budget: Option<String>,
+
+        /// Automatically select layers within the staged budget
+        #[arg(long)]
+        staged_auto: bool,
+
+        /// Safety margin subtracted from observed free VRAM (default 256M)
+        #[arg(long)]
+        staged_margin: Option<String>,
 
         /// Disable CPU weight repacking
         #[arg(long)]
@@ -791,6 +815,9 @@ fn main() {
             device,
             gpu_layers,
             staged_layers,
+            staged_budget,
+            staged_auto,
+            staged_margin,
             no_repack,
             no_prefetch,
         } => {
@@ -803,6 +830,9 @@ fn main() {
                 device,
                 gpu_layers,
                 staged_layers,
+                staged_budget,
+                staged_auto,
+                staged_margin,
                 no_repack,
                 no_prefetch,
             ) {
@@ -823,6 +853,9 @@ fn main() {
             device,
             gpu_layers,
             staged_layers,
+            staged_budget,
+            staged_auto,
+            staged_margin,
             no_repack,
             no_prefetch,
             json,
@@ -840,6 +873,9 @@ fn main() {
                 device,
                 gpu_layers,
                 staged_layers,
+                staged_budget,
+                staged_auto,
+                staged_margin,
                 no_repack,
                 no_prefetch,
                 json,
@@ -1253,6 +1289,9 @@ fn run_service_stdio(
     device: String,
     gpu_layers: u32,
     staged_layers: Vec<u32>,
+    staged_budget: Option<String>,
+    staged_auto: bool,
+    staged_margin: Option<String>,
     no_repack: bool,
     no_prefetch: bool,
 ) -> anyhow::Result<()> {
@@ -1303,9 +1342,25 @@ fn run_service_stdio(
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;
+    let staged_budget_bytes = staged_budget
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --staged-budget: {error}"))?;
+    let staged_margin_bytes = staged_margin
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --staged-margin: {error}"))?
+        .unwrap_or(ramforge_runtime::DEFAULT_STAGING_SAFETY_MARGIN_BYTES);
     let mut service = ramforge_runtime::InferenceService::new(plan)
         .map_err(|error| anyhow::anyhow!(error))?
-        .with_staged_layers(staged_layers);
+        .with_staging_request(ramforge_runtime::StagingRequest {
+            layers: staged_layers,
+            budget_bytes: staged_budget_bytes,
+            auto: staged_auto,
+            safety_margin_bytes: staged_margin_bytes,
+        });
     service.load().map_err(|error| anyhow::anyhow!(error))?;
     service
         .create_session()
@@ -1337,6 +1392,9 @@ fn run_throughput_benchmark(
     device: String,
     gpu_layers: u32,
     staged_layers: Vec<u32>,
+    staged_budget: Option<String>,
+    staged_auto: bool,
+    staged_margin: Option<String>,
     no_repack: bool,
     no_prefetch: bool,
     json: bool,
@@ -1388,6 +1446,17 @@ fn run_throughput_benchmark(
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;
+    let staged_budget_bytes = staged_budget
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --staged-budget: {error}"))?;
+    let staged_margin_bytes = staged_margin
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --staged-margin: {error}"))?
+        .unwrap_or(ramforge_runtime::DEFAULT_STAGING_SAFETY_MARGIN_BYTES);
     let report = run_benchmark(
         plan,
         BenchmarkConfig {
@@ -1396,6 +1465,9 @@ fn run_throughput_benchmark(
             prompt,
             max_tokens,
             staged_layers: staged_layers.to_vec(),
+            staged_budget_bytes,
+            staged_auto,
+            staged_margin_bytes,
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;

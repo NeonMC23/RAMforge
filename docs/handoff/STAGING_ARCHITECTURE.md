@@ -1,7 +1,7 @@
 # Controlled GPU staging architecture (investigation)
 
-Status: **single-layer graph-integrated staged inference validated; no
-multi-layer residency or eviction engine.**
+Status: **multi-layer static GPU residency validated; dynamic eviction and
+transfer/compute overlap remain unsupported.**
 
 This document traces the pinned llama.cpp/ggml execution path, identifies safe
 native extension points, measures the relevant transfer/storage limits, and
@@ -404,16 +404,88 @@ CUDA layer allocation was consumed by the real graph.
 - No durable staging-state machine beyond context lifetime; cancellation and
   unload destroy staged buffers safely with the context.
 
+## Multi-layer budgeted residency (implemented)
+
+Rust planning + native allocation/substitution now support multiple layers.
+
+- Explicit `--staged-layer N` requests are sorted/deduplicated and treated as an
+  all-or-nothing set.
+- `--staged-auto` selects layers in ascending order within the effective budget.
+- `--staged-budget` is a hard limit on RAMforge-owned staged CUDA allocations.
+- `--staged-margin` (default 256 MiB) is subtracted from observed free VRAM.
+- Effective budget = minimum of configured budget and observed-free-minus-margin
+  when both are known.
+- Exact per-layer bytes are obtained from native CUDA buffer allocation-size
+  accounting before any allocation.
+- Explicit requests that do not fit are rejected as a set with a serialized
+  plan; no partial staging and no fallback.
+- Auto requests may be partial; accepted/rejected layers and bytes are reported.
+
+Plan states:
+
+- requested layers;
+- configured/effective budget;
+- observed free VRAM;
+- planned bytes;
+- accepted and rejected layers;
+- exact/estimated/partial/rejected/unknown state;
+- `eviction_supported=false`;
+- `allocation_reuse_supported=false`;
+- `transfer_compute_overlap_supported=false`.
+
+### Physical multi-layer evidence
+
+SmolLM2-135M, layers 0 and 1:
+
+- 2 layers, 9 tensors each, 2,598,964 bytes each;
+- planned/allocated 5,197,928 bytes;
+- 18 graph substitutions per layer over warmup + measured graph;
+- generated text identical to CPU:
+  ` Paris. Paris is a city that is`.
+
+Auto selection with a 10M budget accepted layers 0–3 (10,126,160 bytes) and
+rejected the rest as `partial`. A 1M explicit request was rejected as a set
+before staging.
+
+Qwen2.5-7B Q4_K_M, auto budget 1G:
+
+- accepted layers 0–6, 7 layers, 989,857,792 bytes;
+- per-layer CUDA bytes 131–149 MB;
+- 24 graph substitutions per layer;
+- 21 layers rejected by budget (`partial` plan);
+- 4.40 tok/s, TTFT 329.2 ms, load 2.73 s;
+- generated ` Paris. Which of` for a 4-token request.
+
+### Eviction and reuse blocker
+
+Staged tensors are referenced by graph nodes and the reused graph result until
+the context is destroyed or the graph is rebuilt. There is no proven native
+operation that invalidates all scheduler/graph references while retaining the
+context. Therefore staged allocations are context-lifetime static:
+
+- no eviction API;
+- no allocation reuse;
+- no release-after-execution.
+
+This is explicit in every plan (`eviction_supported=false`).
+
+### Transfer/compute overlap blocker
+
+The staging path prepares all selected layers before graph execution. The graph
+is then executed as a whole by the scheduler. There is no native per-layer
+execution boundary or double-buffered consume point, and the public CUDA copies
+are synchronous. Asynchronous submission alone is not overlap.
+
+Overlap therefore remains unsupported and unmeasured.
+
 ## Decision
 
-**SINGLE-LAYER STAGED INFERENCE VALIDATED — PERFORMANCE OR SCALABILITY WORK
-REMAINS.**
+**MULTI-LAYER GPU RESIDENCY VALIDATED — DYNAMIC EVICTION STILL UNSUPPORTED.**
 
-The graph consumed staged CUDA weights with positive substitution counts,
-matching argmax, high logit correlation, coherent generated text, and a
-corruption control that changed logits. The transfer engine, ownership,
-counters, and failure behavior are physically validated.
+Multiple independently allocated CUDA layers were consumed by the real graph
+with positive substitutions per layer, matching text, exact budget accounting,
+explicit all-or-nothing rejection, and auto-selection with partial plans.
 
-Multi-layer residency, eviction/reuse, overlap, and larger-model scalability
-are not yet validated. Do not claim full controlled staging or transfer/compute
-overlap.
+Eviction/reuse and transfer/compute overlap are not implemented. Staged
+allocations are static for the context lifetime. Do not describe this as dynamic
+streaming or overlap.

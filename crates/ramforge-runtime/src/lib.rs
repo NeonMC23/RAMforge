@@ -68,6 +68,7 @@ pub mod runtime_plan;
 pub mod sampling;
 pub mod service_server;
 pub mod simd;
+pub mod staging_plan;
 pub mod streaming_model;
 pub mod support;
 
@@ -167,6 +168,10 @@ pub use inference_service::{
     ServiceError, ServiceState, ServiceStatus, INFERENCE_SERVICE_API_VERSION,
 };
 pub use service_server::{serve_stdio, ServiceServerError};
+pub use staging_plan::{
+    StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest,
+    DEFAULT_STAGING_SAFETY_MARGIN_BYTES, STAGING_PLAN_SCHEMA_VERSION,
+};
 pub use runtime_plan::{
     CustomRuntimeRequest, EffectiveRuntimeConfig, ExecutionMode, FieldStatus, PlanField,
     RuntimePlan, RuntimeProfileKind, RUNTIME_PLAN_SCHEMA_VERSION,

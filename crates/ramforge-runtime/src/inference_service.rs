@@ -20,6 +20,7 @@ use crate::memory_report::process_rss;
 use crate::runtime_plan::RuntimePlan;
 use crate::sampling::Sampler;
 use crate::staging::{Engine, MemoryType, StagingError};
+use crate::staging_plan::{StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest};
 use ramforge_core::{discover_model_set, Tokenizer};
 
 pub const INFERENCE_SERVICE_API_VERSION: u32 = 1;
@@ -115,6 +116,7 @@ pub struct ServiceStatus {
     pub cpu_transformer_layers: Option<u32>,
     pub output_device_type: Option<String>,
     pub staged_layers: Vec<StagedLayerStatus>,
+    pub staging_plan: Option<StagingPlan>,
     pub model_instance_id: Option<u64>,
     pub context_id: Option<u64>,
     pub rss_bytes: Option<u64>,
@@ -219,6 +221,8 @@ pub struct InferenceService {
     tokenizer: Option<Tokenizer>,
     errors: Vec<String>,
     staged_layers: Vec<u32>,
+    staging_request: StagingRequest,
+    staging_plan: Option<StagingPlan>,
     staging_engine: Option<Engine>,
     staging_status: Vec<StagedLayerStatus>,
 }
@@ -234,6 +238,8 @@ impl InferenceService {
             tokenizer: None,
             errors: Vec::new(),
             staged_layers: Vec::new(),
+            staging_request: StagingRequest::default(),
+            staging_plan: None,
             staging_engine: None,
             staging_status: Vec::new(),
         })
@@ -253,11 +259,18 @@ impl InferenceService {
 
     /// Enable explicit graph-integrated staging for the listed layers.
     /// This is separate from normal CPU/GPU plan modes and never falls back.
-    pub fn with_staged_layers(mut self, layers: Vec<u32>) -> Self {
-        let mut unique = layers;
-        unique.sort_unstable();
-        unique.dedup();
-        self.staged_layers = unique;
+    pub fn with_staged_layers(self, layers: Vec<u32>) -> Self {
+        self.with_staging_request(StagingRequest {
+            layers,
+            ..StagingRequest::default()
+        })
+    }
+
+    pub fn with_staging_request(mut self, mut request: StagingRequest) -> Self {
+        request.layers.sort_unstable();
+        request.layers.dedup();
+        self.staged_layers = request.layers.clone();
+        self.staging_request = request;
         self
     }
 
@@ -322,6 +335,7 @@ impl InferenceService {
                 .as_ref()
                 .map(|model| model.metadata().output_device_type.clone()),
             staged_layers: self.current_staged_status(),
+            staging_plan: self.staging_plan.clone(),
             model_instance_id: model_id,
             context_id,
             rss_bytes: process_rss(),
@@ -410,7 +424,7 @@ impl InferenceService {
         };
         let mut staging_engine = None;
         let mut extra_device_index = None;
-        if !self.staged_layers.is_empty() {
+        if !self.staging_request.layers.is_empty() || self.staging_request.auto {
             if self.plan.effective.execution_mode != crate::runtime_plan::ExecutionMode::Cpu {
                 return Err(ServiceError::UnsupportedExecution(
                     "staged layers require a CPU plan; GPU/hybrid plans use normal placement"
@@ -526,21 +540,35 @@ impl InferenceService {
     }
 
     fn stage_configured_layers(&mut self) -> Result<(), ServiceError> {
-        if self.staged_layers.is_empty() {
+        if self.staging_request.layers.is_empty() && !self.staging_request.auto {
             return Ok(());
         }
-        let model = self
-            .model
-            .as_ref()
-            .ok_or_else(|| ServiceError::InvalidState {
-                expected: "model loaded".to_string(),
-                actual: self.state,
-            })?;
+        let registry = crate::DeviceRegistry::discover();
         let session = self
             .session
             .as_ref()
             .ok_or_else(|| ServiceError::InvalidState {
                 expected: "context ready".to_string(),
+                actual: self.state,
+            })?;
+        let plan = self.build_staging_plan(session, &registry)?;
+        self.staging_plan = Some(plan.clone());
+        if plan.state == StagingPlanState::Rejected
+            || plan.state == StagingPlanState::Unknown
+            || plan.accepted_layers.is_empty()
+        {
+            return Err(ServiceError::Configuration(format!(
+                "staged layer plan rejected: {}",
+                serde_json::to_string(&plan)
+                    .unwrap_or_else(|_| "plan serialization failed".to_string())
+            )));
+        }
+        self.staged_layers = plan.accepted_layers.clone();
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "model loaded".to_string(),
                 actual: self.state,
             })?;
         let engine = self.staging_engine.as_ref().ok_or_else(|| {
@@ -599,6 +627,141 @@ impl InferenceService {
         }
         self.staging_status = statuses;
         Ok(())
+    }
+
+    fn build_staging_plan(
+        &self,
+        session: &crate::ForgeCoreSession,
+        registry: &crate::DeviceRegistry,
+    ) -> Result<StagingPlan, ServiceError> {
+        let layer_count = session.model().metadata().layer_count;
+        let observed_free = registry
+            .devices()
+            .iter()
+            .find(|device| !device.is_cpu() && device.selectable)
+            .and_then(|device| device.memory_free.bytes());
+        let margin = self.staging_request.safety_margin_bytes;
+        let device_limit = observed_free.map(|free| free.saturating_sub(margin));
+        let effective_budget = match (self.staging_request.budget_bytes, device_limit) {
+            (Some(configured), Some(device)) => Some(configured.min(device)),
+            (Some(configured), None) => Some(configured),
+            (None, Some(device)) => Some(device),
+            (None, None) => None,
+        };
+        let Some(effective_budget) = effective_budget else {
+            return Ok(StagingPlan {
+                schema_version: crate::staging_plan::STAGING_PLAN_SCHEMA_VERSION,
+                requested_layers: self.staging_request.layers.clone(),
+                auto_selected: self.staging_request.auto,
+                configured_budget_bytes: self.staging_request.budget_bytes,
+                effective_budget_bytes: None,
+                observed_free_device_bytes: observed_free,
+                safety_margin_bytes: margin,
+                existing_staged_bytes: 0,
+                planned_bytes: 0,
+                available_bytes_after_plan: None,
+                layers: Vec::new(),
+                accepted_layers: Vec::new(),
+                rejected_layers: Vec::new(),
+                eviction_supported: false,
+                allocation_reuse_supported: false,
+                transfer_compute_overlap_supported: false,
+                state: StagingPlanState::Unknown,
+                notes: vec![
+                    "configured budget and free device observation are unavailable".to_string(),
+                ],
+            });
+        };
+        let candidates: Vec<u32> = if self.staging_request.auto {
+            (0..layer_count).collect()
+        } else {
+            self.staging_request.layers.clone()
+        };
+        let mut layers = Vec::new();
+        let mut accepted_layers = Vec::new();
+        let mut rejected_layers = Vec::new();
+        let mut planned_bytes = 0u64;
+        let mut any_unknown = false;
+        for layer in candidates {
+            let Ok(bytes) = session.staged_layer_bytes(layer) else {
+                any_unknown = true;
+                rejected_layers.push(layer);
+                layers.push(StagingLayerPlan {
+                    layer,
+                    bytes: None,
+                    accepted: false,
+                    reason: Some("native staging preflight unavailable".to_string()),
+                });
+                continue;
+            };
+            let fits = planned_bytes.saturating_add(bytes) <= effective_budget;
+            if fits {
+                planned_bytes = planned_bytes.saturating_add(bytes);
+                accepted_layers.push(layer);
+                layers.push(StagingLayerPlan {
+                    layer,
+                    bytes: Some(bytes),
+                    accepted: true,
+                    reason: None,
+                });
+            } else {
+                rejected_layers.push(layer);
+                layers.push(StagingLayerPlan {
+                    layer,
+                    bytes: Some(bytes),
+                    accepted: false,
+                    reason: Some("exceeds effective staged-VRAM budget".to_string()),
+                });
+            }
+        }
+        if !self.staging_request.auto && !rejected_layers.is_empty() {
+            planned_bytes = 0;
+            for layer_plan in &mut layers {
+                if layer_plan.accepted {
+                    layer_plan.accepted = false;
+                    layer_plan.reason =
+                        Some("explicit staging request rejected as a set".to_string());
+                    rejected_layers.push(layer_plan.layer);
+                }
+            }
+            accepted_layers.clear();
+        }
+        let state = if any_unknown {
+            StagingPlanState::Unknown
+        } else if accepted_layers.is_empty() {
+            StagingPlanState::Rejected
+        } else if rejected_layers.is_empty() {
+            StagingPlanState::Exact
+        } else {
+            StagingPlanState::Partial
+        };
+        Ok(StagingPlan {
+            schema_version: crate::staging_plan::STAGING_PLAN_SCHEMA_VERSION,
+            requested_layers: self.staging_request.layers.clone(),
+            auto_selected: self.staging_request.auto,
+            configured_budget_bytes: self.staging_request.budget_bytes,
+            effective_budget_bytes: Some(effective_budget),
+            observed_free_device_bytes: observed_free,
+            safety_margin_bytes: margin,
+            existing_staged_bytes: 0,
+            planned_bytes,
+            available_bytes_after_plan: Some(effective_budget.saturating_sub(planned_bytes)),
+            layers,
+            accepted_layers,
+            rejected_layers,
+            eviction_supported: false,
+            allocation_reuse_supported: false,
+            transfer_compute_overlap_supported: false,
+            state,
+            notes: vec![
+                "budget applies only to RAMforge-owned staged CUDA allocations".to_string(),
+                "observed free device memory is not a reservation against other processes"
+                    .to_string(),
+                "staged layers are static for the context lifetime; eviction/reuse unsupported"
+                    .to_string(),
+                "graph substitutions are reported after execution".to_string(),
+            ],
+        })
     }
 
     fn current_staged_status(&self) -> Vec<StagedLayerStatus> {
@@ -793,6 +956,7 @@ impl InferenceService {
         self.model = None;
         self.tokenizer = None;
         self.staging_status.clear();
+        self.staging_plan = None;
         self.state = ServiceState::Terminated;
     }
 }

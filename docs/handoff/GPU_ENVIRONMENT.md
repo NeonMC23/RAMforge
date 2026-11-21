@@ -217,6 +217,19 @@ Staged layers are static for the context lifetime; no eviction, reuse, or
 overlap is implemented. See
 [STAGING_ARCHITECTURE.md](STAGING_ARCHITECTURE.md).
 
+## Multi-layer budgeted residency
+
+- SmolLM2 layers 0+1: 2 × 2,598,964 B, 18 substitutions per layer over warmup +
+  measured graph, generated text matching CPU.
+- Auto budget 10M: layers 0–3 accepted (10,126,160 B), rest rejected (`partial`).
+- Explicit 1M request: rejected as a set before allocation.
+- Qwen2.5-7B auto budget 1G: layers 0–6, 989,857,792 B, 21 layers rejected,
+  4.40 tok/s, TTFT 329.2 ms.
+- Same-session SmolLM2 comparison: CPU 225.34 tok/s, 2 staged layers 204.30,
+  full GPU 483.15. Two staged layers introduced scheduler-copy overhead on this
+  small model; this is not a throughput win.
+- Eviction/reuse and transfer/compute overlap remain unsupported.
+
 ## Reproduction
 
 ```sh

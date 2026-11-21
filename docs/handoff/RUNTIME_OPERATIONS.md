@@ -162,6 +162,13 @@ duration, and peak VRAM are explicitly unsupported.
 --staged-layer N
 ```
 
+Additional flags:
+
+- `--staged-budget SIZE`: hard limit on RAMforge-owned staged CUDA bytes;
+- `--staged-auto`: select layers ascending within the budget;
+- `--staged-margin SIZE`: safety margin subtracted from observed free VRAM
+  (default 256M).
+
 This is a separate execution mode, not a profile and not normal GPU offload:
 
 - the model loads CPU-resident with both CPU and CUDA devices exposed;
@@ -175,9 +182,17 @@ This is a separate execution mode, not a profile and not normal GPU offload:
 - `inference_consumed_staged_data` is not asserted; substitution counts and
   logits/outputs are the evidence.
 
-Staged layers are static for the context lifetime. There is no eviction,
-per-token replacement, or transfer/compute overlap. A failure is explicit; the
-service does not fall back to CPU or normal GPU placement.
+Planning is deterministic: exact native per-layer byte totals are checked before
+allocation. Explicit layer sets are all-or-nothing; auto selection may be
+partial. `status.staging_plan` reports configured/effective budget, observed
+free VRAM, planned bytes, accepted/rejected layers, and
+`exact`/`partial`/`rejected`/`unknown` state.
+
+Staged layers are static for the context lifetime. The plan explicitly reports
+`eviction_supported=false`, `allocation_reuse_supported=false`, and
+`transfer_compute_overlap_supported=false`. There is no per-token replacement.
+A failure is explicit; the service does not fall back to CPU or normal GPU
+placement.
 
 ## Throughput benchmark
 

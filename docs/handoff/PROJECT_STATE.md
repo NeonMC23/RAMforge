@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **618 tests, 0 failed, 36 ignored**. The ignored
+  environment variables passes **618 tests, 0 failed, 37 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -91,7 +91,7 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 421 passed, 14 ignored. RAMforge tests: 618 passed, 36
+- forgeCORE tests: 421 passed, 14 ignored. RAMforge tests: 618 passed, 37
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
@@ -175,15 +175,20 @@
   Corrupting a staged weight changed logits, proving consumption.
 - Qwen2.5-7B layer 0 staged: 149,112,832 B, 24 substitutions, 5.84 tok/s with
   the other 27 layers CPU-resident.
-- Decision: SINGLE-LAYER STAGED INFERENCE VALIDATED — PERFORMANCE OR
-  SCALABILITY WORK REMAINS. Multi-layer residency, eviction/reuse, and overlap
-  are not implemented.
+- Multi-layer staged residency validated: SmolLM2 layers 0+1 (5,197,928 B,
+  18 substitutions/layer), exact budget plans, explicit 1M rejection, auto
+  selection within 10M/1G budgets. Qwen2.5-7B auto 1G staged 7 layers
+  (989,857,792 B, 4.40 tok/s).
+- Eviction/reuse and transfer/compute overlap are explicitly unsupported;
+  staged allocations are context-lifetime static.
+- Decision: MULTI-LAYER GPU RESIDENCY VALIDATED — DYNAMIC EVICTION STILL
+  UNSUPPORTED.
 - GPU load/placement failure is explicit; no silent CPU fallback occurs.
 - Out-of-core re-verification: 13.13 GB GPT-NeoX-20B Q4_K_M under an 8 GiB
   cgroup with `--no-repack --no-prefetch` produced one token, exit 0, 10.877 s
   wall, 9661 `max` events, and 0 OOM kills. Page release/prefetch/staging is
   OS paging over existing mappings, not tensor streaming.
-- RAMforge tests: 618 passed, 36 ignored.
+- RAMforge tests: 618 passed, 37 ignored.
 
 ## Runtime memory accounting and calibration (2026-11-20)
 
@@ -219,7 +224,7 @@
   evidence is rejected.
 - `ramforge machine --calibration` emits per-plan compatibility decisions and
   accepts `--no-repack`, `--no-prefetch`, `--ubatch`, and `--sequences`.
-- RAMforge tests: 618 passed, 36 ignored.
+- RAMforge tests: 618 passed, 37 ignored.
 
 ## Machine profiles and candidate plans (2026-11-20)
 
@@ -262,7 +267,7 @@
 - Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
   `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
   semantic/removal changes require a version increment.
-- ForgeCORE tests: 421 passed, 14 ignored. RAMforge tests: 618 passed, 36
+- ForgeCORE tests: 421 passed, 14 ignored. RAMforge tests: 618 passed, 37
   ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)

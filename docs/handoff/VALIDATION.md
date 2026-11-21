@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 618 passed, 0 failed, 36 ignored.
+- `cargo test --workspace`: 618 passed, 0 failed, 37 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -370,7 +370,7 @@ Not run or not claimed:
 
 ## Operational runtime validation — 2026-11-21
 
-- `cargo test --workspace --locked`: **618 passed, 0 failed, 36 ignored**.
+- `cargo test --workspace --locked`: **618 passed, 0 failed, 37 ignored**.
 - Real inference-service tests: load, context, stream, throughput, cancellation
   and unload passed.
 - CLI benchmark: median generation 136.87 tok/s (112.58–155.41), decode 171.70,
@@ -411,8 +411,14 @@ Not run or not claimed:
   2,596,608 B, 9 substitutions per graph, equal argmax, cosine 0.9933,
   matching generated text; corruption control changed logits. Qwen2.5-7B
   layer 0: 12 tensors, 149,112,832 B, 24 substitutions, 5.84 tok/s.
-- Decision: SINGLE-LAYER STAGED INFERENCE VALIDATED — PERFORMANCE OR
-  SCALABILITY WORK REMAINS.
+- Multi-layer staged inference validated: SmolLM2 layers 0+1, 5,197,928 B,
+  18 substitutions per layer, matching text; explicit 1M budget rejected before
+  staging; auto 10M accepted layers 0-3. Qwen2.5-7B auto 1G staged 7 layers
+  (989,857,792 B, 4.40 tok/s).
+- Eviction/reuse and transfer/compute overlap are unsupported; plans report
+  `eviction_supported=false` and `transfer_compute_overlap_supported=false`.
+- Decision: MULTI-LAYER GPU RESIDENCY VALIDATED — DYNAMIC EVICTION STILL
+  UNSUPPORTED.
 - Native effective placement readback is wired through forgeCORE and RAMforge;
   zero-effective GPU loads are rejected. No silent CPU fallback.
 - `RuntimePlan` schema is 2; benchmark schema is 6.
@@ -435,7 +441,7 @@ Not run or not claimed:
 
 ## Runtime calibration validation — 2026-11-20
 
-- `cargo test --workspace --locked`: **618 passed, 0 failed, 36 ignored**.
+- `cargo test --workspace --locked`: **618 passed, 0 failed, 37 ignored**.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 - Ignored calibration CLI test: passed; nine lifecycle stages, mapping
   residency, comparisons, attribution, model fingerprint, and plan evidence.
@@ -454,7 +460,7 @@ Not run or not claimed:
 
 ## Machine profile and candidate plan validation — 2026-11-20
 
-- `cargo test --workspace`: **618 passed, 0 failed, 36 ignored**.
+- `cargo test --workspace`: **618 passed, 0 failed, 37 ignored**.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge machine --model ... --ram 1G --json`: passed; includes CPU,
   memory, storage, device, model requirements, four plans, and comparison.
@@ -476,7 +482,7 @@ Not run or not claimed:
   New `node_dispatch` tests cover disabled-by-default behavior, installation
   and removal, event drain, overflow, multiple contexts, four-worker
   exactly-once publication, identity fields, and bounded options.
-- RAMforge `cargo test --workspace`: **618 passed, 0 failed, 36 ignored**.
+- RAMforge `cargo test --workspace`: **618 passed, 0 failed, 37 ignored**.
   The ignored real-model CLI test verifies `--node-dispatch-observe` JSON with
   attributed and unattributed events, zero identity mismatches, CPU backend,
   and bounded serialization.
@@ -524,7 +530,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          618 passed, 0 failed, 36 ignored
+cargo test --workspace                          618 passed, 0 failed, 37 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

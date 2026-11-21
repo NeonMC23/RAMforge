@@ -15,7 +15,7 @@ use crate::inference_service::{
 };
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 7;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
@@ -66,6 +66,7 @@ pub struct BenchmarkReport {
     pub memory_after_unload: Option<GpuObservability>,
     /// Staged layer readback after generation, including graph substitutions.
     pub staged_layers: Vec<StagedLayerStatus>,
+    pub staging_plan: Option<crate::staging_plan::StagingPlan>,
     pub context_create_ns: Vec<u64>,
     pub runs_detail: Vec<BenchmarkRun>,
     pub median_generation_tokens_per_second: f64,
@@ -126,6 +127,9 @@ pub struct BenchmarkConfig {
     pub max_tokens: u32,
     /// Explicit graph-integrated staged layers (empty = normal execution).
     pub staged_layers: Vec<u32>,
+    pub staged_budget_bytes: Option<u64>,
+    pub staged_auto: bool,
+    pub staged_margin_bytes: u64,
 }
 
 impl Default for BenchmarkConfig {
@@ -136,6 +140,9 @@ impl Default for BenchmarkConfig {
             prompt: "The capital of France is".to_string(),
             max_tokens: 4,
             staged_layers: Vec::new(),
+            staged_budget_bytes: None,
+            staged_auto: false,
+            staged_margin_bytes: crate::staging_plan::DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
         }
     }
 }
@@ -171,8 +178,13 @@ pub fn run_benchmark(
     let device_id = plan_snapshot.effective.device_id.clone();
     let requested_gpu_layers = plan_snapshot.requested_gpu_layers;
     let free_before = device_free_bytes(&device_id);
-    let staged_layers_config = config.staged_layers.clone();
-    let mut service = InferenceService::new(plan)?.with_staged_layers(staged_layers_config);
+    let staging_request = crate::staging_plan::StagingRequest {
+        layers: config.staged_layers.clone(),
+        budget_bytes: config.staged_budget_bytes,
+        auto: config.staged_auto,
+        safety_margin_bytes: config.staged_margin_bytes,
+    };
+    let mut service = InferenceService::new(plan)?.with_staging_request(staging_request);
     let load_started = Instant::now();
     service.load()?;
     let model_load_ns = duration_ns(load_started.elapsed());
@@ -215,7 +227,9 @@ pub fn run_benchmark(
         });
     }
     let memory_after_generation = Some(service.memory_observability()?);
-    let staged_layers = service.status().staged_layers;
+    let status_after_generation = service.status();
+    let staged_layers = status_after_generation.staged_layers;
+    let staging_plan = status_after_generation.staging_plan;
     service.unload();
     let free_after_unload = device_free_bytes(&device_id);
     let memory_after_unload = Some(service.memory_observability()?);
@@ -270,6 +284,7 @@ pub fn run_benchmark(
         memory_after_generation,
         memory_after_unload,
         staged_layers,
+        staging_plan,
         median_context_create_ns: median_u64(&mut context_ns.clone()),
         context_create_ns: context_ns,
         median_decode_tokens_per_second: if decode_rates.is_empty() {
@@ -360,6 +375,9 @@ mod tests {
             prompt: "x".to_string(),
             max_tokens: 1,
             staged_layers: Vec::new(),
+            staged_budget_bytes: None,
+            staged_auto: false,
+            staged_margin_bytes: crate::staging_plan::DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
         }
         .validate()
         .is_err());
@@ -369,6 +387,9 @@ mod tests {
             prompt: "x".to_string(),
             max_tokens: 1,
             staged_layers: Vec::new(),
+            staged_budget_bytes: None,
+            staged_auto: false,
+            staged_margin_bytes: crate::staging_plan::DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
         }
         .validate()
         .is_err());
