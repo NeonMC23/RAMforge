@@ -62,6 +62,7 @@ pub struct RuntimePlan {
     pub profile: RuntimeProfileKind,
     pub model_path: String,
     pub model_fingerprint: Option<String>,
+    pub architecture: Option<crate::model_architecture::ModelArchitecture>,
     pub effective: EffectiveRuntimeConfig,
     pub fields: Vec<PlanField>,
     pub warnings: Vec<String>,
@@ -294,6 +295,7 @@ impl RuntimePlan {
             profile,
             model_path: model_path.to_string(),
             model_fingerprint: requirements.model_fingerprint.clone(),
+            architecture: requirements.architecture_info.clone(),
             effective: EffectiveRuntimeConfig {
                 backend: "cpu".to_string(),
                 device_id: "cpu".to_string(),
@@ -329,6 +331,7 @@ mod tests {
             model_fingerprint: Some("fnv:test".to_string()),
             model_name: Some("test".to_string()),
             architecture: Some("llama".to_string()),
+            architecture_info: None,
             quantization: Some("q4".to_string()),
             tensor_count: 1,
             file_bytes: RequirementBytes::exact(100, "test"),

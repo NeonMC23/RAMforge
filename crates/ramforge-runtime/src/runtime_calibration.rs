@@ -618,6 +618,7 @@ mod tests {
             model_fingerprint: Some("fnv1a64:test:size=100".to_string()),
             model_name: Some("test".to_string()),
             architecture: Some("llama".to_string()),
+            architecture_info: None,
             quantization: Some("mostly-q4_k".to_string()),
             tensor_count: 1,
             file_bytes: RequirementBytes::exact(100, "test"),

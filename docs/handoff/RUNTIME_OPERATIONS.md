@@ -63,6 +63,21 @@ No service operation authorizes eviction or release.
 This is the smallest real transport; the service contract is independent of it
 and can be used by a TUI or GUI adapter.
 
+`--threads 0` (the default) lets the selected profile choose the CPU thread
+count; an explicit value overrides the profile and is still constrained and
+read back from the native context.
+
+The native context rounds `n_ctx` up with `GGML_PAD(n_ctx, 256)` in
+`llama-context.cpp`. A requested context of 128 therefore reports an effective
+context of 256 in `status`. `capabilities.max_context_tokens` is the planned
+request; `status.effective_context_tokens` is the native readback.
+
+`architecture` returns the GGUF-derived architecture metadata held by the
+resolved plan. `hierarchy` returns a fresh memory-hierarchy observation, the
+plan's placement model, and an f16-assumption feasibility evaluation. It is not
+a snapshot captured at model load and does not retain the original `--ram`
+budget; the response states both limitations.
+
 Commands:
 
 ```json
@@ -71,6 +86,8 @@ Commands:
 {"id":3,"command":"generate","prompt":"hello","max_tokens":8}
 {"id":4,"command":"session"}
 {"id":5,"command":"unload"}
+{"id":6,"command":"architecture"}
+{"id":7,"command":"hierarchy"}
 {"command":"cancel"}
 ```
 
@@ -116,7 +133,14 @@ Measured baseline on the development machine, SmolLM2-135M Q4_K_M, 256 context,
 | Context creation | 5.52 ms | — |
 | Model load | 234.91 ms | — |
 
-These are single-machine warm observations, not a performance guarantee.
+These debug-build figures are single-machine warm observations, not a
+performance guarantee. Release-build results, which are the authoritative
+throughput evidence, are in [BENCHMARKS.md](BENCHMARKS.md): balanced 8-thread
+median 283.81 tok/s (P25–P75 281.77–285.24), balanced 4-thread 267.65
+(259.09–267.99), maximum-performance 4-thread repacked 263.47, background
+102.80. A second order-reversed session reproduced the 8-over-4 ordering
+(269.05 vs 252.02); absolute rates vary between sessions, so only within-session
+comparisons are treated as evidence.
 
 ## Profile optimization loop
 
@@ -167,16 +191,42 @@ measurement.
 All profiles use the same planning and execution machinery. They are resource
 policies, not separate inference engines.
 
+## Architecture and memory hierarchy
+
+`ModelArchitecture` distinguishes dense and MoE models from GGUF metadata,
+including layer/head/KV-head/context fields and routed-expert fractions. Missing
+metadata stays unknown; routed fraction is not presented as a complete active
+parameter ratio.
+
+`MemoryHierarchy` and `PlacementModel` separate host RAM, cgroup budget, device
+memory, storage, file-backed mappings, anonymous/process memory, KV estimate,
+compute/graph, backend buffers, and staging. Categories overlap and are never
+summed. File-backed mmap is confirmed only when repacking is disabled; compute,
+graph, backend, and staging placement remain unknown. See
+[LARGE_MODEL_EXECUTION.md](LARGE_MODEL_EXECUTION.md).
+
 ## Large-model position
 
 The pinned native backend performs CPU inference and supports file-backed mmap.
-RAMforge can therefore run models whose file-backed pages may not all be
-resident, but it does **not** provide controlled tensor streaming, layer
-swapping, demand paging, asynchronous staging, GPU placement, or reclamation.
-The 500B parameter target remains a product ambition, not a claimed capability.
+Measured out-of-core runs load and generate under a cgroup cap (for example a
+13.13 GB model under 8 GiB), but throughput becomes storage- and reclaim-bound.
+
+RAMforge also exposes model-scoped page release (`MADV_DONTNEED`), bounded
+page-residency sampling (`mincore`), tensor-page release with shared-page
+skipping, bounded prefetch hints (`MADV_WILLNEED`), and staging plans with
+quiescence gates. All of these are explicit and advisory: prefetch is a hint,
+not a synchronous read, and release does not unmap memory or invalidate tensor
+pointers.
+
+RAMforge does **not** provide tensor/layer streaming, caller-owned weight
+staging consumed by the graph, transfer/compute overlap, anonymous or backend
+buffer eviction, GPU placement, or MoE routing-aware residency. The 500B
+parameter target remains a product ambition, not a claimed capability.
 
 ## Exclusions
 
-No eviction, reclamation, prefetch, predictive next-use scheduling, automatic
-plan switching, automatic model/backend/device changes, live tensor migration,
-or unvalidated GPU allocation behavior is implemented.
+Automatic action is excluded: RAMforge does not automatically evict, reclaim,
+prefetch, switch plans, move models, or change backend/device. Page operations
+require an explicit flag/policy and a quiescent model. Predictive staging is
+advisory. No live tensor migration or unvalidated GPU allocation behavior is
+implemented.

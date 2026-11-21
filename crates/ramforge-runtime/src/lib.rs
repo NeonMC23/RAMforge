@@ -34,10 +34,12 @@ pub mod kv_cache;
 pub mod layer;
 pub(crate) mod layer_cache;
 pub(crate) mod layer_read;
+pub mod memory_hierarchy;
 pub mod memory_ledger;
 pub mod memory_report;
 pub mod model;
 pub mod machine_profile;
+pub mod model_architecture;
 pub mod model_executor;
 pub mod model_requirements;
 pub mod model_storage;
@@ -104,6 +106,13 @@ pub use machine_profile::{
     ObservationState, Observed, Provenance, StorageBenchmarkConfig, StorageProfile,
     MACHINE_PROFILE_SCHEMA_VERSION,
 };
+pub use memory_hierarchy::{
+    build_memory_hierarchy, build_placement_model, build_placement_model_for_plan,
+    evaluate_hierarchy_feasibility, ComponentPlacement, DeviceMemory, HierarchyFeasibility,
+    MemoryCategory, MemoryCategoryObservation, MemoryHierarchy, ObservationQuality, PlacementModel,
+    PlacementState, MEMORY_HIERARCHY_SCHEMA_VERSION,
+};
+pub use model_architecture::{inspect_architecture, ArchitectureKind, ModelArchitecture};
 pub use model_storage::{
     assess_storage, copy_model_verified, CopyReport, DestinationAssessment, StorageRecommendation,
     MODEL_STORAGE_SCHEMA_VERSION,

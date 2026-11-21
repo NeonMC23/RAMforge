@@ -1249,7 +1249,26 @@ fn machine_profile_reports_resources_requirements_and_plans() {
     assert_eq!(benchmark["physical_claim"], false);
     assert!(benchmark["samples"].as_array().unwrap().len() == 1);
 
+    let hierarchy = &report["memory_hierarchy"];
+    assert_eq!(hierarchy["schema_version"], 1);
+    assert!(hierarchy["host_total_bytes"].as_u64().unwrap() > 0);
+    let categories = hierarchy["categories"].as_array().unwrap();
+    assert!(categories
+        .iter()
+        .any(|category| category["category"] == "host_ram"));
+    assert!(hierarchy["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|note| note.as_str().unwrap().contains("must not be summed")));
+
     let requirements = &report["model_requirements"];
+    let architecture = &requirements["architecture_info"];
+    assert!(matches!(
+        architecture["kind"].as_str(),
+        Some("dense" | "mixture_of_experts" | "unknown")
+    ));
+    assert_eq!(architecture["provenance"], "GGUF metadata");
     assert!(
         requirements["tensor_payload_bytes"]["bytes"]
             .as_u64()
@@ -1260,6 +1279,27 @@ fn machine_profile_reports_resources_requirements_and_plans() {
     assert_eq!(requirements["kv_cache_bytes"]["certainty"], "estimated");
     let plans = report["candidate_plans"].as_array().unwrap();
     assert_eq!(plans.len(), 4);
+    let plan_hierarchy = report["plan_hierarchy"].as_array().unwrap();
+    assert_eq!(plan_hierarchy.len(), plans.len());
+    for entry in plan_hierarchy {
+        assert!(entry["requested"]["backend"].is_string());
+        assert!(entry["placement"]["components"].is_array());
+        assert!(entry["feasibility"]["status"].is_string());
+    }
+    let streaming = plan_hierarchy
+        .iter()
+        .find(|entry| entry["plan_id"] == "memory-constrained")
+        .expect("streaming candidate");
+    assert_eq!(streaming["requested"]["mapping"], "streaming");
+    assert_eq!(streaming["feasibility"]["status"], "unknown");
+    let weights = streaming["placement"]["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|component| component["component"] == "model_weights")
+        .expect("weights placement");
+    assert_eq!(weights["placement"], "unknown");
+    assert_eq!(weights["confirmed"], false);
     let comparison = &report["plan_comparison"];
     assert_eq!(
         comparison["evaluations"].as_array().unwrap().len(),
@@ -1522,7 +1562,7 @@ fn benchmark_reports_measured_generation_throughput() {
             "--warmup",
             "0",
             "--max-tokens",
-            "2",
+            "8",
             "--context",
             "256",
             "--threads",
@@ -1538,7 +1578,10 @@ fn benchmark_reports_measured_generation_throughput() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["plan"]["effective"]["backend"], "cpu");
+    assert!(report["plan"]["effective"]["threads"].as_u64().unwrap() > 0);
+    assert_eq!(report["plan"]["effective"]["context_tokens"], 256);
     assert!(
         report["median_generation_tokens_per_second"]
             .as_f64()
@@ -1546,7 +1589,17 @@ fn benchmark_reports_measured_generation_throughput() {
             > 0.0
     );
     assert!(report["median_decode_tokens_per_second"].as_f64().is_some());
+    let median = report["median_generation_tokens_per_second"]
+        .as_f64()
+        .unwrap();
+    let p25 = report["p25_generation_tokens_per_second"].as_f64().unwrap();
+    let p75 = report["p75_generation_tokens_per_second"].as_f64().unwrap();
+    let iqr = report["iqr_generation_tokens_per_second"].as_f64().unwrap();
+    assert!(p25 <= median && median <= p75);
+    assert!((p75 - p25 - iqr).abs() < 1e-9);
+    assert!(report["model_load_ns"].as_u64().unwrap() > 0);
     assert_eq!(report["runs"], 1);
+    assert_eq!(report["runs_detail"].as_array().unwrap().len(), 1);
     assert!(report["limitations"]
         .as_array()
         .unwrap()
@@ -1588,6 +1641,8 @@ fn serve_streams_tokens_and_reports_status() {
             r#"{{"id":2,"command":"generate","prompt":"test","max_tokens":2}}"#
         )
         .unwrap();
+        writeln!(stdin, r#"{{"id":3,"command":"architecture"}}"#).unwrap();
+        writeln!(stdin, r#"{{"id":4,"command":"hierarchy"}}"#).unwrap();
     }
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("serve output");
@@ -1609,6 +1664,25 @@ fn serve_streams_tokens_and_reports_status() {
     assert!(lines
         .iter()
         .any(|line| line["event"] == "done" && line["id"] == 2));
+    let architecture = lines
+        .iter()
+        .find(|line| line["event"] == "result" && line["id"] == 3)
+        .expect("architecture result");
+    assert!(matches!(
+        architecture["architecture"]["kind"].as_str(),
+        Some("dense" | "mixture_of_experts" | "unknown")
+    ));
+    let hierarchy = lines
+        .iter()
+        .find(|line| line["event"] == "result" && line["id"] == 4)
+        .expect("hierarchy result");
+    assert_eq!(hierarchy["memory_hierarchy"]["schema_version"], 1);
+    assert!(hierarchy["placement"]["components"].is_array());
+    assert!(hierarchy["feasibility"]["status"].is_string());
+    assert!(hierarchy["note"]
+        .as_str()
+        .unwrap()
+        .contains("fresh OS observation"));
 }
 
 #[test]

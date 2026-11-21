@@ -611,6 +611,37 @@ single-machine, warm, and noisy.
 Storage assessment/copy was verified on a 105,454,432-byte model copy. Copy
 correctness is verified; no throughput improvement is implied.
 
+## Release-build throughput matrix (2026-11-21)
+
+Release build, SmolLM2-135M Q4_K_M, 256 context, 32 generated tokens, 5
+measured runs + 1 warmup per configuration, CPU-only, warm/uncontrolled.
+Threads are effective native values. Each JSON report includes the resolved
+`plan` with requested/effective field statuses. Reproduce the matrix with
+`RUNS=5 FORGE_TEST_MODEL=/models/tiny.gguf sh scripts/throughput-bench.sh`; each
+configuration is written to its own JSON report.
+
+| Profile | Threads | Repack | Median tok/s | P25–P75 | IQR | Decode tok/s | TTFT |
+|---|---:|---|---:|---:|---:|---:|---:|
+| balanced | 8 | off | 283.81 | 281.77–285.24 | 3.47 | 297.27 | 8.31 ms |
+| balanced | 4 | off | 267.65 | 259.09–267.99 | 8.90 | 276.87 | 7.74 ms |
+| maximum-performance | 4 | on | 263.47 | 259.30–266.91 | 7.61 | 272.34 | 7.14 ms |
+| background | 1 | off | 102.80 | 102.43–102.98 | 0.54 | 107.01 | 21.19 ms |
+
+Model load was 88–90 ms. Context creation was 3.0–4.2 ms. Median prompt
+throughput was 650 tok/s for balanced 4, 605 for balanced 8, 705 for
+maximum-performance 4, and 236 for background.
+
+The balanced 8-thread configuration was the fastest measured configuration,
+but the margin over 4 threads is modest. A second matrix with the order reversed
+(8 threads measured first, then 4) reproduced the ordering: medians 269.05 and
+252.02 tok/s. Absolute rates differ between sessions, so only within-session
+comparisons are treated as evidence. Repacking did not show a reliable
+improvement. The workload is one small model, warm, single-machine.
+
+Percentiles use the nearest-rank method over the measured runs. They describe
+dispersion in this session; they are not confidence intervals. No cold-cache,
+GPU, or large-model claim follows from this matrix.
+
 ## Caveats
 
 - These are wall-clock observations on one machine, not a throughput guarantee.

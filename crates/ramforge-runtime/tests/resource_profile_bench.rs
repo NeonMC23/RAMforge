@@ -121,6 +121,7 @@ fn lifecycle_calibration_benchmark() {
         model_fingerprint: Some("benchmark-fixture".to_string()),
         model_name: Some("fixture".to_string()),
         architecture: Some("llama".to_string()),
+        architecture_info: None,
         quantization: Some("fixture".to_string()),
         tensor_count: 1,
         file_bytes: RequirementBytes::exact(1024, "fixture"),

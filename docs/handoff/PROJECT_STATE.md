@@ -14,7 +14,7 @@
   process-local `LD_LIBRARY_PATH`, auto-detects
   `$FORGE_LLAMA_DIR/models/tiny-llama.gguf` for `FORGE_TEST_MODEL`, then runs
   `cargo test`. A direct `cargo test --workspace --locked` without fixture
-  environment variables passes **605 tests, 0 failed, 29 ignored**. The ignored
+  environment variables passes **612 tests, 0 failed, 29 ignored**. The ignored
   tests are the real-model diagnostics, quantized microbenchmark, opt-in
   GPT-NeoX integration, cgroup enforcement, and CLI real-model residency
   checks (including JSON and reuse-aware). Fixture-gated tests report SKIP when
@@ -91,7 +91,7 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 605 passed, 29
+- forgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 612 passed, 29
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
@@ -124,7 +124,25 @@
   fingerprint verification are tested; no deletion or throughput claim.
 - `ramforge serve`, `benchmark`, `optimize`, and `storage` are operational CLI
   clients of runtime modules; no placeholder endpoints were added.
-- RAMforge tests: 605 passed, 29 ignored.
+- `ModelArchitecture` distinguishes dense and MoE metadata, including expert
+  counts and routed-expert fraction; missing metadata remains unknown.
+- `MemoryHierarchy` and `PlacementModel` separate host RAM, cgroup budget,
+  device memory, storage, file-backed mappings, anonymous/process memory, KV
+  estimate, compute/graph, backend buffers, and staging. Overlapping categories
+  are never summed; unconfirmed placement stays unknown.
+- Release-build throughput matrix: balanced 8 threads 283.81 tok/s
+  (P25–P75 281.77–285.24), balanced 4 threads 267.65 (259.09–267.99),
+  maximum-performance 4 threads repacked 263.47, background 102.80. A second
+  order-reversed session reproduced the 8-over-4 ordering; absolute rates vary
+  between sessions.
+- Native audit: CPU backend only in the verified build; CUDA/Vulkan/SYCL/
+  OpenCL/Metal/RPC/dynamic backends are OFF. forgeCORE exposes GPU offload
+  options, but no selectable GPU is present and no GPU placement is claimed.
+- Out-of-core re-verification: 13.13 GB GPT-NeoX-20B Q4_K_M under an 8 GiB
+  cgroup with `--no-repack --no-prefetch` produced one token, exit 0, 10.877 s
+  wall, 9661 `max` events, and 0 OOM kills. Page release/prefetch/staging is
+  OS paging over existing mappings, not tensor streaming.
+- RAMforge tests: 612 passed, 29 ignored.
 
 ## Runtime memory accounting and calibration (2026-11-20)
 
@@ -160,7 +178,7 @@
   evidence is rejected.
 - `ramforge machine --calibration` emits per-plan compatibility decisions and
   accepts `--no-repack`, `--no-prefetch`, `--ubatch`, and `--sequences`.
-- RAMforge tests: 605 passed, 29 ignored.
+- RAMforge tests: 612 passed, 29 ignored.
 
 ## Machine profiles and candidate plans (2026-11-20)
 
@@ -203,7 +221,7 @@
 - Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
   `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
   semantic/removal changes require a version increment.
-- ForgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 605 passed, 29
+- ForgeCORE tests: 413 passed, 9 ignored. RAMforge tests: 612 passed, 29
   ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)

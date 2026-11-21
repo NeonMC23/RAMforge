@@ -6,12 +6,18 @@
 //! adding a network dependency or an unvalidated public server.
 
 use std::io::{BufRead, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use serde::Deserialize;
 
 use crate::inference_service::{GenerationOptions, InferenceService, ServiceError, ServiceState};
+use crate::machine_profile::{collect_machine_profile, MachineProfileConfig};
+use crate::memory_hierarchy::{
+    build_memory_hierarchy, build_placement_model_for_plan, evaluate_hierarchy_feasibility,
+};
+use crate::model_requirements::{model_requirements, ModelRequirementConfig};
 
 #[derive(Debug, Deserialize)]
 struct LineRequest {
@@ -113,6 +119,58 @@ pub fn serve_stdio(mut service: InferenceService) -> Result<(), ServiceServerErr
                     "status": service.status(),
                 }),
             )?,
+            "architecture" => write_event(
+                &mut output,
+                serde_json::json!({
+                    "id": id,
+                    "event": "result",
+                    "architecture": service.plan().architecture,
+                    "provenance": "GGUF metadata captured in the resolved runtime plan",
+                }),
+            )?,
+            "hierarchy" => {
+                let machine = collect_machine_profile(&MachineProfileConfig::default());
+                let hierarchy = build_memory_hierarchy(&machine);
+                let plan = service.plan();
+                let placement = build_placement_model_for_plan(plan, None);
+                let (feasibility, requirements_note) =
+                    match ramforge_core::discover_model_set(Path::new(&plan.model_path)) {
+                        Ok(set) => {
+                            let requirements = model_requirements(
+                                &set.merged_model(),
+                                ModelRequirementConfig {
+                                    context_tokens: plan.effective.context_tokens,
+                                    batch_tokens: plan.effective.batch_tokens,
+                                    kv_bytes_per_element: 2,
+                                },
+                            );
+                            (
+                                Some(evaluate_hierarchy_feasibility(
+                                    &machine,
+                                    &requirements,
+                                    plan,
+                                )),
+                                None,
+                            )
+                        }
+                        Err(error) => (
+                            None,
+                            Some(format!("model requirements unavailable: {error}")),
+                        ),
+                    };
+                write_event(
+                    &mut output,
+                    serde_json::json!({
+                        "id": id,
+                        "event": "result",
+                        "memory_hierarchy": hierarchy,
+                        "placement": placement,
+                        "feasibility": feasibility,
+                        "requirements_note": requirements_note,
+                        "note": "fresh OS observation; not a snapshot captured at model load and does not include the original RAM budget; KV uses an f16 assumption",
+                    }),
+                )?;
+            }
             "load" => {
                 let result = service.load().and_then(|_| service.create_session());
                 write_service_result(&mut output, id, result, &service)?;

@@ -13,7 +13,7 @@ use crate::inference_service::{
 };
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 1;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
@@ -37,6 +37,8 @@ pub struct BenchmarkReport {
     pub api_version: u32,
     pub profile: String,
     pub model_path: String,
+    /// Exact resolved plan, including requested/effective field statuses.
+    pub plan: RuntimePlan,
     pub prompt: String,
     pub max_tokens: u32,
     pub runs: u32,
@@ -47,6 +49,9 @@ pub struct BenchmarkReport {
     pub median_generation_tokens_per_second: f64,
     pub min_generation_tokens_per_second: f64,
     pub max_generation_tokens_per_second: f64,
+    pub p25_generation_tokens_per_second: f64,
+    pub p75_generation_tokens_per_second: f64,
+    pub iqr_generation_tokens_per_second: f64,
     pub median_decode_tokens_per_second: Option<f64>,
     pub median_time_to_first_token_ns: Option<u64>,
     pub median_context_create_ns: u64,
@@ -67,6 +72,18 @@ impl BenchmarkReport {
         }
         if self.context_create_ns.is_empty() {
             return Err("benchmark has no context-creation measurements".to_string());
+        }
+        let ordered = self.min_generation_tokens_per_second
+            <= self.p25_generation_tokens_per_second
+            && self.p25_generation_tokens_per_second <= self.median_generation_tokens_per_second
+            && self.median_generation_tokens_per_second <= self.p75_generation_tokens_per_second
+            && self.p75_generation_tokens_per_second <= self.max_generation_tokens_per_second;
+        if !ordered {
+            return Err("generation throughput statistics are not ordered".to_string());
+        }
+        let iqr = self.p75_generation_tokens_per_second - self.p25_generation_tokens_per_second;
+        if (iqr - self.iqr_generation_tokens_per_second).abs() > 1e-9 {
+            return Err("generation throughput IQR does not match P25/P75".to_string());
         }
         Ok(())
     }
@@ -122,6 +139,7 @@ pub fn run_benchmark(
     config.validate().map_err(ServiceError::Configuration)?;
     let profile = format!("{:?}", plan.profile).to_ascii_lowercase();
     let model_path = plan.model_path.clone();
+    let plan_snapshot = plan.clone();
     let mut service = InferenceService::new(plan)?;
     let load_started = Instant::now();
     service.load()?;
@@ -179,11 +197,14 @@ pub fn run_benchmark(
     let median = median_f64(&rates);
     let min = rates.first().copied().unwrap_or(0.0);
     let max = rates.last().copied().unwrap_or(0.0);
+    let p25 = percentile_f64(&rates, 1, 4).unwrap_or(median);
+    let p75 = percentile_f64(&rates, 3, 4).unwrap_or(median);
     let report = BenchmarkReport {
         schema_version: BENCHMARK_SCHEMA_VERSION,
         api_version: INFERENCE_SERVICE_API_VERSION,
         profile,
         model_path,
+        plan: plan_snapshot,
         prompt: config.prompt,
         max_tokens: config.max_tokens,
         runs: config.runs,
@@ -205,6 +226,9 @@ pub fn run_benchmark(
         median_generation_tokens_per_second: median,
         min_generation_tokens_per_second: min,
         max_generation_tokens_per_second: max,
+        p25_generation_tokens_per_second: p25,
+        p75_generation_tokens_per_second: p75,
+        iqr_generation_tokens_per_second: (p75 - p25).max(0.0),
         condition: "warm-uncontrolled".to_string(),
         limitations: vec![
             "Single-machine warm observation; no cold-cache claim.".to_string(),
@@ -228,6 +252,15 @@ fn median_f64(sorted: &[f64]) -> f64 {
     } else {
         sorted[sorted.len() / 2]
     }
+}
+
+fn percentile_f64(sorted: &[f64], numerator: usize, denominator: usize) -> Option<f64> {
+    if sorted.is_empty() || denominator == 0 {
+        return None;
+    }
+    sorted
+        .get(sorted.len().saturating_mul(numerator) / denominator)
+        .copied()
 }
 
 fn median_u64(values: &mut [u64]) -> u64 {
@@ -269,5 +302,15 @@ mod tests {
         assert_eq!(median_f64(&[1.0, 2.0, 3.0]), 2.0);
         assert_eq!(median_u64(&mut []), 0);
         assert_eq!(median_u64(&mut [3, 1, 2]), 2);
+    }
+
+    #[test]
+    fn nearest_rank_percentiles_are_ordered_and_handle_small_samples() {
+        let values = [96.17, 102.43, 102.80, 102.98, 103.02];
+        assert_eq!(percentile_f64(&values, 1, 4), Some(102.43));
+        assert_eq!(percentile_f64(&values, 3, 4), Some(102.98));
+        assert_eq!(percentile_f64(&[7.0], 1, 4), Some(7.0));
+        assert_eq!(percentile_f64(&[7.0], 3, 4), Some(7.0));
+        assert_eq!(percentile_f64(&[], 1, 4), None);
     }
 }

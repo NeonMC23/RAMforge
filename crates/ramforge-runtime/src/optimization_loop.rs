@@ -212,6 +212,7 @@ mod tests {
             model_fingerprint: Some("fnv:test".to_string()),
             model_name: Some("test".to_string()),
             architecture: Some("llama".to_string()),
+            architecture_info: None,
             quantization: Some("q4".to_string()),
             tensor_count: 1,
             file_bytes: RequirementBytes::exact(100, "test"),

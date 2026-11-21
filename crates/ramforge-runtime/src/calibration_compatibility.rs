@@ -609,6 +609,7 @@ mod tests {
             model_fingerprint: Some("fnv1a64:test:size=100".to_string()),
             model_name: Some("test".to_string()),
             architecture: Some("llama".to_string()),
+            architecture_info: None,
             quantization: Some("mostly-q4_k".to_string()),
             tensor_count: 1,
             file_bytes: RequirementBytes::exact(100, "test"),
@@ -665,9 +666,17 @@ mod tests {
         }
     }
 
+    fn machine() -> crate::machine_profile::MachineProfile {
+        static MACHINE: std::sync::OnceLock<crate::machine_profile::MachineProfile> =
+            std::sync::OnceLock::new();
+        MACHINE
+            .get_or_init(|| collect_machine_profile(&MachineProfileConfig::default()))
+            .clone()
+    }
+
     fn target() -> CompatibilityTarget {
         CompatibilityTarget {
-            machine: collect_machine_profile(&MachineProfileConfig::default()),
+            machine: machine(),
             requirements: requirements(),
             runtime: runtime(),
             observation: conditions(),
@@ -678,7 +687,7 @@ mod tests {
     fn calibration() -> RuntimeCalibration {
         use crate::runtime_calibration::build_calibration;
         use crate::runtime_measurement::LifecycleRecorder;
-        let machine = collect_machine_profile(&MachineProfileConfig::default());
+        let machine = machine();
         let mut recorder = LifecycleRecorder::new(None, None);
         for stage in [
             LifecycleStage::Baseline,

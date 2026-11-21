@@ -31,16 +31,17 @@ use ramforge_runtime::residency_engine::{
     ResidencyReport, ResidencySnapshot, ResourceInventory, StagingPlan, StagingResult,
 };
 use ramforge_runtime::{
-    assess_storage, build_attribution, build_calibration, candidate_plans, collect_machine_profile,
-    compare_plans, compare_plans_with_evidence, copy_model_verified, model_requirements,
-    run_benchmark, run_profile_optimization, serve_stdio, BenchmarkConfig, CandidateRequest,
-    CompatibilityTarget, CpuRuntimeSettings, DeviceRegistry, DeviceSelection, ExecutionConfig,
-    ForgeCoreContextOptions, ForgeCoreLogits, ForgeCoreModel, ForgeCoreModelOptions,
-    ForgeCoreSession, LifecycleRecorder, LifecycleStage, MachineProfileConfig,
-    ModelRequirementConfig, NodeDispatchOptions, NodeSamplingStrategy, ObservationConditions,
-    Observed, OptimizationConfig, PageSampleStatus, RuntimeCalibration, RuntimeConfiguration,
-    RuntimePlan, RuntimeProfileKind, SchedulerObservation, StorageBenchmarkConfig,
-    KV_TYPE_SOURCE_ADAPTER_DEFAULT,
+    assess_storage, build_attribution, build_calibration, build_memory_hierarchy,
+    build_placement_model, candidate_plans, collect_machine_profile, compare_plans,
+    compare_plans_with_evidence, copy_model_verified, evaluate_hierarchy_feasibility,
+    model_requirements, run_benchmark, run_profile_optimization, serve_stdio, BenchmarkConfig,
+    CandidateRequest, CompatibilityTarget, CpuRuntimeSettings, DeviceRegistry, DeviceSelection,
+    ExecutionConfig, ForgeCoreContextOptions, ForgeCoreLogits, ForgeCoreModel,
+    ForgeCoreModelOptions, ForgeCoreSession, LifecycleRecorder, LifecycleStage,
+    MachineProfileConfig, ModelRequirementConfig, NodeDispatchOptions, NodeSamplingStrategy,
+    ObservationConditions, Observed, OptimizationConfig, PageSampleStatus, RuntimeCalibration,
+    RuntimeConfiguration, RuntimePlan, RuntimeProfileKind, SchedulerObservation,
+    StorageBenchmarkConfig, KV_TYPE_SOURCE_ADAPTER_DEFAULT,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -263,8 +264,8 @@ enum Commands {
         #[arg(long, default_value_t = 256)]
         context: u32,
 
-        /// CPU threads
-        #[arg(long, default_value_t = 2)]
+        /// CPU threads (0 = profile-selected)
+        #[arg(long, default_value_t = 0)]
         threads: u32,
 
         /// Disable CPU weight repacking
@@ -308,8 +309,8 @@ enum Commands {
         #[arg(long, default_value_t = 256)]
         context: u32,
 
-        /// CPU threads
-        #[arg(long, default_value_t = 2)]
+        /// CPU threads (0 = profile-selected)
+        #[arg(long, default_value_t = 0)]
         threads: u32,
 
         /// Disable CPU weight repacking
@@ -1215,7 +1216,7 @@ fn run_service_stdio(
         model_path: Some(model_path.clone()),
         ram_budget_bytes: ram_bytes,
         cpu: CpuRuntimeSettings {
-            selected_threads: Some(threads),
+            selected_threads: (threads != 0).then_some(threads),
             user_thread_limit: None,
         },
         ..MachineProfileConfig::default()
@@ -1228,7 +1229,7 @@ fn run_service_stdio(
         &ramforge_runtime::CustomRuntimeRequest {
             context_tokens: Some(context),
             batch_tokens: Some(1),
-            threads: Some(threads),
+            threads: (threads != 0).then_some(threads),
             load_mode: Some(
                 if no_prefetch {
                     "mmap-no-prefetch"
@@ -1294,7 +1295,7 @@ fn run_throughput_benchmark(
         model_path: Some(model_path.clone()),
         ram_budget_bytes: ram_bytes,
         cpu: CpuRuntimeSettings {
-            selected_threads: Some(threads),
+            selected_threads: (threads != 0).then_some(threads),
             user_thread_limit: None,
         },
         ..MachineProfileConfig::default()
@@ -1307,7 +1308,7 @@ fn run_throughput_benchmark(
         &ramforge_runtime::CustomRuntimeRequest {
             context_tokens: Some(context),
             batch_tokens: Some(1),
-            threads: Some(threads),
+            threads: (threads != 0).then_some(threads),
             load_mode: Some(
                 if no_prefetch {
                     "mmap-no-prefetch"
@@ -1795,6 +1796,107 @@ fn run_machine(
             report["plan_comparison"] = comparison
                 .to_json()
                 .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        report["memory_hierarchy"] = build_memory_hierarchy(&profile)
+            .to_json()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if let (Some(requirements), Some(plans)) = (&requirements, &plans) {
+            let model_label = model
+                .as_ref()
+                .map(|model| model.path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let hierarchy = plans
+                .iter()
+                .map(|candidate| {
+                    let (load_mode, no_repack, mut notes) = match candidate.mapping {
+                        ramforge_runtime::MappingStrategy::FileBacked => ("mmap", true, Vec::new()),
+                        ramforge_runtime::MappingStrategy::ResidentWeights => {
+                            ("mmap", false, Vec::new())
+                        }
+                        ramforge_runtime::MappingStrategy::Streaming => (
+                            "mmap",
+                            true,
+                            vec![
+                                "candidate requests streaming; the pinned native backend has no controlled staging API, so execution is not verified"
+                                    .to_string(),
+                            ],
+                        ),
+                    };
+                    if candidate.backend == ramforge_runtime::PlanBackend::Gpu {
+                        notes.push(
+                            "candidate requests a GPU backend; this build has no GPU backend and the operational adapter applies CPU only"
+                                .to_string(),
+                        );
+                    }
+                    let runtime_plan = RuntimePlan::resolve(
+                        &profile,
+                        requirements,
+                        &model_label,
+                        RuntimeProfileKind::Custom,
+                        &ramforge_runtime::CustomRuntimeRequest {
+                            context_tokens: Some(candidate.context_tokens),
+                            batch_tokens: Some(candidate.batch_tokens),
+                            threads: Some(candidate.cpu_threads),
+                            load_mode: Some(load_mode.to_string()),
+                            no_repack: Some(no_repack),
+                        },
+                    );
+                    match runtime_plan {
+                        Ok(runtime_plan) => {
+                            let mut feasibility = evaluate_hierarchy_feasibility(
+                                &profile,
+                                requirements,
+                                &runtime_plan,
+                            );
+                            if candidate.mapping == ramforge_runtime::MappingStrategy::Streaming {
+                                feasibility.status = ramforge_runtime::Feasibility::Unknown;
+                                feasibility.reasons.push(
+                                    "streaming is advisory; no native staging path is enabled"
+                                        .to_string(),
+                                );
+                            }
+                            if candidate.backend == ramforge_runtime::PlanBackend::Gpu {
+                                feasibility.status = ramforge_runtime::Feasibility::Unknown;
+                                feasibility
+                                    .reasons
+                                    .push("GPU backend is unavailable in this build".to_string());
+                            }
+                            let mut placement = build_placement_model(requirements, &runtime_plan);
+                            if candidate.mapping == ramforge_runtime::MappingStrategy::Streaming {
+                                for component in &mut placement.components {
+                                    if component.component == "model_weights" {
+                                        component.placement =
+                                            ramforge_runtime::PlacementState::Unknown;
+                                        component.confirmed = false;
+                                        component.evidence = "no native controlled streaming path"
+                                            .to_string();
+                                    }
+                                }
+                            }
+                            serde_json::json!({
+                                "plan_id": candidate.id,
+                                "requested": {
+                                    "profile": candidate.profile,
+                                    "backend": candidate.backend,
+                                    "device_id": candidate.device_id,
+                                    "mapping": candidate.mapping,
+                                    "cpu_threads": candidate.cpu_threads,
+                                    "context_tokens": candidate.context_tokens,
+                                    "batch_tokens": candidate.batch_tokens,
+                                },
+                                "placement": placement,
+                                "feasibility": feasibility,
+                                "notes": notes,
+                            })
+                        }
+                        Err(error) => serde_json::json!({
+                            "plan_id": candidate.id,
+                            "error": error,
+                        }),
+                    }
+                })
+                .collect::<Vec<_>>();
+            report["plan_hierarchy"] = serde_json::json!(hierarchy);
         }
         if !compatibilities.is_empty() {
             report["calibration_compatibility"] = serde_json::json!(compatibilities

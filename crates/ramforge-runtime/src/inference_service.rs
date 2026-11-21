@@ -58,6 +58,8 @@ impl ServiceCapabilities {
             notes: vec![
                 "One session at a time; cancellation is checked between token decodes.".to_string(),
                 "No ownership or eviction authorization is exposed.".to_string(),
+                "max_context_tokens is the planned request; the native context rounds n_ctx up (GGML_PAD in llama-context.cpp) and status reports the effective value."
+                    .to_string(),
             ],
         }
     }
@@ -74,6 +76,7 @@ pub struct ServiceStatus {
     pub effective_threads: Option<u32>,
     pub effective_threads_batch: Option<u32>,
     pub effective_sequence_max: Option<u32>,
+    pub architecture: Option<crate::model_architecture::ModelArchitecture>,
     pub model_instance_id: Option<u64>,
     pub context_id: Option<u64>,
     pub rss_bytes: Option<u64>,
@@ -236,6 +239,7 @@ impl InferenceService {
                 .session
                 .as_ref()
                 .map(ForgeCoreSession::effective_sequence_max),
+            architecture: self.plan.architecture.clone(),
             model_instance_id: model_id,
             context_id,
             rss_bytes: process_rss(),
@@ -519,6 +523,7 @@ mod tests {
             model_fingerprint: Some("fnv:test".to_string()),
             model_name: Some("test".to_string()),
             architecture: Some("llama".to_string()),
+            architecture_info: None,
             quantization: Some("q4".to_string()),
             tensor_count: 1,
             file_bytes: RequirementBytes::exact(100, "test"),
