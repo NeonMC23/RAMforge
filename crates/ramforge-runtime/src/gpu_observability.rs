@@ -4,6 +4,7 @@
 //! those snapshots, or explicitly unsupported. Categories overlap and are never
 //! summed into a fabricated process total.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::execution::DeviceRegistry;
 use crate::forgecore::{ForgeCoreModel, ForgeCoreSession};
 
-pub const GPU_OBSERVABILITY_SCHEMA_VERSION: u32 = 1;
+pub const GPU_OBSERVABILITY_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +106,24 @@ pub struct TransferObservation {
     pub reason: String,
 }
 
+type LayerStorageKey = (Option<u32>, String, String, bool);
+type LayerStorageTotals = (u64, u64, u64);
+
+/// Read-only tensor storage aggregated by layer, device, and buffer type.
+/// This is the granularity needed to plan placement; it does not authorize
+/// staging or independent buffer release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerStorageObservation {
+    pub layer: Option<u32>,
+    pub device_name: String,
+    pub buffer_type: String,
+    pub tensor_count: u64,
+    pub bytes: u64,
+    pub file_backed_bytes: u64,
+    pub host: bool,
+    pub overlapping: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuObservability {
     pub schema_version: u32,
@@ -112,6 +131,7 @@ pub struct GpuObservability {
     pub collection_sequence: u64,
     pub devices: Vec<DeviceObservation>,
     pub buffers: Vec<BufferObservation>,
+    pub layers: Vec<LayerStorageObservation>,
     pub observations: Vec<MemoryObservation>,
     pub allocation_counters: CounterObservation,
     pub deallocation_counters: CounterObservation,
@@ -334,6 +354,53 @@ pub fn collect_observability(
         );
     }
 
+    let mut layers: Vec<LayerStorageObservation> = Vec::new();
+    if let Some(model) = session.map(|session| session.model()).or(model) {
+        let storage = model.tensor_storage().map_err(|error| error.to_string())?;
+        let mut aggregated: BTreeMap<LayerStorageKey, LayerStorageTotals> = BTreeMap::new();
+        for tensor in storage {
+            let key = (
+                tensor.layer,
+                tensor.device_name.clone(),
+                tensor.buffer_type.clone(),
+                tensor.is_host,
+            );
+            let entry = aggregated.entry(key).or_insert((0, 0, 0));
+            entry.0 += 1;
+            entry.1 = entry.1.saturating_add(tensor.tensor_bytes);
+            if tensor.file_backed {
+                entry.2 = entry.2.saturating_add(tensor.tensor_bytes);
+            }
+        }
+        for ((layer, device_name, buffer_type, host), (count, bytes, file_backed)) in aggregated {
+            layers.push(LayerStorageObservation {
+                layer,
+                device_name,
+                buffer_type,
+                tensor_count: count,
+                bytes,
+                file_backed_bytes: file_backed,
+                host,
+                overlapping: true,
+            });
+        }
+        push_observation(
+            &mut observations,
+            "session_tensor_bytes",
+            ObservationScope::Session,
+            Some(layers.iter().map(|layer| layer.bytes).sum()),
+            None,
+            ObservationSource::Derived,
+            sampled_at,
+            sequence,
+            true,
+            Some(
+                "sum of read-only tensor storage entries; grouped by layer/device/buffer"
+                    .to_string(),
+            ),
+        );
+    }
+
     // Explicit unsupported or unknown measurements.
     for (category, scope, detail) in [
         (
@@ -377,6 +444,7 @@ pub fn collect_observability(
         collection_sequence: sequence,
         devices,
         buffers,
+        layers,
         observations,
         allocation_counters: CounterObservation {
             state: MemoryObservationState::Unsupported,
@@ -466,7 +534,7 @@ mod tests {
         let observability =
             collect_observability(&DeviceRegistry::cpu_only(), None, None).expect("observability");
         observability.validate().expect("valid schema");
-        assert_eq!(observability.schema_version, 1);
+        assert_eq!(observability.schema_version, 2);
         assert!(!observability.devices.is_empty());
         assert_eq!(
             observability.allocation_counters.state,
@@ -484,6 +552,7 @@ mod tests {
                     && observation.state == MemoryObservationState::Unsupported
             ));
         assert!(observability.buffers.is_empty());
+        assert!(observability.layers.is_empty());
         let json = observability.to_json().expect("json");
         let decoded: GpuObservability = serde_json::from_value(json).expect("round trip");
         assert_eq!(decoded, observability);

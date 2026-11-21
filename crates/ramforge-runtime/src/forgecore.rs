@@ -373,6 +373,15 @@ impl ForgeCoreModel {
         &self.metadata
     }
 
+    /// Read-only tensor-to-buffer ownership for this loaded model.
+    pub fn tensor_storage(
+        &self,
+    ) -> Result<Vec<forge_core::TensorStorageInfo>, ForgeCoreAdapterError> {
+        self.model
+            .tensor_storage()
+            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
+    }
+
     /// Native model-only allocation breakdown. Context/compute fields are zero.
     pub fn memory_breakdown(&self) -> Result<Vec<forge_core::BufferMemory>, ForgeCoreAdapterError> {
         self.model

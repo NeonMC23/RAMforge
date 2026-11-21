@@ -108,7 +108,7 @@ about 113 MiB for hybrid. Unload returned near baseline; about 12.6 MiB
 remained in CUDA/driver caches. These are native free-memory snapshots, not
 peak measurements and not exclusive reservations.
 
-## Memory observability (schema 1)
+## Memory observability (schema 2)
 
 The native context already maintains model/context/compute byte totals per
 backend buffer type. A minimal read-only C bridge exposes them; RAMforge wraps
@@ -147,6 +147,11 @@ Unsupported metrics are explicit, not zero:
 - peak VRAM;
 - process-attributed device memory;
 - separable driver overhead.
+
+Schema 2 adds per-layer/device/buffer tensor storage totals from the read-only
+tensor introspection. Full GPU SmolLM2-135M exposes 273 tensors in 2 model
+buffers; layer 0 is 2,596,608 bytes across 9 tensors. See
+[STAGING_ARCHITECTURE.md](STAGING_ARCHITECTURE.md).
 
 `memory` service snapshots and benchmark reports capture before-load,
 after-load, after-warmup, after-generation, and after-unload points. Repeated

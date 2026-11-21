@@ -1626,7 +1626,8 @@ fn benchmark_reports_measured_generation_throughput() {
     assert!((p75 - p25 - iqr).abs() < 1e-9);
     assert!(report["model_load_ns"].as_u64().unwrap() > 0);
     let memory = &report["memory_after_generation"];
-    assert_eq!(memory["schema_version"], 1);
+    assert_eq!(memory["schema_version"], 2);
+    assert!(!memory["layers"].as_array().unwrap().is_empty());
     assert!(!memory["buffers"].as_array().unwrap().is_empty());
     assert_eq!(
         memory["transfers"]["state"], "unsupported",
@@ -1732,7 +1733,11 @@ fn serve_streams_tokens_and_reports_status() {
         .iter()
         .find(|line| line["event"] == "result" && line["id"] == 5)
         .expect("memory result");
-    assert_eq!(memory["gpu_observability"]["schema_version"], 1);
+    assert_eq!(memory["gpu_observability"]["schema_version"], 2);
+    assert!(!memory["gpu_observability"]["layers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert_eq!(
         memory["gpu_observability"]["transfers"]["state"],
         "unsupported"
@@ -1851,7 +1856,14 @@ fn cuda_benchmark_reports_native_placement_and_memory() {
         "unload did not release VRAM: {after_load} -> {after_unload}"
     );
     let memory = &report["memory_after_generation"];
-    assert_eq!(memory["schema_version"], 1);
+    assert_eq!(memory["schema_version"], 2);
+    assert!(memory["layers"].as_array().unwrap().iter().any(|layer| {
+        layer["device_name"]
+            .as_str()
+            .unwrap_or("")
+            .contains("CUDA0")
+            && layer["bytes"].as_u64().unwrap_or(0) > 0
+    }));
     assert!(memory["buffers"].as_array().unwrap().iter().any(|buffer| {
         buffer["device_name"]
             .as_str()

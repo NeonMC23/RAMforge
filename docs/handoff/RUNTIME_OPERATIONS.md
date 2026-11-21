@@ -93,10 +93,11 @@ Commands:
 {"command":"cancel"}
 ```
 
-`memory` returns the versioned GPU observability schema:
+`memory` returns GPU observability schema 2:
 
 - device total/free/used bytes with timestamps and native provenance;
 - per-buffer model, KV/context, and compute bytes;
+- per-layer/device/buffer tensor storage totals and file-backed bytes;
 - overlapping category flags;
 - session buffer totals;
 - explicit unsupported allocation/deallocation counters and transfer metrics.

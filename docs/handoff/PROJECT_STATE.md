@@ -149,7 +149,7 @@
 - Release throughput: first session CPU 240.70, hybrid 289.13, GPU 484.65;
   reverse order CPU 249.62, hybrid 309.53, GPU 488.89; instrumented session CPU
   252.53, hybrid 317.56, GPU 488.09 (P95 261.10/325.21/496.39).
-- Memory observability schema 1: native per-buffer model/KV/compute totals,
+- Memory observability schema 2: native per-buffer model/KV/compute totals,
   device total/free/used, timestamps and sequence. Full GPU: CUDA0 model
   103,739,904 B, KV 5,898,240 B, compute 50,921,472 B; hybrid: CUDA0 model
   46,928,640 B, KV 1,376,256 B, compute 50,921,472 B.
@@ -160,6 +160,13 @@
 - Larger-model hybrid: Qwen2.5-7B Q4_K_M, 12 layers (11 transformer + output),
   CUDA0 model 2,015,414,272 B, CPU-mapped 2,661,705,728 B, 9.30 tok/s,
   coherent output, 2.90 s load.
+- Read-only tensor storage introspection exposes 273 SmolLM2 tensors across 2
+  model buffers, layer/device/buffer/type/file-backed metadata, and per-layer
+  bytes. RAMforge observability schema 2 aggregates it.
+- Controlled staging investigation: the current graph/scheduler and model
+  buffer ownership do not permit layer/tensor staging or independent release.
+  Decision: READY AFTER SPECIFIC NATIVE PRIMITIVES. See
+  `docs/handoff/STAGING_ARCHITECTURE.md`.
 - GPU load/placement failure is explicit; no silent CPU fallback occurs.
 - Out-of-core re-verification: 13.13 GB GPT-NeoX-20B Q4_K_M under an 8 GiB
   cgroup with `--no-repack --no-prefetch` produced one token, exit 0, 10.877 s

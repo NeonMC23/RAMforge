@@ -151,6 +151,14 @@ Measured SmolLM2-135M examples:
 Device used includes driver/desktop and other-process usage. The native buffer
 sums are not a process total and may leave a substantial unclassified gap.
 
+Read-only tensor storage introspection now identifies the buffer, device,
+quantization type, `blk.N` layer, host/file-backed state, and byte size of every
+model tensor. RAMforge schema 2 aggregates this per layer/device/buffer. On
+SmolLM2-135M full GPU this exposes 273 tensors, 2 model buffers, and 2,596,608
+bytes for layer 0. It does not allocate, move, or release tensor data. The full
+staging investigation and decision are in
+[STAGING_ARCHITECTURE.md](STAGING_ARCHITECTURE.md).
+
 ## mmap and page-cache behavior
 
 The native runtime maps model files and executes CPU kernels. The virtual mapping
@@ -222,7 +230,8 @@ What is still not available:
 but they mutate live buffers and provide no ownership, eviction, or scheduling
 contract. Using them per token would not be controlled weight streaming.
 
-A real streaming extension still needs:
+A real streaming extension still needs (see
+[STAGING_ARCHITECTURE.md](STAGING_ARCHITECTURE.md)):
 
 1. stable tensor/layer ownership and residency state;
 2. a bounded staging buffer owned by the caller/forgeCORE;
