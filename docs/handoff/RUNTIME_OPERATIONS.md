@@ -156,9 +156,10 @@ throughput evidence, are in [BENCHMARKS.md](BENCHMARKS.md): in the latest
 session balanced 8 threads measured 223.04 tok/s (P25–P75 218.94–224.91),
 maximum-performance 4 threads repacked 205.25, balanced 4 threads 203.92, and
 background 81.44. An earlier session measured 283.81 and 267.65 for balanced 8
-and 4; an order-reversed session measured 269.05 and 252.02. Absolute rates vary
-by roughly 25% between sessions, but the 8-over-4 ordering was reproduced. Only
-within-session comparisons are treated as evidence.
+and 4; an order-reversed session measured 269.05 and 252.02; a final spot check
+measured 219.91 and 229.50. Absolute rates vary by roughly 25% between sessions
+and the 4/8 ranking reverses. No reliable winner between 4 and 8 threads is
+claimed. Only within-session comparisons are treated as evidence.
 
 ## Machine execution readiness
 

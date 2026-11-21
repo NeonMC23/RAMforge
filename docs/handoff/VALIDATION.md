@@ -394,8 +394,9 @@ Not run or not claimed:
 - Release-build throughput (latest session): balanced 8 threads 223.04 tok/s
   (P25–P75 218.94–224.91), maximum-performance 4 threads repacked 205.25,
   balanced 4 threads 203.92, background 81.44. Earlier sessions measured
-  283.81/267.65 and 269.05/252.02 for balanced 8/4; the ordering was reproduced,
-  but absolute rates vary by roughly 25% between sessions.
+  283.81/267.65 and 269.05/252.02 for balanced 8/4; a final spot check measured
+  219.91/229.50. Absolute rates vary by roughly 25% and the 4/8 ranking
+  reverses, so no reliable winner between 4 and 8 threads is claimed.
 - Out-of-core re-verification (2026-11-21): GPT-NeoX-20B Q4_K_M (13.13 GB)
   under an 8 GiB cgroup with `--no-repack --no-prefetch` produced one greedy
   token (` Paris`), exit 0, 10.877 s wall, 184 ms model load, peak charged

@@ -630,12 +630,15 @@ Model load was 100–106 ms. Context creation was 3.3–4.3 ms. Median prompt
 throughput was 538 tok/s for balanced 4, 655 for balanced 8, 617 for
 maximum-performance 4, and 194 for background.
 
-The balanced 8-thread configuration was the fastest measured configuration.
-An earlier session measured 283.81 tok/s for 8 threads and 267.65 for 4
-threads; a separate order-reversed session measured 269.05 and 252.02. Absolute
-rates therefore vary by roughly 25% between sessions on this machine, while the
-8-over-4 ordering was reproduced. Only within-session comparisons are treated
-as evidence. Repacking did not show a reliable improvement.
+The balanced 8-thread configuration was fastest in this matrix, but the 4/8
+ranking is not stable. An earlier session measured 283.81 tok/s for 8 threads
+and 267.65 for 4; another order-reversed session measured 269.05 and 252.02;
+a final 5-run spot check measured 219.91 for 8 and 229.50 for 4. Absolute rates
+vary by roughly 25% between sessions and the 4/8 ranges overlap or reverse.
+**No reliable winner between 4 and 8 threads is claimed.** Both clearly exceed
+the single-thread background configuration. Only within-session comparisons
+are treated as evidence, and even those are weak at this dispersion. Repacking
+did not show a reliable improvement.
 
 No GPU benchmark exists: no CUDA backend was built and CUDA is blocked by a
 kernel/userspace driver mismatch plus a missing toolkit. See

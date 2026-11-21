@@ -133,8 +133,9 @@
 - Release-build throughput matrix (latest session): balanced 8 threads 223.04
   tok/s (P25–P75 218.94–224.91), maximum-performance 4 threads repacked 205.25,
   balanced 4 threads 203.92, background 81.44. Earlier sessions measured
-  283.81/267.65 and 269.05/252.02 for balanced 8/4; the 8-over-4 ordering was
-  reproduced, but absolute rates vary by roughly 25% between sessions.
+  283.81/267.65 and 269.05/252.02 for balanced 8/4; a final spot check measured
+  219.91/229.50. Absolute rates vary by roughly 25% and the 4/8 ranking
+  reverses, so no reliable winner between 4 and 8 threads is claimed.
 - GPU environment: RTX 3050 Laptop GPU is present (PCI `01:00.0`), but the
   loaded kernel module is 595.112.07 while userspace is 620.70.06 (reboot
   pending), and `nvcc`/CUDA headers are absent. No CUDA build or physical GPU
