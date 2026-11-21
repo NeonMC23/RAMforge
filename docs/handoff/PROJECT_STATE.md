@@ -91,7 +91,7 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 415 passed, 10 ignored. RAMforge tests: 618 passed, 35
+- forgeCORE tests: 421 passed, 12 ignored. RAMforge tests: 618 passed, 35
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
@@ -149,7 +149,7 @@
 - Release throughput: first session CPU 240.70, hybrid 289.13, GPU 484.65;
   reverse order CPU 249.62, hybrid 309.53, GPU 488.89; instrumented session CPU
   252.53, hybrid 317.56, GPU 488.09 (P95 261.10/325.21/496.39).
-- Memory observability schema 2: native per-buffer model/KV/compute totals,
+- Memory observability schema 3: native per-buffer model/KV/compute totals,
   device total/free/used, timestamps and sequence. Full GPU: CUDA0 model
   103,739,904 B, KV 5,898,240 B, compute 50,921,472 B; hybrid: CUDA0 model
   46,928,640 B, KV 1,376,256 B, compute 50,921,472 B.
@@ -162,10 +162,14 @@
   coherent output, 2.90 s load.
 - Read-only tensor storage introspection exposes 273 SmolLM2 tensors across 2
   model buffers, layer/device/buffer/type/file-backed metadata, and per-layer
-  bytes. RAMforge observability schema 2 aggregates it.
-- Controlled staging investigation: the current graph/scheduler and model
-  buffer ownership do not permit layer/tensor staging or independent release.
-  Decision: READY AFTER SPECIFIC NATIVE PRIMITIVES. See
+  bytes. RAMforge observability schema 3 aggregates it.
+- Native staging primitives implemented: bounded pageable/pinned/device buffers,
+  handle lifecycle, private-stream H2D/D2H transfers, events, counters, and
+  deterministic failure behavior.
+- Single-layer transfer prototype: SmolLM2 layer 0, 2,596,608 bytes, FNV-1a
+  integrity matched, H2D 6.53 GB/s, D2H 5.41 GB/s; buffers released.
+- Inference did **not** consume staged bytes. Decision: TRANSFER PRIMITIVES
+  VALIDATED — GRAPH INTEGRATION STILL REQUIRED. See
   `docs/handoff/STAGING_ARCHITECTURE.md`.
 - GPU load/placement failure is explicit; no silent CPU fallback occurs.
 - Out-of-core re-verification: 13.13 GB GPT-NeoX-20B Q4_K_M under an 8 GiB
@@ -251,7 +255,7 @@
 - Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
   `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
   semantic/removal changes require a version increment.
-- ForgeCORE tests: 415 passed, 10 ignored. RAMforge tests: 618 passed, 35
+- ForgeCORE tests: 421 passed, 12 ignored. RAMforge tests: 618 passed, 35
   ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)

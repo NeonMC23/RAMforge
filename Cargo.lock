@@ -65,6 +65,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "cc"
+version = "1.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02f0e023adb368345ce0ca6cdfc0f24a06554468d0e8503e14a0841de79bfa69"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -170,18 +180,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "find-msvc-tools"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+
+[[package]]
 name = "forge-core"
 version = "0.1.0"
-source = "git+https://github.com/NeonMC23/forgeCORE.git?rev=4605d6e#4605d6ece727cd856367f2fa6ea44bbcea94aec5"
+source = "git+https://github.com/NeonMC23/forgeCORE.git?rev=69c74a5#69c74a58f17b185053c127a8a42a4dba1408a7b9"
 dependencies = [
+ "forge-staging",
  "forge-sys",
  "libc",
 ]
 
 [[package]]
+name = "forge-staging"
+version = "0.1.0"
+source = "git+https://github.com/NeonMC23/forgeCORE.git?rev=69c74a5#69c74a58f17b185053c127a8a42a4dba1408a7b9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "forge-sys"
 version = "0.1.0"
-source = "git+https://github.com/NeonMC23/forgeCORE.git?rev=4605d6e#4605d6ece727cd856367f2fa6ea44bbcea94aec5"
+source = "git+https://github.com/NeonMC23/forgeCORE.git?rev=69c74a5#69c74a58f17b185053c127a8a42a4dba1408a7b9"
 
 [[package]]
 name = "getrandom"
@@ -442,6 +467,12 @@ dependencies = [
  "serde_core",
  "zmij",
 ]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "strsim"

@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use ramforge_core::{
     discover_model_set, parse_memory_size, ChatMessage, ChatTemplate, GgufModel, GgufModelSet,
@@ -336,6 +337,19 @@ enum Commands {
         /// Skip whole-file mmap prefaulting
         #[arg(long)]
         no_prefetch: bool,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the single-layer transfer/ownership prototype (not inference staging)
+    StagingProbe {
+        /// GGUF model file
+        model: PathBuf,
+
+        /// Transformer layer index (blk.N)
+        #[arg(long, default_value_t = 0)]
+        layer: u32,
 
         /// JSON output
         #[arg(long)]
@@ -818,6 +832,12 @@ fn main() {
                 no_prefetch,
                 json,
             ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::StagingProbe { model, layer, json } => {
+            if let Err(error) = run_staging_probe(model, layer, json) {
                 eprintln!("Error: {error}");
                 std::process::exit(1);
             }
@@ -1397,6 +1417,188 @@ fn run_throughput_benchmark(
             report.condition,
             report.limitations.join("; ")
         );
+    }
+    Ok(())
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn run_staging_probe(model_path: PathBuf, layer: u32, json_output: bool) -> anyhow::Result<()> {
+    use ramforge_runtime::staging::{Direction, Engine, MemoryType, StagingError};
+
+    let model = ForgeCoreModel::load(&model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let lifetime = model
+        .lifetime_state()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    if !lifetime.quiescent || lifetime.active_contexts != 0 {
+        anyhow::bail!("model is not quiescent; refusing to read tensor bytes");
+    }
+    let plan = model
+        .layer_staging_plan(layer)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let engine = Engine::new(0).map_err(|error| match error {
+        StagingError::Unsupported(reason) => anyhow::anyhow!("CUDA staging unavailable: {reason}"),
+        other => anyhow::anyhow!(other),
+    })?;
+    let total = usize::try_from(plan.total_bytes).context("layer size exceeds usize")?;
+    let mut source = vec![0u8; total];
+    let mut offset = 0usize;
+    for tensor in &plan.tensors {
+        let length = usize::try_from(tensor.tensor_bytes).context("tensor size exceeds usize")?;
+        model
+            .read_tensor_bytes(&tensor.name, 0, &mut source[offset..offset + length])
+            .map_err(|error| anyhow::anyhow!(error))?;
+        offset += length;
+    }
+    let source_hash = fnv1a(&source);
+    let mut host = engine
+        .allocate(MemoryType::PinnedHost, plan.total_bytes)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let mut device = engine
+        .allocate(MemoryType::Device, plan.total_bytes)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let mut readback = engine
+        .allocate(MemoryType::PinnedHost, plan.total_bytes)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    host.write_host(0, &source)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    engine
+        .submit(
+            &host,
+            0,
+            &device,
+            0,
+            plan.total_bytes,
+            Direction::HostToDevice,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let h2d = engine.wait().map_err(|error| anyhow::anyhow!(error))?;
+    engine
+        .submit(
+            &device,
+            0,
+            &readback,
+            0,
+            plan.total_bytes,
+            Direction::DeviceToHost,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let d2h = engine.wait().map_err(|error| anyhow::anyhow!(error))?;
+    let mut received = vec![0u8; total];
+    readback
+        .read_host(0, &mut received)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let readback_hash = fnv1a(&received);
+    let integrity_ok = received == source;
+    host.release().map_err(|error| anyhow::anyhow!(error))?;
+    device.release().map_err(|error| anyhow::anyhow!(error))?;
+    readback.release().map_err(|error| anyhow::anyhow!(error))?;
+    let stats = engine.stats().map_err(|error| anyhow::anyhow!(error))?;
+    let info = engine.info().map_err(|error| anyhow::anyhow!(error))?;
+    let sampled_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+    let staging = ramforge_runtime::StagingObservation {
+        schema_version: 1,
+        state: if stats.in_flight_operations > 0 {
+            ramforge_runtime::StagingState::InFlight
+        } else {
+            ramforge_runtime::StagingState::Idle
+        },
+        reason: "staging probe engine attached; transfer-only, not inference staging".to_string(),
+        counters: Some(ramforge_runtime::StagingCounters {
+            allocation_requests: stats.allocation_requests,
+            allocation_successes: stats.allocation_successes,
+            allocation_failures: stats.allocation_failures,
+            released: stats.released,
+            current_bytes: stats.current_bytes,
+            high_water_bytes: stats.high_water_bytes,
+            transfer_requests: stats.transfer_requests,
+            transfer_completed: stats.transfer_completed,
+            transfer_failed: stats.transfer_failed,
+            transfer_bytes: stats.transfer_bytes,
+            submit_ns: stats.submit_ns,
+            wait_ns: stats.wait_ns,
+            last_duration_ns: stats.last_duration_ns,
+            total_duration_ns: stats.total_duration_ns,
+            in_flight_operations: stats.in_flight_operations,
+            cancellation_requests: stats.cancellation_requests,
+        }),
+        sampled_at_unix_ms: sampled_at,
+        collection_sequence: 1,
+    };
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "kind": "ramforge.staging_probe",
+        "layer": plan.layer,
+        "tensor_count": plan.tensors.len(),
+        "bytes": plan.total_bytes,
+        "source_hash": format!("{source_hash:016x}"),
+        "readback_hash": format!("{readback_hash:016x}"),
+        "integrity_ok": integrity_ok,
+        "h2d": {
+            "bytes": h2d.bytes,
+            "submit_ns": h2d.submit_ns,
+            "wait_ns": h2d.wait_ns,
+            "duration_ns": h2d.duration_ns,
+            "gbps": h2d.bandwidth_gbps(),
+        },
+        "d2h": {
+            "bytes": d2h.bytes,
+            "submit_ns": d2h.submit_ns,
+            "wait_ns": d2h.wait_ns,
+            "duration_ns": d2h.duration_ns,
+            "gbps": d2h.bandwidth_gbps(),
+        },
+        "engine": {
+            "device_index": info.device_index,
+            "device_name": info.device_name(),
+            "driver_version": info.driver_version,
+        },
+        "stats": {
+            "allocation_requests": stats.allocation_requests,
+            "allocation_successes": stats.allocation_successes,
+            "allocation_failures": stats.allocation_failures,
+            "released": stats.released,
+            "current_bytes": stats.current_bytes,
+            "high_water_bytes": stats.high_water_bytes,
+            "transfer_requests": stats.transfer_requests,
+            "transfer_completed": stats.transfer_completed,
+            "transfer_failed": stats.transfer_failed,
+            "transfer_bytes": stats.transfer_bytes,
+            "submit_ns": stats.submit_ns,
+            "wait_ns": stats.wait_ns,
+            "in_flight_operations": stats.in_flight_operations,
+        },
+        "staging_observability": staging,
+        "inference_consumed_staged_data": false,
+        "note": "transfer and ownership prototype only; llama.cpp inference did not consume the staged bytes",
+    });
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "layer={} tensors={} bytes={} integrity={}",
+            plan.layer,
+            plan.tensors.len(),
+            plan.total_bytes,
+            integrity_ok
+        );
+        println!(
+            "H2D {:.2} GB/s, D2H {:.2} GB/s, source_hash={:016x}",
+            h2d.bandwidth_gbps().unwrap_or(0.0),
+            d2h.bandwidth_gbps().unwrap_or(0.0),
+            source_hash
+        );
+        println!("inference_consumed_staged_data=false (transfer/ownership prototype)");
     }
     Ok(())
 }

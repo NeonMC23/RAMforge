@@ -390,7 +390,7 @@ Not run or not claimed:
 - Release comparison: first session CPU 240.70 tok/s, hybrid 289.13, full GPU
   484.65; reverse order CPU 249.62, hybrid 309.53, GPU 488.89; instrumented
   session CPU 252.53, hybrid 317.56, GPU 488.09.
-- GPU observability schema 2 validated: native CUDA0/CPU_Mapped/CPU buffer
+- GPU observability schema 3 validated: native CUDA0/CPU_Mapped/CPU buffer
   model/KV/compute totals, device used, sampling time/sequence; unsupported
   counters remain explicit.
 - Allocation/deallocation counters, transfer accounting, peak VRAM, process
@@ -402,9 +402,12 @@ Not run or not claimed:
 - Read-only tensor storage introspection validated physically: 273 tensors,
   2 model buffers, layer 0 = 2,596,608 bytes; file-backed and CUDA0 metadata
   agree with placement and breakdown.
-- Controlled staging is not implemented; graph/scheduler/model-buffer ownership
-  lacks per-layer allocation, release, and boundary hooks. Decision: READY
-  AFTER SPECIFIC NATIVE PRIMITIVES.
+- Staging primitives validated physically: bounded buffers, private-stream
+  H2D/D2H, event completion, counters, release/double-release/busy checks,
+  allocation failure, and cancellation refusal during active copy.
+- Single-layer prototype: 2,596,608 bytes copied and read back byte-identically;
+  model remained usable. Inference did not consume the staged copy.
+- Decision: TRANSFER PRIMITIVES VALIDATED — GRAPH INTEGRATION STILL REQUIRED.
 - Native effective placement readback is wired through forgeCORE and RAMforge;
   zero-effective GPU loads are rejected. No silent CPU fallback.
 - `RuntimePlan` schema is 2; benchmark schema is 6.
@@ -464,7 +467,7 @@ Not run or not claimed:
 
 ## CPU node-dispatch validation — 2026-10-31
 
-- forgeCORE `cargo test --workspace`: **415 passed, 0 failed, 9 ignored**.
+- forgeCORE `cargo test --workspace`: **421 passed, 0 failed, 12 ignored**.
   New `node_dispatch` tests cover disabled-by-default behavior, installation
   and removal, event drain, overflow, multiple contexts, four-worker
   exactly-once publication, identity fields, and bounded options.

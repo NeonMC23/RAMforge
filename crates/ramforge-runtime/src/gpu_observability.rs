@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::execution::DeviceRegistry;
 use crate::forgecore::{ForgeCoreModel, ForgeCoreSession};
 
-pub const GPU_OBSERVABILITY_SCHEMA_VERSION: u32 = 2;
+pub const GPU_OBSERVABILITY_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +124,45 @@ pub struct LayerStorageObservation {
     pub overlapping: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StagingState {
+    Unsupported,
+    Idle,
+    InFlight,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingCounters {
+    pub allocation_requests: u64,
+    pub allocation_successes: u64,
+    pub allocation_failures: u64,
+    pub released: u64,
+    pub current_bytes: u64,
+    pub high_water_bytes: u64,
+    pub transfer_requests: u64,
+    pub transfer_completed: u64,
+    pub transfer_failed: u64,
+    pub transfer_bytes: u64,
+    pub submit_ns: u64,
+    pub wait_ns: u64,
+    pub last_duration_ns: u64,
+    pub total_duration_ns: u64,
+    pub in_flight_operations: u64,
+    pub cancellation_requests: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagingObservation {
+    pub schema_version: u32,
+    pub state: StagingState,
+    pub reason: String,
+    pub counters: Option<StagingCounters>,
+    pub sampled_at_unix_ms: Option<u64>,
+    pub collection_sequence: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuObservability {
     pub schema_version: u32,
@@ -136,6 +175,7 @@ pub struct GpuObservability {
     pub allocation_counters: CounterObservation,
     pub deallocation_counters: CounterObservation,
     pub transfers: TransferObservation,
+    pub staging: StagingObservation,
     pub notes: Vec<String>,
 }
 
@@ -467,7 +507,15 @@ pub fn collect_observability(
             device_to_host_count: None,
             device_to_host_bytes: None,
             duration_ns: None,
-            reason: "no transfer instrumentation is installed in this milestone".to_string(),
+            reason: "llama.cpp inference transfer instrumentation is not installed; staging probe stats are separate".to_string(),
+        },
+        staging: StagingObservation {
+            schema_version: 1,
+            state: StagingState::Unsupported,
+            reason: "no staging engine is attached to the service; use `ramforge staging-probe`".to_string(),
+            counters: None,
+            sampled_at_unix_ms: sampled_at,
+            collection_sequence: sequence,
         },
         notes: vec![
             "Categories overlap; do not sum them into a process total.".to_string(),
@@ -534,7 +582,8 @@ mod tests {
         let observability =
             collect_observability(&DeviceRegistry::cpu_only(), None, None).expect("observability");
         observability.validate().expect("valid schema");
-        assert_eq!(observability.schema_version, 2);
+        assert_eq!(observability.schema_version, 3);
+        assert_eq!(observability.staging.state, StagingState::Unsupported);
         assert!(!observability.devices.is_empty());
         assert_eq!(
             observability.allocation_counters.state,

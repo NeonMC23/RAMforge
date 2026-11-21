@@ -107,10 +107,12 @@ pub use machine_profile::{
     MachineProfileConfig, ObservationState, Observed, Provenance, RegisteredBackend,
     StorageBenchmarkConfig, StorageProfile, MACHINE_PROFILE_SCHEMA_VERSION,
 };
+pub use forge_core::staging;
 pub use gpu_observability::{
     collect_observability, BufferObservation, CounterObservation, DeviceObservation,
-    GpuObservability, MemoryObservation, MemoryObservationState, ObservationScope,
-    ObservationSource, TransferObservation, GPU_OBSERVABILITY_SCHEMA_VERSION,
+    GpuObservability, LayerStorageObservation, MemoryObservation, MemoryObservationState,
+    ObservationScope, ObservationSource, StagingCounters, StagingObservation, StagingState,
+    TransferObservation, GPU_OBSERVABILITY_SCHEMA_VERSION,
 };
 pub use memory_hierarchy::{
     build_memory_hierarchy, build_placement_model, build_placement_model_for_plan,

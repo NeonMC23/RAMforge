@@ -93,7 +93,7 @@ Commands:
 {"command":"cancel"}
 ```
 
-`memory` returns GPU observability schema 2:
+`memory` returns GPU observability schema 3:
 
 - device total/free/used bytes with timestamps and native provenance;
 - per-buffer model, KV/context, and compute bytes;
@@ -213,6 +213,24 @@ claimed. Only within-session comparisons are treated as evidence.
 A detected device is not automatically a selectable device. With the validated
 CUDA build, CUDA0 is selectable; with a CPU-only build it is not registered at
 all. `execution_readiness.gpu_execution` reflects current selectability.
+
+## Staging transfer prototype
+
+`ramforge staging-probe MODEL --layer N [--json]` runs the native staging
+prototype:
+
+- selects one `blk.N` layer and reads its exact tensor bytes while the model is
+  quiescent;
+- allocates pinned host, CUDA device, and pinned readback buffers;
+- transfers H2D and D2H through the native engine;
+- verifies FNV-1a integrity and reports byte counts, event durations,
+  submission/wait overhead, allocation/transfer counters, and high-water bytes;
+- releases buffers after completion.
+
+**This is not inference staging.** The report states
+`inference_consumed_staged_data=false`; llama.cpp does not consume the staged
+copy. The graph has no safe layer-boundary rebind/consume contract yet. See
+[STAGING_ARCHITECTURE.md](STAGING_ARCHITECTURE.md).
 
 ## Profile optimization loop
 

@@ -108,7 +108,7 @@ about 113 MiB for hybrid. Unload returned near baseline; about 12.6 MiB
 remained in CUDA/driver caches. These are native free-memory snapshots, not
 peak measurements and not exclusive reservations.
 
-## Memory observability (schema 2)
+## Memory observability (schema 3)
 
 The native context already maintains model/context/compute byte totals per
 backend buffer type. A minimal read-only C bridge exposes them; RAMforge wraps
@@ -187,6 +187,18 @@ with 12 requested layers, 256 context, and 4 CPU threads.
 This was a conservative fit: roughly 2.3 GB device used of 4 GB total, with
 17 transformer layers and 2.66 GB of weights on CPU. It is a correctness and
 fit result, not a throughput recommendation. No VRAM exhaustion test was run.
+
+## Staging transfer primitives
+
+A bounded native staging engine (pageable/pinned host, CUDA device) and a
+private-stream transfer engine are compiled into forgeCORE. Measured transfer
+matrix and the single-layer integrity prototype are in
+[STAGING_ARCHITECTURE.md](STAGING_ARCHITECTURE.md). The prototype transferred
+SmolLM2 layer 0 (2,596,608 bytes), verified byte-identical readback, and
+released all buffers. It did **not** feed inference; no graph integration exists.
+
+`ramforge staging-probe MODEL --layer 0 --json` reproduces the transfer-only
+prototype.
 
 ## Reproduction
 

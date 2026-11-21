@@ -198,7 +198,7 @@ Read-only tensor storage introspection was added:
 - tensor name, buffer type, device, quantization type, `blk.N` layer, stable
   buffer index, host/file-backed flags, tensor bytes/offset, buffer bytes;
 - forgeCORE `Model::tensor_storage()`;
-- RAMforge observability schema 2 aggregates per layer/device/buffer.
+- RAMforge observability schema 3 aggregates per layer/device/buffer.
 
 Physical validation on SmolLM2-135M, full GPU:
 
@@ -231,11 +231,107 @@ Rust remains responsible for budgets, planning, policy, profiles, and service
 contracts. C++ owns native buffers and graph hooks. CUDA code owns streams,
 events, pinned memory, and transfers.
 
+## Implemented primitives (this milestone)
+
+`forge-staging` (forgeCORE) provides a handle-based C ABI with runtime CUDA
+driver loading. CPU-only builds compile without CUDA headers; engine creation
+returns `Unsupported` when `libcuda` is unavailable.
+
+### Buffer ownership
+
+- Memory types: pageable host, CUDA-pinned host, CUDA device.
+- Requested capacity is explicit; allocated size is reported.
+- Handles are never reused; released handles remain queryable as released.
+- Allocation is bounded by the request; no fallback conversion.
+- State: empty, allocated, in-flight, released, failed.
+- Release is refused while in flight or while an engine still owns buffers.
+- Double release is reported as `ALREADY_RELEASED`.
+- Engine destruction is refused while buffers or transfers remain.
+
+### Transfer engine
+
+- Private CUDA context, non-blocking stream, start/end events.
+- Single in-flight operation in the prototype.
+- H2D/D2H only with correct buffer types.
+- Byte range validation and buffer-in-flight exclusion.
+- Submission duration, wait duration, event duration, byte counts, counters,
+  high-water bytes.
+- Cancellation during an active copy is explicitly refused; the caller must
+  wait. No device-wide synchronize is used.
+- On a CUDA submission/event failure the engine is marked unusable and rejects
+  further work.
+
+### Tensor/layer integration
+
+- Read-only tensor storage introspection.
+- `Model::layer_staging_plan(layer)` groups `blk.N` tensors and bytes.
+- `Model::read_tensor_bytes` copies a bounded tensor range while quiescent.
+- No tensor pointer/buffer rebinding; no inference consumption.
+
+### Measured transfer matrix
+
+Pinned and pageable transfers, 5 measured iterations after warmup, RTX 3050,
+private staging context:
+
+| Size | Type | H2D median | H2D p25–p75 | D2H median | Effective H2D | Effective D2H |
+|---:|---|---:|---:|---:|---:|---:|
+| 2.60 MB | pinned | 534 µs | 484–564 µs | 569 µs | 4.86 GB/s | 4.56 GB/s |
+| 2.60 MB | pageable | 459 µs | 446–497 µs | 374 µs | 5.66 GB/s | 6.94 GB/s |
+| 16 MiB | pinned | 3.53 ms | 3.51–4.40 ms | 3.46 ms | 4.76 GB/s | 4.86 GB/s |
+| 16 MiB | pageable | 4.12 ms | 3.50–4.84 ms | 3.55 ms | 4.07 GB/s | 4.73 GB/s |
+| 64 MiB | pinned | 12.49 ms | 12.23–13.29 ms | 13.44 ms | 5.37 GB/s | 4.99 GB/s |
+| 64 MiB | pageable | 19.40 ms | 16.81–20.16 ms | 14.37 ms | 3.46 GB/s | 4.67 GB/s |
+| 183 MiB | pinned | 40.51 ms | 40.14–41.06 ms | 41.95 ms | 4.74 GB/s | 4.57 GB/s |
+
+These are lower than the earlier ad-hoc 6.3/6.37 GB/s maxima. The matrix uses a
+private context, single stream, and includes event/stream overhead. Pageable
+submission is expensive (0.26–19 ms) because the driver stages it internally;
+pinned submission is 4–32 µs. Small-size results are noisy and are not used for
+bandwidth claims.
+
+Engine stats snapshot overhead: 1,000 snapshots in 78.7 µs (~79 ns each).
+
+### Single-layer prototype
+
+SmolLM2-135M layer 0: 9 tensors, 2,596,608 bytes.
+
+- Source bytes read from the model into a pinned buffer.
+- H2D to a device buffer, event wait.
+- D2H to a second pinned buffer, event wait.
+- FNV-1a source and readback hashes matched.
+- H2D 6.53 GB/s, D2H 5.41 GB/s in this run.
+- Buffers released; counters show zero current bytes.
+- Model remained usable; a context opened successfully afterward.
+
+**The graph did not consume the staged bytes.** This is a transfer/ownership
+prototype, not inference staging.
+
+## Reproduction
+
+```sh
+export FORGE_LLAMA_DIR=/path/to/native
+export FORGE_LLAMA_BUILD_DIR=build-cuda
+export LD_LIBRARY_PATH="$FORGE_LLAMA_DIR/build-cuda/bin"
+
+cd forgeCORE
+cargo test -p forge-staging
+cargo test -p forge-staging -- --ignored transfer_benchmark_matrix --nocapture
+FORGE_TEST_MODEL=/path/to/SmolLM2.gguf \
+  cargo test -p forge-core --test staging_prototype -- --ignored --nocapture
+
+cd ../RAMforge
+cargo build --release -p ramforge-cli
+./target/release/ramforge staging-probe /path/to/SmolLM2.gguf --layer 0 --json
+```
+
+The CLI probe intentionally reports `inference_consumed_staged_data=false`.
+
 ## Decision
 
-**READY AFTER SPECIFIC NATIVE PRIMITIVES.**
+**TRANSFER PRIMITIVES VALIDATED — GRAPH INTEGRATION STILL REQUIRED.**
 
-The architecture is understood and the read-only ownership foundation exists,
-but controlled staging cannot be implemented safely on the current public API.
-The next milestone should implement primitives 1–4 with narrow C ABI tests and
-must not claim overlap or throughput before measuring real transfers.
+The staging-buffer lifecycle, asynchronous transfer engine, event completion,
+failure handling, and single-layer transfer/integrity prototype are physically
+validated. The graph still has no safe layer-boundary consume/rebind contract,
+so inference does not consume staged weights. Do not claim controlled inference
+staging or transfer/compute overlap yet.

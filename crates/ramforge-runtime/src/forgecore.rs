@@ -373,6 +373,30 @@ impl ForgeCoreModel {
         &self.metadata
     }
 
+    /// Read-only tensor inventory for one `blk.N` layer.
+    pub fn layer_staging_plan(
+        &self,
+        layer: u32,
+    ) -> Result<forge_core::LayerStagingPlan, ForgeCoreAdapterError> {
+        self.model
+            .layer_staging_plan(layer)
+            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
+    }
+
+    /// Read a bounded byte range from a named model tensor. The caller must
+    /// ensure no context is executing (this wrapper is quiescence-checked by
+    /// the caller; the native read mutates no tensor storage).
+    pub fn read_tensor_bytes(
+        &self,
+        name: &str,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<(), ForgeCoreAdapterError> {
+        self.model
+            .read_tensor_bytes(name, offset, out)
+            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
+    }
+
     /// Read-only tensor-to-buffer ownership for this loaded model.
     pub fn tensor_storage(
         &self,
