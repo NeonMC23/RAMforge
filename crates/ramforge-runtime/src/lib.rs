@@ -102,9 +102,9 @@ pub use execution_candidate::{
     PlanReason, EXECUTION_CANDIDATE_SCHEMA_VERSION,
 };
 pub use machine_profile::{
-    collect_machine_profile, CpuRuntimeSettings, Freshness, MachineProfile, MachineProfileConfig,
-    ObservationState, Observed, Provenance, StorageBenchmarkConfig, StorageProfile,
-    MACHINE_PROFILE_SCHEMA_VERSION,
+    collect_machine_profile, BackendInventory, CpuRuntimeSettings, Freshness, MachineProfile,
+    MachineProfileConfig, ObservationState, Observed, Provenance, RegisteredBackend,
+    StorageBenchmarkConfig, StorageProfile, MACHINE_PROFILE_SCHEMA_VERSION,
 };
 pub use memory_hierarchy::{
     build_memory_hierarchy, build_placement_model, build_placement_model_for_plan,
@@ -160,8 +160,8 @@ pub use inference_service::{
 };
 pub use service_server::{serve_stdio, ServiceServerError};
 pub use runtime_plan::{
-    CustomRuntimeRequest, EffectiveRuntimeConfig, FieldStatus, PlanField, RuntimePlan,
-    RuntimeProfileKind, RUNTIME_PLAN_SCHEMA_VERSION,
+    CustomRuntimeRequest, EffectiveRuntimeConfig, ExecutionMode, FieldStatus, PlanField,
+    RuntimePlan, RuntimeProfileKind, RUNTIME_PLAN_SCHEMA_VERSION,
 };
 pub use runtime_config::{RuntimeConfig, RuntimeConfigError, RuntimeExecutionDevice};
 

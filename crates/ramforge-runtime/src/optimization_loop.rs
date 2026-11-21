@@ -137,6 +137,8 @@ pub fn run_profile_optimization(
                     threads: config.threads,
                     load_mode: config.load_mode.clone(),
                     no_repack: config.no_repack,
+                    device: None,
+                    gpu_layers: None,
                 },
             ) {
                 Ok(plan) => plan,

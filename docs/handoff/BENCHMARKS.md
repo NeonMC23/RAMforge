@@ -616,31 +616,35 @@ correctness is verified; no throughput improvement is implied.
 Release build, SmolLM2-135M Q4_K_M, 256 context, 32 generated tokens, 5
 measured runs + 1 warmup per configuration, CPU-only, warm/uncontrolled.
 Threads are effective native values. Each JSON report includes the resolved
-`plan` with requested/effective field statuses. Reproduce the matrix with
-`RUNS=5 FORGE_TEST_MODEL=/models/tiny.gguf sh scripts/throughput-bench.sh`; each
-configuration is written to its own JSON report.
+`plan` with requested/effective field statuses. All plans report
+`execution_mode=cpu` and `gpu_layers=0`.
 
 | Profile | Threads | Repack | Median tok/s | P25–P75 | IQR | Decode tok/s | TTFT |
 |---|---:|---|---:|---:|---:|---:|---:|
-| balanced | 8 | off | 283.81 | 281.77–285.24 | 3.47 | 297.27 | 8.31 ms |
-| balanced | 4 | off | 267.65 | 259.09–267.99 | 8.90 | 276.87 | 7.74 ms |
-| maximum-performance | 4 | on | 263.47 | 259.30–266.91 | 7.61 | 272.34 | 7.14 ms |
-| background | 1 | off | 102.80 | 102.43–102.98 | 0.54 | 107.01 | 21.19 ms |
+| balanced | 8 | off | 223.04 | 218.94–224.91 | 5.97 | 228.29 | 7.68 ms |
+| maximum-performance | 4 | on | 205.25 | 200.81–206.19 | 5.38 | 210.83 | 8.16 ms |
+| balanced | 4 | off | 203.92 | 191.68–206.01 | 14.33 | 210.17 | 9.34 ms |
+| background | 1 | off | 81.44 | 80.53–82.55 | 2.02 | 84.56 | 25.77 ms |
 
-Model load was 88–90 ms. Context creation was 3.0–4.2 ms. Median prompt
-throughput was 650 tok/s for balanced 4, 605 for balanced 8, 705 for
-maximum-performance 4, and 236 for background.
+Model load was 100–106 ms. Context creation was 3.3–4.3 ms. Median prompt
+throughput was 538 tok/s for balanced 4, 655 for balanced 8, 617 for
+maximum-performance 4, and 194 for background.
 
-The balanced 8-thread configuration was the fastest measured configuration,
-but the margin over 4 threads is modest. A second matrix with the order reversed
-(8 threads measured first, then 4) reproduced the ordering: medians 269.05 and
-252.02 tok/s. Absolute rates differ between sessions, so only within-session
-comparisons are treated as evidence. Repacking did not show a reliable
-improvement. The workload is one small model, warm, single-machine.
+The balanced 8-thread configuration was the fastest measured configuration.
+An earlier session measured 283.81 tok/s for 8 threads and 267.65 for 4
+threads; a separate order-reversed session measured 269.05 and 252.02. Absolute
+rates therefore vary by roughly 25% between sessions on this machine, while the
+8-over-4 ordering was reproduced. Only within-session comparisons are treated
+as evidence. Repacking did not show a reliable improvement.
 
-Percentiles use the nearest-rank method over the measured runs. They describe
-dispersion in this session; they are not confidence intervals. No cold-cache,
-GPU, or large-model claim follows from this matrix.
+No GPU benchmark exists: no CUDA backend was built and CUDA is blocked by a
+kernel/userspace driver mismatch plus a missing toolkit. See
+[GPU_ENVIRONMENT.md](GPU_ENVIRONMENT.md). No CPU/GPU speedup, transfer rate, or
+offload result is claimed.
+
+Percentiles use the nearest-rank method. They describe dispersion in this
+session; they are not confidence intervals. No cold-cache, GPU, or large-model
+claim follows from this matrix.
 
 ## Caveats
 

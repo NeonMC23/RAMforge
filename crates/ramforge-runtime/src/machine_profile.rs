@@ -192,7 +192,44 @@ pub struct MachineProfile {
     pub storage: Vec<StorageProfile>,
     pub devices: Vec<DeviceProfile>,
     pub backends: Vec<BackendProfile>,
+    /// Native backend registrations, independent of whether a usable
+    /// physical device exists. Additive field; absent in older JSON.
+    #[serde(default)]
+    pub backend_inventory: BackendInventory,
     pub limitations: Vec<String>,
+}
+
+/// One backend registered with ggml in this process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredBackend {
+    pub name: String,
+    pub device_count: usize,
+}
+
+/// Build/runtime backend evidence. A registered GPU backend does not prove
+/// that a physical GPU is present or usable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BackendInventory {
+    pub registered: Vec<RegisteredBackend>,
+    /// Native `llama_supports_gpu_offload()` result at collection time.
+    pub gpu_offload_available: bool,
+    pub notes: Vec<String>,
+}
+
+impl BackendInventory {
+    /// Whether a backend name is registered in this process.
+    pub fn has_backend(&self, name: &str) -> bool {
+        self.registered
+            .iter()
+            .any(|backend| backend.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Whether at least one registered backend reports a device.
+    pub fn has_any_device(&self) -> bool {
+        self.registered
+            .iter()
+            .any(|backend| backend.device_count > 0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +257,14 @@ impl std::error::Error for ProfileError {}
 
 impl MachineProfile {
     pub fn validate(&self) -> Result<(), ProfileError> {
+        for backend in &self.backend_inventory.registered {
+            if backend.name.trim().is_empty() {
+                return Err(ProfileError::Invariant(
+                    "registered backend has an empty name".to_string(),
+                ));
+            }
+        }
+
         if self.schema_version != MACHINE_PROFILE_SCHEMA_VERSION {
             return Err(ProfileError::UnsupportedSchema(self.schema_version));
         }
@@ -281,6 +326,7 @@ pub fn collect_machine_profile(config: &MachineProfileConfig) -> MachineProfile 
     let memory = collect_memory_profile(config.ram_budget_bytes, sequence);
     let devices = collect_devices(sequence);
     let backends = collect_backends(&devices);
+    let backend_inventory = collect_backend_inventory(&devices);
     let mut storage = Vec::new();
     let mut paths = config.storage_paths.clone();
     if let Some(model) = &config.model_path {
@@ -333,6 +379,7 @@ pub fn collect_machine_profile(config: &MachineProfileConfig) -> MachineProfile 
         storage,
         devices,
         backends,
+        backend_inventory,
         limitations,
     }
 }
@@ -400,6 +447,39 @@ fn device_profile(device: &crate::execution::DeviceInfo, sequence: u64) -> Devic
     }
 }
 
+fn collect_backend_inventory(devices: &[DeviceProfile]) -> BackendInventory {
+    let registered = forge_core::registered_backends()
+        .into_iter()
+        .map(|backend| RegisteredBackend {
+            name: backend.name,
+            device_count: backend.device_count,
+        })
+        .collect::<Vec<_>>();
+    let gpu_offload_available = forge_core::supports_gpu_offload();
+    let gpu_devices = devices.iter().filter(|device| device.kind != "cpu").count();
+    let mut notes = Vec::new();
+    if !gpu_offload_available {
+        notes.push(
+            "no GPU backend/device is registered; GPU execution is unavailable in this process"
+                .to_string(),
+        );
+    }
+    if gpu_offload_available && gpu_devices == 0 {
+        notes.push(
+            "native GPU offload reports available but no GPU/IGPU device was enumerated"
+                .to_string(),
+        );
+    }
+    if !registered.iter().any(|backend| backend.device_count > 0) {
+        notes.push("backend registry contains no device-bearing backend".to_string());
+    }
+    BackendInventory {
+        registered,
+        gpu_offload_available,
+        notes,
+    }
+}
+
 fn collect_backends(devices: &[DeviceProfile]) -> Vec<BackendProfile> {
     let mut ids: Vec<&str> = devices
         .iter()
@@ -464,6 +544,28 @@ mod tests {
         let value = Observed::<u64>::unavailable("not reported", 1);
         assert_eq!(value.as_ref(), None);
         assert!(!value.is_known());
+    }
+
+    #[test]
+    fn backend_inventory_is_explicit_about_registration_and_gpu_state() {
+        let profile = collect_machine_profile(&MachineProfileConfig::default());
+        assert!(
+            profile.backend_inventory.has_any_device(),
+            "a running process must expose at least one device-bearing backend"
+        );
+        assert_eq!(
+            profile.backend_inventory.gpu_offload_available,
+            forge_core::supports_gpu_offload()
+        );
+        let gpu_devices = profile
+            .devices
+            .iter()
+            .filter(|device| device.kind != "cpu")
+            .count();
+        if !profile.backend_inventory.gpu_offload_available {
+            assert!(gpu_devices == 0 || !profile.backend_inventory.notes.is_empty());
+        }
+        profile.validate().expect("inventory validates");
     }
 
     #[cfg(target_os = "linux")]

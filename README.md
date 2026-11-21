@@ -22,6 +22,8 @@ RAMforge is a local inference runtime designed to run AI models that may be sign
 >
 > **Milestone 6.1 Baseline (Correctness & Accounting Fixes):** `generate()` is cleanly repeatable on one engine (explicit KV reset + failure-proof budget); RoPE uses the correct llama/qwen2 **half-split** pair convention; F16/BF16 resident RAM is booked at its true decoded size (4 B/elem, with a 3×-file-byte load transient); qwen2 Q/K/V biases are loaded, budgeted, validated (all-or-none + exact shape), and applied after the projections. The historical M6.1 baseline was verified by 132 synthetic tests; current validation is summarized below.
 >
+> **GPU milestone status (2026-11-21):** The physical RTX 3050 Laptop GPU is detected, but CUDA execution is blocked. The running NVIDIA kernel module is 595.112.07 while userspace is 620.70.06 (reboot pending), and `nvcc`/CUDA development headers are not installed. The native build remains CPU-only. RAMforge now reports registered backends and GPU availability, performs native effective-placement readback, and rejects non-CPU requests explicitly with no silent fallback. A detected GPU is not claimed as usable. See [GPU_ENVIRONMENT.md](docs/handoff/GPU_ENVIRONMENT.md) and [LARGE_MODEL_EXECUTION.md](docs/handoff/LARGE_MODEL_EXECUTION.md).
+
 > **Milestone 6 Status (Managed Out-of-Core Path):** The legacy inference path charges its named, RAMforge-managed allocations via scoped accounting helpers; the cache is budget-charged per entry; matrix layout is the explicit GGML/GGUF convention (no orientation guessing, no full-F32 fallbacks); logits use a single budget-charged buffer with a budget-aware chunked streamed projection; the KV cache grows chunk-wise without prefix copies; the F32 matvec hot path uses AVX2/rayon. CPU-only, llama/qwen2 dense models. GPU, MoE, HTTP not implemented. This ledger is not a process-RSS or OS-memory cap; allocator overhead, native/dependency allocations, page cache, and some legacy returned buffers remain outside it.
 
 ## Purpose
@@ -1089,7 +1091,7 @@ crates/
 - Missing tensors → "missing tensor 'blk.0.attn_q.weight'"
 - Budget too small → "RAM budget too small for layer..."
 
-**CPU-only:** No GPU. The pinned native build is CPU-only; the forgeCORE adapter binds CPU.
+**CPU-only in this build:** The pinned native build registers only the CPU backend; the forgeCORE adapter binds CPU. The machine has an NVIDIA GPU, but CUDA is blocked by a kernel/userspace driver mismatch and a missing toolkit, so no GPU execution is claimed. See [GPU_ENVIRONMENT.md](docs/handoff/GPU_ENVIRONMENT.md).
 
 ## Testing
 
@@ -1105,7 +1107,7 @@ crates/
 - Existing Milestone 4 streaming tests still pass
 - M6 integrity proofs: scoped temp release on success/error (`memory.rs`), budgeted cache inserts/evictions (`cache.rs`), explicit ggml layout incl. non-square Q4_0/Q4_K/F32/F16 anchors and arity-error rejections (`tensor.rs`, `backend.rs`), chunked streamed output projection + too-small-budget failure (`persistent.rs`), no-copy attention vs naive reference (`ops.rs`), chunk-growing KV preserving data with exact bytes (`kv_cache.rs`), end-to-end out-of-core inference with model > budget (`inference.rs`)
 
-The current workspace run (`cargo test --workspace --locked`) passes **612 tests, 0 failed, 29 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
+The current workspace run (`cargo test --workspace --locked`) passes **617 tests, 0 failed, 30 ignored**. The ignored tests include the real-model Qwen2.5 diagnostic, the quantized microbenchmark, the opt-in GPT-NeoX integration test, cgroup enforcement, CLI enforcement, graph-trace, bounded prefetch, and the opt-in observe/active/JSON/reuse-aware/profile/prediction/observation residency checks. The cgroup and CLI enforcement tests require explicit `--ignored` execution, cgroup v2 delegation, real models, and libggml; fixture-gated tests report SKIP when their environment variables are unset. Run `scripts/test.sh --workspace --locked` to reproduce the standard invocation.
 
 ## Real-model smoke validation
 

@@ -114,6 +114,10 @@ pub struct ForgeCoreModelMetadata {
     pub kv_head_count: u32,
     pub load_mode: ModelLoadMode,
     pub use_extra_bufts: bool,
+    /// Effective non-CPU layers reported by the native model after load.
+    pub effective_gpu_layers: u32,
+    /// Effective output-layer device type label.
+    pub output_device_type: String,
     pub description: String,
 }
 
@@ -273,6 +277,16 @@ impl ForgeCoreModel {
             description: model
                 .description()
                 .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))?,
+            effective_gpu_layers: model
+                .effective_gpu_layers()
+                .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))?,
+            output_device_type: format!(
+                "{:?}",
+                model
+                    .output_device_type()
+                    .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))?
+            )
+            .to_ascii_lowercase(),
         };
 
         Ok(Self {
@@ -712,6 +726,8 @@ mod tests {
                 kv_head_count: 0,
                 load_mode: ModelLoadMode::MmapNoPrefetch,
                 use_extra_bufts: false,
+                effective_gpu_layers: 0,
+                output_device_type: "cpu".to_string(),
                 description: String::new(),
             }
             .load_mode_label(),

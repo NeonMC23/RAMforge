@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 612 passed, 0 failed, 29 ignored.
+- `cargo test --workspace`: 617 passed, 0 failed, 30 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -370,7 +370,7 @@ Not run or not claimed:
 
 ## Operational runtime validation — 2026-11-21
 
-- `cargo test --workspace --locked`: **612 passed, 0 failed, 29 ignored**.
+- `cargo test --workspace --locked`: **617 passed, 0 failed, 30 ignored**.
 - Real inference-service tests: load, context, stream, throughput, cancellation
   and unload passed.
 - CLI benchmark: median generation 136.87 tok/s (112.58–155.41), decode 171.70,
@@ -381,12 +381,21 @@ Not run or not claimed:
   background; advisory balanced recommendation.
 - CLI storage: 105,454,432-byte verified copy with source preserved.
 - Native build audit: CPU backend only; CUDA/Vulkan/SYCL/OpenCL/Metal/RPC and
-  dynamic backends are OFF. No GPU device was available, so no GPU execution
-  or placement was validated.
-- Release-build throughput: balanced 8 threads 283.81 tok/s (P25–P75
-  281.77–285.24), balanced 4 threads 267.65 (259.09–267.99), maximum-performance
-  4 threads repacked 263.47, background 102.80. A second order-reversed session
-  reproduced the 8-over-4 ordering; absolute rates vary between sessions.
+  dynamic backends are OFF. Registered backend inventory contains only CPU.
+- GPU environment audit: RTX 3050 Laptop GPU detected at PCI `01:00.0`; running
+  NVIDIA kernel module 595.112.07 vs userspace 620.70.06; `nvidia-smi` fails
+  with a driver/library mismatch; `nvcc` and CUDA development headers are
+  absent. No CUDA build or physical GPU execution/placement was validated.
+- Native effective placement readback is wired through forgeCORE; CPU loads
+  report `effective_gpu_layers=0`, `output_device_type=cpu`. GPU requests fail
+  explicitly before load and do not fall back to CPU.
+- `RuntimePlan` schema is 2; benchmark schema is 2. Non-CPU plans are rejected
+  by the inference service.
+- Release-build throughput (latest session): balanced 8 threads 223.04 tok/s
+  (P25–P75 218.94–224.91), maximum-performance 4 threads repacked 205.25,
+  balanced 4 threads 203.92, background 81.44. Earlier sessions measured
+  283.81/267.65 and 269.05/252.02 for balanced 8/4; the ordering was reproduced,
+  but absolute rates vary by roughly 25% between sessions.
 - Out-of-core re-verification (2026-11-21): GPT-NeoX-20B Q4_K_M (13.13 GB)
   under an 8 GiB cgroup with `--no-repack --no-prefetch` produced one greedy
   token (` Paris`), exit 0, 10.877 s wall, 184 ms model load, peak charged
@@ -399,7 +408,7 @@ Not run or not claimed:
 
 ## Runtime calibration validation — 2026-11-20
 
-- `cargo test --workspace --locked`: **612 passed, 0 failed, 29 ignored**.
+- `cargo test --workspace --locked`: **617 passed, 0 failed, 30 ignored**.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 - Ignored calibration CLI test: passed; nine lifecycle stages, mapping
   residency, comparisons, attribution, model fingerprint, and plan evidence.
@@ -418,7 +427,7 @@ Not run or not claimed:
 
 ## Machine profile and candidate plan validation — 2026-11-20
 
-- `cargo test --workspace`: **612 passed, 0 failed, 29 ignored**.
+- `cargo test --workspace`: **617 passed, 0 failed, 30 ignored**.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge machine --model ... --ram 1G --json`: passed; includes CPU,
   memory, storage, device, model requirements, four plans, and comparison.
@@ -436,11 +445,11 @@ Not run or not claimed:
 
 ## CPU node-dispatch validation — 2026-10-31
 
-- forgeCORE `cargo test --workspace`: **413 passed, 0 failed, 9 ignored**.
+- forgeCORE `cargo test --workspace`: **415 passed, 0 failed, 9 ignored**.
   New `node_dispatch` tests cover disabled-by-default behavior, installation
   and removal, event drain, overflow, multiple contexts, four-worker
   exactly-once publication, identity fields, and bounded options.
-- RAMforge `cargo test --workspace`: **612 passed, 0 failed, 29 ignored**.
+- RAMforge `cargo test --workspace`: **617 passed, 0 failed, 30 ignored**.
   The ignored real-model CLI test verifies `--node-dispatch-observe` JSON with
   attributed and unattributed events, zero identity mismatches, CPU backend,
   and bounded serialization.
@@ -488,7 +497,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          612 passed, 0 failed, 29 ignored
+cargo test --workspace                          617 passed, 0 failed, 30 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

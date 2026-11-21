@@ -268,6 +268,14 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         threads: u32,
 
+        /// Execution device: cpu, auto, or a discovered device id
+        #[arg(long, default_value = "cpu")]
+        device: String,
+
+        /// Requested GPU-offloaded layers (0 = CPU)
+        #[arg(long, default_value_t = 0)]
+        gpu_layers: u32,
+
         /// Disable CPU weight repacking
         #[arg(long)]
         no_repack: bool,
@@ -312,6 +320,14 @@ enum Commands {
         /// CPU threads (0 = profile-selected)
         #[arg(long, default_value_t = 0)]
         threads: u32,
+
+        /// Execution device: cpu, auto, or a discovered device id
+        #[arg(long, default_value = "cpu")]
+        device: String,
+
+        /// Requested GPU-offloaded layers (0 = CPU)
+        #[arg(long, default_value_t = 0)]
+        gpu_layers: u32,
 
         /// Disable CPU weight repacking
         #[arg(long)]
@@ -750,6 +766,8 @@ fn main() {
             ram,
             context,
             threads,
+            device,
+            gpu_layers,
             no_repack,
             no_prefetch,
         } => {
@@ -759,6 +777,8 @@ fn main() {
                 ram,
                 context,
                 threads,
+                device,
+                gpu_layers,
                 no_repack,
                 no_prefetch,
             ) {
@@ -776,6 +796,8 @@ fn main() {
             warmup,
             context,
             threads,
+            device,
+            gpu_layers,
             no_repack,
             no_prefetch,
             json,
@@ -790,6 +812,8 @@ fn main() {
                 warmup,
                 context,
                 threads,
+                device,
+                gpu_layers,
                 no_repack,
                 no_prefetch,
                 json,
@@ -1194,6 +1218,8 @@ fn run_service_stdio(
     ram: Option<String>,
     context: u32,
     threads: u32,
+    device: String,
+    gpu_layers: u32,
     no_repack: bool,
     no_prefetch: bool,
 ) -> anyhow::Result<()> {
@@ -1239,6 +1265,8 @@ fn run_service_stdio(
                 .to_string(),
             ),
             no_repack: Some(no_repack),
+            device: Some(device),
+            gpu_layers: Some(gpu_layers),
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;
@@ -1272,6 +1300,8 @@ fn run_throughput_benchmark(
     warmup: u32,
     context: u32,
     threads: u32,
+    device: String,
+    gpu_layers: u32,
     no_repack: bool,
     no_prefetch: bool,
     json: bool,
@@ -1318,6 +1348,8 @@ fn run_throughput_benchmark(
                 .to_string(),
             ),
             no_repack: Some(no_repack),
+            device: Some(device),
+            gpu_layers: Some(gpu_layers),
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;
@@ -1338,6 +1370,14 @@ fn run_throughput_benchmark(
         println!(
             "profile={} runs={} max_tokens={}",
             report.profile, report.runs, report.max_tokens
+        );
+        println!(
+            "execution={} backend={} device={} gpu_layers={} threads={}",
+            format!("{:?}", report.plan.effective.execution_mode).to_ascii_lowercase(),
+            report.plan.effective.backend,
+            report.plan.effective.device_id,
+            report.plan.effective.gpu_layers,
+            report.plan.effective.threads,
         );
         println!(
             "generation tok/s median={:.2} min={:.2} max={:.2}",
@@ -1797,6 +1837,19 @@ fn run_machine(
                 .to_json()
                 .map_err(|error| anyhow::anyhow!(error))?;
         }
+        report["execution_readiness"] = serde_json::json!({
+            "cpu_execution": true,
+            "gpu_execution": false,
+            "selected_device": "cpu",
+            "gpu_offload_available": profile.backend_inventory.gpu_offload_available,
+            "registered_backends": profile.backend_inventory.registered,
+            "gpu_devices": profile
+                .devices
+                .iter()
+                .filter(|device| device.kind != "cpu")
+                .collect::<Vec<_>>(),
+            "notes": profile.backend_inventory.notes,
+        });
         report["memory_hierarchy"] = build_memory_hierarchy(&profile)
             .to_json()
             .map_err(|error| anyhow::anyhow!(error))?;
@@ -1839,6 +1892,8 @@ fn run_machine(
                             threads: Some(candidate.cpu_threads),
                             load_mode: Some(load_mode.to_string()),
                             no_repack: Some(no_repack),
+                            device: None,
+                            gpu_layers: None,
                         },
                     );
                     match runtime_plan {

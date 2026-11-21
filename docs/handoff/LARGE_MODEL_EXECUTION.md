@@ -27,11 +27,13 @@ checkout; the page APIs are local patches):
 
 | Capability | State | Evidence |
 |---|---|---|
-| Backend/device registry | available | `ggml/include/ggml-backend.h:241–244` |
+| Backend/device registry | available | `ggml/include/ggml-backend.h:241–244`, `ggml_backend_reg_*` |
+| Registered backend names/counts | available | `ggml/include/ggml-backend.h:236–238`; forgeCORE `registered_backends()` |
 | Device properties and memory | available | `ggml/src/ggml-backend.cpp:589–599` |
 | Dynamic backend loading code | present, build OFF | `ggml/src/ggml-backend-reg.cpp:574` |
 | mmap / no-prefetch load modes | available | `src/llama-model-loader.cpp:559,830`; `src/llama-mmap.cpp:472` |
 | GPU offload parameters | API present, backend not built | `include/llama.h:322–332` |
+| Effective layer/output placement readback | available (patch) | `llama_model_effective_gpu_layers`, `llama_model_layer_device_type`, `llama_model_output_device_type` |
 | Tensor split / multi-device | API present, backend not built | `src/llama-model.cpp:1208` |
 | File-backed tensor mapping metadata | available (patch) | `include/llama.h:665–666`; `src/llama-model.cpp:3285–3292` |
 | Page residency sampling | available on Linux | `include/llama.h:691`; `src/llama-model.cpp:3259` |
@@ -43,7 +45,10 @@ checkout; the page APIs are local patches):
 | Context padding | observed | `src/llama-context.cpp:291` (`GGML_PAD(n_ctx, 256)`) |
 
 Runtime device registry on the development machine contains one CPU device.
-No GPU device is present or selectable.
+No GPU device is selectable in the current process. The physical machine does
+contain an NVIDIA RTX 3050 Laptop GPU, but CUDA is blocked: the loaded kernel
+module is 595.112.07 while userspace is 620.70.06, and no CUDA compiler/toolkit
+is installed. See [GPU_ENVIRONMENT.md](GPU_ENVIRONMENT.md).
 
 ### forgeCORE surface
 
@@ -66,6 +71,24 @@ Current RAMforge operational adapter:
 
 GPU offload exists in the safe forgeCORE model options but is **not physically
 validated** in this build. No CUDA/Vulkan/SYCL/Metal test result is claimed.
+
+## GPU execution status
+
+- Hardware detected: RTX 3050 Laptop GPU (GA107M).
+- Native GPU backend built: **no** (all GPU backend flags OFF).
+- CUDA toolkit available: **no** (`nvcc` and headers absent).
+- Driver usable by CUDA: **no** in this session (kernel/userspace mismatch).
+- Physical GPU inference or offload: **not performed**.
+- Claimed effective GPU layers: **none**; CPU loads report zero through native
+  readback.
+
+RAMforge now records registered backends, `gpu_offload_available`, and device
+memory in the machine profile. GPU execution requests (`--device auto` or
+`--gpu-layers N`) fail with an explicit error when no GPU backend/device is
+registered; they are never converted into a CPU plan. Plans can represent
+`cpu`, `gpu`, and `hybrid` modes and mark placement fields advisory, but the
+service rejects non-CPU plans because no physical GPU load path has been
+validated. No silent CPU fallback occurs.
 
 ## Memory hierarchy
 
@@ -232,6 +255,8 @@ residency, this is not an implemented strategy.
   execution of a 13.13 GB model under an 8 GiB cgroup cap.
 - Bounded page release, page-residency sampling, and prefetch hints with
   quiescence gates and explicit unknown states.
+- Registered-backend inventory and explicit GPU-unavailable reporting.
+- Native effective layer/output placement readback (zero GPU layers on CPU).
 - Effective CPU configuration and throughput measurement.
 - Bounded profile comparison, architecture metadata, memory hierarchy, and
   placement reporting.

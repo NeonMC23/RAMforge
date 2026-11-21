@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::execution_candidate::Feasibility;
 use crate::machine_profile::MachineProfile;
 use crate::model_requirements::{ModelRequirements, RequirementBytes, RequirementCertainty};
-use crate::runtime_plan::RuntimePlan;
+use crate::runtime_plan::{ExecutionMode, RuntimePlan};
 
 pub const MEMORY_HIERARCHY_SCHEMA_VERSION: u32 = 1;
 
@@ -18,6 +18,7 @@ pub const MEMORY_HIERARCHY_SCHEMA_VERSION: u32 = 1;
 pub enum MemoryCategory {
     HostRam,
     DeviceMemory,
+    DeviceMemoryAvailable,
     FileBackedMapping,
     AnonymousProcess,
     KvCache,
@@ -190,6 +191,40 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
                     detail: Some(detail),
                 }
             },
+            {
+                let mut non_cpu = machine
+                    .devices
+                    .iter()
+                    .filter(|device| device.kind != "cpu")
+                    .filter_map(|device| device.memory_free_bytes.as_ref().copied());
+                let (bytes, quality, detail) = match (non_cpu.next(), non_cpu.next()) {
+                    (Some(free), None) => (
+                        Some(free),
+                        ObservationQuality::Observed,
+                        "single non-CPU device; a point-in-time free value is not a reservation"
+                            .to_string(),
+                    ),
+                    (Some(_), Some(_)) => (
+                        None,
+                        ObservationQuality::Unknown,
+                        "multiple non-CPU devices; per-device free values are listed separately"
+                            .to_string(),
+                    ),
+                    _ => (
+                        None,
+                        ObservationQuality::Unsupported,
+                        "no non-CPU device is present in the backend registry".to_string(),
+                    ),
+                };
+                MemoryCategoryObservation {
+                    category: MemoryCategory::DeviceMemoryAvailable,
+                    bytes,
+                    quality,
+                    provenance: "native device snapshot".to_string(),
+                    overlapping: true,
+                    detail: Some(detail),
+                }
+            },
             MemoryCategoryObservation {
                 category: MemoryCategory::AnonymousProcess,
                 bytes: machine.memory.process_rss_bytes.as_ref().copied(),
@@ -270,10 +305,30 @@ pub fn build_memory_hierarchy(machine: &MachineProfile) -> MemoryHierarchy {
             "Categories overlap and must not be summed.".to_string(),
             "Resident model pages are not equivalent to tensor use.".to_string(),
             "Compute, graph, backend, and staging bytes are not universally exposed.".to_string(),
+            "Free device memory is a point-in-time observation, not a reservation for this process."
+                .to_string(),
             "Storage totals refer to the first observed filesystem; other filesystems are listed in the machine profile."
                 .to_string(),
         ],
     }
+}
+
+fn estimate_gpu_weight_bytes(tensor_bytes: u64, layer_count: u64, gpu_layers: u32) -> u64 {
+    let total_with_output = layer_count.saturating_add(1);
+    let layers = u64::from(gpu_layers).min(total_with_output);
+    (u128::from(tensor_bytes) * u128::from(layers) / u128::from(total_with_output))
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn single_device_free_bytes(machine: &MachineProfile) -> Option<u64> {
+    let mut devices = machine
+        .devices
+        .iter()
+        .filter(|device| device.kind != "cpu")
+        .filter_map(|device| device.memory_free_bytes.as_ref().copied());
+    let first = devices.next()?;
+    devices.next().is_none().then_some(first)
 }
 
 fn observation_quality(known: bool) -> ObservationQuality {
@@ -298,7 +353,7 @@ pub fn build_placement_model_for_plan(
     model_bytes: Option<u64>,
 ) -> PlacementModel {
     let file_backed = plan.effective.load_mode.starts_with("mmap");
-    let components = vec![
+    let mut components = vec![
         ComponentPlacement {
             component: "model_weights".to_string(),
             placement: if file_backed && !plan.effective.weight_repacking {
@@ -343,6 +398,17 @@ pub fn build_placement_model_for_plan(
             evidence: "no controlled staging path is enabled".to_string(),
         },
     ];
+    if plan.effective.execution_mode != ExecutionMode::Cpu {
+        components.push(ComponentPlacement {
+            component: "gpu_offload".to_string(),
+            placement: PlacementState::GpuResident,
+            confirmed: false,
+            evidence: format!(
+                "plan requests {} offloaded layers; native placement readback is not captured by this builder",
+                plan.effective.gpu_layers
+            ),
+        });
+    }
     PlacementModel {
         profile: format!("{:?}", plan.profile).to_ascii_lowercase(),
         components,
@@ -384,10 +450,32 @@ pub fn evaluate_hierarchy_feasibility(
                 .to_string(),
         );
     }
-    let device = if plan.effective.backend == "gpu" {
-        RequirementBytes::unknown("GPU allocation is not verified")
-    } else {
+    let device = if plan.effective.execution_mode == ExecutionMode::Cpu {
         RequirementBytes::exact(0, "CPU backend")
+    } else {
+        match (
+            requirements.tensor_payload_bytes.bytes,
+            plan.architecture
+                .as_ref()
+                .and_then(|architecture| architecture.layer_count),
+        ) {
+            (Some(tensor_bytes), Some(layer_count)) if layer_count > 0 => {
+                let bytes =
+                    estimate_gpu_weight_bytes(tensor_bytes, layer_count, plan.effective.gpu_layers);
+                reasons.push(
+                    "GPU weight estimate assumes uniform bytes per layer and excludes KV, compute, graph, and backend buffers"
+                        .to_string(),
+                );
+                RequirementBytes::estimated(bytes, "uniform per-layer weight estimate")
+            }
+            _ => {
+                unknown.push(
+                    "GPU weight estimate needs tensor payload and architecture layer count"
+                        .to_string(),
+                );
+                RequirementBytes::unknown("GPU allocation is not verified")
+            }
+        }
     };
     let storage = requirements.file_bytes.clone();
     let budget = machine
@@ -398,9 +486,28 @@ pub fn evaluate_hierarchy_feasibility(
         .copied()
         .or_else(|| machine.memory.configured_budget_bytes.as_ref().copied());
     let mut status;
-    if plan.effective.backend == "gpu" {
+    if plan.effective.execution_mode != ExecutionMode::Cpu {
         status = Feasibility::Unknown;
-        reasons.push("GPU backend is not verified by this adapter".to_string());
+        reasons.push(
+            "GPU execution is planning-only in this adapter; native allocation and placement are not verified"
+                .to_string(),
+        );
+        if let (Some(free), Some(required)) = (single_device_free_bytes(machine), device.bytes) {
+            if required > free {
+                status = Feasibility::Infeasible;
+                reasons.push(format!(
+                    "estimated GPU weight requirement {required} exceeds observed free device memory {free}"
+                ));
+            } else {
+                status = Feasibility::ConditionallyFeasible;
+                reasons.push(
+                    "estimated GPU weights fit observed free device memory, but KV, compute, graph, and backend buffers are unmodeled"
+                        .to_string(),
+                );
+            }
+        } else {
+            unknown.push("free device memory or GPU requirement is unavailable".to_string());
+        }
     } else if let Some(budget) = budget {
         if let Some(required) = host.bytes {
             if required > budget {
@@ -515,6 +622,14 @@ mod tests {
             .components
             .iter()
             .any(|component| component.component == "model_weights"));
+    }
+
+    #[test]
+    fn gpu_weight_estimate_is_uniform_per_layer_and_capped() {
+        assert_eq!(estimate_gpu_weight_bytes(1_000, 4, 0), 0);
+        assert_eq!(estimate_gpu_weight_bytes(1_000, 4, 2), 400);
+        assert_eq!(estimate_gpu_weight_bytes(1_000, 4, 5), 1_000);
+        assert_eq!(estimate_gpu_weight_bytes(1_000, 4, 99), 1_000);
     }
 
     #[test]

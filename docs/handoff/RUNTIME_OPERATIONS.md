@@ -7,7 +7,7 @@ reclamation, automatic live switching, or GPU offload.
 
 ## Execution-plan contract
 
-`RuntimePlan` (schema version 1) resolves a profile request against the machine
+`RuntimePlan` (schema version 2) resolves a profile request against the machine
 and model:
 
 - profile: maximum-performance, balanced, background, custom
@@ -104,6 +104,23 @@ A cancel line sets a shared atomic flag; the generation loop observes it
 between token decodes. The transport is local-process only. It does not expose
 authentication or network access.
 
+`status` includes `execution_mode` and `effective_gpu_layers` (native readback
+after load). `capabilities` includes `execution_modes` and `gpu_execution`. On
+the verified CPU-only build these report `cpu`, zero, `["cpu"]`, and `false`.
+
+### GPU requests
+
+`benchmark` and `serve` accept:
+
+- `--device cpu|auto|<device-id>` (default `cpu`)
+- `--gpu-layers N` (default `0`)
+
+Plans can represent CPU, GPU, and hybrid modes. If no GPU backend/device is
+registered, a non-CPU request fails before model load with an explicit error
+and **no CPU fallback**. If a GPU plan is ever constructed, the service rejects
+it rather than pretending to execute on CPU. See
+[GPU_ENVIRONMENT.md](GPU_ENVIRONMENT.md) for the current environment blockers.
+
 ## Throughput benchmark
 
 `ramforge benchmark MODEL --profile balanced --runs 3 --warmup 1` measures:
@@ -135,12 +152,28 @@ Measured baseline on the development machine, SmolLM2-135M Q4_K_M, 256 context,
 
 These debug-build figures are single-machine warm observations, not a
 performance guarantee. Release-build results, which are the authoritative
-throughput evidence, are in [BENCHMARKS.md](BENCHMARKS.md): balanced 8-thread
-median 283.81 tok/s (P25–P75 281.77–285.24), balanced 4-thread 267.65
-(259.09–267.99), maximum-performance 4-thread repacked 263.47, background
-102.80. A second order-reversed session reproduced the 8-over-4 ordering
-(269.05 vs 252.02); absolute rates vary between sessions, so only within-session
-comparisons are treated as evidence.
+throughput evidence, are in [BENCHMARKS.md](BENCHMARKS.md): in the latest
+session balanced 8 threads measured 223.04 tok/s (P25–P75 218.94–224.91),
+maximum-performance 4 threads repacked 205.25, balanced 4 threads 203.92, and
+background 81.44. An earlier session measured 283.81 and 267.65 for balanced 8
+and 4; an order-reversed session measured 269.05 and 252.02. Absolute rates vary
+by roughly 25% between sessions, but the 8-over-4 ordering was reproduced. Only
+within-session comparisons are treated as evidence.
+
+## Machine execution readiness
+
+`ramforge machine --json` includes:
+
+- `profile.backend_inventory`: registered backend names and device counts,
+  `gpu_offload_available`, and explicit notes.
+- `execution_readiness`: CPU/GPU execution flags, selected device, registered
+  backends, enumerated non-CPU devices (with memory observations), and the
+  same backend notes.
+- `memory_hierarchy`: host, cgroup, storage, device total/free, KV, mapping,
+  backend-buffer, and staging categories without double counting.
+
+A detected device is not a selectable device. GPU devices remain unselectable
+until a CUDA build and physical offload validation exist.
 
 ## Profile optimization loop
 

@@ -47,6 +47,8 @@ fn service_executes_streams_and_reports_throughput() {
             threads: Some(2),
             load_mode: Some("mmap".to_string()),
             no_repack: Some(true),
+            device: None,
+            gpu_layers: None,
         },
     )
     .expect("plan");
@@ -119,6 +121,8 @@ fn service_cancellation_is_explicit() {
             threads: Some(1),
             load_mode: Some("mmap".to_string()),
             no_repack: Some(true),
+            device: None,
+            gpu_layers: None,
         },
     )
     .expect("plan");

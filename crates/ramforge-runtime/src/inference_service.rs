@@ -41,6 +41,8 @@ pub struct ServiceCapabilities {
     pub multiple_sessions: bool,
     pub concurrent_generation: bool,
     pub max_context_tokens: Option<u32>,
+    pub execution_modes: Vec<String>,
+    pub gpu_execution: bool,
     pub notes: Vec<String>,
 }
 
@@ -55,6 +57,8 @@ impl ServiceCapabilities {
             multiple_sessions: false,
             concurrent_generation: false,
             max_context_tokens: Some(plan.effective.context_tokens),
+            execution_modes: vec!["cpu".to_string()],
+            gpu_execution: false,
             notes: vec![
                 "One session at a time; cancellation is checked between token decodes.".to_string(),
                 "No ownership or eviction authorization is exposed.".to_string(),
@@ -77,6 +81,8 @@ pub struct ServiceStatus {
     pub effective_threads_batch: Option<u32>,
     pub effective_sequence_max: Option<u32>,
     pub architecture: Option<crate::model_architecture::ModelArchitecture>,
+    pub execution_mode: crate::runtime_plan::ExecutionMode,
+    pub effective_gpu_layers: Option<u32>,
     pub model_instance_id: Option<u64>,
     pub context_id: Option<u64>,
     pub rss_bytes: Option<u64>,
@@ -143,6 +149,7 @@ pub enum ServiceError {
     Tokenizer(String),
     Context(String),
     Execution(String),
+    UnsupportedExecution(String),
     Cancelled,
     Sink(String),
 }
@@ -161,6 +168,9 @@ impl std::fmt::Display for ServiceError {
             Self::Tokenizer(message) => write!(formatter, "tokenizer: {message}"),
             Self::Context(message) => write!(formatter, "context: {message}"),
             Self::Execution(message) => write!(formatter, "execution: {message}"),
+            Self::UnsupportedExecution(message) => {
+                write!(formatter, "unsupported execution: {message}")
+            }
             Self::Cancelled => formatter.write_str("generation cancelled"),
             Self::Sink(message) => write!(formatter, "stream sink: {message}"),
         }
@@ -240,6 +250,11 @@ impl InferenceService {
                 .as_ref()
                 .map(ForgeCoreSession::effective_sequence_max),
             architecture: self.plan.architecture.clone(),
+            execution_mode: self.plan.effective.execution_mode,
+            effective_gpu_layers: self
+                .model
+                .as_ref()
+                .map(|model| model.metadata().effective_gpu_layers),
             model_instance_id: model_id,
             context_id,
             rss_bytes: process_rss(),
@@ -257,6 +272,12 @@ impl InferenceService {
                     actual: self.state,
                 })
             }
+        }
+        if self.plan.effective.execution_mode != crate::runtime_plan::ExecutionMode::Cpu {
+            return Err(ServiceError::UnsupportedExecution(format!(
+                "plan requests {:?} execution; this service has no physically validated GPU load path and does not silently fall back to CPU",
+                self.plan.effective.execution_mode
+            )));
         }
         let path = PathBuf::from(&self.plan.model_path);
         let model_set =
@@ -578,6 +599,18 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, ServiceError::InvalidState { .. }));
+    }
+
+    #[test]
+    fn gpu_plan_is_rejected_without_silent_cpu_fallback() {
+        let mut plan = plan();
+        plan.effective.execution_mode = crate::runtime_plan::ExecutionMode::Hybrid;
+        plan.effective.gpu_layers = 1;
+        plan.effective.backend = "hybrid".to_string();
+        let mut service = InferenceService::new(plan).expect("service");
+        let error = service.load().unwrap_err();
+        assert!(matches!(error, ServiceError::UnsupportedExecution(_)));
+        assert_eq!(service.state(), ServiceState::Empty);
     }
 
     #[test]

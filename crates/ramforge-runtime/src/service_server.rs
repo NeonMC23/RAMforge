@@ -336,6 +336,7 @@ fn error_kind(error: &ServiceError) -> &'static str {
         ServiceError::Tokenizer(_) => "tokenizer",
         ServiceError::Context(_) => "context",
         ServiceError::Execution(_) => "execution",
+        ServiceError::UnsupportedExecution(_) => "unsupported_execution",
         ServiceError::Cancelled => "cancelled",
         ServiceError::Sink(_) => "transport",
     }

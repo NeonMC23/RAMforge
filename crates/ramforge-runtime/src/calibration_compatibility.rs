@@ -711,6 +711,10 @@ mod tests {
             attribution,
         );
         calibration.captured_at_unix_ms = Some(500);
+        // The target fixture uses a fixed low-pressure condition. Pin the
+        // calibration's pressure too so this remains deterministic while the
+        // full suite runs under varying host load.
+        calibration.observation.pressure_class = "low".to_string();
         calibration
     }
 
@@ -718,7 +722,12 @@ mod tests {
     fn exact_match_applies_evidence() {
         let calibration = calibration();
         let compatibility = calibration.compatibility(&target());
-        assert_eq!(compatibility.classification, CompatibilityClass::Exact);
+        assert_eq!(
+            compatibility.classification,
+            CompatibilityClass::Exact,
+            "reasons: {:?}",
+            compatibility.reasons
+        );
         assert_eq!(compatibility.evidence_use, EvidenceUse::Apply);
         assert!(compatibility.mismatched.is_empty());
     }

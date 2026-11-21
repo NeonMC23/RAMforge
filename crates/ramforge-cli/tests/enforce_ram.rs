@@ -1249,6 +1249,20 @@ fn machine_profile_reports_resources_requirements_and_plans() {
     assert_eq!(benchmark["physical_claim"], false);
     assert!(benchmark["samples"].as_array().unwrap().len() == 1);
 
+    let readiness = &report["execution_readiness"];
+    assert_eq!(readiness["cpu_execution"], true);
+    assert_eq!(readiness["selected_device"], "cpu");
+    assert!(readiness["registered_backends"].is_array());
+    let inventory = &report["profile"]["backend_inventory"];
+    assert!(!inventory["registered"].as_array().unwrap().is_empty());
+    assert_eq!(
+        inventory["gpu_offload_available"],
+        readiness["gpu_offload_available"]
+    );
+    if readiness["gpu_offload_available"] == false {
+        assert_eq!(readiness["gpu_execution"], false);
+    }
+
     let hierarchy = &report["memory_hierarchy"];
     assert_eq!(hierarchy["schema_version"], 1);
     assert!(hierarchy["host_total_bytes"].as_u64().unwrap() > 0);
@@ -1580,6 +1594,8 @@ fn benchmark_reports_measured_generation_throughput() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(report["schema_version"], 2);
     assert_eq!(report["plan"]["effective"]["backend"], "cpu");
+    assert_eq!(report["plan"]["effective"]["execution_mode"], "cpu");
+    assert_eq!(report["plan"]["effective"]["gpu_layers"], 0);
     assert!(report["plan"]["effective"]["threads"].as_u64().unwrap() > 0);
     assert_eq!(report["plan"]["effective"]["context_tokens"], 256);
     assert!(
@@ -1655,9 +1671,12 @@ fn serve_streams_tokens_and_reports_status() {
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
-    assert!(lines
+    let status = lines
         .iter()
-        .any(|line| line["event"] == "result" && line["id"] == 1));
+        .find(|line| line["event"] == "result" && line["id"] == 1)
+        .expect("status result");
+    assert_eq!(status["status"]["execution_mode"], "cpu");
+    assert_eq!(status["status"]["effective_gpu_layers"], 0);
     assert!(lines
         .iter()
         .any(|line| line["event"] == "token" && line["id"] == 2));
@@ -1683,6 +1702,49 @@ fn serve_streams_tokens_and_reports_status() {
         .as_str()
         .unwrap()
         .contains("fresh OS observation"));
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL and a CPU-only native build"]
+fn gpu_request_fails_explicitly_when_backend_is_unavailable() {
+    let model = std::env::var("FORGE_TEST_MODEL").expect("set FORGE_TEST_MODEL");
+    let output = ramforge()
+        .args([
+            "benchmark",
+            &model,
+            "--profile",
+            "balanced",
+            "--ram",
+            "1G",
+            "--runs",
+            "1",
+            "--warmup",
+            "0",
+            "--max-tokens",
+            "4",
+            "--context",
+            "128",
+            "--device",
+            "auto",
+            "--gpu-layers",
+            "4",
+        ])
+        .output()
+        .unwrap();
+    if output.status.success() {
+        println!("SKIP: a GPU execution path is available on this machine");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("GPU execution requested")
+            || stderr.contains("GPU execution requested but unavailable"),
+        "unexpected GPU failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("no GPU backend") || stderr.contains("GPU execution unavailable"),
+        "failure must explain backend unavailability: {stderr}"
+    );
 }
 
 #[test]
