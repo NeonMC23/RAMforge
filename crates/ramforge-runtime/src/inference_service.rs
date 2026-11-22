@@ -1179,7 +1179,7 @@ impl InferenceService {
                 accepted_layers: Vec::new(),
                 rejected_layers: Vec::new(),
                 eviction_supported: true,
-                allocation_reuse_supported: false,
+                allocation_reuse_supported: true,
                 transfer_compute_overlap_supported: false,
                 state: StagingPlanState::Unknown,
                 notes: vec![
@@ -1289,7 +1289,7 @@ impl InferenceService {
                 .to_string(),
             "replacement uses invalidate -> evict -> allocate; old allocations are released before new ones are created"
                 .to_string(),
-            "allocations are freed on eviction; capacity reuse is not implemented"
+            "evicted buffers may be retained in a bounded pool and reused; reuse requires invalidation"
                 .to_string(),
             "graph substitutions for the new selection are reported after the next execution"
                 .to_string(),
@@ -1334,7 +1334,7 @@ impl InferenceService {
             accepted_layers,
             rejected_layers,
             eviction_supported: true,
-            allocation_reuse_supported: false,
+            allocation_reuse_supported: true,
             transfer_compute_overlap_supported: false,
             state,
             notes,

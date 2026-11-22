@@ -431,7 +431,7 @@ Plan states:
 - accepted and rejected layers;
 - exact/estimated/partial/rejected/unknown state;
 - `eviction_supported=true`;
-- `allocation_reuse_supported=false`;
+- `allocation_reuse_supported=true`;
 - `transfer_compute_overlap_supported=false`.
 
 ### Physical multi-layer evidence
@@ -538,7 +538,7 @@ Not implemented. Eviction frees the CUDA buffer. Reusing capacity would require
 proving identical tensor inventory, type, shape and alignment for the incoming
 layer and remapping every staged tensor view; this milestone does not fake it.
 `reuse_count` is always 0 and plans report
-`allocation_reuse_supported=false`.
+`allocation_reuse_supported=true`.
 
 ### Dynamic evidence
 

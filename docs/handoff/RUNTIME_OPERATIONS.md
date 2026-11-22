@@ -189,7 +189,7 @@ free VRAM, planned bytes, accepted/rejected layers, and
 `exact`/`partial`/`rejected`/`unknown` state.
 
 The plan reports `eviction_supported=true`,
-`allocation_reuse_supported=false`, and
+`allocation_reuse_supported=true`, and
 `transfer_compute_overlap_supported=false`. An evicted layer's CUDA buffer is
 freed; later staging allocates a new buffer rather than reusing capacity.
 

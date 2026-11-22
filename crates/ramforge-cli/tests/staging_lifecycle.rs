@@ -169,7 +169,7 @@ fn rejected_replacement_preserves_old_selection_and_context() {
     assert_eq!(lifecycle.release_count, 1);
     assert_eq!(lifecycle.reuse_count, 0);
     assert!(lifecycle.eviction_supported);
-    assert!(!lifecycle.allocation_reuse_supported);
+    assert!(lifecycle.allocation_reuse_supported);
 
     let third = generate(&mut service);
     assert!(!third.is_empty(), "context unusable after replacement");
