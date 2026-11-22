@@ -330,6 +330,8 @@ metadata remains required.
   rollback and explicit lifecycle counters.
 - Bounded staged-allocation reuse, pending double buffering and asynchronous
   batch transfers with measured overlap.
+- Hardware/model calibration, adaptive strategy selection with deterministic
+  fallback, profile-aware hysteresis and selectable residency ordering.
 - Honest unsupported/unknown reporting for GPU execution, capacity reuse and
   transfer/compute overlap.
 
@@ -338,8 +340,9 @@ metadata remains required.
 - Expose per-layer/device allocation sizes and richer allocation failures.
 - Add a per-layer intra-graph execution boundary or scheduler-integrated
   prefetch hook; current overlap is between executions.
-- Add bandwidth isolation or copy-engine prioritization that can preserve
-  compute throughput under concurrent staging.
+- Add profiler-backed contention attribution and bandwidth isolation.
+- Extend calibrated residency selection beyond the validated Qwen short-run
+  sample and measure longer generation and larger contexts.
 - Add MoE routing/expert residency metadata and control.
 - Expose anonymous/backend buffer accounting and safe reclamation.
 - Measure bandwidth, working-set, and page-fault behavior under additional
@@ -348,3 +351,13 @@ metadata remains required.
 Until those exist, RAMforge must not claim efficient execution of 500B models
 or arbitrary models exceeding available RAM/VRAM. The page controls improve
 working-set management for mapped models; they are not a 500B streaming engine.
+
+## Capacity versus speed
+
+The validated residency policies make the trade-off explicit. With a 1 GiB
+staged budget, ascending selection placed 7 Qwen layers (989,857,792 B), while
+smallest-first placed 8 layers (1,049,083,904 B). In five warm-cache runs,
+smallest-first measured 6.418 tok/s vs 6.161 tok/s and a lower TTFT (212.5 vs
+221.5 ms). This is a modest, workload-specific improvement, not a universal
+default. Plans expose exact bytes, accepted/rejected layers, calibration state
+and whether a strategy is measured, calibrated, advisory or fallback.

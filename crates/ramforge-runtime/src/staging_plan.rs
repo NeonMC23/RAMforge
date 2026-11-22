@@ -2,8 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const STAGING_PLAN_SCHEMA_VERSION: u32 = 3;
+pub const STAGING_PLAN_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_STAGING_SAFETY_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionPolicy {
+    #[default]
+    Ascending,
+    SmallestFirst,
+    ResidentFirst,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagingRequest {
@@ -47,6 +56,7 @@ pub struct StagingPlan {
     pub schema_version: u32,
     pub requested_layers: Vec<u32>,
     pub auto_selected: bool,
+    pub selection_policy: SelectionPolicy,
     pub configured_budget_bytes: Option<u64>,
     pub effective_budget_bytes: Option<u64>,
     pub observed_free_device_bytes: Option<u64>,

@@ -363,6 +363,10 @@ enum Commands {
         #[arg(long)]
         staged_margin: Option<String>,
 
+        /// Automatic residency ordering: ascending, smallest-first, resident-first
+        #[arg(long = "selection-policy")]
+        selection_policy: Option<String>,
+
         /// Disable CPU weight repacking
         #[arg(long)]
         no_repack: bool,
@@ -372,6 +376,28 @@ enum Commands {
         no_prefetch: bool,
 
         /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a bounded hardware transfer calibration for a model
+    #[command(name = "calibrate-hw")]
+    HwCalibrate {
+        /// GGUF model file
+        model: PathBuf,
+
+        /// CUDA device index
+        #[arg(long, default_value_t = 0)]
+        device: u32,
+
+        /// Output calibration JSON (defaults next to the model)
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// Replace an existing calibration file
+        #[arg(long)]
+        force: bool,
+
+        /// Print the calibration record as JSON
         #[arg(long)]
         json: bool,
     },
@@ -431,6 +457,22 @@ enum Commands {
         /// Use the same batch staging path but commit before generation (no overlap)
         #[arg(long)]
         pipeline_sync: bool,
+
+        /// Select transfer strategy from calibration and measured outcomes
+        #[arg(long)]
+        adaptive: bool,
+
+        /// Calibration record for adaptive scheduling
+        #[arg(long)]
+        calibration: Option<PathBuf>,
+
+        /// Explicit strategy override: sync or async
+        #[arg(long)]
+        strategy: Option<String>,
+
+        /// Automatic residency ordering: ascending, smallest-first, resident-first
+        #[arg(long = "selection-policy")]
+        selection_policy: Option<String>,
 
         /// Replacement cycles (alternates replacement and initial sets)
         #[arg(long, default_value_t = 1)]
@@ -938,6 +980,7 @@ fn main() {
             staged_budget,
             staged_auto,
             staged_margin,
+            selection_policy,
             no_repack,
             no_prefetch,
             json,
@@ -958,10 +1001,23 @@ fn main() {
                 staged_budget,
                 staged_auto,
                 staged_margin,
+                selection_policy,
                 no_repack,
                 no_prefetch,
                 json,
             ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::HwCalibrate {
+            model,
+            device,
+            out,
+            force,
+            json,
+        } => {
+            if let Err(error) = run_calibrate(model, device, out, force, json) {
                 eprintln!("Error: {error}");
                 std::process::exit(1);
             }
@@ -981,6 +1037,10 @@ fn main() {
             staged_pool,
             pipeline,
             pipeline_sync,
+            adaptive,
+            calibration,
+            strategy,
+            selection_policy,
             cycles,
             prompt,
             max_tokens,
@@ -1003,6 +1063,10 @@ fn main() {
                 staged_pool,
                 pipeline,
                 pipeline_sync,
+                adaptive,
+                calibration,
+                strategy,
+                selection_policy,
                 cycles,
                 prompt,
                 max_tokens,
@@ -1430,6 +1494,86 @@ fn cycle_generate(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn parse_selection_policy(value: &str) -> anyhow::Result<ramforge_runtime::SelectionPolicy> {
+    match value {
+        "ascending" => Ok(ramforge_runtime::SelectionPolicy::Ascending),
+        "smallest-first" => Ok(ramforge_runtime::SelectionPolicy::SmallestFirst),
+        "resident-first" => Ok(ramforge_runtime::SelectionPolicy::ResidentFirst),
+        other => Err(anyhow::anyhow!(
+            "unknown selection policy '{other}' (ascending, smallest-first, resident-first)"
+        )),
+    }
+}
+
+fn parse_transfer_strategy(value: &str) -> anyhow::Result<ramforge_runtime::TransferStrategy> {
+    match value {
+        "sync" | "synchronous" => Ok(ramforge_runtime::TransferStrategy::SynchronousReplace),
+        "async" | "prefetch" => Ok(ramforge_runtime::TransferStrategy::AsyncPrefetch),
+        other => Err(anyhow::anyhow!("unknown strategy '{other}' (sync, async)")),
+    }
+}
+
+fn run_calibrate(
+    model: PathBuf,
+    device: u32,
+    out: Option<PathBuf>,
+    force: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let out = out.unwrap_or_else(|| ramforge_runtime::default_calibration_path(&model));
+    let record = ramforge_runtime::run_calibration(&model, device, &out, force)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&record)?);
+    } else {
+        let pinned = record
+            .pinned
+            .iter()
+            .max_by_key(|sample| sample.payload_bytes);
+        let pageable = record
+            .pageable
+            .iter()
+            .max_by_key(|sample| sample.payload_bytes);
+        println!("calibration: {}", out.display());
+        println!(
+            "device: {} (index {}, driver {}, backend {})",
+            record.identity.device_name,
+            record.identity.device_index,
+            record.identity.driver_version,
+            record.identity.native_backend
+        );
+        println!(
+            "model: {} ({} bytes)",
+            record.identity.model_path, record.identity.model_size_bytes
+        );
+        if let Some(sample) = pinned {
+            println!(
+                "pinned H2D: {:.2} GB/s at {} bytes ({} us, submit {} us)",
+                sample.bandwidth_gbps,
+                sample.payload_bytes,
+                sample.duration_ns / 1000,
+                sample.submit_ns / 1000
+            );
+        }
+        if let Some(sample) = pageable {
+            println!(
+                "pageable H2D: {:.2} GB/s at {} bytes ({} us)",
+                sample.bandwidth_gbps,
+                sample.payload_bytes,
+                sample.duration_ns / 1000
+            );
+        }
+        for chunk in &record.chunks {
+            println!(
+                "chunk {} bytes in {} batches: {:.2} GB/s",
+                chunk.chunk_bytes, chunk.batches, chunk.bandwidth_gbps
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_staging_cycle(
     model_path: PathBuf,
     profile: String,
@@ -1445,6 +1589,10 @@ fn run_staging_cycle(
     staged_pool: Option<String>,
     pipeline: bool,
     pipeline_sync: bool,
+    adaptive: bool,
+    calibration: Option<PathBuf>,
+    strategy: Option<String>,
+    selection_policy: Option<String>,
     cycles: u32,
     prompt: String,
     max_tokens: u32,
@@ -1522,6 +1670,30 @@ fn run_staging_cycle(
         .transpose()
         .map_err(|error| anyhow::anyhow!("invalid --staged-pool: {error}"))?
         .unwrap_or(0);
+    let selection_policy_kind = selection_policy
+        .as_deref()
+        .map(parse_selection_policy)
+        .transpose()?
+        .unwrap_or(ramforge_runtime::SelectionPolicy::Ascending);
+    let strategy_override = strategy
+        .as_deref()
+        .map(parse_transfer_strategy)
+        .transpose()?;
+    let calibration_record = calibration
+        .as_ref()
+        .map(|path| ramforge_runtime::CalibrationRecord::load(path))
+        .transpose()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let calibration_status = if let Some(record) = calibration_record.as_ref() {
+        let engine =
+            ramforge_runtime::staging::Engine::new(0).map_err(|error| anyhow::anyhow!(error))?;
+        let identity =
+            ramforge_runtime::hw_calibration::identity_for_model(&engine, 0, &model_path)
+                .map_err(|error| anyhow::anyhow!(error))?;
+        record.status_for(&identity)
+    } else {
+        ramforge_runtime::CalibrationStatus::Missing
+    };
 
     let initial_request = ramforge_runtime::StagingRequest {
         layers: staged_layers,
@@ -1532,6 +1704,7 @@ fn run_staging_cycle(
     let mut service = ramforge_runtime::InferenceService::new(plan)
         .map_err(|error| anyhow::anyhow!(error))?
         .with_staging_pool_limit(staged_pool_bytes)
+        .with_selection_policy(selection_policy_kind)
         .with_staging_request(initial_request);
     service.load().map_err(|error| anyhow::anyhow!(error))?;
     service
@@ -1547,6 +1720,24 @@ fn run_staging_cycle(
         .collect();
     if initial_layers.is_empty() {
         anyhow::bail!("initial staging produced no resident layers");
+    }
+    let mut controller = ramforge_runtime::AdaptiveController::new();
+    let mut last_compute_ns = initial_report.stats.total_generation_ns;
+    let profile_kind = parse_runtime_profile(&profile)?;
+    if adaptive {
+        let mut warm_layers = initial_layers.clone();
+        warm_layers.extend(replace_layers.iter().copied());
+        warm_layers.sort_unstable();
+        warm_layers.dedup();
+        let warmed = service
+            .warm_model_layers(&warm_layers)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if !json {
+            eprintln!(
+                "adaptive warmup: read {} MiB of file-backed layer tensors",
+                warmed / (1024 * 1024)
+            );
+        }
     }
 
     if !json {
@@ -1569,7 +1760,114 @@ fn run_staging_cycle(
             auto: false,
             safety_margin_bytes: staged_margin_bytes,
         };
-        if pipeline_sync {
+        if adaptive {
+            let preview = service
+                .preview_staging_plan(request.clone())
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let decision = controller.decide(&ramforge_runtime::DecisionContext {
+                profile: profile_kind,
+                calibration: calibration_record.as_ref(),
+                calibration_status,
+                pending_bytes: preview.planned_bytes,
+                compute_estimate_ns: Some(last_compute_ns),
+                budget_bytes: staged_budget_bytes,
+                user_override: strategy_override,
+                allow_async: true,
+            });
+            let async_selected =
+                decision.strategy == ramforge_runtime::TransferStrategy::AsyncPrefetch;
+            let prepare_started = Instant::now();
+            let prepared = service
+                .prepare_staged_pipeline(request)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let prepare_ns =
+                u64::try_from(prepare_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let (commit, report, compute_ns, total_ns, mode) = if async_selected {
+                let compute_started = Instant::now();
+                let report = cycle_generate(&mut service, &prompt, max_tokens)?;
+                let compute_ns =
+                    u64::try_from(compute_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let commit_started = Instant::now();
+                let commit = service
+                    .commit_staged_pipeline()
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                let commit_ns =
+                    u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                (
+                    Some(commit),
+                    report,
+                    compute_ns,
+                    prepare_ns
+                        .saturating_add(compute_ns)
+                        .saturating_add(commit_ns),
+                    "adaptive_async",
+                )
+            } else {
+                let commit_started = Instant::now();
+                let commit = service
+                    .commit_staged_pipeline()
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                let commit_ns =
+                    u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let compute_started = Instant::now();
+                let report = cycle_generate(&mut service, &prompt, max_tokens)?;
+                let compute_ns =
+                    u64::try_from(compute_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                (
+                    Some(commit),
+                    report,
+                    compute_ns,
+                    prepare_ns
+                        .saturating_add(commit_ns)
+                        .saturating_add(compute_ns),
+                    "adaptive_sync",
+                )
+            };
+            let effective_strategy = if async_selected {
+                ramforge_runtime::TransferStrategy::AsyncPrefetch
+            } else {
+                ramforge_runtime::TransferStrategy::SynchronousReplace
+            };
+            controller.record(effective_strategy, total_ns);
+            last_compute_ns = compute_ns;
+            let status = service.status();
+            let resident: Vec<u32> = status
+                .staged_layers
+                .iter()
+                .map(|layer| layer.layer)
+                .collect();
+            if !json {
+                println!(
+                    "cycle {} {}: selected={} confidence={} reason={} target={:?} resident={:?} total_ms={:.2} compute_ms={:.2} tokens={} text={:?}",
+                    index,
+                    mode,
+                    decision.strategy,
+                    decision.confidence.name(),
+                    decision.reason,
+                    target_layers,
+                    resident,
+                    total_ns as f64 / 1_000_000.0,
+                    compute_ns as f64 / 1_000_000.0,
+                    report.stats.generated_tokens,
+                    report.text
+                );
+            }
+            cycle_reports.push(serde_json::json!({
+                "cycle": index,
+                "mode": mode,
+                "target_layers": target_layers,
+                "preview_plan": preview,
+                "decision": decision,
+                "prepared_plan": prepared,
+                "effective_strategy": effective_strategy,
+                "prepare_ns": prepare_ns,
+                "compute_ns": compute_ns,
+                "measured_total_ns": total_ns,
+                "commit": commit,
+                "report": report,
+                "status": status,
+            }));
+        } else if pipeline_sync {
             let prepare_started = Instant::now();
             let prepared = service
                 .prepare_staged_pipeline(request)
@@ -1731,6 +2029,14 @@ fn run_staging_cycle(
             "initial_layers": initial_layers,
             "initial_report": initial_report,
             "initial_status": initial_status,
+            "adaptive": {
+                "enabled": adaptive,
+                "calibration_status": calibration_status,
+                "sync_samples": controller.sync_samples(),
+                "async_samples": controller.async_samples(),
+                "measured_sync_median_ns": controller.sync_median_ns(),
+                "measured_async_median_ns": controller.async_median_ns(),
+            },
             "cycles": cycle_reports,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -1854,6 +2160,7 @@ fn run_throughput_benchmark(
     staged_budget: Option<String>,
     staged_auto: bool,
     staged_margin: Option<String>,
+    selection_policy: Option<String>,
     no_repack: bool,
     no_prefetch: bool,
     json: bool,
@@ -1916,6 +2223,11 @@ fn run_throughput_benchmark(
         .transpose()
         .map_err(|error| anyhow::anyhow!("invalid --staged-margin: {error}"))?
         .unwrap_or(ramforge_runtime::DEFAULT_STAGING_SAFETY_MARGIN_BYTES);
+    let selection_policy_kind = selection_policy
+        .as_deref()
+        .map(parse_selection_policy)
+        .transpose()?
+        .unwrap_or(ramforge_runtime::SelectionPolicy::Ascending);
     let report = run_benchmark(
         plan,
         BenchmarkConfig {
@@ -1927,6 +2239,7 @@ fn run_throughput_benchmark(
             staged_budget_bytes,
             staged_auto,
             staged_margin_bytes,
+            selection_policy: selection_policy_kind,
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;

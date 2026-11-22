@@ -158,6 +158,7 @@ pub fn run_profile_optimization(
                     staged_budget_bytes: None,
                     staged_auto: false,
                     staged_margin_bytes: crate::staging_plan::DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+                    selection_policy: crate::staging_plan::SelectionPolicy::Ascending,
                 },
             ) {
                 Ok(benchmark) => measurements.push(ProfileMeasurement {

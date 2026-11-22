@@ -18,6 +18,7 @@
 pub(crate) mod accounting;
 pub mod backend;
 pub mod benchmark_runner;
+pub mod hw_calibration;
 pub mod cgroup;
 pub mod calibration;
 pub mod calibration_compatibility;
@@ -65,6 +66,7 @@ pub mod runtime_calibration;
 pub mod runtime_config;
 pub mod runtime_measurement;
 pub mod runtime_plan;
+pub mod scheduler_policy;
 pub mod sampling;
 pub mod service_server;
 pub mod simd;
@@ -169,8 +171,15 @@ pub use inference_service::{
     StagedLayerStatus, StagingLifecycleStatus, INFERENCE_SERVICE_API_VERSION,
 };
 pub use service_server::{serve_stdio, ServiceServerError};
+pub use hw_calibration::{
+    default_calibration_path, run_calibration, CalibrationIdentity, CalibrationRecord,
+    CalibrationStatus, HW_CALIBRATION_SCHEMA_VERSION,
+};
+pub use scheduler_policy::{
+    AdaptiveController, DecisionConfidence, DecisionContext, StrategyDecision, TransferStrategy,
+};
 pub use staging_plan::{
-    StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest,
+    SelectionPolicy, StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest,
     DEFAULT_STAGING_SAFETY_MARGIN_BYTES, STAGING_PLAN_SCHEMA_VERSION,
 };
 pub use runtime_plan::{

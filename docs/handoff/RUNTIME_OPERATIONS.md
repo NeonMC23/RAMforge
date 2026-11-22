@@ -278,6 +278,49 @@ Staged weights are loaded once per layer and remain static between replacements.
 There is no per-token streaming. A failure is explicit; the service does not
 fall back to CPU or normal GPU placement.
 
+### Hardware calibration
+
+`ramforge calibrate-hw MODEL --out PATH [--json] [--force]` runs a bounded
+synthetic transfer calibration (maximum 128 MiB host plus 128 MiB device):
+
+- pinned and pageable H2D at 64 KiB, 256 KiB, 1, 4, 16, 64 and 128 MiB;
+- CUDA-event duration, submission time and effective bandwidth;
+- sequential chunking at 4, 16 and 64 MiB for a 64 MiB payload;
+- pinned/device allocation and release overhead;
+- device, driver, native backend, model path/size/mtime and tool version.
+
+Records are versioned JSON and are rejected when identity differs. Existing
+files are not overwritten without `--force`. Calibration does not load a model
+and does not run inference.
+
+### Adaptive strategy selection
+
+`staging-cycle` flags:
+
+- `--adaptive`: choose a transfer strategy from calibration and measured results;
+- `--calibration PATH`: hardware/model calibration record;
+- `--strategy sync|async`: explicit override for experiments;
+- `--selection-policy ascending|smallest-first|resident-first`: automatic
+  residency ordering.
+
+The controller:
+
+1. deterministically explores both strategies, interleaving them;
+2. warms the file-backed tensors of the candidate layers before comparison;
+3. requires at least two samples per strategy;
+4. applies 5% hysteresis for Balanced and 2% for Maximum Performance;
+5. prefers synchronous on ties or insufficient evidence;
+6. never prefetches in Background;
+7. falls back to synchronous when calibration is missing or stale.
+
+Every decision reports strategy, confidence (`measured`, `calibrated`,
+`advisory`, `fallback`), reason, expected transfer/compute/exposed time,
+predicted totals, sample counts and measured medians. Adaptive mode is opt-in.
+
+`--selection-policy smallest-first` orders auto-selection by exact native layer
+bytes. `resident-first` keeps current residents ahead of new layers. Both remain
+bounded by the same effective budget and all-or-nothing rules.
+
 ## Throughput benchmark
 
 `ramforge benchmark MODEL --profile balanced --runs 3 --warmup 1` measures:

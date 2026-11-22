@@ -279,6 +279,36 @@ average about 12) and reported much lower absolute rates. Those numbers must not
 be compared across sessions. Within the current controlled matrix all modes were
 measured under the same conditions.
 
+## Hardware calibration and adaptive policy
+
+Bounded `ramforge calibrate-hw` measurements on the RTX 3050:
+
+- pinned H2D: 6.3–7.1 GB/s for 16–128 MiB payloads; 6.93–7.05 GB/s at 1 MiB;
+- pageable H2D: 4.7–5.7 GB/s for 1–64 MiB;
+- 64 KiB event/latency floor: 8–21 µs;
+- 64 MiB payload chunking medians: 9.75 ms (4 MiB × 16), 9.98 ms (16 MiB × 4),
+  10.0 ms (one batch) — no material benefit, coarse batch retained;
+- allocation/release overhead is recorded separately in the calibration JSON.
+
+Adaptive policy evidence:
+
+- Balanced Qwen run: async median 654.8 ms vs sync 682.7 ms, within 5%
+  hysteresis → synchronous selected.
+- Maximum Performance Qwen run: sync median 834.0 ms vs async 855.8 ms → sync.
+- Calibration identity mismatch on a different model → synchronous fallback.
+- Background profile → synchronous with explicit advisory reason.
+- Interleaved exploration plus page-cache warming removes strategy-order bias.
+
+Residency ordering on Qwen2.5-7B, 1 GiB staged budget, warm cache, five runs:
+
+| Policy | Layers | Staged bytes | Median tok/s | P25 | P75 | P95 | TTFT |
+|---|---|---|---|---|---|---|---|
+| ascending | 7 | 989,857,792 | 6.161 | 6.107 | 6.173 | 6.241 | 221.5 ms |
+| smallest-first | 8 | 1,049,083,904 | 6.418 | 6.227 | 6.423 | 6.429 | 212.5 ms |
+
+Smallest-first is opt-in and model/workload-specific; it was 4.2% faster and
+resident about 6% more model bytes in this controlled sample.
+
 ## Reproduction
 
 ```sh

@@ -680,21 +680,80 @@ end-to-end benefit is not.
 - No bandwidth isolation or copy-engine prioritization beyond stream priority.
 - Pipelined execution requires both slots to fit the effective budget.
 
+## Adaptive scheduling, calibration and residency policy
+
+### Resource measurements
+
+The physical RTX 3050 was calibrated with pinned and pageable transfers at
+64 KiB–128 MiB. Large pinned transfers measured roughly 6.3–7.1 GB/s; pageable
+transfers roughly 4.7–5.7 GB/s. Event overhead at 64 KiB was about 8–21 µs.
+Allocation/release cost and chunking were measured separately.
+
+Chunking a 64 MiB payload produced medians of 9.75 ms for 4 MiB × 16 batches,
+9.98 ms for 16 MiB × 4 and 10.0 ms for one 64 MiB batch. The difference is
+within run-to-run noise; the coarse batch path is retained.
+
+### Contention diagnosis
+
+The overlapped Qwen path hid 80–100 ms of transfer inside 350–500 ms of compute,
+but compute slowed by a similar amount. This is consistent with shared device
+memory bandwidth and copy/compute contention. It is not proven by hardware
+counters because no external profiler is installed; the evidence is:
+
+- calibration shows the transfer rate is bandwidth-bound at the measured sizes;
+- overlapped compute is consistently slower than commit-before-compute;
+- low-priority staging streams did not remove the slowdown;
+- disabling overlap restores compute duration.
+
+No causal claim beyond shared-bandwidth contention is made.
+
+### Adaptive policy
+
+`AdaptiveController` combines calibration with in-session measurements. It
+interleaves exploration, requires two samples per strategy, applies profile
+hysteresis, and falls back to synchronous deterministically. Calibration
+identity mismatch, missing compute estimates and Background profiles all select
+synchronous replacement. Explicit overrides are reported as advisory.
+
+Profiles:
+
+- Maximum Performance: 2% hysteresis, may select measured async if faster;
+- Balanced: 5% hysteresis, prefers synchronous unless clearly faster;
+- Background: never concurrent prefetch;
+- Custom: explicit override or synchronous fallback.
+
+### Residency policy
+
+Auto-selection can be ordered ascending, by smallest exact layer bytes, or
+resident-first. On Qwen2.5-7B with a 1 GiB staged budget and warm page cache,
+smallest-first selected 8 layers (1,049,083,904 B) versus 7 ascending
+(989,857,792 B). Five measured runs: 6.418 vs 6.161 tok/s median (P25 6.227 vs
+6.107, P75 6.423 vs 6.173), and TTFT 212.5 vs 221.5 ms. The gain is modest and
+model/workload-specific; ascending remains the default and the policy is opt-in.
+
+### Calibration state
+
+Records are `missing`, `identity_mismatch` or `valid`; schema/tool version
+mismatches fail loading. Calibration is explicit, bounded and never runs at
+startup. It is tied to device, driver, backend, model path/size/mtime and tool
+version.
+
 ## Decision
 
-**ALLOCATION REUSE, DOUBLE BUFFERING AND ASYNC TRANSFERS VALIDATED —
-TRANSFER/COMPUTE OVERLAP MEASURED WITHOUT END-TO-END THROUGHPUT GAIN.**
+**HARDWARE PERFORMANCE MODEL VALIDATED — ADAPTIVE SCHEDULING, CALIBRATION AND
+PROFILE-AWARE POLICY IMPLEMENTED — RESIDENCY ORDERING IMPROVED THROUGHPUT —
+OVERLAP REMAINS SLOWER THAN SYNCHRONOUS ON THIS HARDWARE.**
 
-- Allocation reuse is real: pooled CUDA buffers are reused and counters prove
-  it.
-- Double buffering is real: an active selection executes while a pending
-  selection is staged and committed afterwards.
-- Asynchronous transfers are real: batched CUDA copies, start/completion events
-  and explicit waits are tested on hardware.
-- Overlap is measured: the transfer is fully hidden inside the compute interval
-  using device-event transfer timing and a synchronized compute interval.
-- It is not a performance win on the RTX 3050; compute slows under concurrent
-  DMA by approximately the hidden transfer time.
+- Calibration measures pinned/pageable bandwidth, latency, chunking and
+  allocation overhead with explicit identity and invalidation.
+- Adaptive scheduling explores and measures both paths, then deterministically
+  falls back to synchronous when no clear win exists.
+- Profile hysteresis changes selection behavior; Background never prefetches.
+- Smallest-first residency selected one more Qwen layer and measured ~4% higher
+  generation throughput (P25/P75 non-overlapping in the five-run sample).
+- Chunking showed no material benefit; the coarse batch remains.
+- Adaptive overlap scheduling did not demonstrate a reliable end-to-end win and
+  remains opt-in.
 
-Per-layer intra-graph execution, bandwidth isolation and a demonstrated
-throughput improvement remain unsupported.
+Per-layer intra-graph execution, profiler-backed contention attribution and a
+universal adaptive default remain unsupported.

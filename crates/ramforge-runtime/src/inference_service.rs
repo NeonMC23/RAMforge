@@ -297,6 +297,7 @@ pub struct InferenceService {
     staging_engine: Option<Engine>,
     staging_status: Vec<StagedLayerStatus>,
     staging_pool_limit_bytes: u64,
+    selection_policy: crate::staging_plan::SelectionPolicy,
     pending_pipeline: Option<PendingPipeline>,
 }
 
@@ -316,6 +317,7 @@ impl InferenceService {
             staging_engine: None,
             staging_status: Vec::new(),
             staging_pool_limit_bytes: 0,
+            selection_policy: crate::staging_plan::SelectionPolicy::Ascending,
             pending_pipeline: None,
         })
     }
@@ -344,6 +346,27 @@ impl InferenceService {
     pub fn with_staging_pool_limit(mut self, bytes: u64) -> Self {
         self.staging_pool_limit_bytes = bytes;
         self
+    }
+
+    pub fn with_selection_policy(mut self, policy: crate::staging_plan::SelectionPolicy) -> Self {
+        self.selection_policy = policy;
+        self
+    }
+
+    /// Build a plan without mutating residency or touching CUDA state.
+    pub fn preview_staging_plan(
+        &self,
+        request: StagingRequest,
+    ) -> Result<StagingPlan, ServiceError> {
+        let registry = crate::DeviceRegistry::discover();
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "context ready".to_string(),
+                actual: self.state,
+            })?;
+        self.build_staging_plan_for(session, &registry, &request)
     }
 
     pub fn with_staging_request(mut self, mut request: StagingRequest) -> Self {
@@ -1150,6 +1173,7 @@ impl InferenceService {
                 schema_version: crate::staging_plan::STAGING_PLAN_SCHEMA_VERSION,
                 requested_layers: request.layers.clone(),
                 auto_selected: request.auto,
+                selection_policy: self.selection_policy,
                 configured_budget_bytes: request.budget_bytes,
                 effective_budget_bytes: None,
                 observed_free_device_bytes: observed_free,
@@ -1189,7 +1213,29 @@ impl InferenceService {
         };
 
         let candidates: Vec<u32> = if request.auto {
-            (0..layer_count).collect()
+            let mut ordered: Vec<u32> = (0..layer_count).collect();
+            match self.selection_policy {
+                crate::staging_plan::SelectionPolicy::Ascending => {}
+                crate::staging_plan::SelectionPolicy::SmallestFirst => {
+                    ordered.sort_by_key(|layer| {
+                        (
+                            session.staged_layer_bytes(*layer).unwrap_or(u64::MAX),
+                            *layer,
+                        )
+                    });
+                }
+                crate::staging_plan::SelectionPolicy::ResidentFirst => {
+                    ordered.sort_by_key(|layer| {
+                        let resident = current_layers.contains(layer);
+                        (
+                            !resident,
+                            session.staged_layer_bytes(*layer).unwrap_or(u64::MAX),
+                            *layer,
+                        )
+                    });
+                }
+            }
+            ordered
         } else {
             request.layers.clone()
         };
@@ -1229,6 +1275,10 @@ impl InferenceService {
                     reason: Some("exceeds effective staged-VRAM budget".to_string()),
                 });
             }
+        }
+        if request.auto {
+            layers.sort_by_key(|entry| entry.layer);
+            accepted_layers.sort_unstable();
         }
         if !request.auto && !rejected_layers.is_empty() {
             planned_bytes = 0;
@@ -1305,6 +1355,7 @@ impl InferenceService {
             schema_version: crate::staging_plan::STAGING_PLAN_SCHEMA_VERSION,
             requested_layers: request.layers.clone(),
             auto_selected: request.auto,
+            selection_policy: self.selection_policy,
             configured_budget_bytes: request.budget_bytes,
             effective_budget_bytes: Some(effective_budget),
             observed_free_device_bytes: observed_free,
@@ -1399,6 +1450,38 @@ impl InferenceService {
             allocation_reuse_supported: state.allocation_reuse_supported,
             transfer_compute_overlap_supported: state.transfer_compute_overlap_supported,
         })
+    }
+
+    /// Read the file-backed tensors of the given layers once so later staging
+    /// comparisons are not biased by cold page-cache reads. Returns bytes read.
+    pub fn warm_model_layers(&self, layers: &[u32]) -> Result<u64, ServiceError> {
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "model loaded".to_string(),
+                actual: self.state,
+            })?;
+        let storage = model
+            .tensor_storage()
+            .map_err(|error| ServiceError::Execution(error.to_string()))?;
+        let mut total = 0u64;
+        for tensor in storage {
+            let Some(layer) = tensor.layer else {
+                continue;
+            };
+            if !layers.contains(&layer) || !tensor.file_backed {
+                continue;
+            }
+            let length = usize::try_from(tensor.tensor_bytes)
+                .map_err(|_| ServiceError::Execution("tensor is too large".to_string()))?;
+            let mut bytes = vec![0u8; length];
+            model
+                .read_tensor_bytes(&tensor.name, 0, &mut bytes)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            total = total.saturating_add(tensor.tensor_bytes);
+        }
+        Ok(total)
     }
 
     /// Generate tokens, streaming decoded text into `sink`.

@@ -16,7 +16,7 @@ use crate::inference_service::{
 };
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 10;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
@@ -132,6 +132,7 @@ pub struct BenchmarkConfig {
     pub staged_budget_bytes: Option<u64>,
     pub staged_auto: bool,
     pub staged_margin_bytes: u64,
+    pub selection_policy: crate::staging_plan::SelectionPolicy,
 }
 
 impl Default for BenchmarkConfig {
@@ -145,6 +146,7 @@ impl Default for BenchmarkConfig {
             staged_budget_bytes: None,
             staged_auto: false,
             staged_margin_bytes: crate::staging_plan::DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+            selection_policy: crate::staging_plan::SelectionPolicy::Ascending,
         }
     }
 }
@@ -186,7 +188,10 @@ pub fn run_benchmark(
         auto: config.staged_auto,
         safety_margin_bytes: config.staged_margin_bytes,
     };
-    let mut service = InferenceService::new(plan)?.with_staging_request(staging_request);
+    let selection_policy = config.selection_policy;
+    let mut service = InferenceService::new(plan)?
+        .with_selection_policy(selection_policy)
+        .with_staging_request(staging_request);
     let load_started = Instant::now();
     service.load()?;
     let model_load_ns = duration_ns(load_started.elapsed());
@@ -382,6 +387,7 @@ mod tests {
             staged_budget_bytes: None,
             staged_auto: false,
             staged_margin_bytes: crate::staging_plan::DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+            selection_policy: crate::staging_plan::SelectionPolicy::Ascending,
         }
         .validate()
         .is_err());
@@ -394,6 +400,7 @@ mod tests {
             staged_budget_bytes: None,
             staged_auto: false,
             staged_margin_bytes: crate::staging_plan::DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+            selection_policy: crate::staging_plan::SelectionPolicy::Ascending,
         }
         .validate()
         .is_err());
