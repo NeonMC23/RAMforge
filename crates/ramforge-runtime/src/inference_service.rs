@@ -23,7 +23,7 @@ use crate::staging::{Engine, MemoryType, StagingError};
 use crate::staging_plan::{StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest};
 use ramforge_core::{discover_model_set, Tokenizer};
 
-pub const INFERENCE_SERVICE_API_VERSION: u32 = 2;
+pub const INFERENCE_SERVICE_API_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +105,12 @@ pub struct StagingLifecycleStatus {
     pub graph_invalidated: bool,
     pub resident_layers: Vec<u32>,
     pub resident_bytes: u64,
+    pub pending_layers: u32,
+    pub pending_bytes: u64,
+    pub pool_bytes: u64,
+    pub pool_limit_bytes: u64,
+    pub pool_buffers: u64,
+    pub commit_count: u64,
     pub allocation_count: u64,
     pub release_count: u64,
     pub reuse_count: u64,
@@ -120,6 +126,26 @@ pub struct StagingLifecycleStatus {
     pub eviction_supported: bool,
     pub allocation_reuse_supported: bool,
     pub transfer_compute_overlap_supported: bool,
+}
+
+/// Result of committing a prepared pipeline replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineCommitReport {
+    pub layers: Vec<u32>,
+    pub transfer_bytes: u64,
+    pub transfer_duration_ns: u64,
+    pub transfer_wait_ns: u64,
+    pub submit_ns: u64,
+    pub invalidation_ns: u64,
+    pub commit_ns: u64,
+    pub transfer_in_flight_at_commit: bool,
+}
+
+struct PendingPipeline {
+    plan: StagingPlan,
+    layers: Vec<u32>,
+    host: crate::staging::StagingBuffer,
+    submit_ns: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +170,7 @@ pub struct ServiceStatus {
     pub staged_layers: Vec<StagedLayerStatus>,
     pub staging_plan: Option<StagingPlan>,
     pub staging_lifecycle: Option<StagingLifecycleStatus>,
+    pub pipeline_pending: bool,
     pub model_instance_id: Option<u64>,
     pub context_id: Option<u64>,
     pub rss_bytes: Option<u64>,
@@ -269,6 +296,8 @@ pub struct InferenceService {
     staging_plan: Option<StagingPlan>,
     staging_engine: Option<Engine>,
     staging_status: Vec<StagedLayerStatus>,
+    staging_pool_limit_bytes: u64,
+    pending_pipeline: Option<PendingPipeline>,
 }
 
 impl InferenceService {
@@ -286,6 +315,8 @@ impl InferenceService {
             staging_plan: None,
             staging_engine: None,
             staging_status: Vec::new(),
+            staging_pool_limit_bytes: 0,
+            pending_pipeline: None,
         })
     }
 
@@ -308,6 +339,11 @@ impl InferenceService {
             layers,
             ..StagingRequest::default()
         })
+    }
+
+    pub fn with_staging_pool_limit(mut self, bytes: u64) -> Self {
+        self.staging_pool_limit_bytes = bytes;
+        self
     }
 
     pub fn with_staging_request(mut self, mut request: StagingRequest) -> Self {
@@ -381,6 +417,7 @@ impl InferenceService {
             staged_layers: self.current_staged_status(),
             staging_plan: self.staging_plan.clone(),
             staging_lifecycle: self.staging_lifecycle(),
+            pipeline_pending: self.pending_pipeline.is_some(),
             model_instance_id: model_id,
             context_id,
             rss_bytes: process_rss(),
@@ -551,6 +588,9 @@ impl InferenceService {
                 actual: self.state,
             });
         }
+        // A pending double buffer owns device allocations and an in-flight
+        // transfer; complete and discard it before dropping the context.
+        let _ = self.abort_staged_pipeline();
         // Drop the previous context before opening the replacement so two
         // contexts are not held simultaneously during a benchmark reset.
         self.session = None;
@@ -575,6 +615,16 @@ impl InferenceService {
             ));
         }
         self.session = Some(session);
+        if self.staging_pool_limit_bytes > 0 {
+            let limit = self
+                .staging_pool_limit_bytes
+                .min(self.staging_request.budget_bytes.unwrap_or(u64::MAX));
+            self.session
+                .as_ref()
+                .expect("session assigned")
+                .set_staging_pool_limit(limit)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+        }
         self.state = ServiceState::Ready;
         if let Err(error) = self.stage_configured_layers() {
             self.session = None;
@@ -625,6 +675,264 @@ impl InferenceService {
         }
         self.staging_status = statuses;
         Ok(())
+    }
+
+    /// Prepare a double-buffered pipeline replacement. Allocates the complete
+    /// next selection in the native pending slot and submits one asynchronous
+    /// H2D batch on the staging stream. Returns before any transfer completes;
+    /// the caller may execute inference on the active selection while the batch
+    /// runs. Commit after execution completion.
+    pub fn prepare_staged_pipeline(
+        &mut self,
+        request: StagingRequest,
+    ) -> Result<StagingPlan, ServiceError> {
+        if self.state != ServiceState::Ready {
+            return Err(ServiceError::InvalidState {
+                expected: "ready".to_string(),
+                actual: self.state,
+            });
+        }
+        if self.pending_pipeline.is_some() {
+            return Err(ServiceError::Configuration(
+                "a pipeline replacement is already pending".to_string(),
+            ));
+        }
+        let registry = crate::DeviceRegistry::discover();
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "context ready".to_string(),
+                actual: self.state,
+            })?;
+        let mut plan = self.build_staging_plan_for(session, &registry, &request)?;
+        let state = session.staging_state().map_err(|error| {
+            ServiceError::Execution(format!("native staging state failed: {error}"))
+        })?;
+        let pending_bytes = plan.planned_bytes;
+        let required = state
+            .resident_bytes
+            .saturating_add(pending_bytes)
+            .saturating_add(state.pool_bytes);
+        let fits = plan
+            .effective_budget_bytes
+            .map(|budget| required <= budget)
+            .unwrap_or(false);
+        plan.pipeline = true;
+        plan.pipeline_active_bytes = state.resident_bytes;
+        plan.pipeline_pending_bytes = pending_bytes;
+        plan.pipeline_pool_bytes = state.pool_bytes;
+        plan.pipeline_required_bytes = required;
+        plan.pipeline_fits = fits;
+        if !fits
+            || plan.state == StagingPlanState::Rejected
+            || plan.state == StagingPlanState::Unknown
+            || plan.accepted_layers.is_empty()
+        {
+            plan.state = StagingPlanState::Rejected;
+            plan.notes.push(
+                "pipeline requires active + pending + pool bytes within the effective budget"
+                    .to_string(),
+            );
+            self.staging_plan = Some(plan.clone());
+            return Err(ServiceError::Configuration(format!(
+                "staged pipeline plan rejected: {}",
+                serde_json::to_string(&plan)
+                    .unwrap_or_else(|_| "plan serialization failed".to_string())
+            )));
+        }
+
+        // Bound retained evicted buffers before any commit. The limit cannot
+        // exceed the effective budget.
+        let pool_limit = self
+            .staging_pool_limit_bytes
+            .min(plan.effective_budget_bytes.unwrap_or(0));
+        session
+            .set_staging_pool_limit(pool_limit)
+            .map_err(|error| ServiceError::Execution(format!("pool limit failed: {error}")))?;
+
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "model loaded".to_string(),
+                actual: self.state,
+            })?;
+        let engine = self.staging_engine.as_ref().ok_or_else(|| {
+            ServiceError::Execution("staging engine is not initialized".to_string())
+        })?;
+
+        let mut stage_error = None;
+        for layer in &plan.accepted_layers {
+            if let Err(error) = session.stage_layer_pending_cuda(*layer) {
+                stage_error = Some(format!("pending stage layer {layer}: {error}"));
+                break;
+            }
+        }
+        if let Some(message) = stage_error {
+            let _ = session.discard_pending_cuda();
+            return Err(ServiceError::Execution(message));
+        }
+
+        let mut tensors = Vec::new();
+        for layer in &plan.accepted_layers {
+            let count = session
+                .pending_tensor_count(*layer)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            for index in 0..count {
+                tensors.push(
+                    session
+                        .pending_tensor_info(*layer, index)
+                        .map_err(|error| ServiceError::Execution(error.to_string()))?,
+                );
+            }
+        }
+        let total: u64 = tensors.iter().map(|tensor| tensor.bytes).sum();
+        let host = engine
+            .allocate(MemoryType::PinnedHost, total)
+            .map_err(|error| ServiceError::Execution(error.to_string()))?;
+        let mut offsets = Vec::with_capacity(tensors.len());
+        let mut device_ptrs = Vec::with_capacity(tensors.len());
+        let mut sizes = Vec::with_capacity(tensors.len());
+        let mut offset = 0u64;
+        for tensor in &tensors {
+            let length = usize::try_from(tensor.bytes)
+                .map_err(|_| ServiceError::Execution("staged tensor is too large".to_string()))?;
+            let mut bytes = vec![0u8; length];
+            model
+                .read_tensor_bytes(&tensor.name, 0, &mut bytes)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            host.write_host(offset, &bytes)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            offsets.push(offset);
+            device_ptrs.push(tensor.device_ptr);
+            sizes.push(tensor.bytes);
+            offset += tensor.bytes;
+        }
+        let submit_started = Instant::now();
+        let submit_result =
+            engine.submit_batch_to_device_ptrs(&host, &offsets, &device_ptrs, &sizes);
+        let submit_ns = duration_ns(submit_started.elapsed());
+        if let Err(error) = submit_result {
+            let mut host = host;
+            let _ = host.release();
+            let _ = session.discard_pending_cuda();
+            return Err(ServiceError::Execution(format!(
+                "pipeline transfer submission failed: {error}"
+            )));
+        }
+        // Ensure the DMA has started before the caller begins compute. This is
+        // the anchor for overlap accounting; it does not wait for completion.
+        engine.wait_started().map_err(|error| {
+            ServiceError::Execution(format!("pipeline transfer start failed: {error}"))
+        })?;
+
+        self.pending_pipeline = Some(PendingPipeline {
+            plan: plan.clone(),
+            layers: plan.accepted_layers.clone(),
+            host,
+            submit_ns,
+        });
+        self.staging_plan = Some(plan.clone());
+        Ok(plan)
+    }
+
+    /// Wait for the pending pipeline transfer, invalidate the active graph and
+    /// activate the pending selection. The old active buffers are recycled into
+    /// the bounded pool. On failure before commit the active selection is kept.
+    pub fn commit_staged_pipeline(&mut self) -> Result<PipelineCommitReport, ServiceError> {
+        let pending = self
+            .pending_pipeline
+            .take()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "pending pipeline".to_string(),
+                actual: self.state,
+            })?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "context ready".to_string(),
+                actual: self.state,
+            })?;
+        let engine = self.staging_engine.as_ref().ok_or_else(|| {
+            ServiceError::Execution("staging engine is not initialized".to_string())
+        })?;
+        let (transfer, transfer_in_flight_at_commit, transfer_wait_ns) = match engine.query() {
+            Ok(Some(report)) => (report, false, 0),
+            Ok(None) => {
+                let wait_started = Instant::now();
+                match engine.wait() {
+                    Ok(report) => (report, true, duration_ns(wait_started.elapsed())),
+                    Err(error) => {
+                        let _ = session.discard_pending_cuda();
+                        return Err(ServiceError::Execution(format!(
+                            "pipeline transfer wait failed: {error}"
+                        )));
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = session.discard_pending_cuda();
+                return Err(ServiceError::Execution(format!(
+                    "pipeline transfer query failed: {error}"
+                )));
+            }
+        };
+        let invalidation_started = Instant::now();
+        session.invalidate_graph().map_err(|error| {
+            ServiceError::Execution(format!("pipeline invalidation failed: {error}"))
+        })?;
+        let invalidation_ns = duration_ns(invalidation_started.elapsed());
+        let commit_started = Instant::now();
+        session
+            .commit_pending_cuda()
+            .map_err(|error| ServiceError::Execution(format!("pipeline commit failed: {error}")))?;
+        let commit_ns = duration_ns(commit_started.elapsed());
+        let layers = pending.layers.clone();
+        let mut host = pending.host;
+        let _ = host.release();
+        let statuses = statuses_for_layers(session, &layers);
+        self.staged_layers = layers.clone();
+        self.staging_status = statuses;
+        self.staging_plan = Some(pending.plan.clone());
+        Ok(PipelineCommitReport {
+            layers,
+            transfer_bytes: transfer.bytes,
+            transfer_duration_ns: transfer.duration_ns,
+            transfer_wait_ns,
+            submit_ns: pending.submit_ns,
+            invalidation_ns,
+            commit_ns,
+            transfer_in_flight_at_commit,
+        })
+    }
+
+    /// Wait for and discard a prepared pipeline selection without changing the
+    /// active selection. Safe to call when no pipeline is pending.
+    pub fn abort_staged_pipeline(&mut self) -> Result<(), ServiceError> {
+        let Some(pending) = self.pending_pipeline.take() else {
+            return Ok(());
+        };
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "context ready".to_string(),
+                actual: self.state,
+            })?;
+        if let Some(engine) = self.staging_engine.as_ref() {
+            let _ = engine.wait();
+        }
+        let mut host = pending.host;
+        let _ = host.release();
+        session
+            .discard_pending_cuda()
+            .map_err(|error| ServiceError::Execution(error.to_string()))
+    }
+
+    pub fn has_pending_pipeline(&self) -> bool {
+        self.pending_pipeline.is_some()
     }
 
     /// Transactional same-context replacement of the staged layer selection.
@@ -857,6 +1165,12 @@ impl InferenceService {
                 reclaimable_bytes: 0,
                 required_new_bytes: 0,
                 temporary_headroom_bytes: 0,
+                pipeline: false,
+                pipeline_active_bytes: 0,
+                pipeline_pending_bytes: 0,
+                pipeline_pool_bytes: 0,
+                pipeline_required_bytes: 0,
+                pipeline_fits: false,
                 replacement_invalidation_ns: None,
                 replacement_eviction_ns: None,
                 replacement_staging_ns: None,
@@ -1006,6 +1320,12 @@ impl InferenceService {
             reclaimable_bytes,
             required_new_bytes,
             temporary_headroom_bytes: 0,
+            pipeline: false,
+            pipeline_active_bytes: 0,
+            pipeline_pending_bytes: 0,
+            pipeline_pool_bytes: 0,
+            pipeline_required_bytes: 0,
+            pipeline_fits: false,
             replacement_invalidation_ns: None,
             replacement_eviction_ns: None,
             replacement_staging_ns: None,
@@ -1057,6 +1377,12 @@ impl InferenceService {
             graph_invalidated: state.graph_invalidated,
             resident_layers,
             resident_bytes: state.resident_bytes,
+            pending_layers: state.pending_layers,
+            pending_bytes: state.pending_bytes,
+            pool_bytes: state.pool_bytes,
+            pool_limit_bytes: state.pool_limit_bytes,
+            pool_buffers: state.pool_buffers,
+            commit_count: state.commit_count,
             allocation_count: state.allocation_count,
             release_count: state.release_count,
             reuse_count: state.reuse_count,
@@ -1242,12 +1568,21 @@ impl InferenceService {
 
     /// Drop the context and model; the service can be loaded again.
     pub fn unload(&mut self) {
+        let _ = self.abort_staged_pipeline();
         self.session = None;
         self.model = None;
         self.tokenizer = None;
         self.staging_status.clear();
         self.staging_plan = None;
         self.state = ServiceState::Terminated;
+    }
+}
+
+impl Drop for InferenceService {
+    fn drop(&mut self) {
+        // Never drop a live context while a pipeline transfer or pending slot
+        // may still reference device memory.
+        let _ = self.abort_staged_pipeline();
     }
 }
 

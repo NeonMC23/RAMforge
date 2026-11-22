@@ -420,6 +420,18 @@ enum Commands {
         #[arg(long)]
         staged_margin: Option<String>,
 
+        /// Bound retained evicted CUDA buffers for reuse
+        #[arg(long)]
+        staged_pool: Option<String>,
+
+        /// Prepare the next selection asynchronously while the current one runs
+        #[arg(long)]
+        pipeline: bool,
+
+        /// Use the same batch staging path but commit before generation (no overlap)
+        #[arg(long)]
+        pipeline_sync: bool,
+
         /// Replacement cycles (alternates replacement and initial sets)
         #[arg(long, default_value_t = 1)]
         cycles: u32,
@@ -966,6 +978,9 @@ fn main() {
             staged_budget,
             staged_auto,
             staged_margin,
+            staged_pool,
+            pipeline,
+            pipeline_sync,
             cycles,
             prompt,
             max_tokens,
@@ -985,6 +1000,9 @@ fn main() {
                 staged_budget,
                 staged_auto,
                 staged_margin,
+                staged_pool,
+                pipeline,
+                pipeline_sync,
                 cycles,
                 prompt,
                 max_tokens,
@@ -1424,6 +1442,9 @@ fn run_staging_cycle(
     staged_budget: Option<String>,
     staged_auto: bool,
     staged_margin: Option<String>,
+    staged_pool: Option<String>,
+    pipeline: bool,
+    pipeline_sync: bool,
     cycles: u32,
     prompt: String,
     max_tokens: u32,
@@ -1495,6 +1516,12 @@ fn run_staging_cycle(
         .transpose()
         .map_err(|error| anyhow::anyhow!("invalid --staged-margin: {error}"))?
         .unwrap_or(ramforge_runtime::DEFAULT_STAGING_SAFETY_MARGIN_BYTES);
+    let staged_pool_bytes = staged_pool
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --staged-pool: {error}"))?
+        .unwrap_or(0);
 
     let initial_request = ramforge_runtime::StagingRequest {
         layers: staged_layers,
@@ -1504,6 +1531,7 @@ fn run_staging_cycle(
     };
     let mut service = ramforge_runtime::InferenceService::new(plan)
         .map_err(|error| anyhow::anyhow!(error))?
+        .with_staging_pool_limit(staged_pool_bytes)
         .with_staging_request(initial_request);
     service.load().map_err(|error| anyhow::anyhow!(error))?;
     service
@@ -1541,38 +1569,160 @@ fn run_staging_cycle(
             auto: false,
             safety_margin_bytes: staged_margin_bytes,
         };
-        let started = Instant::now();
-        let replacement_plan = service
-            .replace_staged_layers(request)
-            .map_err(|error| anyhow::anyhow!(error))?;
-        let replacement_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let report = cycle_generate(&mut service, &prompt, max_tokens)?;
-        let status = service.status();
-        let resident: Vec<u32> = status
-            .staged_layers
-            .iter()
-            .map(|layer| layer.layer)
-            .collect();
-        if !json {
-            println!(
-                "cycle {}: target={:?} resident={:?} plan={:?} replacement_ms={:.2} tokens={} text={:?}",
-                index,
-                target_layers,
-                resident,
-                replacement_plan.state,
-                replacement_ns as f64 / 1_000_000.0,
-                report.stats.generated_tokens,
-                report.text
-            );
+        if pipeline_sync {
+            let prepare_started = Instant::now();
+            let prepared = service
+                .prepare_staged_pipeline(request)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let prepare_ns =
+                u64::try_from(prepare_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let commit_started = Instant::now();
+            let commit = service
+                .commit_staged_pipeline()
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let commit_ns = u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let compute_started = Instant::now();
+            let report = cycle_generate(&mut service, &prompt, max_tokens)?;
+            let compute_ns =
+                u64::try_from(compute_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let status = service.status();
+            let resident: Vec<u32> = status
+                .staged_layers
+                .iter()
+                .map(|layer| layer.layer)
+                .collect();
+            if !json {
+                println!(
+                    "cycle {} pipeline-sync: target={:?} resident={:?} prepare_ms={:.2} transfer_ms={:.2} wait_ms={:.2} compute_ms={:.2} tokens={} text={:?}",
+                    index,
+                    target_layers,
+                    resident,
+                    prepare_ns as f64 / 1_000_000.0,
+                    commit.transfer_duration_ns as f64 / 1_000_000.0,
+                    commit.transfer_wait_ns as f64 / 1_000_000.0,
+                    compute_ns as f64 / 1_000_000.0,
+                    report.stats.generated_tokens,
+                    report.text
+                );
+            }
+            cycle_reports.push(serde_json::json!({
+                "cycle": index,
+                "mode": "pipeline_sync",
+                "target_layers": target_layers,
+                "replacement_plan": prepared,
+                "prepare_ns": prepare_ns,
+                "commit_wall_ns": commit_ns,
+                "compute_ns": compute_ns,
+                "commit": commit,
+                "overlap_estimate_ns": 0,
+                "transfer_hidden_percent": 0.0,
+                "report": report,
+                "status": status,
+            }));
+        } else if pipeline {
+            let prepare_started = Instant::now();
+            let prepared = service
+                .prepare_staged_pipeline(request)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let prepare_ns =
+                u64::try_from(prepare_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let compute_started = Instant::now();
+            let prep_to_compute_ns =
+                u64::try_from(compute_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let report = cycle_generate(&mut service, &prompt, max_tokens)?;
+            let compute_ns =
+                u64::try_from(compute_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let commit_started = Instant::now();
+            let commit = service
+                .commit_staged_pipeline()
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let commit_ns = u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let status = service.status();
+            let resident: Vec<u32> = status
+                .staged_layers
+                .iter()
+                .map(|layer| layer.layer)
+                .collect();
+            // Transfer starts on device before compute and the compute interval
+            // is measured with an explicit synchronize. The prepare->compute
+            // gap is subtracted so the overlap estimate is conservative.
+            let observed_overlap_ns = if commit.transfer_in_flight_at_commit {
+                compute_ns
+            } else {
+                compute_ns.min(commit.transfer_duration_ns)
+            };
+            let hidden_ns = observed_overlap_ns.saturating_sub(prep_to_compute_ns);
+            let transfer_hidden_pct = if commit.transfer_duration_ns == 0 {
+                0.0
+            } else {
+                hidden_ns as f64 * 100.0 / commit.transfer_duration_ns as f64
+            };
+            if !json {
+                println!(
+                    "cycle {} pipeline: target={:?} resident={:?} plan={:?} compute_ms={:.2} transfer_ms={:.2} wait_ms={:.2} hidden_pct={:.1} tokens={} text={:?}",
+                    index,
+                    target_layers,
+                    resident,
+                    prepared.state,
+                    compute_ns as f64 / 1_000_000.0,
+                    commit.transfer_duration_ns as f64 / 1_000_000.0,
+                    commit.transfer_wait_ns as f64 / 1_000_000.0,
+                    transfer_hidden_pct,
+                    report.stats.generated_tokens,
+                    report.text
+                );
+            }
+            cycle_reports.push(serde_json::json!({
+                "cycle": index,
+                "mode": "pipeline",
+                "target_layers": target_layers,
+                "replacement_plan": prepared,
+                "prepare_ns": prepare_ns,
+                "prep_to_compute_ns": prep_to_compute_ns,
+                "compute_ns": compute_ns,
+                "commit_wall_ns": commit_ns,
+                "commit": commit,
+                "overlap_estimate_ns": hidden_ns,
+                "overlap_method": "transfer CUDA-event duration bounded by measured compute interval minus prepare-to-compute gap",
+                "transfer_hidden_percent": transfer_hidden_pct,
+                "report": report,
+                "status": status,
+            }));
+        } else {
+            let started = Instant::now();
+            let replacement_plan = service
+                .replace_staged_layers(request)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let replacement_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let report = cycle_generate(&mut service, &prompt, max_tokens)?;
+            let status = service.status();
+            let resident: Vec<u32> = status
+                .staged_layers
+                .iter()
+                .map(|layer| layer.layer)
+                .collect();
+            if !json {
+                println!(
+                    "cycle {}: target={:?} resident={:?} plan={:?} replacement_ms={:.2} tokens={} text={:?}",
+                    index,
+                    target_layers,
+                    resident,
+                    replacement_plan.state,
+                    replacement_ns as f64 / 1_000_000.0,
+                    report.stats.generated_tokens,
+                    report.text
+                );
+            }
+            cycle_reports.push(serde_json::json!({
+                "cycle": index,
+                "mode": "replace",
+                "target_layers": target_layers,
+                "replacement_plan": replacement_plan,
+                "replacement_ns": replacement_ns,
+                "report": report,
+                "status": status,
+            }));
         }
-        cycle_reports.push(serde_json::json!({
-            "cycle": index,
-            "target_layers": target_layers,
-            "replacement_plan": replacement_plan,
-            "replacement_ns": replacement_ns,
-            "report": report,
-            "status": status,
-        }));
     }
 
     if json {

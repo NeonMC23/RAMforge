@@ -300,3 +300,139 @@ fn failed_rollback_fails_closed_and_rejects_generation() {
         .expect_err("failed service must reject generation");
     assert!(matches!(generate_error, ServiceError::InvalidState { .. }));
 }
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn pipeline_reuses_pool_and_commits_pending_selection() {
+    let _guard = env_lock();
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let plan = plan_for(&path);
+    let initial = StagingRequest {
+        layers: vec![0, 1],
+        budget_bytes: Some(20 * 1024 * 1024),
+        auto: false,
+        safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+    };
+    let mut service = InferenceService::new(plan)
+        .expect("service")
+        .with_staging_pool_limit(20 * 1024 * 1024)
+        .with_staging_request(initial);
+    service.load().expect("load");
+    service.create_session().expect("session");
+    assert!(!generate(&mut service).is_empty());
+
+    let selections = [vec![1, 2], vec![0, 1], vec![1, 2]];
+    for target in selections {
+        let prepared = service
+            .prepare_staged_pipeline(StagingRequest {
+                layers: target.clone(),
+                budget_bytes: Some(20 * 1024 * 1024),
+                auto: false,
+                safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+            })
+            .expect("prepare pipeline");
+        assert!(prepared.pipeline);
+        assert!(prepared.pipeline_fits);
+        assert!(prepared.pipeline_required_bytes > prepared.pipeline_pending_bytes);
+        let text = generate(&mut service);
+        assert!(!text.is_empty());
+        let commit = service.commit_staged_pipeline().expect("commit pipeline");
+        assert_eq!(commit.layers, target);
+        assert!(commit.transfer_duration_ns > 0);
+        let status = service.status();
+        let resident: Vec<u32> = status
+            .staged_layers
+            .iter()
+            .map(|layer| layer.layer)
+            .collect();
+        assert_eq!(resident, target);
+        assert!(!status.pipeline_pending);
+    }
+    let lifecycle = service.status().staging_lifecycle.expect("lifecycle");
+    assert_eq!(lifecycle.allocation_count, 4);
+    assert!(lifecycle.reuse_count >= 4);
+    assert_eq!(lifecycle.commit_count, 3);
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn pipeline_rejects_two_slots_over_budget_and_abort_preserves_active() {
+    let _guard = env_lock();
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let plan = plan_for(&path);
+    let initial = StagingRequest {
+        layers: vec![0, 1],
+        budget_bytes: Some(8 * 1024 * 1024),
+        auto: false,
+        safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+    };
+    let mut service = InferenceService::new(plan)
+        .expect("service")
+        .with_staging_request(initial);
+    service.load().expect("load");
+    service.create_session().expect("session");
+    let first = generate(&mut service);
+    assert!(!first.is_empty());
+
+    let error = service
+        .prepare_staged_pipeline(StagingRequest {
+            layers: vec![1, 2],
+            budget_bytes: Some(8 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        })
+        .expect_err("two slots must not exceed the budget");
+    assert!(
+        matches!(error, ServiceError::Configuration(_)),
+        "unexpected: {error}"
+    );
+    let status = service.status();
+    assert!(!status.pipeline_pending);
+    let resident: Vec<u32> = status
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    assert_eq!(resident, vec![0, 1]);
+    assert!(!generate(&mut service).is_empty());
+
+    // A fitting service can prepare and then abort without changing residency.
+    let plan = plan_for(&path);
+    let mut aborting = InferenceService::new(plan)
+        .expect("service")
+        .with_staging_pool_limit(20 * 1024 * 1024)
+        .with_staging_request(StagingRequest {
+            layers: vec![0, 1],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        });
+    aborting.load().expect("load");
+    aborting.create_session().expect("session");
+    assert!(!generate(&mut aborting).is_empty());
+    aborting
+        .prepare_staged_pipeline(StagingRequest {
+            layers: vec![1, 2],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        })
+        .expect("prepare");
+    assert!(aborting.status().pipeline_pending);
+    aborting.abort_staged_pipeline().expect("abort");
+    let status = aborting.status();
+    assert!(!status.pipeline_pending);
+    let resident: Vec<u32> = status
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    assert_eq!(resident, vec![0, 1]);
+    assert!(!generate(&mut aborting).is_empty());
+}

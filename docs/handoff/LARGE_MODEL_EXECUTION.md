@@ -300,9 +300,11 @@ Evidence available today:
   in the pinned native tree.
 - Dynamic replacement between executions is validated. Staged sources cannot be
   replaced while a graph or execution can still reference them.
-- There is still no per-layer execution boundary, double-buffered consume point,
-  transfer/compute overlap, or allocation-capacity reuse. The scheduler still
-  owns whole-graph execution and compute-buffer lifetimes.
+- The scheduler still owns whole-graph execution; there is no per-layer
+  intra-graph boundary. Inter-execution double buffering, pending-slot commits,
+  bounded allocation reuse and asynchronous batch transfers are implemented.
+  Measured transfer/compute overlap exists but did not improve end-to-end
+  latency because concurrent DMA reduced compute throughput.
 
 For MoE, there is still no active-expert observation or routing metadata in the
 safe API. Buffer totals cannot distinguish shared from routed expert storage, so
@@ -326,16 +328,18 @@ metadata remains required.
 - Storage assessment and verified copy.
 - Same-context staged layer eviction and replacement with transactional
   rollback and explicit lifecycle counters.
+- Bounded staged-allocation reuse, pending double buffering and asynchronous
+  batch transfers with measured overlap.
 - Honest unsupported/unknown reporting for GPU execution, capacity reuse and
   transfer/compute overlap.
 
 ## Required next native work
 
 - Expose per-layer/device allocation sizes and richer allocation failures.
-- Add a per-layer execution boundary (or scheduler-integrated prefetch hook) with
-  event-guarded double buffering for genuine transfer/compute overlap.
-- Add safe staged-allocation capacity reuse that proves tensor inventory and
-  layout compatibility before remapping views.
+- Add a per-layer intra-graph execution boundary or scheduler-integrated
+  prefetch hook; current overlap is between executions.
+- Add bandwidth isolation or copy-engine prioritization that can preserve
+  compute throughput under concurrent staging.
 - Add MoE routing/expert residency metadata and control.
 - Expose anonymous/backend buffer accounting and safe reclamation.
 - Measure bandwidth, working-set, and page-fault behavior under additional

@@ -1,7 +1,8 @@
 # Controlled GPU staging architecture (investigation)
 
-Status: **dynamic same-context eviction and replacement validated; allocation
-capacity reuse and transfer/compute overlap remain unsupported.**
+Status: **allocation reuse, double buffering, async batch transfers and measured
+transfer/compute overlap validated; the overlap produced no end-to-end
+throughput gain on the RTX 3050.**
 
 This document traces the pinned llama.cpp/ggml execution path, identifies safe
 native extension points, measures the relevant transfer/storage limits, and
@@ -573,13 +574,127 @@ executions, not during them. Asynchronous submission alone is not overlap.
 
 Overlap therefore remains unsupported and unmeasured.
 
+## Execution pipeline, double buffering and overlap (implemented)
+
+### Execution-boundary finding
+
+The pinned scheduler executes a whole graph:
+`ggml_backend_sched_alloc_graph()` allocates the complete graph and
+`ggml_backend_sched_graph_compute_async()` submits it. `cb_eval` observes nodes
+but cannot pause or split a graph safely. Graph nodes are built by llama.cpp and
+depend on the full topology; manually executing transformer-layer fragments
+would require a new scheduler contract and risks violating backend/dependency
+semantics.
+
+The selected design is therefore an **inter-execution pipeline**, not an
+intra-graph layer split:
+
+- the active selection executes normally;
+- a complete next selection is allocated in a separate pending slot;
+- its weights are copied into that slot by one asynchronous CUDA batch on a
+  private stream while the active graph computes;
+- after execution completion the graph is invalidated and the pending slot is
+  committed atomically;
+- the next decode rebuilds the graph against the new selection.
+
+Per-layer intra-graph execution remains unsupported.
+
+### Allocation pool
+
+`llama_context_set_staging_pool_limit()` bounds retained evicted buffers.
+Eviction moves a CUDA buffer into a best-fit pool instead of freeing it. When a
+new layer requires no more capacity, the matching buffer is reused and the
+tensor metadata context is recreated over it. Pool bytes, buffer count and
+reuse count are reported natively. Buffers are only pooled after invalidation
+proved that no graph or scheduler mapping references them. The pool never
+exceeds its configured limit; reduction frees excess buffers immediately.
+
+SmolLM2 evidence: allocation count stayed at 4 across five pipeline cycles while
+`reuse_count` advanced 0→2→4→6→8. Non-pipelined replacement with a 20M pool also
+stabilized allocation count at 3 with reuse counts 1,1,2,3.
+
+### Double-buffered pending slot
+
+`llama_context_stage_layer_pending_cuda()` allocates layers in a separate
+pending vector. Pending tensors are not substituted into the active graph, so
+pending staging is allowed while the active selection executes. Commit requires
+`staged_graph_invalidated == true`, no in-flight execution and no active graph;
+it recycles the old active buffers and moves the pending vector into the active
+selection. Discard releases pending allocations without changing the active
+selection.
+
+Corrupting `blk.1.attn_q.weight` in the pending slot before commit changed logits
+by 10.25 with 9 substitutions after commit, proving the committed pending
+weights are consumed by inference.
+
+### Asynchronous transfers and events
+
+`fstage_transfer_submit_batch_to_ptr()` enqueues all layer tensor copies on one
+non-blocking staging stream, records CUDA start/end events and returns after
+submission. `fstage_transfer_wait_started()` waits only for the start event, so
+compute can begin once the DMA has begun. `query()` reports completion without
+blocking; `wait()` completes with device-event duration and host wait time.
+The staging stream is created at the lowest CUDA stream priority so compute
+kernels are preferred where the driver honours priorities. Cancellation never
+releases an in-flight source; shutdown waits or fails closed.
+
+### Overlap evidence and method
+
+Transfer duration is measured by CUDA events on the staging stream. Compute
+duration is measured on the host around a generation that explicitly
+synchronizes. The transfer is confirmed to have started before compute via
+`wait_started`, and the prepare→compute host gap is measured and subtracted from
+the overlap bound. This is a conservative device-event/host-synchronization
+bound, not an asynchronous-API claim.
+
+SmolLM2, 16 generated tokens, 5 cycles:
+
+- transfer 0.94–1.31 ms, compute 70–78 ms, commit wait 0;
+- transfer 100% hidden, overlap estimate equal to the full transfer duration;
+- allocation count constant, reuse advanced every cycle.
+
+Qwen2.5-7B Q4_K_M, four layers per slot, 2 generated tokens, 3 cycles:
+
+- median transfer 81.3 ms hidden inside median compute 443.7 ms, commit wait 0;
+- overlap estimate 100% of transfer;
+- resident slot 560–578 MB, pool 560–578 MB, reuse 4 per cycle after the first.
+
+### Performance result
+
+The overlap is real but does not improve end-to-end latency on this hardware.
+In a controlled comparison using the same batch staging path:
+
+- overlapped median (prepare + compute + commit): 790.2 ms;
+- commit-before-compute median: 728.1 ms.
+
+Concurrent DMA reduced compute throughput by roughly the hidden transfer time,
+consistent with shared memory bandwidth on the laptop GPU. The pipeline is
+therefore an experimental capability, not a throughput win, and is not the
+default. The required transfer/compute concurrency is demonstrably present; the
+end-to-end benefit is not.
+
+### Remaining overlap blockers
+
+- No per-layer graph execution boundary; overlap is between executions.
+- Transfer and compute share device memory bandwidth; no measured net speedup.
+- No bandwidth isolation or copy-engine prioritization beyond stream priority.
+- Pipelined execution requires both slots to fit the effective budget.
+
 ## Decision
 
-**DYNAMIC GPU RESIDENCY VALIDATED — ALLOCATION REUSE NOT YET SUPPORTED.**
+**ALLOCATION REUSE, DOUBLE BUFFERING AND ASYNC TRANSFERS VALIDATED —
+TRANSFER/COMPUTE OVERLAP MEASURED WITHOUT END-TO-END THROUGHPUT GAIN.**
 
-The native invalidation contract was established from the actual graph and
-scheduler implementation, exercised physically, and used to evict and replace
-staged layers in one live context for SmolLM2 and Qwen2.5-7B.
+- Allocation reuse is real: pooled CUDA buffers are reused and counters prove
+  it.
+- Double buffering is real: an active selection executes while a pending
+  selection is staged and committed afterwards.
+- Asynchronous transfers are real: batched CUDA copies, start/completion events
+  and explicit waits are tested on hardware.
+- Overlap is measured: the transfer is fully hidden inside the compute interval
+  using device-event transfer timing and a synchronized compute interval.
+- It is not a performance win on the RTX 3050; compute slows under concurrent
+  DMA by approximately the hidden transfer time.
 
-Allocation capacity reuse and transfer/compute overlap are not implemented. Do
-not describe this as streaming or overlap.
+Per-layer intra-graph execution, bandwidth isolation and a demonstrated
+throughput improvement remain unsupported.

@@ -693,6 +693,55 @@ impl ForgeCoreSession {
             .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
     }
 
+    pub fn stage_layer_pending_cuda(&self, layer: u32) -> Result<(), ForgeCoreAdapterError> {
+        self.context
+            .stage_layer_pending_cuda(layer)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn pending_layer_info(
+        &self,
+        layer: u32,
+    ) -> Result<forge_core::StagedLayerInfo, ForgeCoreAdapterError> {
+        self.context
+            .pending_layer_info(layer)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn pending_tensor_count(&self, layer: u32) -> Result<u32, ForgeCoreAdapterError> {
+        self.context
+            .pending_tensor_count(layer)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn pending_tensor_info(
+        &self,
+        layer: u32,
+        index: u32,
+    ) -> Result<forge_core::StagedTensorInfo, ForgeCoreAdapterError> {
+        self.context
+            .pending_tensor_info(layer, index)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn commit_pending_cuda(&self) -> Result<(), ForgeCoreAdapterError> {
+        self.context
+            .commit_pending_cuda()
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn discard_pending_cuda(&self) -> Result<(), ForgeCoreAdapterError> {
+        self.context
+            .discard_pending_cuda()
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn set_staging_pool_limit(&self, bytes: u64) -> Result<(), ForgeCoreAdapterError> {
+        self.context
+            .set_staging_pool_limit(bytes)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
     pub fn staged_layer_bytes(&self, layer: u32) -> Result<u64, ForgeCoreAdapterError> {
         self.context
             .staged_layer_bytes(layer)

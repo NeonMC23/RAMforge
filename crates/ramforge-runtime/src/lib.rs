@@ -164,9 +164,9 @@ pub use runtime_measurement::{
     RuntimeSnapshot, SystemMemorySnapshot, MAX_RUNTIME_SNAPSHOTS,
 };
 pub use inference_service::{
-    GenerationOptions, GenerationReport, GenerationStats, InferenceService, ServiceCapabilities,
-    ServiceError, ServiceState, ServiceStatus, StagedLayerStatus, StagingLifecycleStatus,
-    INFERENCE_SERVICE_API_VERSION,
+    GenerationOptions, GenerationReport, GenerationStats, InferenceService,
+    PipelineCommitReport, ServiceCapabilities, ServiceError, ServiceState, ServiceStatus,
+    StagedLayerStatus, StagingLifecycleStatus, INFERENCE_SERVICE_API_VERSION,
 };
 pub use service_server::{serve_stdio, ServiceServerError};
 pub use staging_plan::{

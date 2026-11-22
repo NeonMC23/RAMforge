@@ -212,6 +212,11 @@ Flags:
 - `--cycles N`: alternate replacement and initial selections in the same
   context;
 - `--staged-budget`, `--staged-margin`: budget policy shared by every cycle;
+- `--staged-pool SIZE`: bounded pool for retaining/reusing evicted CUDA buffers;
+- `--pipeline`: prepare the next selection in the pending slot and transfer it
+  asynchronously while the active selection generates;
+- `--pipeline-sync`: use the same pending slot and batch path but commit before
+  generation (controlled no-overlap comparison);
 - `--json`: full plans, statuses, timings and native lifecycle counters.
 
 Replacement sequence:
@@ -234,6 +239,40 @@ graph can consume the staged sources, resident layers/bytes, allocation,
 release, reuse, invalidation, rebuild and scheduler-reset counts, quiescence and
 graph-build durations, and the supported capability flags. Counters are native
 facts; budget planning remains RAMforge policy.
+
+### Pipelined replacement
+
+Pipeline mode uses two slots:
+
+1. the active selection remains graph-visible and is used for generation;
+2. the complete next selection is allocated in the native pending slot and
+   filled by one asynchronous H2D batch on a private stream;
+3. `wait_started()` confirms the DMA has begun, then generation runs;
+4. after generation, RAMforge queries/wait for transfer completion, invalidates
+   the graph and commits the pending selection atomically;
+5. the next decode rebuilds the graph against the new selection.
+
+Pending tensors are never referenced by the active graph, so staging is safe
+while it executes. Commit requires successful invalidation and no in-flight
+execution. Abort waits for the transfer and discards pending allocations while
+preserving the active selection. Unload, session reset and service drop abort a
+pending pipeline safely.
+
+Budget: pipeline planning requires
+`active + pending + pool <= effective budget`. The pool is bounded by
+`--staged-pool` and never exceeds the effective budget. A configuration that
+does not fit both slots is rejected before allocation.
+
+`status.pipeline_pending`, `staging_lifecycle.pending_layers/pending_bytes`,
+`pool_bytes/pool_limit_bytes/pool_buffers`, `commit_count` and `reuse_count`
+expose the pipeline state. `reuse_count` is a native fact; allocation reuse only
+happens after invalidation.
+
+Overlap is measured with CUDA transfer events and a synchronized compute
+interval. The transfer must start before compute; the prepare→compute gap is
+subtracted from the overlap bound. On this hardware the transfer is fully hidden
+but concurrent DMA reduces compute throughput, so pipeline mode is experimental
+and not the default.
 
 Staged weights are loaded once per layer and remain static between replacements.
 There is no per-token streaming. A failure is explicit; the service does not

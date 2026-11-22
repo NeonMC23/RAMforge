@@ -248,12 +248,36 @@ overlap remain unsupported. See
   coherent throughout.
 - Allocation capacity reuse and transfer/compute overlap remain unsupported.
 
-The controlled throughput numbers above were collected on a host under heavy
-external CPU load (load average about 12 on 12 threads). Absolute values are
-therefore lower than earlier clean-session measurements and must not be compared
-across sessions. All modes were measured under the same conditions; the relative
-ordering (full GPU > CPU > two staged layers in that loaded session) is reported
-as observed, not as a staging benefit.
+## Allocation reuse, double buffering and overlap
+
+- Bounded pool reuse is validated. SmolLM2 pipeline cycles kept allocation count
+  at 4 while reuse advanced 0→2→4→6→8. Non-pipelined replacement with a 20M pool
+  stabilized allocation count at 3 with reuse 1,1,2,3.
+- Double buffering is validated. The active slot generated while a complete
+  pending slot was filled and committed after invalidation.
+- Async batch transfers are validated. One batch enqueued all tensor copies on a
+  private low-priority stream, with start/completion events and explicit waits.
+- Corruption of a pending layer before commit changed logits by 10.25 with 9
+  substitutions after commit, proving inference consumed the committed slot.
+- SmolLM2 overlap: transfer 0.94–1.31 ms hidden inside 70–78 ms compute
+  (100% hidden), commit wait 0.
+- Qwen2.5-7B overlap: four layers per slot, median transfer 81.3 ms hidden
+  inside median 443.7 ms compute, 100% hidden, 4 reuse per cycle after the first.
+- No end-to-end win: overlapped median 790.2 ms (P25 771.2, P75 813.7, P95
+  842.9) vs synchronized-batch 728.1 ms (P25 701.7, P75 729.6, P95 732.0) over
+  five cycles. Concurrent DMA slowed compute by roughly the hidden transfer
+  time.
+
+Controlled SmolLM2 throughput (5 runs, 32 tokens, context 256, 4 threads):
+CPU median 204.68 tok/s (P25 184.18, P75 236.80, P95 237.07); two staged
+layers 217.03 (204.43/224.42/224.70); full GPU 492.35 (467.35/493.52/494.69).
+The staged result is within run-to-run variance and is not claimed as a
+throughput improvement.
+
+A previous session measured the same modes under heavy external CPU load (load
+average about 12) and reported much lower absolute rates. Those numbers must not
+be compared across sessions. Within the current controlled matrix all modes were
+measured under the same conditions.
 
 ## Reproduction
 

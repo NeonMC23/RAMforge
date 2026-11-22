@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const STAGING_PLAN_SCHEMA_VERSION: u32 = 2;
+pub const STAGING_PLAN_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_STAGING_SAFETY_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +62,12 @@ pub struct StagingPlan {
     pub reclaimable_bytes: u64,
     pub required_new_bytes: u64,
     pub temporary_headroom_bytes: u64,
+    pub pipeline: bool,
+    pub pipeline_active_bytes: u64,
+    pub pipeline_pending_bytes: u64,
+    pub pipeline_pool_bytes: u64,
+    pub pipeline_required_bytes: u64,
+    pub pipeline_fits: bool,
     pub replacement_invalidation_ns: Option<u64>,
     pub replacement_eviction_ns: Option<u64>,
     pub replacement_staging_ns: Option<u64>,

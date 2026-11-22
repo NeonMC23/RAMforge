@@ -1600,7 +1600,7 @@ fn benchmark_reports_measured_generation_throughput() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 9);
+    assert_eq!(report["schema_version"], 10);
     assert_eq!(report["plan"]["effective"]["backend"], "cpu");
     assert_eq!(report["effective_gpu_layers"], 0);
     assert_eq!(report["device_id"], "cpu");
@@ -1836,7 +1836,7 @@ fn staged_layer_inference_consumes_graph_substitutions() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 9);
+    assert_eq!(report["schema_version"], 10);
     let staged = report["staged_layers"].as_array().expect("staged");
     assert_eq!(staged.len(), 1);
     assert_eq!(staged[0]["layer"], 0);
@@ -2040,7 +2040,7 @@ fn cuda_benchmark_reports_native_placement_and_memory() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json");
-    assert_eq!(report["schema_version"], 9);
+    assert_eq!(report["schema_version"], 10);
     assert_ne!(report["device_id"], "cpu");
     assert_eq!(report["requested_gpu_layers"], 8);
     let effective = report["effective_gpu_layers"].as_u64().expect("readback");
