@@ -240,6 +240,28 @@ release, reuse, invalidation, rebuild and scheduler-reset counts, quiescence and
 graph-build durations, and the supported capability flags. Counters are native
 facts; budget planning remains RAMforge policy.
 
+### Host staging optimization
+
+`staging-cycle` and `benchmark` accept:
+
+- `--host-staging copy|direct`: legacy pageable read-then-copy, or positional
+  `pread` directly into the pinned host buffer;
+- `--read-batching tensor|coalesced`: coalesce exact-adjacent tensor ranges in
+  the same GGUF file (direct mode);
+- `--pinned-pool SIZE`: bounded reusable pinned host memory (`0` disables);
+- `--host-read-async`: pipeline mode only; read file-to-pinned data on a worker
+  thread while the active selection generates.
+
+Direct reads use verified native tensor mappings (file path, offset, size) and
+work with split GGUF files. Short reads, EINTR and I/O errors are explicit; a
+partial read never reaches commit. The worker owns the pinned buffer until join;
+abort and unload wait before recycling it.
+
+`status.host_staging` reports mode, batching, bytes read, read groups,
+coalesced groups, read/prepare durations, pinned capacity/reuse and pool
+allocation/reuse/peak/idle bytes. Plan `host_staging` reports the same for the
+prepared selection.
+
 ### Pipelined replacement
 
 Pipeline mode uses two slots:

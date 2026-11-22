@@ -159,6 +159,9 @@ pub fn run_profile_optimization(
                     staged_auto: false,
                     staged_margin_bytes: crate::staging_plan::DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
                     selection_policy: crate::staging_plan::SelectionPolicy::Ascending,
+                    host_staging_mode: crate::host_staging::HostStagingMode::Copy,
+                    read_batching: crate::host_staging::ReadBatching::Coalesced,
+                    pinned_pool_bytes: 0,
                 },
             ) {
                 Ok(benchmark) => measurements.push(ProfileMeasurement {

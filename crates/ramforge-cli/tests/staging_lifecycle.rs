@@ -436,3 +436,68 @@ fn pipeline_rejects_two_slots_over_budget_and_abort_preserves_active() {
     assert_eq!(resident, vec![0, 1]);
     assert!(!generate(&mut aborting).is_empty());
 }
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn async_host_read_abort_and_commit_preserve_lifecycle() {
+    let _guard = env_lock();
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let plan = plan_for(&path);
+    let mut service = InferenceService::new(plan)
+        .expect("service")
+        .with_host_staging(
+            ramforge_runtime::HostStagingMode::Direct,
+            ramforge_runtime::ReadBatching::Coalesced,
+            32 * 1024 * 1024,
+        )
+        .with_async_host_read(true)
+        .with_staging_request(StagingRequest {
+            layers: vec![0, 1],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        });
+    service.load().expect("load");
+    service.create_session().expect("session");
+    assert!(!generate(&mut service).is_empty());
+
+    let request = || StagingRequest {
+        layers: vec![1, 2],
+        budget_bytes: Some(20 * 1024 * 1024),
+        auto: false,
+        safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+    };
+
+    service
+        .prepare_staged_pipeline(request())
+        .expect("prepare async host read");
+    assert!(service.status().pipeline_pending);
+    service.abort_staged_pipeline().expect("abort host read");
+    let status = service.status();
+    assert!(!status.pipeline_pending);
+    let resident: Vec<u32> = status
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    assert_eq!(resident, vec![0, 1]);
+    assert!(!generate(&mut service).is_empty());
+
+    service
+        .prepare_staged_pipeline(request())
+        .expect("prepare async host read");
+    assert!(!generate(&mut service).is_empty());
+    let commit = service.commit_staged_pipeline().expect("commit host read");
+    assert!(commit.host_staging.bytes_read > 0);
+    let resident: Vec<u32> = service
+        .status()
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    assert_eq!(resident, vec![1, 2]);
+    assert!(!generate(&mut service).is_empty());
+}

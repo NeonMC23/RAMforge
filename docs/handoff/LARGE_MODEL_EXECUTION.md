@@ -332,6 +332,8 @@ metadata remains required.
   batch transfers with measured overlap.
 - Hardware/model calibration, adaptive strategy selection with deterministic
   fallback, profile-aware hysteresis and selectable residency ordering.
+- Direct file-to-pinned reads, exact GGUF range coalescing, cached tensor
+  mappings, bounded pinned pooling and asynchronous host reads.
 - Honest unsupported/unknown reporting for GPU execution, capacity reuse and
   transfer/compute overlap.
 
@@ -341,6 +343,8 @@ metadata remains required.
 - Add a per-layer intra-graph execution boundary or scheduler-integrated
   prefetch hook; current overlap is between executions.
 - Add profiler-backed contention attribution and bandwidth isolation.
+- Extend direct-read/async-host staging beyond warm page cache and quantify
+  natural cold-cache behavior without destructive cache manipulation.
 - Extend calibrated residency selection beyond the validated Qwen short-run
   sample and measure longer generation and larger contexts.
 - Add MoE routing/expert residency metadata and control.
@@ -361,3 +365,13 @@ smallest-first measured 6.418 tok/s vs 6.161 tok/s and a lower TTFT (212.5 vs
 221.5 ms). This is a modest, workload-specific improvement, not a universal
 default. Plans expose exact bytes, accepted/rejected layers, calibration state
 and whether a strategy is measured, calibrated, advisory or fallback.
+
+## Host staging
+
+The dominant replacement cost was host preparation, not H2D. Reading tensors
+through a pageable vector and copying into pinned memory cost 276 ms for four
+Qwen layers, while H2D cost about 80 ms. Direct positional reads into pinned
+memory plus exact range coalescing reduced preparation to 178 ms and read time
+from 137 to 70 ms. Async file-to-pinned reads with a warm pool reduced prepare
+to ~0.3 ms and lowered five-cycle end-to-end medians from 728/758 ms to
+687/691 ms. This is storage/host-pipeline progress, not a 500B streaming claim.

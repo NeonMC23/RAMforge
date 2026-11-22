@@ -4,6 +4,7 @@
 //! streams decoded text through a caller callback, and supports cooperative
 //! cancellation between token decodes. It is not an inference implementation.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -16,14 +17,17 @@ use crate::forgecore::{
 use crate::gpu_observability::{
     collect_observability, GpuObservability, StagingCounters, StagingObservation, StagingState,
 };
+use crate::host_staging::{
+    HostStagingMode, HostStagingReport, HostStagingStatus, PinnedPool, ReadBatching,
+};
 use crate::memory_report::process_rss;
 use crate::runtime_plan::RuntimePlan;
 use crate::sampling::Sampler;
-use crate::staging::{Engine, MemoryType, StagingError};
+use crate::staging::{Engine, StagingError};
 use crate::staging_plan::{StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest};
 use ramforge_core::{discover_model_set, Tokenizer};
 
-pub const INFERENCE_SERVICE_API_VERSION: u32 = 3;
+pub const INFERENCE_SERVICE_API_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,13 +143,19 @@ pub struct PipelineCommitReport {
     pub invalidation_ns: u64,
     pub commit_ns: u64,
     pub transfer_in_flight_at_commit: bool,
+    pub host_staging: HostStagingReport,
+    pub host_read_wait_ns: Option<u64>,
 }
 
 struct PendingPipeline {
     plan: StagingPlan,
     layers: Vec<u32>,
-    host: crate::staging::StagingBuffer,
+    host: Option<crate::staging::StagingBuffer>,
     submit_ns: u64,
+    host_staging: HostStagingReport,
+    read_job: Option<crate::host_staging::HostReadJob>,
+    device_ptrs: Vec<u64>,
+    sizes: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +180,7 @@ pub struct ServiceStatus {
     pub staged_layers: Vec<StagedLayerStatus>,
     pub staging_plan: Option<StagingPlan>,
     pub staging_lifecycle: Option<StagingLifecycleStatus>,
+    pub host_staging: HostStagingStatus,
     pub pipeline_pending: bool,
     pub model_instance_id: Option<u64>,
     pub context_id: Option<u64>,
@@ -298,6 +309,12 @@ pub struct InferenceService {
     staging_status: Vec<StagedLayerStatus>,
     staging_pool_limit_bytes: u64,
     selection_policy: crate::staging_plan::SelectionPolicy,
+    host_staging_mode: HostStagingMode,
+    read_batching: ReadBatching,
+    host_read_async: bool,
+    pinned_pool: PinnedPool,
+    last_host_staging: Option<HostStagingReport>,
+    tensor_mappings: Option<HashMap<String, forge_core::TensorMappingInfo>>,
     pending_pipeline: Option<PendingPipeline>,
 }
 
@@ -318,6 +335,12 @@ impl InferenceService {
             staging_status: Vec::new(),
             staging_pool_limit_bytes: 0,
             selection_policy: crate::staging_plan::SelectionPolicy::Ascending,
+            host_staging_mode: HostStagingMode::Copy,
+            read_batching: ReadBatching::Coalesced,
+            host_read_async: false,
+            pinned_pool: PinnedPool::new(0),
+            last_host_staging: None,
+            tensor_mappings: None,
             pending_pipeline: None,
         })
     }
@@ -350,6 +373,23 @@ impl InferenceService {
 
     pub fn with_selection_policy(mut self, policy: crate::staging_plan::SelectionPolicy) -> Self {
         self.selection_policy = policy;
+        self
+    }
+
+    pub fn with_host_staging(
+        mut self,
+        mode: HostStagingMode,
+        batching: ReadBatching,
+        pinned_pool_bytes: u64,
+    ) -> Self {
+        self.host_staging_mode = mode;
+        self.read_batching = batching;
+        self.pinned_pool = PinnedPool::new(pinned_pool_bytes);
+        self
+    }
+
+    pub fn with_async_host_read(mut self, enabled: bool) -> Self {
+        self.host_read_async = enabled;
         self
     }
 
@@ -440,6 +480,12 @@ impl InferenceService {
             staged_layers: self.current_staged_status(),
             staging_plan: self.staging_plan.clone(),
             staging_lifecycle: self.staging_lifecycle(),
+            host_staging: HostStagingStatus {
+                mode: self.host_staging_mode,
+                batching: self.read_batching,
+                last: self.last_host_staging.clone(),
+                pool: self.pinned_pool.stats(),
+            },
             pipeline_pending: self.pending_pipeline.is_some(),
             model_instance_id: model_id,
             context_id,
@@ -661,6 +707,7 @@ impl InferenceService {
         if self.staging_request.layers.is_empty() && !self.staging_request.auto {
             return Ok(());
         }
+        self.ensure_tensor_mappings()?;
         let registry = crate::DeviceRegistry::discover();
         let session = self
             .session
@@ -692,9 +739,32 @@ impl InferenceService {
         let engine = self.staging_engine.as_ref().ok_or_else(|| {
             ServiceError::Execution("staging engine is not initialized".to_string())
         })?;
+        let mode = self.host_staging_mode;
+        let batching = self.read_batching;
+        let mappings = self.tensor_mappings.as_ref().expect("mappings cached");
         let mut statuses = Vec::with_capacity(self.staged_layers.len());
+        let mut aggregate: Option<HostStagingReport> = None;
         for layer in &self.staged_layers {
-            statuses.push(stage_layer_data(model, session, engine, *layer)?);
+            let (status, report) = stage_layer_data(
+                model,
+                session,
+                engine,
+                &mut self.pinned_pool,
+                mappings,
+                mode,
+                batching,
+                *layer,
+            )?;
+            if let Some(total) = aggregate.as_mut() {
+                total.accumulate(&report);
+            } else {
+                aggregate = Some(report);
+            }
+            statuses.push(status);
+        }
+        self.last_host_staging = aggregate.clone();
+        if let (Some(plan), Some(report)) = (self.staging_plan.as_mut(), aggregate) {
+            plan.host_staging = Some(report);
         }
         self.staging_status = statuses;
         Ok(())
@@ -720,6 +790,7 @@ impl InferenceService {
                 "a pipeline replacement is already pending".to_string(),
             ));
         }
+        self.ensure_tensor_mappings()?;
         let registry = crate::DeviceRegistry::discover();
         let session = self
             .session
@@ -784,6 +855,7 @@ impl InferenceService {
         let engine = self.staging_engine.as_ref().ok_or_else(|| {
             ServiceError::Execution("staging engine is not initialized".to_string())
         })?;
+        let mappings = self.tensor_mappings.as_ref().expect("mappings cached");
 
         let mut stage_error = None;
         for layer in &plan.accepted_layers {
@@ -811,34 +883,75 @@ impl InferenceService {
             }
         }
         let total: u64 = tensors.iter().map(|tensor| tensor.bytes).sum();
-        let host = engine
-            .allocate(MemoryType::PinnedHost, total)
-            .map_err(|error| ServiceError::Execution(error.to_string()))?;
-        let mut offsets = Vec::with_capacity(tensors.len());
-        let mut device_ptrs = Vec::with_capacity(tensors.len());
-        let mut sizes = Vec::with_capacity(tensors.len());
-        let mut offset = 0u64;
-        for tensor in &tensors {
-            let length = usize::try_from(tensor.bytes)
-                .map_err(|_| ServiceError::Execution("staged tensor is too large".to_string()))?;
-            let mut bytes = vec![0u8; length];
-            model
-                .read_tensor_bytes(&tensor.name, 0, &mut bytes)
-                .map_err(|error| ServiceError::Execution(error.to_string()))?;
-            host.write_host(offset, &bytes)
-                .map_err(|error| ServiceError::Execution(error.to_string()))?;
-            offsets.push(offset);
-            device_ptrs.push(tensor.device_ptr);
-            sizes.push(tensor.bytes);
-            offset += tensor.bytes;
+        let device_ptrs: Vec<u64> = tensors.iter().map(|tensor| tensor.device_ptr).collect();
+        let sizes: Vec<u64> = tensors.iter().map(|tensor| tensor.bytes).collect();
+        if self.host_read_async {
+            let prepare_started = Instant::now();
+            let (host, pinned_reused) = self.pinned_pool.acquire(engine, total)?;
+            let capacity = host
+                .info()
+                .map_err(|error| ServiceError::Execution(error.to_string()))?
+                .capacity;
+            let job =
+                match crate::host_staging::HostReadJob::prepare(model, &tensors, mappings, host) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        let _ = session.discard_pending_cuda();
+                        return Err(error);
+                    }
+                };
+            let report = HostStagingReport {
+                mode: HostStagingMode::Direct,
+                batching: ReadBatching::Coalesced,
+                tensors: tensors.len() as u64,
+                bytes_read: total,
+                read_groups: 0,
+                coalesced_groups: 0,
+                read_ns: 0,
+                prepare_ns: duration_ns(prepare_started.elapsed()),
+                pinned_capacity: capacity,
+                pinned_reused,
+                fallback_tensors: 0,
+            };
+            plan.host_staging = Some(report.clone());
+            self.last_host_staging = Some(report.clone());
+            self.pending_pipeline = Some(PendingPipeline {
+                plan: plan.clone(),
+                layers: plan.accepted_layers.clone(),
+                host: None,
+                submit_ns: 0,
+                host_staging: report,
+                read_job: Some(job),
+                device_ptrs,
+                sizes,
+            });
+            self.staging_plan = Some(plan.clone());
+            return Ok(plan);
         }
+        let prepare_started = Instant::now();
+        let (host, pinned_reused) = self.pinned_pool.acquire(engine, total)?;
+        let (offsets, mut host_report) = match crate::host_staging::read_tensors_into_host(
+            model,
+            &tensors,
+            &host,
+            self.host_staging_mode,
+            self.read_batching,
+            mappings,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.pinned_pool.release(host);
+                return Err(error);
+            }
+        };
+        host_report.prepare_ns = duration_ns(prepare_started.elapsed());
+        host_report.pinned_reused = pinned_reused;
         let submit_started = Instant::now();
         let submit_result =
             engine.submit_batch_to_device_ptrs(&host, &offsets, &device_ptrs, &sizes);
         let submit_ns = duration_ns(submit_started.elapsed());
         if let Err(error) = submit_result {
-            let mut host = host;
-            let _ = host.release();
+            self.pinned_pool.release(host);
             let _ = session.discard_pending_cuda();
             return Err(ServiceError::Execution(format!(
                 "pipeline transfer submission failed: {error}"
@@ -850,11 +963,18 @@ impl InferenceService {
             ServiceError::Execution(format!("pipeline transfer start failed: {error}"))
         })?;
 
+        let host_staging = host_report;
+        plan.host_staging = Some(host_staging.clone());
+        self.last_host_staging = Some(host_staging.clone());
         self.pending_pipeline = Some(PendingPipeline {
             plan: plan.clone(),
             layers: plan.accepted_layers.clone(),
-            host,
+            host: Some(host),
             submit_ns,
+            host_staging,
+            read_job: None,
+            device_ptrs,
+            sizes,
         });
         self.staging_plan = Some(plan.clone());
         Ok(plan)
@@ -864,13 +984,13 @@ impl InferenceService {
     /// activate the pending selection. The old active buffers are recycled into
     /// the bounded pool. On failure before commit the active selection is kept.
     pub fn commit_staged_pipeline(&mut self) -> Result<PipelineCommitReport, ServiceError> {
-        let pending = self
-            .pending_pipeline
-            .take()
-            .ok_or_else(|| ServiceError::InvalidState {
-                expected: "pending pipeline".to_string(),
-                actual: self.state,
-            })?;
+        let mut pending =
+            self.pending_pipeline
+                .take()
+                .ok_or_else(|| ServiceError::InvalidState {
+                    expected: "pending pipeline".to_string(),
+                    actual: self.state,
+                })?;
         let session = self
             .session
             .as_ref()
@@ -881,27 +1001,76 @@ impl InferenceService {
         let engine = self.staging_engine.as_ref().ok_or_else(|| {
             ServiceError::Execution("staging engine is not initialized".to_string())
         })?;
-        let (transfer, transfer_in_flight_at_commit, transfer_wait_ns) = match engine.query() {
-            Ok(Some(report)) => (report, false, 0),
-            Ok(None) => {
+        let mut async_host = None;
+        let mut host_staging = pending.host_staging.clone();
+        let mut host_read_wait_ns = None;
+        let (transfer, transfer_in_flight_at_commit, transfer_wait_ns) =
+            if let Some(job) = pending.read_job.take() {
+                let read_started = Instant::now();
+                let (host, offsets, report, _) = match job.finish() {
+                    Ok(result) => result,
+                    Err((error, host)) => {
+                        if let Some(host) = host {
+                            self.pinned_pool.release(host);
+                        } else {
+                            self.state = ServiceState::Failed;
+                        }
+                        let _ = session.discard_pending_cuda();
+                        return Err(ServiceError::Execution(format!(
+                            "pipeline host read failed: {error}"
+                        )));
+                    }
+                };
+                host_read_wait_ns = Some(duration_ns(read_started.elapsed()));
+                host_staging = report;
+                if let Err(error) = engine.submit_batch_to_device_ptrs(
+                    &host,
+                    &offsets,
+                    &pending.device_ptrs,
+                    &pending.sizes,
+                ) {
+                    self.pinned_pool.release(host);
+                    let _ = session.discard_pending_cuda();
+                    return Err(ServiceError::Execution(format!(
+                        "pipeline transfer submission failed: {error}"
+                    )));
+                }
                 let wait_started = Instant::now();
-                match engine.wait() {
-                    Ok(report) => (report, true, duration_ns(wait_started.elapsed())),
+                let transfer = match engine.wait() {
+                    Ok(report) => report,
                     Err(error) => {
+                        self.pinned_pool.release(host);
                         let _ = session.discard_pending_cuda();
                         return Err(ServiceError::Execution(format!(
                             "pipeline transfer wait failed: {error}"
                         )));
                     }
+                };
+                async_host = Some(host);
+                (transfer, false, duration_ns(wait_started.elapsed()))
+            } else {
+                match engine.query() {
+                    Ok(Some(report)) => (report, false, 0),
+                    Ok(None) => {
+                        let wait_started = Instant::now();
+                        match engine.wait() {
+                            Ok(report) => (report, true, duration_ns(wait_started.elapsed())),
+                            Err(error) => {
+                                let _ = session.discard_pending_cuda();
+                                return Err(ServiceError::Execution(format!(
+                                    "pipeline transfer wait failed: {error}"
+                                )));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = session.discard_pending_cuda();
+                        return Err(ServiceError::Execution(format!(
+                            "pipeline transfer query failed: {error}"
+                        )));
+                    }
                 }
-            }
-            Err(error) => {
-                let _ = session.discard_pending_cuda();
-                return Err(ServiceError::Execution(format!(
-                    "pipeline transfer query failed: {error}"
-                )));
-            }
-        };
+            };
         let invalidation_started = Instant::now();
         session.invalidate_graph().map_err(|error| {
             ServiceError::Execution(format!("pipeline invalidation failed: {error}"))
@@ -913,8 +1082,12 @@ impl InferenceService {
             .map_err(|error| ServiceError::Execution(format!("pipeline commit failed: {error}")))?;
         let commit_ns = duration_ns(commit_started.elapsed());
         let layers = pending.layers.clone();
-        let mut host = pending.host;
-        let _ = host.release();
+        if let Some(host) = pending.host.take() {
+            self.pinned_pool.release(host);
+        }
+        if let Some(host) = async_host {
+            self.pinned_pool.release(host);
+        }
         let statuses = statuses_for_layers(session, &layers);
         self.staged_layers = layers.clone();
         self.staging_status = statuses;
@@ -928,13 +1101,15 @@ impl InferenceService {
             invalidation_ns,
             commit_ns,
             transfer_in_flight_at_commit,
+            host_staging,
+            host_read_wait_ns,
         })
     }
 
     /// Wait for and discard a prepared pipeline selection without changing the
     /// active selection. Safe to call when no pipeline is pending.
     pub fn abort_staged_pipeline(&mut self) -> Result<(), ServiceError> {
-        let Some(pending) = self.pending_pipeline.take() else {
+        let Some(mut pending) = self.pending_pipeline.take() else {
             return Ok(());
         };
         let session = self
@@ -947,8 +1122,16 @@ impl InferenceService {
         if let Some(engine) = self.staging_engine.as_ref() {
             let _ = engine.wait();
         }
-        let mut host = pending.host;
-        let _ = host.release();
+        if let Some(job) = pending.read_job.take() {
+            match job.finish() {
+                Ok((host, _, _, _)) => self.pinned_pool.release(host),
+                Err((_, Some(host))) => self.pinned_pool.release(host),
+                Err((_, None)) => self.state = ServiceState::Failed,
+            }
+        }
+        if let Some(host) = pending.host.take() {
+            self.pinned_pool.release(host);
+        }
         session
             .discard_pending_cuda()
             .map_err(|error| ServiceError::Execution(error.to_string()))
@@ -975,6 +1158,7 @@ impl InferenceService {
                 actual: self.state,
             });
         }
+        self.ensure_tensor_mappings()?;
         let registry = crate::DeviceRegistry::discover();
         let mut plan = {
             let session = self
@@ -1002,7 +1186,14 @@ impl InferenceService {
             return Ok(plan);
         }
 
-        type ReplacementOutcome = (Vec<StagedLayerStatus>, u64, u64, u64, u64);
+        type ReplacementOutcome = (
+            Vec<StagedLayerStatus>,
+            u64,
+            u64,
+            u64,
+            u64,
+            Option<HostStagingReport>,
+        );
         let outcome: Result<ReplacementOutcome, (String, bool, Vec<StagedLayerStatus>)> = {
             let model = self
                 .model
@@ -1021,6 +1212,10 @@ impl InferenceService {
             let engine = self.staging_engine.as_ref().ok_or_else(|| {
                 ServiceError::Execution("staging engine is not initialized".to_string())
             })?;
+            let mode = self.host_staging_mode;
+            let batching = self.read_batching;
+            let mappings = self.tensor_mappings.as_ref().expect("mappings cached");
+            let pool = &mut self.pinned_pool;
 
             let total_started = Instant::now();
             let mut failure: Option<String> = None;
@@ -1044,10 +1239,20 @@ impl InferenceService {
             let eviction_ns = duration_ns(eviction_started.elapsed());
 
             let staging_started = Instant::now();
+            let mut host_aggregate: Option<HostStagingReport> = None;
             if failure.is_none() {
                 for layer in &plan.newly_staged_layers {
-                    match stage_layer_data(model, session, engine, *layer) {
-                        Ok(_) => staged_now.push(*layer),
+                    match stage_layer_data(
+                        model, session, engine, pool, mappings, mode, batching, *layer,
+                    ) {
+                        Ok((_, report)) => {
+                            if let Some(total) = host_aggregate.as_mut() {
+                                total.accumulate(&report);
+                            } else {
+                                host_aggregate = Some(report);
+                            }
+                            staged_now.push(*layer);
+                        }
                         Err(error) => {
                             failure = Some(format!("stage layer {layer}: {error}"));
                             break;
@@ -1065,6 +1270,7 @@ impl InferenceService {
                     eviction_ns,
                     staging_ns,
                     total_ns,
+                    host_aggregate,
                 )),
                 Some(message) => {
                     // Roll back to the previous selection: release partial new
@@ -1077,7 +1283,9 @@ impl InferenceService {
                         if session.staged_layer_info(*layer).is_ok() {
                             continue;
                         }
-                        if let Err(error) = stage_layer_data(model, session, engine, *layer) {
+                        if let Err(error) = stage_layer_data(
+                            model, session, engine, pool, mappings, mode, batching, *layer,
+                        ) {
                             rollback_errors.push(format!("restage layer {layer}: {error}"));
                         }
                     }
@@ -1096,7 +1304,9 @@ impl InferenceService {
         };
 
         match outcome {
-            Ok((statuses, invalidation_ns, eviction_ns, staging_ns, total_ns)) => {
+            Ok((statuses, invalidation_ns, eviction_ns, staging_ns, total_ns, host_aggregate)) => {
+                plan.host_staging = host_aggregate.clone();
+                self.last_host_staging = host_aggregate;
                 plan.replacement_invalidation_ns = Some(invalidation_ns);
                 plan.replacement_eviction_ns = Some(eviction_ns);
                 plan.replacement_staging_ns = Some(staging_ns);
@@ -1126,6 +1336,29 @@ impl InferenceService {
                 })
             }
         }
+    }
+
+    fn ensure_tensor_mappings(&mut self) -> Result<(), ServiceError> {
+        if self.tensor_mappings.is_some() {
+            return Ok(());
+        }
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "model loaded".to_string(),
+                actual: self.state,
+            })?;
+        let mappings = model
+            .tensor_mappings()
+            .map_err(|error| ServiceError::Execution(error.to_string()))?;
+        self.tensor_mappings = Some(
+            mappings
+                .into_iter()
+                .map(|mapping| (mapping.name.clone(), mapping))
+                .collect(),
+        );
+        Ok(())
     }
 
     fn build_staging_plan(
@@ -1195,6 +1428,7 @@ impl InferenceService {
                 pipeline_pool_bytes: 0,
                 pipeline_required_bytes: 0,
                 pipeline_fits: false,
+                host_staging: None,
                 replacement_invalidation_ns: None,
                 replacement_eviction_ns: None,
                 replacement_staging_ns: None,
@@ -1377,6 +1611,7 @@ impl InferenceService {
             pipeline_pool_bytes: 0,
             pipeline_required_bytes: 0,
             pipeline_fits: false,
+            host_staging: None,
             replacement_invalidation_ns: None,
             replacement_eviction_ns: None,
             replacement_staging_ns: None,
@@ -1652,6 +1887,7 @@ impl InferenceService {
     /// Drop the context and model; the service can be loaded again.
     pub fn unload(&mut self) {
         let _ = self.abort_staged_pipeline();
+        self.pinned_pool.clear();
         self.session = None;
         self.model = None;
         self.tokenizer = None;
@@ -1693,14 +1929,17 @@ fn statuses_for_layers(
 /// the live native metadata. On error the caller is responsible for releasing a
 /// partially staged layer (native allocation is reclaimed by the context even if
 /// the transfer fails).
+#[allow(clippy::too_many_arguments)]
 fn stage_layer_data(
     model: &ForgeCoreModel,
     session: &crate::ForgeCoreSession,
     engine: &Engine,
+    pool: &mut PinnedPool,
+    mappings: &HashMap<String, forge_core::TensorMappingInfo>,
+    mode: HostStagingMode,
+    batching: ReadBatching,
     layer: u32,
-) -> Result<StagedLayerStatus, ServiceError> {
-    // Deterministic fault injection for debug/test builds only. Release builds
-    // ignore these variables; no production path depends on them.
+) -> Result<(StagedLayerStatus, HostStagingReport), ServiceError> {
     #[cfg(debug_assertions)]
     {
         if std::env::var("RAMFORGE_TEST_FAIL_STAGE_ALL").as_deref() == Ok("1") {
@@ -1733,41 +1972,49 @@ fn stage_layer_data(
         );
     }
     let total: u64 = tensors.iter().map(|tensor| tensor.bytes).sum();
-    let mut host = engine
-        .allocate(MemoryType::PinnedHost, total)
-        .map_err(|error| ServiceError::Execution(error.to_string()))?;
-    let mut offset = 0u64;
-    for tensor in &tensors {
-        let length = usize::try_from(tensor.bytes)
-            .map_err(|_| ServiceError::Execution("staged tensor is too large".to_string()))?;
-        let mut bytes = vec![0u8; length];
-        model
-            .read_tensor_bytes(&tensor.name, 0, &mut bytes)
-            .map_err(|error| ServiceError::Execution(error.to_string()))?;
-        host.write_host(offset, &bytes)
-            .map_err(|error| ServiceError::Execution(error.to_string()))?;
-        engine
-            .submit_to_device_ptr(&host, offset, tensor.device_ptr, tensor.bytes)
-            .map_err(|error| ServiceError::Execution(error.to_string()))?;
-        engine
-            .wait()
-            .map_err(|error| ServiceError::Execution(error.to_string()))?;
-        offset += tensor.bytes;
+    let prepare_started = Instant::now();
+    let (host, pinned_reused) = pool.acquire(engine, total)?;
+    let (offsets, mut report) = match crate::host_staging::read_tensors_into_host(
+        model, &tensors, &host, mode, batching, mappings,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            pool.release(host);
+            return Err(error);
+        }
+    };
+    report.prepare_ns = duration_ns(prepare_started.elapsed());
+    report.pinned_reused = pinned_reused;
+    let device_ptrs: Vec<u64> = tensors.iter().map(|tensor| tensor.device_ptr).collect();
+    let sizes: Vec<u64> = tensors.iter().map(|tensor| tensor.bytes).collect();
+    if let Err(error) = engine.submit_batch_to_device_ptrs(&host, &offsets, &device_ptrs, &sizes) {
+        pool.release(host);
+        return Err(ServiceError::Execution(format!(
+            "layer {layer} H2D submission failed: {error}"
+        )));
     }
-    host.release()
-        .map_err(|error| ServiceError::Execution(error.to_string()))?;
+    if let Err(error) = engine.wait() {
+        pool.release(host);
+        return Err(ServiceError::Execution(format!(
+            "layer {layer} H2D wait failed: {error}"
+        )));
+    }
+    pool.release(host);
     let info = session
         .staged_layer_info(layer)
         .map_err(|error| ServiceError::Execution(error.to_string()))?;
-    Ok(StagedLayerStatus {
-        layer,
-        tensor_count: info.tensor_count,
-        device_bytes: info.device_bytes,
-        graph_substitutions: info.graph_substitutions,
-    })
+    Ok((
+        StagedLayerStatus {
+            layer,
+            tensor_count: info.tensor_count,
+            device_bytes: info.device_bytes,
+            graph_substitutions: info.graph_substitutions,
+        },
+        report,
+    ))
 }
 
-fn duration_ns(duration: Duration) -> u64 {
+pub(crate) fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 

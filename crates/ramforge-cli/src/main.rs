@@ -367,6 +367,18 @@ enum Commands {
         #[arg(long = "selection-policy")]
         selection_policy: Option<String>,
 
+        /// Host staging path: copy (legacy) or direct (file to pinned)
+        #[arg(long)]
+        host_staging: Option<String>,
+
+        /// Direct-read batching: tensor or coalesced
+        #[arg(long)]
+        read_batching: Option<String>,
+
+        /// Bounded reusable pinned host memory
+        #[arg(long)]
+        pinned_pool: Option<String>,
+
         /// Disable CPU weight repacking
         #[arg(long)]
         no_repack: bool,
@@ -473,6 +485,22 @@ enum Commands {
         /// Automatic residency ordering: ascending, smallest-first, resident-first
         #[arg(long = "selection-policy")]
         selection_policy: Option<String>,
+
+        /// Host staging path: copy (legacy) or direct (file to pinned)
+        #[arg(long)]
+        host_staging: Option<String>,
+
+        /// Direct-read batching: tensor or coalesced
+        #[arg(long)]
+        read_batching: Option<String>,
+
+        /// Bounded reusable pinned host memory
+        #[arg(long)]
+        pinned_pool: Option<String>,
+
+        /// Overlap file-to-pinned reads with the active generation
+        #[arg(long)]
+        host_read_async: bool,
 
         /// Replacement cycles (alternates replacement and initial sets)
         #[arg(long, default_value_t = 1)]
@@ -981,6 +1009,9 @@ fn main() {
             staged_auto,
             staged_margin,
             selection_policy,
+            host_staging,
+            read_batching,
+            pinned_pool,
             no_repack,
             no_prefetch,
             json,
@@ -1002,6 +1033,9 @@ fn main() {
                 staged_auto,
                 staged_margin,
                 selection_policy,
+                host_staging,
+                read_batching,
+                pinned_pool,
                 no_repack,
                 no_prefetch,
                 json,
@@ -1041,6 +1075,10 @@ fn main() {
             calibration,
             strategy,
             selection_policy,
+            host_staging,
+            read_batching,
+            pinned_pool,
+            host_read_async,
             cycles,
             prompt,
             max_tokens,
@@ -1067,6 +1105,10 @@ fn main() {
                 calibration,
                 strategy,
                 selection_policy,
+                host_staging,
+                read_batching,
+                pinned_pool,
+                host_read_async,
                 cycles,
                 prompt,
                 max_tokens,
@@ -1505,6 +1547,34 @@ fn parse_selection_policy(value: &str) -> anyhow::Result<ramforge_runtime::Selec
     }
 }
 
+fn parse_host_staging(value: &str) -> anyhow::Result<ramforge_runtime::HostStagingMode> {
+    match value {
+        "copy" => Ok(ramforge_runtime::HostStagingMode::Copy),
+        "direct" => Ok(ramforge_runtime::HostStagingMode::Direct),
+        other => Err(anyhow::anyhow!(
+            "unknown host staging mode '{other}' (copy, direct)"
+        )),
+    }
+}
+
+fn parse_read_batching(value: &str) -> anyhow::Result<ramforge_runtime::ReadBatching> {
+    match value {
+        "tensor" => Ok(ramforge_runtime::ReadBatching::Tensor),
+        "coalesced" => Ok(ramforge_runtime::ReadBatching::Coalesced),
+        other => Err(anyhow::anyhow!(
+            "unknown read batching '{other}' (tensor, coalesced)"
+        )),
+    }
+}
+
+fn parse_pinned_pool(value: &str) -> anyhow::Result<u64> {
+    if value == "0" {
+        Ok(0)
+    } else {
+        parse_memory_size(value).map_err(|error| anyhow::anyhow!("invalid --pinned-pool: {error}"))
+    }
+}
+
 fn parse_transfer_strategy(value: &str) -> anyhow::Result<ramforge_runtime::TransferStrategy> {
     match value {
         "sync" | "synchronous" => Ok(ramforge_runtime::TransferStrategy::SynchronousReplace),
@@ -1593,6 +1663,10 @@ fn run_staging_cycle(
     calibration: Option<PathBuf>,
     strategy: Option<String>,
     selection_policy: Option<String>,
+    host_staging: Option<String>,
+    read_batching: Option<String>,
+    pinned_pool: Option<String>,
+    host_read_async: bool,
     cycles: u32,
     prompt: String,
     max_tokens: u32,
@@ -1675,6 +1749,21 @@ fn run_staging_cycle(
         .map(parse_selection_policy)
         .transpose()?
         .unwrap_or(ramforge_runtime::SelectionPolicy::Ascending);
+    let host_staging_mode = host_staging
+        .as_deref()
+        .map(parse_host_staging)
+        .transpose()?
+        .unwrap_or(ramforge_runtime::HostStagingMode::Copy);
+    let read_batching_kind = read_batching
+        .as_deref()
+        .map(parse_read_batching)
+        .transpose()?
+        .unwrap_or(ramforge_runtime::ReadBatching::Coalesced);
+    let pinned_pool_bytes = pinned_pool
+        .as_deref()
+        .map(parse_pinned_pool)
+        .transpose()?
+        .unwrap_or(0);
     let strategy_override = strategy
         .as_deref()
         .map(parse_transfer_strategy)
@@ -1705,6 +1794,8 @@ fn run_staging_cycle(
         .map_err(|error| anyhow::anyhow!(error))?
         .with_staging_pool_limit(staged_pool_bytes)
         .with_selection_policy(selection_policy_kind)
+        .with_host_staging(host_staging_mode, read_batching_kind, pinned_pool_bytes)
+        .with_async_host_read(host_read_async)
         .with_staging_request(initial_request);
     service.load().map_err(|error| anyhow::anyhow!(error))?;
     service
@@ -1770,6 +1861,11 @@ fn run_staging_cycle(
                 calibration_status,
                 pending_bytes: preview.planned_bytes,
                 compute_estimate_ns: Some(last_compute_ns),
+                host_prepare_estimate_ns: service
+                    .status()
+                    .host_staging
+                    .last
+                    .map(|report| report.prepare_ns),
                 budget_bytes: staged_budget_bytes,
                 user_override: strategy_override,
                 allow_async: true,
@@ -2161,6 +2257,9 @@ fn run_throughput_benchmark(
     staged_auto: bool,
     staged_margin: Option<String>,
     selection_policy: Option<String>,
+    host_staging: Option<String>,
+    read_batching: Option<String>,
+    pinned_pool: Option<String>,
     no_repack: bool,
     no_prefetch: bool,
     json: bool,
@@ -2228,6 +2327,21 @@ fn run_throughput_benchmark(
         .map(parse_selection_policy)
         .transpose()?
         .unwrap_or(ramforge_runtime::SelectionPolicy::Ascending);
+    let host_staging_mode = host_staging
+        .as_deref()
+        .map(parse_host_staging)
+        .transpose()?
+        .unwrap_or(ramforge_runtime::HostStagingMode::Copy);
+    let read_batching_kind = read_batching
+        .as_deref()
+        .map(parse_read_batching)
+        .transpose()?
+        .unwrap_or(ramforge_runtime::ReadBatching::Coalesced);
+    let pinned_pool_bytes = pinned_pool
+        .as_deref()
+        .map(parse_pinned_pool)
+        .transpose()?
+        .unwrap_or(0);
     let report = run_benchmark(
         plan,
         BenchmarkConfig {
@@ -2240,6 +2354,9 @@ fn run_throughput_benchmark(
             staged_auto,
             staged_margin_bytes,
             selection_policy: selection_policy_kind,
+            host_staging_mode,
+            read_batching: read_batching_kind,
+            pinned_pool_bytes,
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;

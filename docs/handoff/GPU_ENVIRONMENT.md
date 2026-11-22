@@ -309,6 +309,26 @@ Residency ordering on Qwen2.5-7B, 1 GiB staged budget, warm cache, five runs:
 Smallest-first is opt-in and model/workload-specific; it was 4.2% faster and
 resident about 6% more model bytes in this controlled sample.
 
+## Host-side staging pipeline
+
+Qwen2.5-7B, four layers (560,023,552 B), warm page cache:
+
+| Path | Read | Host preparation | H2D |
+|---|---|---|---|
+| pageable copy | 137.3 ms | 276.1 ms | ~80 ms |
+| direct per-tensor | 80.5 ms | 190.1 ms | ~80 ms |
+| direct coalesced | 69.7 ms | 178.4 ms | ~80 ms |
+| async direct coalesced, warm pool | hidden | ~0.3 ms prepare | ~80 ms |
+
+- 48 tensors collapsed to 2 coalesced read groups.
+- Bounded pinned pool (1.5 GiB) retained both slot sizes: 2 allocations,
+  3 reuses, ~709 MiB idle, no unbounded growth.
+- Tensor-mapping caching removed a recurring ~100 ms enumeration cost.
+- End-to-end Qwen, 5 cycles, 4 tokens, order-controlled: synchronous median
+  728.4/758.2 ms; async host-read median 691.4/687.2 ms (~7% lower).
+- Split GGUF: layers 20–23 read directly (3 groups, 560,496,640 B) and
+  generated coherent text; direct bytes matched model reads for two shard files.
+
 ## Reproduction
 
 ```sh

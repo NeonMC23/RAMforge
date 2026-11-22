@@ -18,6 +18,7 @@
 pub(crate) mod accounting;
 pub mod backend;
 pub mod benchmark_runner;
+pub mod host_staging;
 pub mod hw_calibration;
 pub mod cgroup;
 pub mod calibration;
@@ -171,6 +172,9 @@ pub use inference_service::{
     StagedLayerStatus, StagingLifecycleStatus, INFERENCE_SERVICE_API_VERSION,
 };
 pub use service_server::{serve_stdio, ServiceServerError};
+pub use host_staging::{
+    HostStagingMode, HostStagingReport, PinnedPool, PooledPinnedStats, ReadBatching,
+};
 pub use hw_calibration::{
     default_calibration_path, run_calibration, CalibrationIdentity, CalibrationRecord,
     CalibrationStatus, HW_CALIBRATION_SCHEMA_VERSION,

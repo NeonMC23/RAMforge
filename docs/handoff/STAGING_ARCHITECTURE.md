@@ -738,11 +738,61 @@ mismatches fail loading. Calibration is explicit, bounded and never runs at
 startup. It is tied to device, driver, backend, model path/size/mtime and tool
 version.
 
+## Host-side staging optimization
+
+The previous pipeline read each tensor into a pageable `Vec`, then copied it
+into pinned host memory, then submitted H2D. On Qwen2.5-7B, four layers
+(560,023,552 B) cost 209–276 ms host preparation, while H2D was ~80 ms.
+
+Implemented:
+
+- positional `pread` directly into a pinned staging buffer
+  (`fstage_buffer_read_fd`), with EINTR, short-read and error handling;
+- exact tensor-range coalescing using native GGUF mappings, including split
+  files; non-adjacent ranges are never over-read;
+- a bounded best-fit pinned host pool with explicit idle limit, reuse counters
+  and peak accounting;
+- cached tensor mappings (the mapping enumeration itself cost ~100 ms per
+  prepare);
+- asynchronous host reads on a worker thread that owns the pinned buffer until
+  join, overlapping file-to-pinned work with generation.
+
+Measured on Qwen2.5-7B, four layers per slot, warm page cache:
+
+- copy read/prepare: 137 ms read, 276 ms preparation;
+- direct per-tensor: 80.5 ms read, 190 ms preparation;
+- direct coalesced: 69.7 ms read, 179 ms preparation;
+- coalesced groups: 2 (48 tensors, 560 MB);
+- pinned pool with two retained slot sizes: 2 allocations, 3 reuses, ~709 MiB
+  idle, no unbounded growth;
+- async host read: prepare returns in ~0.3 ms with a warm pool; the read is
+  fully hidden and commit reports zero read wait.
+
+End-to-end, order-controlled five-cycle Qwen runs with 4 generated tokens:
+synchronous median 728.4/758.2 ms; async host-read median 691.4/687.2 ms,
+about 7% lower end-to-end. Compute variance remains and is reported; the
+improvement is the hidden 70 ms host read and reduced preparation stalls.
+
+Split GGUF verification: layers 20–23 (560,496,640 B, 3 coalesced groups)
+staged with direct reads and generated coherent text; direct-read bytes were
+compared against model tensor reads for two distinct shard files.
+
+This does not change graph consumption: the prepared bytes are copied into the
+same pending CUDA tensors and committed through the existing invalidation and
+corruption-controlled path.
+
 ## Decision
 
-**HARDWARE PERFORMANCE MODEL VALIDATED — ADAPTIVE SCHEDULING, CALIBRATION AND
-PROFILE-AWARE POLICY IMPLEMENTED — RESIDENCY ORDERING IMPROVED THROUGHPUT —
-OVERLAP REMAINS SLOWER THAN SYNCHRONOUS ON THIS HARDWARE.**
+**HOST STAGING PIPELINE OPTIMIZED — DIRECT COALESCED PINNED READS AND ASYNC HOST
+READ OVERLAP MEASURED — ~7% END-TO-END QWEN IMPROVEMENT.**
+
+- Direct-to-pinned reads eliminate the pageable intermediate copy.
+- Coalesced GGUF ranges reduce read calls and read time.
+- A bounded pinned pool prevents repeated large pinned allocations.
+- Cached tensor mappings remove a recurring ~100 ms preparation cost.
+- Async host reads hide file-to-pinned work under generation.
+- Split GGUF direct reads and real graph consumption are verified.
+- Transfer/compute overlap remains slower than synchronous on this hardware.
 
 - Calibration measures pinned/pageable bandwidth, latency, chunking and
   allocation overhead with explicit identity and invalidation.

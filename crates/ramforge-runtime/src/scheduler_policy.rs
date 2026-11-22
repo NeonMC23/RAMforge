@@ -62,6 +62,7 @@ pub struct StrategyDecision {
     pub strategy: TransferStrategy,
     pub reason: String,
     pub confidence: DecisionConfidence,
+    pub expected_host_prepare_ns: Option<u64>,
     pub expected_transfer_ns: Option<u64>,
     pub expected_compute_ns: Option<u64>,
     pub expected_exposed_transfer_ns: Option<u64>,
@@ -81,6 +82,7 @@ pub struct DecisionContext<'a> {
     pub calibration_status: CalibrationStatus,
     pub pending_bytes: u64,
     pub compute_estimate_ns: Option<u64>,
+    pub host_prepare_estimate_ns: Option<u64>,
     pub budget_bytes: Option<u64>,
     pub user_override: Option<TransferStrategy>,
     pub allow_async: bool,
@@ -131,11 +133,16 @@ impl AdaptiveController {
     pub fn decide(&self, context: &DecisionContext<'_>) -> StrategyDecision {
         let expected_transfer_ns = estimate_transfer_ns(context);
         let expected_compute_ns = context.compute_estimate_ns;
+        let host_prepare = context.host_prepare_estimate_ns.unwrap_or(0);
         let (predicted_sync_total_ns, predicted_async_total_ns) =
             match (expected_transfer_ns, expected_compute_ns) {
                 (Some(transfer), Some(compute)) => (
-                    Some(transfer.saturating_add(compute)),
-                    Some(transfer.max(compute)),
+                    Some(
+                        host_prepare
+                            .saturating_add(transfer)
+                            .saturating_add(compute),
+                    ),
+                    Some(host_prepare.saturating_add(transfer.max(compute))),
                 ),
                 _ => (None, None),
             };
@@ -155,6 +162,7 @@ impl AdaptiveController {
             strategy: TransferStrategy::SynchronousReplace,
             reason: String::new(),
             confidence: DecisionConfidence::Fallback,
+            expected_host_prepare_ns: context.host_prepare_estimate_ns,
             expected_transfer_ns,
             expected_compute_ns,
             expected_exposed_transfer_ns: None,
@@ -353,6 +361,7 @@ mod tests {
             },
             pending_bytes: 10 * 1024 * 1024,
             compute_estimate_ns: Some(100_000_000),
+            host_prepare_estimate_ns: Some(0),
             budget_bytes: Some(1 << 30),
             user_override: None,
             allow_async: true,
