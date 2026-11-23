@@ -662,3 +662,68 @@ fn failed_partial_prepare_preserves_active_residency() {
         .collect();
     assert_eq!(resident, vec![0, 1]);
 }
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn standby_cache_makes_alternating_transitions_zero_read() {
+    let _guard = env_lock();
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let plan = plan_for(&path);
+    let mut service = InferenceService::new(plan)
+        .expect("service")
+        .with_host_staging(
+            ramforge_runtime::HostStagingMode::Direct,
+            ramforge_runtime::ReadBatching::Coalesced,
+            32 * 1024 * 1024,
+        )
+        .with_staging_standby_limit(20 * 1024 * 1024)
+        .with_partial_residency(true)
+        .with_staging_request(StagingRequest {
+            layers: vec![0, 1],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        });
+    service.load().expect("load");
+    service.create_session().expect("session");
+    assert!(!generate(&mut service).is_empty());
+
+    let prepare = |service: &mut InferenceService, layers: Vec<u32>| {
+        service
+            .prepare_staged_pipeline(StagingRequest {
+                layers,
+                budget_bytes: Some(20 * 1024 * 1024),
+                auto: false,
+                safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+            })
+            .expect("prepare")
+    };
+
+    let first = prepare(&mut service, vec![1, 2]);
+    assert!(first.host_staging.expect("host").bytes_read > 0);
+    assert!(!generate(&mut service).is_empty());
+    let first_commit = service.commit_staged_pipeline().expect("commit 1");
+    assert_eq!(first_commit.new_layers, vec![2]);
+
+    let second = prepare(&mut service, vec![0, 1]);
+    assert_eq!(second.host_staging.expect("host").bytes_read, 0);
+    assert_eq!(second.standby_reused_layers, vec![0]);
+    assert!(!generate(&mut service).is_empty());
+    let second_commit = service.commit_staged_pipeline().expect("commit 2");
+    assert_eq!(second_commit.transfer_bytes, 0);
+    assert_eq!(second_commit.promoted_layers, vec![0]);
+    assert!(second_commit.promoted_bytes > 0);
+    let status = service.status();
+    let resident: Vec<u32> = status
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    assert_eq!(resident, vec![0, 1]);
+    assert!(status.prefetch.bytes_from_standby > 0);
+    assert!(status.staging_lifecycle.expect("lifecycle").standby_hits >= 1);
+    assert!(!generate(&mut service).is_empty());
+}

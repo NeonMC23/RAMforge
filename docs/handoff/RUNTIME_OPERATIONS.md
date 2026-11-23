@@ -255,7 +255,10 @@ facts; budget planning remains RAMforge policy.
 - `--host-read-async`: pipeline mode only; read file-to-pinned data on a worker
   thread while the active selection generates;
 - `--partial-residency`: preserve shared active layers, stage only missing
-  layers, remove obsolete layers atomically, and reuse preserved allocations.
+  layers, remove obsolete layers atomically, and reuse preserved allocations;
+- `--standby-limit SIZE`: retain recently removed layers in VRAM for fast
+  re-activation (`0` disables);
+- `--predictive`: use transition history to choose the next prefetch target.
 
 Direct reads use verified native tensor mappings (file path, offset, size) and
 work with split GGUF files. Short reads, EINTR and I/O errors are explicit; a
@@ -267,7 +270,10 @@ coalesced groups, read requests, concurrency, peak outstanding bytes,
 read/prepare durations, pinned capacity/reuse and pool allocation/reuse/peak/
 idle bytes. Plan `host_staging` reports the same for the prepared selection.
 `status.prefetch` reports prepared/committed/aborted counts, prefetched/
-committed/wasted/preserved bytes and hit rate in permille. Pipeline commit
+committed/wasted/preserved/standby bytes and hit rate in permille.
+`status.staging_lifecycle` reports standby bytes/limit/layers/hits.
+`prediction` in the staging-cycle JSON reports horizon, predictions, hits,
+misses, hit rate and the next predicted selection. Pipeline commit
 reports `partial`, `preserved_layers`, `new_layers`, `removed_layers`,
 `preserved_bytes`, `new_bytes` and `removed_bytes`.
 
@@ -275,6 +281,11 @@ Partial residency computes the exact delta against current native resident
 layers. Pending staging allocates and reads only new layers; commit removes
 obsolete layers and appends new ones in one validated native call. A
 removal-only transition performs no storage read or H2D transfer.
+
+Standby layers are not active and are counted in the pipeline budget. They are
+promoted into the pending selection without allocation or transfer when the
+next delta needs them. Reducing the limit moves excess layers to the device
+buffer pool.
 
 Storage backend is positional `pread`. `io_uring` runtime libraries exist on the
 target, but development headers are absent and no measured benefit justified a

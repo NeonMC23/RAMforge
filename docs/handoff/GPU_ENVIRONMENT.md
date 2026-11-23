@@ -369,6 +369,32 @@ transfer zero bytes.
 Failure/abort tests verify the active set is unchanged when pending preparation
 fails or is aborted.
 
+## Standby residency and thread policy
+
+Qwen `[0..3] ↔ [2..5]`, 1 GiB standby limit, partial + async host reads, 4 tokens:
+
+- first transition: 280.2 MB read/transferred, 137.8 ms;
+- subsequent transitions: 0 bytes read/transferred, 0.2/1.2/0.5/0.3 ms,
+  2 promoted layers each;
+- standby hits 2 per transition; 1.157 GB served from standby over four
+  transitions.
+
+SmolLM2 alternating transitions show the same zero-read behavior after the first.
+
+Qwen 7B staged selection, five-run medians, order-controlled:
+
+| Thread default | Threads | Median tok/s |
+|---|---|---|
+| logical (old) | 12 | 3.965 / 2.104 |
+| physical (new) | 6 | 6.200 / 5.753 |
+
+TTFT improved from 266.9/563.9 ms to 220.1/216.6 ms. Absolute rates vary with
+host load; the physical-core direction was consistent.
+
+CUPTI: Nsight absent; CUPTI tracer available. CUDA-graph kernel timestamps are
+often missing. With graphs disabled for attribution only, kernel busy was
+94.1 ms over a 155.6 ms generation (~60%) and memcpy 15.5 ms.
+
 ## Reproduction
 
 ```sh

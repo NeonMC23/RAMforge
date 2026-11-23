@@ -745,6 +745,27 @@ impl ForgeCoreSession {
             .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
     }
 
+    pub fn set_staging_standby_limit(&self, bytes: u64) -> Result<(), ForgeCoreAdapterError> {
+        self.context
+            .set_staging_standby_limit(bytes)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn standby_layer_count(&self) -> Result<u32, ForgeCoreAdapterError> {
+        self.context
+            .standby_layer_count()
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
+    pub fn standby_layer_at(
+        &self,
+        index: u32,
+    ) -> Result<forge_core::StagedLayerInfo, ForgeCoreAdapterError> {
+        self.context
+            .standby_layer_at(index)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
     pub fn set_staging_pool_limit(&self, bytes: u64) -> Result<(), ForgeCoreAdapterError> {
         self.context
             .set_staging_pool_limit(bytes)

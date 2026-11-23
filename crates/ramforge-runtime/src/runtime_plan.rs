@@ -172,6 +172,16 @@ impl RuntimePlan {
             .copied()
             .unwrap_or(1)
             .max(1);
+        // CPU inference is usually fastest at physical-core count; logical SMT
+        // siblings add contention. Fall back to available threads when the
+        // topology is unknown.
+        let physical = machine
+            .cpu
+            .hardware_physical_cores
+            .as_ref()
+            .copied()
+            .unwrap_or(available)
+            .clamp(1, available);
         let model_max = requirements
             .model_max_context_tokens
             .and_then(|value| u32::try_from(value).ok());
@@ -191,10 +201,10 @@ impl RuntimePlan {
         let requested_batch = custom.batch_tokens.unwrap_or(1).max(1);
         let batch = requested_batch.min(context);
         let requested_threads = custom.threads.unwrap_or(match profile {
-            RuntimeProfileKind::MaximumPerformance => available,
-            RuntimeProfileKind::Balanced => available.saturating_sub(1).max(1),
+            RuntimeProfileKind::MaximumPerformance => physical,
+            RuntimeProfileKind::Balanced => physical,
             RuntimeProfileKind::Background => 1,
-            RuntimeProfileKind::Custom => available,
+            RuntimeProfileKind::Custom => physical,
         });
         let threads = requested_threads.min(available).max(1);
         let threads_batch = threads;

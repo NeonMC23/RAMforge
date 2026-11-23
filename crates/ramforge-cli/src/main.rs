@@ -514,6 +514,10 @@ enum Commands {
         #[arg(long)]
         storage_max_bytes: Option<String>,
 
+        /// Retain recently removed layers in VRAM for fast re-activation
+        #[arg(long)]
+        standby_limit: Option<String>,
+
         /// Overlap file-to-pinned reads with the active generation
         #[arg(long)]
         host_read_async: bool,
@@ -521,6 +525,10 @@ enum Commands {
         /// Preserve shared active layers and stage only the residency delta
         #[arg(long)]
         partial_residency: bool,
+
+        /// Use transition history to choose the next prefetch target
+        #[arg(long)]
+        predictive: bool,
 
         /// Replacement cycles (alternates replacement and initial sets)
         #[arg(long, default_value_t = 1)]
@@ -1104,8 +1112,10 @@ fn main() {
             pinned_pool,
             storage_concurrency,
             storage_max_bytes,
+            standby_limit,
             host_read_async,
             partial_residency,
+            predictive,
             cycles,
             prompt,
             max_tokens,
@@ -1137,8 +1147,10 @@ fn main() {
                 pinned_pool,
                 storage_concurrency,
                 storage_max_bytes,
+                standby_limit,
                 host_read_async,
                 partial_residency,
+                predictive,
                 cycles,
                 prompt,
                 max_tokens,
@@ -1698,8 +1710,10 @@ fn run_staging_cycle(
     pinned_pool: Option<String>,
     storage_concurrency: usize,
     storage_max_bytes: Option<String>,
+    standby_limit: Option<String>,
     host_read_async: bool,
     partial_residency: bool,
+    predictive: bool,
     cycles: u32,
     prompt: String,
     max_tokens: u32,
@@ -1809,6 +1823,18 @@ fn run_staging_cycle(
         })
         .transpose()?
         .unwrap_or(0);
+    let standby_limit_bytes = standby_limit
+        .as_deref()
+        .map(|value| {
+            if value == "0" {
+                Ok(0)
+            } else {
+                parse_memory_size(value)
+                    .map_err(|error| anyhow::anyhow!("invalid --standby-limit: {error}"))
+            }
+        })
+        .transpose()?
+        .unwrap_or(0);
     let strategy_override = strategy
         .as_deref()
         .map(parse_transfer_strategy)
@@ -1838,6 +1864,7 @@ fn run_staging_cycle(
     let mut service = ramforge_runtime::InferenceService::new(plan)
         .map_err(|error| anyhow::anyhow!(error))?
         .with_staging_pool_limit(staged_pool_bytes)
+        .with_staging_standby_limit(standby_limit_bytes)
         .with_selection_policy(selection_policy_kind)
         .with_host_staging(host_staging_mode, read_batching_kind, pinned_pool_bytes)
         .with_storage_pipeline(storage_concurrency, storage_max_outstanding_bytes)
@@ -1859,6 +1886,9 @@ fn run_staging_cycle(
     if initial_layers.is_empty() {
         anyhow::bail!("initial staging produced no resident layers");
     }
+    let mut predictor = ramforge_runtime::TransitionPredictor::new();
+    predictor.observe(&initial_layers);
+    let mut predictions_before: Vec<Option<Vec<u32>>> = Vec::new();
     let mut controller = ramforge_runtime::AdaptiveController::new();
     let mut last_compute_ns = initial_report.stats.total_generation_ns;
     let profile_kind = parse_runtime_profile(&profile)?;
@@ -1887,11 +1917,20 @@ fn run_staging_cycle(
 
     let mut cycle_reports = Vec::new();
     for index in 0..cycles {
-        let target_layers = if index % 2 == 0 {
+        let cli_target = if index % 2 == 0 {
             replace_layers.clone()
         } else {
             initial_layers.clone()
         };
+        let predicted = if predictive {
+            predictor
+                .next_prediction()
+                .map(|prediction| prediction.layers.clone())
+        } else {
+            None
+        };
+        predictions_before.push(predicted.clone());
+        let target_layers = predicted.clone().unwrap_or(cli_target);
         let request = ramforge_runtime::StagingRequest {
             layers: target_layers.clone(),
             budget_bytes: staged_budget_bytes,
@@ -2158,12 +2197,20 @@ fn run_staging_cycle(
                 "cycle": index,
                 "mode": "replace",
                 "target_layers": target_layers,
+                "predicted_before": predictions_before.last().cloned().flatten(),
                 "replacement_plan": replacement_plan,
                 "replacement_ns": replacement_ns,
                 "report": report,
                 "status": status,
             }));
         }
+        let actual: Vec<u32> = service
+            .status()
+            .staged_layers
+            .iter()
+            .map(|layer| layer.layer)
+            .collect();
+        predictor.observe(&actual);
     }
 
     if json {
@@ -2172,6 +2219,7 @@ fn run_staging_cycle(
             "initial_layers": initial_layers,
             "initial_report": initial_report,
             "initial_status": initial_status,
+            "prediction": predictor.status(),
             "adaptive": {
                 "enabled": adaptive,
                 "calibration_status": calibration_status,

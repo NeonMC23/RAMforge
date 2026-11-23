@@ -27,7 +27,7 @@ use crate::staging::{Engine, StagingError};
 use crate::staging_plan::{StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest};
 use ramforge_core::{discover_model_set, Tokenizer};
 
-pub const INFERENCE_SERVICE_API_VERSION: u32 = 6;
+pub const INFERENCE_SERVICE_API_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +98,7 @@ pub struct StagedLayerStatus {
     pub tensor_count: u32,
     pub device_bytes: u64,
     pub graph_substitutions: u64,
+    pub promoted_from_standby: bool,
 }
 
 /// Native staged-residency lifecycle snapshot. Counters are native facts, not
@@ -115,6 +116,10 @@ pub struct StagingLifecycleStatus {
     pub pool_limit_bytes: u64,
     pub pool_buffers: u64,
     pub commit_count: u64,
+    pub standby_bytes: u64,
+    pub standby_limit_bytes: u64,
+    pub standby_layers: u64,
+    pub standby_hits: u64,
     pub allocation_count: u64,
     pub release_count: u64,
     pub reuse_count: u64,
@@ -152,6 +157,8 @@ pub struct PipelineCommitReport {
     pub preserved_bytes: u64,
     pub new_bytes: u64,
     pub removed_bytes: u64,
+    pub promoted_layers: Vec<u32>,
+    pub promoted_bytes: u64,
 }
 
 struct PendingPipeline {
@@ -170,6 +177,8 @@ struct PendingPipeline {
     preserved_bytes: u64,
     new_bytes: u64,
     removed_bytes: u64,
+    promoted_layers: Vec<u32>,
+    promoted_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +190,7 @@ pub struct PrefetchStatus {
     pub bytes_committed: u64,
     pub bytes_wasted: u64,
     pub bytes_preserved: u64,
+    pub bytes_from_standby: u64,
     pub hit_rate_permille: Option<u32>,
 }
 
@@ -335,6 +345,7 @@ pub struct InferenceService {
     staging_engine: Option<Engine>,
     staging_status: Vec<StagedLayerStatus>,
     staging_pool_limit_bytes: u64,
+    staging_standby_limit_bytes: u64,
     selection_policy: crate::staging_plan::SelectionPolicy,
     host_staging_mode: HostStagingMode,
     read_batching: ReadBatching,
@@ -351,6 +362,7 @@ pub struct InferenceService {
     prefetch_committed_bytes: u64,
     prefetch_wasted_bytes: u64,
     prefetch_preserved_bytes: u64,
+    prefetch_standby_bytes: u64,
     tensor_mappings: Option<HashMap<String, forge_core::TensorMappingInfo>>,
     pending_pipeline: Option<PendingPipeline>,
 }
@@ -371,6 +383,7 @@ impl InferenceService {
             staging_engine: None,
             staging_status: Vec::new(),
             staging_pool_limit_bytes: 0,
+            staging_standby_limit_bytes: 0,
             selection_policy: crate::staging_plan::SelectionPolicy::Ascending,
             host_staging_mode: HostStagingMode::Copy,
             read_batching: ReadBatching::Coalesced,
@@ -387,6 +400,7 @@ impl InferenceService {
             prefetch_committed_bytes: 0,
             prefetch_wasted_bytes: 0,
             prefetch_preserved_bytes: 0,
+            prefetch_standby_bytes: 0,
             tensor_mappings: None,
             pending_pipeline: None,
         })
@@ -415,6 +429,11 @@ impl InferenceService {
 
     pub fn with_staging_pool_limit(mut self, bytes: u64) -> Self {
         self.staging_pool_limit_bytes = bytes;
+        self
+    }
+
+    pub fn with_staging_standby_limit(mut self, bytes: u64) -> Self {
+        self.staging_standby_limit_bytes = bytes;
         self
     }
 
@@ -552,6 +571,7 @@ impl InferenceService {
                 bytes_committed: self.prefetch_committed_bytes,
                 bytes_wasted: self.prefetch_wasted_bytes,
                 bytes_preserved: self.prefetch_preserved_bytes,
+                bytes_from_standby: self.prefetch_standby_bytes,
                 hit_rate_permille: (self.prefetch_prepared > 0).then(|| {
                     ((self.prefetch_committed.saturating_mul(1000)) / self.prefetch_prepared) as u32
                 }),
@@ -764,6 +784,16 @@ impl InferenceService {
                 .set_staging_pool_limit(limit)
                 .map_err(|error| ServiceError::Execution(error.to_string()))?;
         }
+        if self.staging_standby_limit_bytes > 0 {
+            let limit = self
+                .staging_standby_limit_bytes
+                .min(self.staging_request.budget_bytes.unwrap_or(u64::MAX));
+            self.session
+                .as_ref()
+                .expect("session assigned")
+                .set_staging_standby_limit(limit)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+        }
         self.state = ServiceState::Ready;
         if let Err(error) = self.stage_configured_layers() {
             self.session = None;
@@ -899,14 +929,39 @@ impl InferenceService {
                 .unwrap_or(0)
         };
         let preserved_bytes: u64 = preserved_layers.iter().map(|layer| bytes_for(*layer)).sum();
+        let standby_count = session
+            .standby_layer_count()
+            .map_err(|error| ServiceError::Execution(error.to_string()))?;
+        let mut standby_layers = Vec::with_capacity(standby_count as usize);
+        for index in 0..standby_count {
+            standby_layers.push(
+                session
+                    .standby_layer_at(index)
+                    .map_err(|error| ServiceError::Execution(error.to_string()))?
+                    .layer,
+            );
+        }
+        let standby_candidates: Vec<u32> = stage_layers
+            .iter()
+            .copied()
+            .filter(|layer| standby_layers.contains(layer))
+            .collect();
+        let standby_candidate_bytes: u64 = standby_candidates
+            .iter()
+            .map(|layer| bytes_for(*layer))
+            .sum();
+        plan.standby_candidates = standby_candidates.clone();
+        plan.standby_candidate_bytes = standby_candidate_bytes;
         let pending_bytes = if partial {
             plan.required_new_bytes
+                .saturating_sub(standby_candidate_bytes)
         } else {
             plan.planned_bytes
         };
         let removed_bytes: u64 = remove_layers.iter().map(|layer| bytes_for(*layer)).sum();
         let required = state
             .resident_bytes
+            .saturating_add(state.standby_bytes)
             .saturating_add(pending_bytes)
             .saturating_add(state.pool_bytes);
         let fits = plan
@@ -962,7 +1017,54 @@ impl InferenceService {
         })?;
         let mappings = self.tensor_mappings.as_ref().expect("mappings cached");
 
-        if partial && stage_layers.is_empty() {
+        let mut stage_error = None;
+        let mut promoted_layers = Vec::new();
+        let mut promoted_bytes = 0u64;
+        for layer in &stage_layers {
+            #[cfg(debug_assertions)]
+            {
+                if std::env::var("RAMFORGE_TEST_FAIL_PENDING_LAYER")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    == Some(*layer)
+                {
+                    stage_error = Some(format!("injected pending stage failure (layer {layer})"));
+                    break;
+                }
+            }
+            if let Err(error) = session.stage_layer_pending_cuda(*layer) {
+                stage_error = Some(format!("pending stage layer {layer}: {error}"));
+                break;
+            }
+            if let Ok(info) = session.pending_layer_info(*layer) {
+                if info.promoted_from_standby {
+                    promoted_layers.push(*layer);
+                    promoted_bytes = promoted_bytes.saturating_add(info.device_bytes);
+                }
+            }
+        }
+        if let Some(message) = stage_error {
+            let _ = session.discard_pending_cuda();
+            return Err(ServiceError::Execution(message));
+        }
+
+        let mut tensors = Vec::new();
+        for layer in &stage_layers {
+            if promoted_layers.contains(layer) {
+                continue;
+            }
+            let count = session
+                .pending_tensor_count(*layer)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            for index in 0..count {
+                tensors.push(
+                    session
+                        .pending_tensor_info(*layer, index)
+                        .map_err(|error| ServiceError::Execution(error.to_string()))?,
+                );
+            }
+        }
+        if tensors.is_empty() {
             let report = HostStagingReport {
                 mode: self.host_staging_mode,
                 batching: self.read_batching,
@@ -980,8 +1082,11 @@ impl InferenceService {
                 fallback_tensors: 0,
             };
             plan.host_staging = Some(report.clone());
+            plan.standby_reused_layers = promoted_layers.clone();
+            plan.standby_reused_bytes = promoted_bytes;
             self.last_host_staging = Some(report.clone());
             self.prefetch_prepared += 1;
+            self.prefetch_bytes = self.prefetch_bytes.saturating_add(promoted_bytes);
             self.pending_pipeline = Some(PendingPipeline {
                 plan: plan.clone(),
                 layers: plan.accepted_layers.clone(),
@@ -991,54 +1096,20 @@ impl InferenceService {
                 read_job: None,
                 device_ptrs: Vec::new(),
                 sizes: Vec::new(),
-                partial: true,
+                partial,
                 preserved_layers: preserved_layers.clone(),
-                new_layers: Vec::new(),
+                new_layers: promoted_layers.clone(),
                 remove_layers: remove_layers.clone(),
                 preserved_bytes,
-                new_bytes: 0,
+                new_bytes: promoted_bytes,
                 removed_bytes,
+                promoted_layers,
+                promoted_bytes,
             });
             self.staging_plan = Some(plan.clone());
             return Ok(plan);
         }
 
-        let mut stage_error = None;
-        for layer in &stage_layers {
-            #[cfg(debug_assertions)]
-            {
-                if std::env::var("RAMFORGE_TEST_FAIL_PENDING_LAYER")
-                    .ok()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    == Some(*layer)
-                {
-                    stage_error = Some(format!("injected pending stage failure (layer {layer})"));
-                    break;
-                }
-            }
-            if let Err(error) = session.stage_layer_pending_cuda(*layer) {
-                stage_error = Some(format!("pending stage layer {layer}: {error}"));
-                break;
-            }
-        }
-        if let Some(message) = stage_error {
-            let _ = session.discard_pending_cuda();
-            return Err(ServiceError::Execution(message));
-        }
-
-        let mut tensors = Vec::new();
-        for layer in &stage_layers {
-            let count = session
-                .pending_tensor_count(*layer)
-                .map_err(|error| ServiceError::Execution(error.to_string()))?;
-            for index in 0..count {
-                tensors.push(
-                    session
-                        .pending_tensor_info(*layer, index)
-                        .map_err(|error| ServiceError::Execution(error.to_string()))?,
-                );
-            }
-        }
         let total: u64 = tensors.iter().map(|tensor| tensor.bytes).sum();
         let device_ptrs: Vec<u64> = tensors.iter().map(|tensor| tensor.device_ptr).collect();
         let sizes: Vec<u64> = tensors.iter().map(|tensor| tensor.bytes).collect();
@@ -1099,6 +1170,8 @@ impl InferenceService {
                 preserved_bytes,
                 new_bytes: total,
                 removed_bytes,
+                promoted_layers: promoted_layers.clone(),
+                promoted_bytes,
             });
             self.staging_plan = Some(plan.clone());
             return Ok(plan);
@@ -1142,6 +1215,8 @@ impl InferenceService {
 
         let host_staging = host_report;
         plan.host_staging = Some(host_staging.clone());
+        plan.standby_reused_layers = promoted_layers.clone();
+        plan.standby_reused_bytes = promoted_bytes;
         self.last_host_staging = Some(host_staging.clone());
         self.prefetch_prepared += 1;
         self.prefetch_bytes = self.prefetch_bytes.saturating_add(total);
@@ -1161,6 +1236,8 @@ impl InferenceService {
             preserved_bytes,
             new_bytes: total,
             removed_bytes,
+            promoted_layers,
+            promoted_bytes,
         });
         self.staging_plan = Some(plan.clone());
         Ok(plan)
@@ -1295,6 +1372,9 @@ impl InferenceService {
         self.prefetch_preserved_bytes = self
             .prefetch_preserved_bytes
             .saturating_add(pending.preserved_bytes);
+        self.prefetch_standby_bytes = self
+            .prefetch_standby_bytes
+            .saturating_add(pending.promoted_bytes);
         Ok(PipelineCommitReport {
             layers,
             transfer_bytes: transfer.bytes,
@@ -1313,6 +1393,8 @@ impl InferenceService {
             preserved_bytes: pending.preserved_bytes,
             new_bytes: pending.new_bytes,
             removed_bytes: pending.removed_bytes,
+            promoted_layers: pending.promoted_layers.clone(),
+            promoted_bytes: pending.promoted_bytes,
         })
     }
 
@@ -1661,6 +1743,10 @@ impl InferenceService {
                 pipeline_new_bytes: 0,
                 pipeline_removed_bytes: 0,
                 pipeline_partial: false,
+                standby_candidates: Vec::new(),
+                standby_candidate_bytes: 0,
+                standby_reused_layers: Vec::new(),
+                standby_reused_bytes: 0,
                 pipeline_pool_bytes: 0,
                 pipeline_required_bytes: 0,
                 pipeline_fits: false,
@@ -1848,6 +1934,10 @@ impl InferenceService {
             pipeline_new_bytes: 0,
             pipeline_removed_bytes: 0,
             pipeline_partial: false,
+            standby_candidates: Vec::new(),
+            standby_candidate_bytes: 0,
+            standby_reused_layers: Vec::new(),
+            standby_reused_bytes: 0,
             pipeline_pool_bytes: 0,
             pipeline_required_bytes: 0,
             pipeline_fits: false,
@@ -1884,6 +1974,7 @@ impl InferenceService {
                             tensor_count: info.tensor_count,
                             device_bytes: info.device_bytes,
                             graph_substitutions: info.graph_substitutions,
+                            promoted_from_standby: info.promoted_from_standby,
                         })
                 })
                 .collect();
@@ -1909,6 +2000,10 @@ impl InferenceService {
             pool_limit_bytes: state.pool_limit_bytes,
             pool_buffers: state.pool_buffers,
             commit_count: state.commit_count,
+            standby_bytes: state.standby_bytes,
+            standby_limit_bytes: state.standby_limit_bytes,
+            standby_layers: state.standby_layers,
+            standby_hits: state.standby_hits,
             allocation_count: state.allocation_count,
             release_count: state.release_count,
             reuse_count: state.reuse_count,
@@ -2160,6 +2255,7 @@ fn statuses_for_layers(
                     tensor_count: info.tensor_count,
                     device_bytes: info.device_bytes,
                     graph_substitutions: info.graph_substitutions,
+                    promoted_from_standby: info.promoted_from_standby,
                 })
         })
         .collect()
@@ -2258,6 +2354,7 @@ fn stage_layer_data(
             tensor_count: info.tensor_count,
             device_bytes: info.device_bytes,
             graph_substitutions: info.graph_substitutions,
+            promoted_from_standby: info.promoted_from_standby,
         },
         report,
     ))

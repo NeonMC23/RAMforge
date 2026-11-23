@@ -338,6 +338,8 @@ metadata remains required.
   next-selection prefetch accounting.
 - Atomic partial-residency delta commits preserving shared active layer
   allocations and staging only missing layers.
+- Bounded VRAM standby residency, transition-history prediction and physical-
+  core thread defaults.
 - Honest unsupported/unknown reporting for GPU execution, capacity reuse and
   transfer/compute overlap.
 
@@ -400,3 +402,13 @@ preserved 280 MB of active residency, and reduced transition median from
 generation gains varied with compute (roughly 4–11% in five-cycle medians);
 transition latency is the deterministic result. Removal-only transitions read
 and transfer zero bytes.
+
+## Standby and thread policy
+
+Retaining recently removed layers in a bounded standby vector turns repeated
+alternating transitions into zero-read/zero-transfer operations: Qwen
+[0..3]↔[2..5] read 280 MB on the first transition, then 0 bytes and completed in
+0.2–1.2 ms while promoting two layers. The standby budget is explicit and
+counted against VRAM. Profile thread defaults now use physical cores; Qwen
+staged decode measured 6.200/5.753 tok/s at 6 physical threads versus
+3.965/2.104 at 12 logical threads in order-controlled five-run samples.

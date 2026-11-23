@@ -299,7 +299,7 @@ Not run or not claimed:
 
 ## Predictive residency validation — 2026-10-30
 
-- `cargo test --workspace`: 632 passed, 0 failed, 45 ignored.
+- `cargo test --workspace`: 636 passed, 0 failed, 46 ignored.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge simulate` deterministic output and budget safety: passed.
 - Real prediction run with saved profile: 64 predictions, 16,650,240 B
@@ -370,7 +370,7 @@ Not run or not claimed:
 
 ## Operational runtime validation — 2026-11-21
 
-- `cargo test --workspace --locked`: **632 passed, 0 failed, 45 ignored**.
+- `cargo test --workspace --locked`: **636 passed, 0 failed, 46 ignored**.
 - Real inference-service tests: load, context, stream, throughput, cancellation
   and unload passed.
 - CLI benchmark: median generation 136.87 tok/s (112.58–155.41), decode 171.70,
@@ -473,12 +473,20 @@ Not run or not claimed:
   allocations 6 versus 8.
 - Removal-only delta commits zero transfer bytes. Injected pending failure and
   abort preserve the active set; concurrent prepare is rejected.
-- Decision: PARTIAL RESIDENCY VALIDATED — SHARED LAYERS PRESERVED, ONLY DELTAS
-  READ AND TRANSFERRED, TRANSITION LATENCY ROUGHLY HALVED.
+- Standby cache validated: Qwen alternating transitions after the first read and
+  transferred zero bytes; transition times 0.2/1.2/0.5/0.3 ms with two promoted
+  layers; native/device-pointer preservation and inference consumption tested.
+- Predictor validated: repeat, alternating and constant-shift patterns; horizon
+  one; SmolLM2 4/4 hits, 2 unknown warmup.
+- Thread defaults changed to physical cores with measured Qwen improvement:
+  6.200/5.753 tok/s vs 3.965/2.104 at logical 12 threads.
+- CUPTI tracer tool and attribution documented; graph-mode timestamps partial.
+- Decision: PARTIAL RESIDENCY + STANDBY VALIDATED — REPEATED TRANSITIONS
+  ZERO-READ — PHYSICAL-CORE THREAD DEFAULT IMPROVES STAGED TPS.
 - Native effective placement readback is wired through forgeCORE and RAMforge;
   zero-effective GPU loads are rejected. No silent CPU fallback.
-- `RuntimePlan` schema is 2; benchmark schema is 14; service API 6; staging
-  plan schema 7; calibration schema 1; GPU observability schema 3.
+- `RuntimePlan` schema is 2; benchmark schema is 15; service API 7; staging
+  plan schema 8; calibration schema 1; GPU observability schema 3.
 - Release-build throughput (latest session): balanced 8 threads 223.04 tok/s
   (P25–P75 218.94–224.91), maximum-performance 4 threads repacked 205.25,
   balanced 4 threads 203.92, background 81.44. Earlier sessions measured
@@ -498,7 +506,7 @@ Not run or not claimed:
 
 ## Runtime calibration validation — 2026-11-20
 
-- `cargo test --workspace --locked`: **632 passed, 0 failed, 45 ignored**.
+- `cargo test --workspace --locked`: **636 passed, 0 failed, 46 ignored**.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 - Ignored calibration CLI test: passed; nine lifecycle stages, mapping
   residency, comparisons, attribution, model fingerprint, and plan evidence.
@@ -517,7 +525,7 @@ Not run or not claimed:
 
 ## Machine profile and candidate plan validation — 2026-11-20
 
-- `cargo test --workspace`: **632 passed, 0 failed, 45 ignored**.
+- `cargo test --workspace`: **636 passed, 0 failed, 46 ignored**.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - `ramforge machine --model ... --ram 1G --json`: passed; includes CPU,
   memory, storage, device, model requirements, four plans, and comparison.
@@ -535,11 +543,11 @@ Not run or not claimed:
 
 ## CPU node-dispatch validation — 2026-10-31
 
-- forgeCORE `cargo test --workspace`: **423 passed, 0 failed, 21 ignored**.
+- forgeCORE `cargo test --workspace`: **423 passed, 0 failed, 23 ignored**.
   New `node_dispatch` tests cover disabled-by-default behavior, installation
   and removal, event drain, overflow, multiple contexts, four-worker
   exactly-once publication, identity fields, and bounded options.
-- RAMforge `cargo test --workspace`: **632 passed, 0 failed, 45 ignored**.
+- RAMforge `cargo test --workspace`: **636 passed, 0 failed, 46 ignored**.
   The ignored real-model CLI test verifies `--node-dispatch-observe` JSON with
   attributed and unattributed events, zero identity mismatches, CPU backend,
   and bounded serialization.
@@ -587,7 +595,7 @@ RAMforge checks:
 
 ```text
 cargo check --workspace                         passed
-cargo test --workspace                          632 passed, 0 failed, 45 ignored
+cargo test --workspace                          636 passed, 0 failed, 46 ignored
 cargo clippy --workspace --all-targets -D warnings  passed
 ```
 

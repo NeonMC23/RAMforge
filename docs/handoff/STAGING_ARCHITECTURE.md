@@ -910,11 +910,85 @@ The prefetch window remains one pending selection. Partial mode removes duplicat
 reads for shared layers but does not implement arbitrary lookahead or
 reprioritization of obsolete in-flight reads beyond abort.
 
+## Standby residency, prediction and attribution
+
+### VRAM standby cache
+
+`llama_context_set_staging_standby_limit()` retains recently removed layers in a
+separate standby vector instead of immediately pooling them. Delta commit retires
+removed layers into standby when the byte limit allows. A later
+`stage_layer_pending_cuda(layer)` promotes a matching standby layer into pending
+with no allocation, storage read or H2D transfer; `promoted_from_standby` and
+`standby_hits` expose the event.
+
+The cache is bounded by bytes, counted in the pipeline budget, and reduced by
+moving excess layers to the existing device pool. Promotion preserves the
+device pointer and tensor metadata.
+
+Measured alternating transitions:
+
+- Qwen `[0..3] ↔ [2..5]`, first transition read/transferred 280.2 MB in 137.8 ms;
+  subsequent transitions read/transferred **0 bytes** and measured
+  0.2/1.2/0.5/0.3 ms while promoting 2 layers each.
+- SmolLM2 `[0,1] ↔ [1,2]`: first transition read 2.33 MB; subsequent
+  transitions read/transferred 0 and promoted one layer each.
+- Standby hits advanced 2 per Qwen transition; `bytes_from_standby` reached
+  1.157 GB over four transitions with zero waste.
+
+This is a genuine repeated-transition optimization, not steady-state decode
+throughput.
+
+### Transition prediction
+
+`TransitionPredictor` records committed layer sets and predicts the next set by
+repeat, alternating or constant-shift patterns, bounded to a horizon of one
+pending selection. The pending slot is the limiting resource; no speculative
+multi-slot VRAM prefetch is attempted.
+
+SmolLM2 six-cycle run: 4 predictions, 4 hits, 0 misses, 2 unknown (warmup),
+1000 permille hit rate. Prediction drives the next prefetch target when
+`--predictive` is set. Hit rate is reported separately from performance benefit.
+
+### CPU thread policy
+
+CPU inference is faster at physical-core count than logical SMT sibling count.
+Profile defaults now use `hardware_physical_cores` when known. Qwen 7B staged,
+five-run medians with identical selection:
+
+- old logical-thread default (12 threads): 3.965 and 2.104 tok/s in two
+  order-controlled samples;
+- new physical-core default (6 threads): 6.200 and 5.753 tok/s;
+- TTFT improved from 266.9/563.9 ms to 220.1/216.6 ms.
+
+The direction is consistent and large on this i5-11400H; absolute values vary
+with host load. Explicit `--threads` remains an override.
+
+### Profiler-backed attribution
+
+`forgeCORE/tools/cupti_trace.cpp` is an optional LD_PRELOAD CUPTI activity tracer.
+It records kernel, memcpy, runtime and driver API intervals. Nsight Systems and
+Nsight Compute are not installed; CUPTI headers and runtime are present.
+
+Findings:
+
+- Full-GPU SmolLM2 with CUDA graphs enabled: kernel records often have zero
+  timestamps under CUPTI 13.2, so graph-replay kernel-time attribution is
+  incomplete.
+- With `GGML_CUDA_DISABLE_GRAPHS=1`, all 18,577 kernel records had timestamps:
+  94.1 ms kernel busy over 155.6 ms generation (~60% occupancy of the interval);
+  memcpy 15.5 ms. Graph mode measured 492 tok/s vs 205 tok/s without graphs, so
+  the remaining gaps are largely graph/scheduling overhead. The disabled-graph
+  trace is attribution evidence, not a performance configuration.
+- Runtime/driver API tracing slows inference roughly 4x; it is useful only for
+  relative host-submission cost.
+- Staged Qwen generation is CPU-dominated; CUPTI cannot attribute CPU kernel
+  time. Host phase timings remain the defensible attribution.
+
 ## Decision
 
-**PARTIAL RESIDENCY VALIDATED — SHARED LAYERS PRESERVED, ONLY DELTAS READ AND
-TRANSFERRED, TRANSITION LATENCY ROUGHLY HALVED — END-TO-END GAIN REMAINS
-MODEL/COMPUTE-DEPENDENT.**
+**PARTIAL RESIDENCY + BOUNDED VRAM STANDBY VALIDATED — REPEATED ALTERNATING
+TRANSITIONS BECOME ZERO-READ — PHYSICAL-CORE THREAD DEFAULT IMPROVES STAGED
+DECODE THROUGHPUT — CUPTI ATTRIBUTION PARTIAL.**
 
 - Direct-to-pinned reads eliminate the pageable intermediate copy.
 - Coalesced GGUF ranges reduce read calls and read time.

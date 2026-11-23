@@ -66,6 +66,7 @@ pub mod resource_lifetime;
 pub mod runtime_calibration;
 pub mod runtime_config;
 pub mod runtime_measurement;
+pub mod residency_prediction;
 pub mod runtime_plan;
 pub mod scheduler_policy;
 pub mod sampling;
@@ -178,6 +179,10 @@ pub use host_staging::{
 pub use hw_calibration::{
     default_calibration_path, run_calibration, CalibrationIdentity, CalibrationRecord,
     CalibrationStatus, HW_CALIBRATION_SCHEMA_VERSION,
+};
+pub use residency_prediction::{
+    PredictionConfidence, PredictionStatus, PredictionStrategy, ResidencyPrediction,
+    TransitionPredictor,
 };
 pub use scheduler_policy::{
     AdaptiveController, DecisionConfidence, DecisionContext, StrategyDecision, TransferStrategy,
