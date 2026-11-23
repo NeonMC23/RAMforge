@@ -336,6 +336,8 @@ metadata remains required.
   mappings, bounded pinned pooling and asynchronous host reads.
 - Bounded parallel storage reads with outstanding-byte limits and explicit
   next-selection prefetch accounting.
+- Atomic partial-residency delta commits preserving shared active layer
+  allocations and staging only missing layers.
 - Honest unsupported/unknown reporting for GPU execution, capacity reuse and
   transfer/compute overlap.
 
@@ -388,3 +390,13 @@ alternative to 59.9 ms. The default therefore stays coalesced with concurrency
 level next-selection staging with hit/waste/byte accounting, not a fabricated
 per-layer execution signal. Three SmolLM2 cycles committed 15,040,512 bytes with
 zero waste; abort records wasted bytes and lower hit rate.
+
+## Partial residency
+
+Overlapping selections no longer re-read or re-transfer shared layers. On Qwen
+[0,1,2,3]→[2,3,4,5], partial mode read/transferred 280/298 MB versus 560/578 MB,
+preserved 280 MB of active residency, and reduced transition median from
+82–88 ms to 42–44 ms. It used 6 staged allocations versus 8. End-to-end
+generation gains varied with compute (roughly 4–11% in five-cycle medians);
+transition latency is the deterministic result. Removal-only transitions read
+and transfer zero bytes.

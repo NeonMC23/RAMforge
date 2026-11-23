@@ -505,3 +505,160 @@ fn async_host_read_abort_and_commit_preserve_lifecycle() {
     assert_eq!(resident, vec![1, 2]);
     assert!(!generate(&mut service).is_empty());
 }
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn partial_residency_stages_only_delta_and_preserves_shared_layers() {
+    let _guard = env_lock();
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let plan = plan_for(&path);
+    let mut service = InferenceService::new(plan)
+        .expect("service")
+        .with_host_staging(
+            ramforge_runtime::HostStagingMode::Direct,
+            ramforge_runtime::ReadBatching::Coalesced,
+            32 * 1024 * 1024,
+        )
+        .with_async_host_read(false)
+        .with_partial_residency(true)
+        .with_staging_request(StagingRequest {
+            layers: vec![0, 1],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        });
+    service.load().expect("load");
+    service.create_session().expect("session");
+    assert!(!generate(&mut service).is_empty());
+
+    let prepared = service
+        .prepare_staged_pipeline(StagingRequest {
+            layers: vec![1, 2],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        })
+        .expect("prepare partial");
+    assert!(prepared.pipeline_partial);
+    assert_eq!(prepared.pipeline_preserved_bytes, 2_598_964);
+    assert_eq!(prepared.pipeline_new_bytes, 2_329_268);
+    let host = prepared.host_staging.expect("host report");
+    assert!(
+        host.bytes_read < 2_598_964,
+        "partial read staged shared data"
+    );
+    assert!(!generate(&mut service).is_empty());
+    let commit = service.commit_staged_pipeline().expect("commit partial");
+    assert!(commit.partial);
+    assert_eq!(commit.preserved_layers, vec![1]);
+    assert_eq!(commit.new_layers, vec![2]);
+    assert_eq!(commit.removed_layers, vec![0]);
+    assert!(commit.preserved_bytes > 0);
+    assert!(commit.transfer_bytes < 2_598_964);
+    let status = service.status();
+    let resident: Vec<u32> = status
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    assert_eq!(resident, vec![1, 2]);
+    assert!(status.prefetch.bytes_preserved > 0);
+    assert!(!generate(&mut service).is_empty());
+
+    // Removal-only delta: no storage or transfer should be needed.
+    service
+        .prepare_staged_pipeline(StagingRequest {
+            layers: vec![1],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        })
+        .expect("prepare removal-only");
+    let commit = service
+        .commit_staged_pipeline()
+        .expect("commit removal-only");
+    assert!(commit.new_layers.is_empty());
+    assert_eq!(commit.removed_layers, vec![2]);
+    assert_eq!(commit.transfer_bytes, 0);
+    let resident: Vec<u32> = service
+        .status()
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    assert_eq!(resident, vec![1]);
+    assert!(!generate(&mut service).is_empty());
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn failed_partial_prepare_preserves_active_residency() {
+    let _guard = env_lock();
+    let Some(path) = fixture() else {
+        eprintln!("SKIP: FORGE_TEST_MODEL not set");
+        return;
+    };
+    let plan = plan_for(&path);
+    let mut service = InferenceService::new(plan)
+        .expect("service")
+        .with_partial_residency(true)
+        .with_staging_request(StagingRequest {
+            layers: vec![0, 1],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        });
+    service.load().expect("load");
+    service.create_session().expect("session");
+    assert!(!generate(&mut service).is_empty());
+
+    std::env::set_var("RAMFORGE_TEST_FAIL_PENDING_LAYER", "3");
+    let error = service
+        .prepare_staged_pipeline(StagingRequest {
+            layers: vec![2, 3],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        })
+        .expect_err("injected pending failure must be reported");
+    std::env::remove_var("RAMFORGE_TEST_FAIL_PENDING_LAYER");
+    assert!(error.to_string().contains("injected pending stage failure"));
+    let status = service.status();
+    assert!(!status.pipeline_pending);
+    let resident: Vec<u32> = status
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    assert_eq!(resident, vec![0, 1]);
+    assert!(!generate(&mut service).is_empty());
+
+    service
+        .prepare_staged_pipeline(StagingRequest {
+            layers: vec![1, 2],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        })
+        .expect("prepare after failure");
+    let second = service
+        .prepare_staged_pipeline(StagingRequest {
+            layers: vec![3],
+            budget_bytes: Some(20 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        })
+        .expect_err("concurrent transaction must be rejected");
+    assert!(second.to_string().contains("already pending"));
+    service.abort_staged_pipeline().expect("abort");
+    let resident: Vec<u32> = service
+        .status()
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    assert_eq!(resident, vec![0, 1]);
+}

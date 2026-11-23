@@ -839,11 +839,82 @@ asserts one abort plus one commit yields 500 permille.
 - Cancellation waits for in-flight `pread` workers; buffers are recycled only
   after join.
 
+## Partial residency and delta transactions
+
+### Native contract
+
+`llama_context_commit_pending_delta_cuda(remove_layers, n_remove)` validates the
+entire delta before mutation:
+
+- the graph must be invalidated and quiescent;
+- every removal must exist and be unique;
+- pending layers must not already be active unless also removed;
+- removals are applied in descending index order, recycling buffers into the
+  bounded pool;
+- pending layers are appended to the surviving active selection.
+
+The active graph is never mutated. Shared active `llama_staged_layer` objects,
+tensor metadata, and device pointers survive unchanged. Failure before commit
+leaves the active selection usable.
+
+### RAMforge delta planning
+
+The existing plan already exposes `kept_layers`, `newly_staged_layers` and
+`evicted_layers`. Partial mode uses those directly:
+
+- preserve `A ∩ D`;
+- stage only `D \ A`;
+- remove `A \ D`;
+- keep the active set untouched until transfer/host completion and invalidation;
+- commit the delta atomically.
+
+Pipeline budget uses `active + new + pool`, not `active + complete next
+selection + pool`. Removal-only transitions allocate no host buffer, read no
+storage, and transfer no bytes.
+
+### Measured Qwen transition
+
+Selections `[0,1,2,3] → [2,3,4,5]`, four layers per slot:
+
+| Mode | Read bytes | New bytes | Preserved bytes | Transition median | Allocations |
+|---|---|---|---|---|---|
+| Full selection | 560.5/578.5 MB | 560.5/578.5 MB | 0 | 82.5–87.6 ms | 8 |
+| Partial delta | 280.2/298.2 MB | 280.2/298.2 MB | 280.2 MB | 42.1–44.2 ms | 6 |
+
+- Storage read and H2D bytes approximately halved.
+- Shared two-layer allocations and graph metadata preserved.
+- Transition median reduced by roughly 48–52% after warmup.
+- End-to-end five-cycle medians with 4 generated tokens varied with compute:
+  717.8–880.7 ms full versus 640.3–687.6 ms partial (roughly 4–11% lower).
+- Pool reuse counters advanced; total allocations fell from 8 to 6.
+- Removed layers are recycled only after invalidation; preserved layers are
+  never re-read or re-transferred.
+
+### Failure behavior
+
+- Failed pending allocation/storage leaves active residency unchanged; the
+  integration test injects a pending-layer failure and verifies the active set.
+- Abort discards pending allocations and preserves the active set.
+- Concurrent prepare is rejected.
+- A removal-only commit is accepted with zero transfer bytes.
+- Native test verifies the preserved layer's device pointer is identical before
+  and after delta commit and that inference still consumes the new layer.
+
+### Identity and limits
+
+Delta interchangeability is valid only within one live context/model instance.
+Layer indices are not treated as cross-model identities. Model identity is
+fixed by the service/model instance; no cross-model reuse is implemented.
+
+The prefetch window remains one pending selection. Partial mode removes duplicate
+reads for shared layers but does not implement arbitrary lookahead or
+reprioritization of obsolete in-flight reads beyond abort.
+
 ## Decision
 
-**BOUNDED STORAGE PIPELINE IMPLEMENTED — COALESCED PRE-READ REMAINS BEST —
-PREDICTIVE PREFETCH ACCOUNTED — ~7% END-TO-END QWEN IMPROVEMENT FROM HOST-READ
-OVERLAP.**
+**PARTIAL RESIDENCY VALIDATED — SHARED LAYERS PRESERVED, ONLY DELTAS READ AND
+TRANSFERRED, TRANSITION LATENCY ROUGHLY HALVED — END-TO-END GAIN REMAINS
+MODEL/COMPUTE-DEPENDENT.**
 
 - Direct-to-pinned reads eliminate the pageable intermediate copy.
 - Coalesced GGUF ranges reduce read calls and read time.
@@ -851,6 +922,8 @@ OVERLAP.**
 - Cached tensor mappings remove a recurring ~100 ms preparation cost.
 - Async host reads hide file-to-pinned work under generation.
 - Split GGUF direct reads and real graph consumption are verified.
+- Partial residency halves transition bytes/latency on overlapping Qwen
+  selections, but end-to-end generation improvement is smaller and noisy.
 - Parallel per-tensor reads help only marginally; coalesced sequential remains
   the default.
 - Transfer/compute overlap remains slower than synchronous on this hardware.

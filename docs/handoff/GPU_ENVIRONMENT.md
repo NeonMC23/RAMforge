@@ -352,6 +352,23 @@ wasted, 1000 permille hit rate. Abort test: one abort + one commit yields
 no development headers are installed and the coalesced pread path already
 saturates the warm-cache workload. No dependency was added.
 
+## Partial residency
+
+Qwen selections `[0,1,2,3] → [2,3,4,5]`, warm cache, four layers per slot:
+
+- full: 560.5/578.5 MB read and transferred, 0 preserved, transition median
+  82.5–87.6 ms, 8 allocations;
+- partial: 280.2/298.2 MB read/transferred, 280.2 MB preserved, transition median
+  42.1–44.2 ms, 6 allocations.
+
+Both produce coherent output. End-to-end five-cycle medians with 4 tokens were
+717.8–880.7 ms full versus 640.3–687.6 ms partial, but compute variance is large;
+transition latency is the deterministic improvement. Removal-only delta commits
+transfer zero bytes.
+
+Failure/abort tests verify the active set is unchanged when pending preparation
+fails or is aborted.
+
 ## Reproduction
 
 ```sh

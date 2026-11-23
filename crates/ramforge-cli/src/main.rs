@@ -518,6 +518,10 @@ enum Commands {
         #[arg(long)]
         host_read_async: bool,
 
+        /// Preserve shared active layers and stage only the residency delta
+        #[arg(long)]
+        partial_residency: bool,
+
         /// Replacement cycles (alternates replacement and initial sets)
         #[arg(long, default_value_t = 1)]
         cycles: u32,
@@ -1101,6 +1105,7 @@ fn main() {
             storage_concurrency,
             storage_max_bytes,
             host_read_async,
+            partial_residency,
             cycles,
             prompt,
             max_tokens,
@@ -1133,6 +1138,7 @@ fn main() {
                 storage_concurrency,
                 storage_max_bytes,
                 host_read_async,
+                partial_residency,
                 cycles,
                 prompt,
                 max_tokens,
@@ -1693,6 +1699,7 @@ fn run_staging_cycle(
     storage_concurrency: usize,
     storage_max_bytes: Option<String>,
     host_read_async: bool,
+    partial_residency: bool,
     cycles: u32,
     prompt: String,
     max_tokens: u32,
@@ -1835,6 +1842,7 @@ fn run_staging_cycle(
         .with_host_staging(host_staging_mode, read_batching_kind, pinned_pool_bytes)
         .with_storage_pipeline(storage_concurrency, storage_max_outstanding_bytes)
         .with_async_host_read(host_read_async)
+        .with_partial_residency(partial_residency)
         .with_staging_request(initial_request);
     service.load().map_err(|error| anyhow::anyhow!(error))?;
     service

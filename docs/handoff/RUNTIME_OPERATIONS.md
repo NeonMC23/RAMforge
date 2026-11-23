@@ -253,7 +253,9 @@ facts; budget planning remains RAMforge policy.
 - `--storage-max-bytes SIZE`: maximum outstanding read bytes (`0` = bounded by
   concurrency only);
 - `--host-read-async`: pipeline mode only; read file-to-pinned data on a worker
-  thread while the active selection generates.
+  thread while the active selection generates;
+- `--partial-residency`: preserve shared active layers, stage only missing
+  layers, remove obsolete layers atomically, and reuse preserved allocations.
 
 Direct reads use verified native tensor mappings (file path, offset, size) and
 work with split GGUF files. Short reads, EINTR and I/O errors are explicit; a
@@ -265,7 +267,14 @@ coalesced groups, read requests, concurrency, peak outstanding bytes,
 read/prepare durations, pinned capacity/reuse and pool allocation/reuse/peak/
 idle bytes. Plan `host_staging` reports the same for the prepared selection.
 `status.prefetch` reports prepared/committed/aborted counts, prefetched/
-committed/wasted bytes and hit rate in permille.
+committed/wasted/preserved bytes and hit rate in permille. Pipeline commit
+reports `partial`, `preserved_layers`, `new_layers`, `removed_layers`,
+`preserved_bytes`, `new_bytes` and `removed_bytes`.
+
+Partial residency computes the exact delta against current native resident
+layers. Pending staging allocates and reads only new layers; commit removes
+obsolete layers and appends new ones in one validated native call. A
+removal-only transition performs no storage read or H2D transfer.
 
 Storage backend is positional `pread`. `io_uring` runtime libraries exist on the
 target, but development headers are absent and no measured benefit justified a

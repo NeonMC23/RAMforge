@@ -730,6 +730,15 @@ impl ForgeCoreSession {
             .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
     }
 
+    pub fn commit_pending_delta_cuda(
+        &self,
+        remove_layers: &[u32],
+    ) -> Result<(), ForgeCoreAdapterError> {
+        self.context
+            .commit_pending_delta_cuda(remove_layers)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
+    }
+
     pub fn discard_pending_cuda(&self) -> Result<(), ForgeCoreAdapterError> {
         self.context
             .discard_pending_cuda()

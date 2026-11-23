@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::host_staging::HostStagingReport;
 
-pub const STAGING_PLAN_SCHEMA_VERSION: u32 = 6;
+pub const STAGING_PLAN_SCHEMA_VERSION: u32 = 7;
 pub const DEFAULT_STAGING_SAFETY_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +77,10 @@ pub struct StagingPlan {
     pub pipeline: bool,
     pub pipeline_active_bytes: u64,
     pub pipeline_pending_bytes: u64,
+    pub pipeline_preserved_bytes: u64,
+    pub pipeline_new_bytes: u64,
+    pub pipeline_removed_bytes: u64,
+    pub pipeline_partial: bool,
     pub pipeline_pool_bytes: u64,
     pub pipeline_required_bytes: u64,
     pub pipeline_fits: bool,

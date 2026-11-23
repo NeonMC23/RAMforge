@@ -91,7 +91,7 @@
   within noise at one/four threads. Across four strategy smoke runs, systematic
   was 17.6–19.4 ms, targeted 17.6–18.1 ms (252 skips), and adaptive 17.7–19.7 ms
   (252 reuses). The spread is noisy; no speedup is claimed.
-- forgeCORE tests: 423 passed, 20 ignored. RAMforge tests: 632 passed, 43
+- forgeCORE tests: 423 passed, 21 ignored. RAMforge tests: 632 passed, 45
   ignored. New tests cover opt-in/default disabled, exact one event per active
   node with four workers, ordered events, overflow, multiple contexts,
   removal, bounded options, and CLI JSON attribution.
@@ -202,7 +202,7 @@
   cgroup with `--no-repack --no-prefetch` produced one token, exit 0, 10.877 s
   wall, 9661 `max` events, and 0 OOM kills. Page release/prefetch/staging is
   OS paging over existing mappings, not tensor streaming.
-- RAMforge tests: 632 passed, 43 ignored.
+- RAMforge tests: 632 passed, 45 ignored.
 
 ## Runtime memory accounting and calibration (2026-11-20)
 
@@ -238,7 +238,7 @@
   evidence is rejected.
 - `ramforge machine --calibration` emits per-plan compatibility decisions and
   accepts `--no-repack`, `--no-prefetch`, `--ubatch`, and `--sequences`.
-- RAMforge tests: 632 passed, 43 ignored.
+- RAMforge tests: 632 passed, 45 ignored.
 
 ## Machine profiles and candidate plans (2026-11-20)
 
@@ -281,7 +281,7 @@
 - Models: `ModelRequirements` schema 1, `MachineProfile` schema 1,
   `ExecutionPlanCandidate` schema 1. Additive changes remain compatible;
   semantic/removal changes require a version increment.
-- ForgeCORE tests: 423 passed, 20 ignored. RAMforge tests: 632 passed, 43
+- ForgeCORE tests: 423 passed, 21 ignored. RAMforge tests: 632 passed, 45
   ignored.
 
 ## Residency observability and end-to-end accounting (2026-10-30)

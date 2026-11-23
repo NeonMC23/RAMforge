@@ -16,7 +16,7 @@ use crate::inference_service::{
 };
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 13;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {

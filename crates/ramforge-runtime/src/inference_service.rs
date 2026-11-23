@@ -27,7 +27,7 @@ use crate::staging::{Engine, StagingError};
 use crate::staging_plan::{StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest};
 use ramforge_core::{discover_model_set, Tokenizer};
 
-pub const INFERENCE_SERVICE_API_VERSION: u32 = 5;
+pub const INFERENCE_SERVICE_API_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,6 +145,13 @@ pub struct PipelineCommitReport {
     pub transfer_in_flight_at_commit: bool,
     pub host_staging: HostStagingReport,
     pub host_read_wait_ns: Option<u64>,
+    pub partial: bool,
+    pub preserved_layers: Vec<u32>,
+    pub new_layers: Vec<u32>,
+    pub removed_layers: Vec<u32>,
+    pub preserved_bytes: u64,
+    pub new_bytes: u64,
+    pub removed_bytes: u64,
 }
 
 struct PendingPipeline {
@@ -156,6 +163,13 @@ struct PendingPipeline {
     read_job: Option<crate::host_staging::HostReadJob>,
     device_ptrs: Vec<u64>,
     sizes: Vec<u64>,
+    partial: bool,
+    preserved_layers: Vec<u32>,
+    new_layers: Vec<u32>,
+    remove_layers: Vec<u32>,
+    preserved_bytes: u64,
+    new_bytes: u64,
+    removed_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +180,7 @@ pub struct PrefetchStatus {
     pub bytes_prefetched: u64,
     pub bytes_committed: u64,
     pub bytes_wasted: u64,
+    pub bytes_preserved: u64,
     pub hit_rate_permille: Option<u32>,
 }
 
@@ -324,6 +339,7 @@ pub struct InferenceService {
     host_staging_mode: HostStagingMode,
     read_batching: ReadBatching,
     host_read_async: bool,
+    partial_residency: bool,
     storage_concurrency: usize,
     storage_max_outstanding_bytes: u64,
     pinned_pool: PinnedPool,
@@ -334,6 +350,7 @@ pub struct InferenceService {
     prefetch_bytes: u64,
     prefetch_committed_bytes: u64,
     prefetch_wasted_bytes: u64,
+    prefetch_preserved_bytes: u64,
     tensor_mappings: Option<HashMap<String, forge_core::TensorMappingInfo>>,
     pending_pipeline: Option<PendingPipeline>,
 }
@@ -358,6 +375,7 @@ impl InferenceService {
             host_staging_mode: HostStagingMode::Copy,
             read_batching: ReadBatching::Coalesced,
             host_read_async: false,
+            partial_residency: false,
             storage_concurrency: 1,
             storage_max_outstanding_bytes: 0,
             pinned_pool: PinnedPool::new(0),
@@ -368,6 +386,7 @@ impl InferenceService {
             prefetch_bytes: 0,
             prefetch_committed_bytes: 0,
             prefetch_wasted_bytes: 0,
+            prefetch_preserved_bytes: 0,
             tensor_mappings: None,
             pending_pipeline: None,
         })
@@ -418,6 +437,11 @@ impl InferenceService {
 
     pub fn with_async_host_read(mut self, enabled: bool) -> Self {
         self.host_read_async = enabled;
+        self
+    }
+
+    pub fn with_partial_residency(mut self, enabled: bool) -> Self {
+        self.partial_residency = enabled;
         self
     }
 
@@ -527,6 +551,7 @@ impl InferenceService {
                 bytes_prefetched: self.prefetch_bytes,
                 bytes_committed: self.prefetch_committed_bytes,
                 bytes_wasted: self.prefetch_wasted_bytes,
+                bytes_preserved: self.prefetch_preserved_bytes,
                 hit_rate_permille: (self.prefetch_prepared > 0).then(|| {
                     ((self.prefetch_committed.saturating_mul(1000)) / self.prefetch_prepared) as u32
                 }),
@@ -850,7 +875,36 @@ impl InferenceService {
         let state = session.staging_state().map_err(|error| {
             ServiceError::Execution(format!("native staging state failed: {error}"))
         })?;
-        let pending_bytes = plan.planned_bytes;
+        let partial = self.partial_residency;
+        let stage_layers = if partial {
+            plan.newly_staged_layers.clone()
+        } else {
+            plan.accepted_layers.clone()
+        };
+        let preserved_layers = if partial {
+            plan.kept_layers.clone()
+        } else {
+            Vec::new()
+        };
+        let remove_layers = if partial {
+            plan.evicted_layers.clone()
+        } else {
+            Vec::new()
+        };
+        let bytes_for = |layer: u32| {
+            plan.layers
+                .iter()
+                .find(|entry| entry.layer == layer)
+                .and_then(|entry| entry.bytes)
+                .unwrap_or(0)
+        };
+        let preserved_bytes: u64 = preserved_layers.iter().map(|layer| bytes_for(*layer)).sum();
+        let pending_bytes = if partial {
+            plan.required_new_bytes
+        } else {
+            plan.planned_bytes
+        };
+        let removed_bytes: u64 = remove_layers.iter().map(|layer| bytes_for(*layer)).sum();
         let required = state
             .resident_bytes
             .saturating_add(pending_bytes)
@@ -860,8 +914,12 @@ impl InferenceService {
             .map(|budget| required <= budget)
             .unwrap_or(false);
         plan.pipeline = true;
+        plan.pipeline_partial = partial;
         plan.pipeline_active_bytes = state.resident_bytes;
         plan.pipeline_pending_bytes = pending_bytes;
+        plan.pipeline_preserved_bytes = preserved_bytes;
+        plan.pipeline_new_bytes = pending_bytes;
+        plan.pipeline_removed_bytes = removed_bytes;
         plan.pipeline_pool_bytes = state.pool_bytes;
         plan.pipeline_required_bytes = required;
         plan.pipeline_fits = fits;
@@ -904,8 +962,60 @@ impl InferenceService {
         })?;
         let mappings = self.tensor_mappings.as_ref().expect("mappings cached");
 
+        if partial && stage_layers.is_empty() {
+            let report = HostStagingReport {
+                mode: self.host_staging_mode,
+                batching: self.read_batching,
+                tensors: 0,
+                bytes_read: 0,
+                read_groups: 0,
+                coalesced_groups: 0,
+                read_requests: 0,
+                read_concurrency: self.storage_concurrency as u32,
+                max_outstanding_bytes: 0,
+                read_ns: 0,
+                prepare_ns: 0,
+                pinned_capacity: 0,
+                pinned_reused: false,
+                fallback_tensors: 0,
+            };
+            plan.host_staging = Some(report.clone());
+            self.last_host_staging = Some(report.clone());
+            self.prefetch_prepared += 1;
+            self.pending_pipeline = Some(PendingPipeline {
+                plan: plan.clone(),
+                layers: plan.accepted_layers.clone(),
+                host: None,
+                submit_ns: 0,
+                host_staging: report,
+                read_job: None,
+                device_ptrs: Vec::new(),
+                sizes: Vec::new(),
+                partial: true,
+                preserved_layers: preserved_layers.clone(),
+                new_layers: Vec::new(),
+                remove_layers: remove_layers.clone(),
+                preserved_bytes,
+                new_bytes: 0,
+                removed_bytes,
+            });
+            self.staging_plan = Some(plan.clone());
+            return Ok(plan);
+        }
+
         let mut stage_error = None;
-        for layer in &plan.accepted_layers {
+        for layer in &stage_layers {
+            #[cfg(debug_assertions)]
+            {
+                if std::env::var("RAMFORGE_TEST_FAIL_PENDING_LAYER")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    == Some(*layer)
+                {
+                    stage_error = Some(format!("injected pending stage failure (layer {layer})"));
+                    break;
+                }
+            }
             if let Err(error) = session.stage_layer_pending_cuda(*layer) {
                 stage_error = Some(format!("pending stage layer {layer}: {error}"));
                 break;
@@ -917,7 +1027,7 @@ impl InferenceService {
         }
 
         let mut tensors = Vec::new();
-        for layer in &plan.accepted_layers {
+        for layer in &stage_layers {
             let count = session
                 .pending_tensor_count(*layer)
                 .map_err(|error| ServiceError::Execution(error.to_string()))?;
@@ -982,6 +1092,13 @@ impl InferenceService {
                 read_job: Some(job),
                 device_ptrs,
                 sizes,
+                partial,
+                preserved_layers: preserved_layers.clone(),
+                new_layers: stage_layers.clone(),
+                remove_layers: remove_layers.clone(),
+                preserved_bytes,
+                new_bytes: total,
+                removed_bytes,
             });
             self.staging_plan = Some(plan.clone());
             return Ok(plan);
@@ -1037,6 +1154,13 @@ impl InferenceService {
             read_job: None,
             device_ptrs,
             sizes,
+            partial,
+            preserved_layers,
+            new_layers: stage_layers,
+            remove_layers,
+            preserved_bytes,
+            new_bytes: total,
+            removed_bytes,
         });
         self.staging_plan = Some(plan.clone());
         Ok(plan)
@@ -1066,82 +1190,92 @@ impl InferenceService {
         let mut async_host = None;
         let mut host_staging = pending.host_staging.clone();
         let mut host_read_wait_ns = None;
-        let (transfer, transfer_in_flight_at_commit, transfer_wait_ns) =
-            if let Some(job) = pending.read_job.take() {
-                let read_started = Instant::now();
-                let (host, offsets, report, _) = match job.finish() {
-                    Ok(result) => result,
-                    Err((error, host)) => {
-                        if let Some(host) = host {
-                            self.pinned_pool.release(host);
-                        } else {
-                            self.state = ServiceState::Failed;
-                        }
-                        let _ = session.discard_pending_cuda();
-                        return Err(ServiceError::Execution(format!(
-                            "pipeline host read failed: {error}"
-                        )));
+        let has_pending_transfer = pending.host.is_some() || pending.read_job.is_some();
+        let (transfer, transfer_in_flight_at_commit, transfer_wait_ns) = if !has_pending_transfer {
+            (crate::staging::TransferReport::default(), false, 0)
+        } else if let Some(job) = pending.read_job.take() {
+            let read_started = Instant::now();
+            let (host, offsets, report, _) = match job.finish() {
+                Ok(result) => result,
+                Err((error, host)) => {
+                    if let Some(host) = host {
+                        self.pinned_pool.release(host);
+                    } else {
+                        self.state = ServiceState::Failed;
                     }
-                };
-                host_read_wait_ns = Some(duration_ns(read_started.elapsed()));
-                host_staging = report;
-                if let Err(error) = engine.submit_batch_to_device_ptrs(
-                    &host,
-                    &offsets,
-                    &pending.device_ptrs,
-                    &pending.sizes,
-                ) {
+                    let _ = session.discard_pending_cuda();
+                    return Err(ServiceError::Execution(format!(
+                        "pipeline host read failed: {error}"
+                    )));
+                }
+            };
+            host_read_wait_ns = Some(duration_ns(read_started.elapsed()));
+            host_staging = report;
+            if let Err(error) = engine.submit_batch_to_device_ptrs(
+                &host,
+                &offsets,
+                &pending.device_ptrs,
+                &pending.sizes,
+            ) {
+                self.pinned_pool.release(host);
+                let _ = session.discard_pending_cuda();
+                return Err(ServiceError::Execution(format!(
+                    "pipeline transfer submission failed: {error}"
+                )));
+            }
+            let wait_started = Instant::now();
+            let transfer = match engine.wait() {
+                Ok(report) => report,
+                Err(error) => {
                     self.pinned_pool.release(host);
                     let _ = session.discard_pending_cuda();
                     return Err(ServiceError::Execution(format!(
-                        "pipeline transfer submission failed: {error}"
+                        "pipeline transfer wait failed: {error}"
                     )));
                 }
-                let wait_started = Instant::now();
-                let transfer = match engine.wait() {
-                    Ok(report) => report,
-                    Err(error) => {
-                        self.pinned_pool.release(host);
-                        let _ = session.discard_pending_cuda();
-                        return Err(ServiceError::Execution(format!(
-                            "pipeline transfer wait failed: {error}"
-                        )));
-                    }
-                };
-                async_host = Some(host);
-                (transfer, false, duration_ns(wait_started.elapsed()))
-            } else {
-                match engine.query() {
-                    Ok(Some(report)) => (report, false, 0),
-                    Ok(None) => {
-                        let wait_started = Instant::now();
-                        match engine.wait() {
-                            Ok(report) => (report, true, duration_ns(wait_started.elapsed())),
-                            Err(error) => {
-                                let _ = session.discard_pending_cuda();
-                                return Err(ServiceError::Execution(format!(
-                                    "pipeline transfer wait failed: {error}"
-                                )));
-                            }
+            };
+            async_host = Some(host);
+            (transfer, false, duration_ns(wait_started.elapsed()))
+        } else {
+            match engine.query() {
+                Ok(Some(report)) => (report, false, 0),
+                Ok(None) => {
+                    let wait_started = Instant::now();
+                    match engine.wait() {
+                        Ok(report) => (report, true, duration_ns(wait_started.elapsed())),
+                        Err(error) => {
+                            let _ = session.discard_pending_cuda();
+                            return Err(ServiceError::Execution(format!(
+                                "pipeline transfer wait failed: {error}"
+                            )));
                         }
                     }
-                    Err(error) => {
-                        let _ = session.discard_pending_cuda();
-                        return Err(ServiceError::Execution(format!(
-                            "pipeline transfer query failed: {error}"
-                        )));
-                    }
                 }
-            };
+                Err(error) => {
+                    let _ = session.discard_pending_cuda();
+                    return Err(ServiceError::Execution(format!(
+                        "pipeline transfer query failed: {error}"
+                    )));
+                }
+            }
+        };
         let invalidation_started = Instant::now();
         session.invalidate_graph().map_err(|error| {
             ServiceError::Execution(format!("pipeline invalidation failed: {error}"))
         })?;
         let invalidation_ns = duration_ns(invalidation_started.elapsed());
         let commit_started = Instant::now();
-        session
-            .commit_pending_cuda()
-            .map_err(|error| ServiceError::Execution(format!("pipeline commit failed: {error}")))?;
+        if pending.partial {
+            session
+                .commit_pending_delta_cuda(&pending.remove_layers)
+                .map_err(|error| {
+                    ServiceError::Execution(format!("pipeline delta commit failed: {error}"))
+                })?;
+        } else {
+            session.commit_pending_cuda().map_err(|error| {
+                ServiceError::Execution(format!("pipeline commit failed: {error}"))
+            })?;
+        }
         let commit_ns = duration_ns(commit_started.elapsed());
         let layers = pending.layers.clone();
         if let Some(host) = pending.host.take() {
@@ -1158,6 +1292,9 @@ impl InferenceService {
         self.prefetch_committed_bytes = self
             .prefetch_committed_bytes
             .saturating_add(host_staging.bytes_read);
+        self.prefetch_preserved_bytes = self
+            .prefetch_preserved_bytes
+            .saturating_add(pending.preserved_bytes);
         Ok(PipelineCommitReport {
             layers,
             transfer_bytes: transfer.bytes,
@@ -1169,6 +1306,13 @@ impl InferenceService {
             transfer_in_flight_at_commit,
             host_staging,
             host_read_wait_ns,
+            partial: pending.partial,
+            preserved_layers: pending.preserved_layers.clone(),
+            new_layers: pending.new_layers.clone(),
+            removed_layers: pending.remove_layers.clone(),
+            preserved_bytes: pending.preserved_bytes,
+            new_bytes: pending.new_bytes,
+            removed_bytes: pending.removed_bytes,
         })
     }
 
@@ -1513,6 +1657,10 @@ impl InferenceService {
                 pipeline: false,
                 pipeline_active_bytes: 0,
                 pipeline_pending_bytes: 0,
+                pipeline_preserved_bytes: 0,
+                pipeline_new_bytes: 0,
+                pipeline_removed_bytes: 0,
+                pipeline_partial: false,
                 pipeline_pool_bytes: 0,
                 pipeline_required_bytes: 0,
                 pipeline_fits: false,
@@ -1696,6 +1844,10 @@ impl InferenceService {
             pipeline: false,
             pipeline_active_bytes: 0,
             pipeline_pending_bytes: 0,
+            pipeline_preserved_bytes: 0,
+            pipeline_new_bytes: 0,
+            pipeline_removed_bytes: 0,
+            pipeline_partial: false,
             pipeline_pool_bytes: 0,
             pipeline_required_bytes: 0,
             pipeline_fits: false,
