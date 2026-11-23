@@ -162,6 +162,8 @@ pub fn run_profile_optimization(
                     host_staging_mode: crate::host_staging::HostStagingMode::Copy,
                     read_batching: crate::host_staging::ReadBatching::Coalesced,
                     pinned_pool_bytes: 0,
+                    storage_concurrency: 1,
+                    storage_max_outstanding_bytes: 0,
                 },
             ) {
                 Ok(benchmark) => measurements.push(ProfileMeasurement {

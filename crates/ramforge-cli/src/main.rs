@@ -379,6 +379,14 @@ enum Commands {
         #[arg(long)]
         pinned_pool: Option<String>,
 
+        /// Bounded storage read concurrency (default 1)
+        #[arg(long, default_value_t = 1)]
+        storage_concurrency: usize,
+
+        /// Maximum outstanding read bytes (0 = bounded only by concurrency)
+        #[arg(long)]
+        storage_max_bytes: Option<String>,
+
         /// Disable CPU weight repacking
         #[arg(long)]
         no_repack: bool,
@@ -497,6 +505,14 @@ enum Commands {
         /// Bounded reusable pinned host memory
         #[arg(long)]
         pinned_pool: Option<String>,
+
+        /// Bounded storage read concurrency (default 1)
+        #[arg(long, default_value_t = 1)]
+        storage_concurrency: usize,
+
+        /// Maximum outstanding read bytes (0 = bounded only by concurrency)
+        #[arg(long)]
+        storage_max_bytes: Option<String>,
 
         /// Overlap file-to-pinned reads with the active generation
         #[arg(long)]
@@ -1012,6 +1028,8 @@ fn main() {
             host_staging,
             read_batching,
             pinned_pool,
+            storage_concurrency,
+            storage_max_bytes,
             no_repack,
             no_prefetch,
             json,
@@ -1036,6 +1054,8 @@ fn main() {
                 host_staging,
                 read_batching,
                 pinned_pool,
+                storage_concurrency,
+                storage_max_bytes,
                 no_repack,
                 no_prefetch,
                 json,
@@ -1078,6 +1098,8 @@ fn main() {
             host_staging,
             read_batching,
             pinned_pool,
+            storage_concurrency,
+            storage_max_bytes,
             host_read_async,
             cycles,
             prompt,
@@ -1108,6 +1130,8 @@ fn main() {
                 host_staging,
                 read_batching,
                 pinned_pool,
+                storage_concurrency,
+                storage_max_bytes,
                 host_read_async,
                 cycles,
                 prompt,
@@ -1666,6 +1690,8 @@ fn run_staging_cycle(
     host_staging: Option<String>,
     read_batching: Option<String>,
     pinned_pool: Option<String>,
+    storage_concurrency: usize,
+    storage_max_bytes: Option<String>,
     host_read_async: bool,
     cycles: u32,
     prompt: String,
@@ -1764,6 +1790,18 @@ fn run_staging_cycle(
         .map(parse_pinned_pool)
         .transpose()?
         .unwrap_or(0);
+    let storage_max_outstanding_bytes = storage_max_bytes
+        .as_deref()
+        .map(|value| {
+            if value == "0" {
+                Ok(0)
+            } else {
+                parse_memory_size(value)
+                    .map_err(|error| anyhow::anyhow!("invalid --storage-max-bytes: {error}"))
+            }
+        })
+        .transpose()?
+        .unwrap_or(0);
     let strategy_override = strategy
         .as_deref()
         .map(parse_transfer_strategy)
@@ -1795,6 +1833,7 @@ fn run_staging_cycle(
         .with_staging_pool_limit(staged_pool_bytes)
         .with_selection_policy(selection_policy_kind)
         .with_host_staging(host_staging_mode, read_batching_kind, pinned_pool_bytes)
+        .with_storage_pipeline(storage_concurrency, storage_max_outstanding_bytes)
         .with_async_host_read(host_read_async)
         .with_staging_request(initial_request);
     service.load().map_err(|error| anyhow::anyhow!(error))?;
@@ -2260,6 +2299,8 @@ fn run_throughput_benchmark(
     host_staging: Option<String>,
     read_batching: Option<String>,
     pinned_pool: Option<String>,
+    storage_concurrency: usize,
+    storage_max_bytes: Option<String>,
     no_repack: bool,
     no_prefetch: bool,
     json: bool,
@@ -2342,6 +2383,18 @@ fn run_throughput_benchmark(
         .map(parse_pinned_pool)
         .transpose()?
         .unwrap_or(0);
+    let storage_max_outstanding_bytes = storage_max_bytes
+        .as_deref()
+        .map(|value| {
+            if value == "0" {
+                Ok(0)
+            } else {
+                parse_memory_size(value)
+                    .map_err(|error| anyhow::anyhow!("invalid --storage-max-bytes: {error}"))
+            }
+        })
+        .transpose()?
+        .unwrap_or(0);
     let report = run_benchmark(
         plan,
         BenchmarkConfig {
@@ -2357,6 +2410,8 @@ fn run_throughput_benchmark(
             host_staging_mode,
             read_batching: read_batching_kind,
             pinned_pool_bytes,
+            storage_concurrency,
+            storage_max_outstanding_bytes,
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;

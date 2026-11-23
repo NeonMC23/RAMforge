@@ -334,6 +334,8 @@ metadata remains required.
   fallback, profile-aware hysteresis and selectable residency ordering.
 - Direct file-to-pinned reads, exact GGUF range coalescing, cached tensor
   mappings, bounded pinned pooling and asynchronous host reads.
+- Bounded parallel storage reads with outstanding-byte limits and explicit
+  next-selection prefetch accounting.
 - Honest unsupported/unknown reporting for GPU execution, capacity reuse and
   transfer/compute overlap.
 
@@ -375,3 +377,14 @@ memory plus exact range coalescing reduced preparation to 178 ms and read time
 from 137 to 70 ms. Async file-to-pinned reads with a warm pool reduced prepare
 to ~0.3 ms and lowered five-cycle end-to-end medians from 728/758 ms to
 687/691 ms. This is storage/host-pipeline progress, not a 500B streaming claim.
+
+## Storage pipeline result
+
+Coalesced sequential `pread` into pinned memory remains the best storage path on
+this machine. Bounded concurrency of 2 or 4 did not improve coalesced reads
+(59.9 ms at c=1 versus 61.0/83.5 ms), although per-tensor c=4 improved that
+alternative to 59.9 ms. The default therefore stays coalesced with concurrency
+1; advanced users can raise concurrency. Predictive prefetch is application-
+level next-selection staging with hit/waste/byte accounting, not a fabricated
+per-layer execution signal. Three SmolLM2 cycles committed 15,040,512 bytes with
+zero waste; abort records wasted bytes and lower hit rate.

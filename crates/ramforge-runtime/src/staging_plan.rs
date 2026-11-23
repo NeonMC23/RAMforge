@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::host_staging::HostStagingReport;
 
-pub const STAGING_PLAN_SCHEMA_VERSION: u32 = 5;
+pub const STAGING_PLAN_SCHEMA_VERSION: u32 = 6;
 pub const DEFAULT_STAGING_SAFETY_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

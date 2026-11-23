@@ -6,6 +6,7 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -39,6 +40,9 @@ pub struct HostStagingReport {
     pub bytes_read: u64,
     pub read_groups: u64,
     pub coalesced_groups: u64,
+    pub read_requests: u64,
+    pub read_concurrency: u32,
+    pub max_outstanding_bytes: u64,
     pub read_ns: u64,
     pub prepare_ns: u64,
     pub pinned_capacity: u64,
@@ -319,27 +323,143 @@ fn build_specs(
         .collect()
 }
 
-fn read_file_groups(host: &StagingBuffer, groups: &[ReadGroup]) -> Result<(), String> {
-    let mut files: HashMap<String, File> = HashMap::new();
-    for group in groups {
-        let Some(path) = &group.file_path else {
-            return Err("asynchronous direct read requires file-backed tensors".to_string());
-        };
-        if !files.contains_key(path) {
-            let file = File::open(Path::new(path))
-                .map_err(|error| format!("open {path} failed: {error}"))?;
-            files.insert(path.clone(), file);
-        }
-        let file = files.get(path).expect("file opened");
-        host.read_fd(
-            group.host_offset,
-            file.as_raw_fd(),
-            group.file_offset,
-            group.bytes,
-        )
-        .map_err(|error| format!("direct read of {path} failed: {error}"))?;
+struct ReadQueue {
+    next: usize,
+    active: usize,
+    outstanding: u64,
+    limit: u64,
+    peak: u64,
+    error: Option<String>,
+}
+
+fn open_read_file<'a>(
+    files: &'a mut HashMap<String, File>,
+    path: &str,
+) -> Result<&'a File, String> {
+    if !files.contains_key(path) {
+        let file =
+            File::open(Path::new(path)).map_err(|error| format!("open {path} failed: {error}"))?;
+        files.insert(path.to_string(), file);
     }
-    Ok(())
+    Ok(files.get(path).expect("file opened"))
+}
+
+fn read_one_group(
+    host: &StagingBuffer,
+    group: &ReadGroup,
+    files: &mut HashMap<String, File>,
+) -> Result<(), String> {
+    let Some(path) = &group.file_path else {
+        return Err("direct read requires file-backed tensors".to_string());
+    };
+    let file = open_read_file(files, path)?;
+    host.read_fd(
+        group.host_offset,
+        file.as_raw_fd(),
+        group.file_offset,
+        group.bytes,
+    )
+    .map_err(|error| format!("direct read of {path} failed: {error}"))
+}
+
+/// Execute read groups with bounded concurrency and bounded outstanding bytes.
+/// Returns (requests, peak outstanding bytes).
+fn read_file_groups(
+    host: &StagingBuffer,
+    groups: &[ReadGroup],
+    concurrency: usize,
+    max_outstanding_bytes: u64,
+) -> Result<(u64, u64), String> {
+    if groups.is_empty() {
+        return Ok((0, 0));
+    }
+    let workers = concurrency.max(1).min(groups.len());
+    if workers == 1 {
+        let mut files = HashMap::new();
+        for group in groups {
+            read_one_group(host, group, &mut files)?;
+        }
+        let peak = groups.iter().map(|group| group.bytes).max().unwrap_or(0);
+        return Ok((groups.len() as u64, peak));
+    }
+
+    let state = Mutex::new(ReadQueue {
+        next: 0,
+        active: 0,
+        outstanding: 0,
+        limit: max_outstanding_bytes,
+        peak: 0,
+        error: None,
+    });
+    let condition = Condvar::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let state = &state;
+            let condition = &condition;
+            handles.push(scope.spawn(move || -> Result<(), String> {
+                let mut files = HashMap::new();
+                loop {
+                    let (index, bytes) = {
+                        let mut queue = state.lock().expect("read queue lock");
+                        loop {
+                            if queue.error.is_some() {
+                                return Ok(());
+                            }
+                            if queue.next >= groups.len() {
+                                if queue.active == 0 {
+                                    condition.notify_all();
+                                    return Ok(());
+                                }
+                                queue = condition.wait(queue).expect("read queue wait");
+                                continue;
+                            }
+                            let index = queue.next;
+                            let bytes = groups[index].bytes;
+                            let fits = queue.limit == 0
+                                || queue.outstanding == 0
+                                || queue.outstanding.saturating_add(bytes) <= queue.limit;
+                            if !fits {
+                                queue = condition.wait(queue).expect("read queue wait");
+                                continue;
+                            }
+                            queue.next += 1;
+                            queue.active += 1;
+                            queue.outstanding = queue.outstanding.saturating_add(bytes);
+                            queue.peak = queue.peak.max(queue.outstanding);
+                            break (index, bytes);
+                        }
+                    };
+                    let result = read_one_group(host, &groups[index], &mut files);
+                    let mut queue = state.lock().expect("read queue lock");
+                    queue.active -= 1;
+                    queue.outstanding = queue.outstanding.saturating_sub(bytes);
+                    if let Err(error) = result {
+                        queue.error = Some(error);
+                    }
+                    condition.notify_all();
+                    if queue.error.is_some() {
+                        return Ok(());
+                    }
+                }
+            }));
+        }
+        let mut error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => error = Some(message),
+                Err(_) => error = Some("storage read worker panicked".to_string()),
+            }
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok(())
+    })?;
+
+    let peak = state.lock().expect("read queue lock").peak;
+    Ok((groups.len() as u64, peak))
 }
 
 /// A host read running on a worker thread. The pinned buffer is owned by the
@@ -361,6 +481,8 @@ impl HostReadJob {
         tensors: &[forge_core::StagedTensorInfo],
         mappings: &HashMap<String, forge_core::TensorMappingInfo>,
         host: StagingBuffer,
+        concurrency: usize,
+        max_outstanding_bytes: u64,
     ) -> Result<Self, ServiceError> {
         let specs = build_specs(model, tensors, HostStagingMode::Direct, mappings);
         if specs.iter().any(|spec| spec.file_path.is_none()) {
@@ -388,9 +510,11 @@ impl HostReadJob {
         let started = Instant::now();
         let handle = std::thread::spawn(move || {
             let read_started = Instant::now();
-            let result = catch_unwind(AssertUnwindSafe(|| read_file_groups(&host, &groups)));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                read_file_groups(&host, &groups, concurrency, max_outstanding_bytes)
+            }));
             match result {
-                Ok(Ok(())) => {
+                Ok(Ok((read_requests, peak_outstanding))) => {
                     let read_ns = crate::inference_service::duration_ns(read_started.elapsed());
                     let report = HostStagingReport {
                         mode: HostStagingMode::Direct,
@@ -399,6 +523,9 @@ impl HostReadJob {
                         bytes_read: total,
                         read_groups,
                         coalesced_groups,
+                        read_requests,
+                        read_concurrency: concurrency as u32,
+                        max_outstanding_bytes: peak_outstanding,
                         read_ns,
                         prepare_ns: read_ns,
                         pinned_capacity: capacity,
@@ -429,6 +556,7 @@ impl HostReadJob {
 }
 
 /// Read the selected staged tensors into a pinned host buffer.
+#[allow(clippy::too_many_arguments)]
 pub fn read_tensors_into_host(
     model: &ForgeCoreModel,
     tensors: &[forge_core::StagedTensorInfo],
@@ -436,6 +564,8 @@ pub fn read_tensors_into_host(
     mode: HostStagingMode,
     batching: ReadBatching,
     mappings: &HashMap<String, forge_core::TensorMappingInfo>,
+    concurrency: usize,
+    max_outstanding_bytes: u64,
 ) -> Result<(Vec<u64>, HostStagingReport), ServiceError> {
     let specs = build_specs(model, tensors, mode, mappings);
 
@@ -456,40 +586,33 @@ pub fn read_tensors_into_host(
         .filter(|group| group.members.len() > 1)
         .count() as u64;
     let read_started = Instant::now();
-    let mut files: HashMap<String, File> = HashMap::new();
     let mut fallback_tensors = 0u64;
-    for group in &groups {
-        if let Some(path) = &group.file_path {
-            if !files.contains_key(path) {
-                let file = File::open(Path::new(path)).map_err(|error| {
-                    ServiceError::Execution(format!("open {path} failed: {error}"))
-                })?;
-                files.insert(path.clone(), file);
-            }
-            let file = files.get(path).expect("file opened");
-            host.read_fd(
-                group.host_offset,
-                file.as_raw_fd(),
-                group.file_offset,
-                group.bytes,
-            )
-            .map_err(|error| {
-                ServiceError::Execution(format!("direct read of {path} failed: {error}"))
-            })?;
-        } else {
-            for member in &group.members {
-                let tensor = &tensors[*member];
-                let length = usize::try_from(tensor.bytes).map_err(|_| {
-                    ServiceError::Execution("staged tensor is too large".to_string())
-                })?;
-                let mut bytes = vec![0u8; length];
-                model
-                    .read_tensor_bytes(&tensor.name, 0, &mut bytes)
-                    .map_err(|error| ServiceError::Execution(error.to_string()))?;
-                host.write_host(host_offsets[*member], &bytes)
-                    .map_err(|error| ServiceError::Execution(error.to_string()))?;
-                fallback_tensors += 1;
-            }
+    let mut read_requests = 0u64;
+    let mut peak_outstanding = 0u64;
+    let file_groups: Vec<ReadGroup> = groups
+        .iter()
+        .filter(|group| group.file_path.is_some())
+        .cloned()
+        .collect();
+    if !file_groups.is_empty() {
+        let (requests, peak) =
+            read_file_groups(host, &file_groups, concurrency, max_outstanding_bytes)
+                .map_err(ServiceError::Execution)?;
+        read_requests += requests;
+        peak_outstanding = peak.max(peak_outstanding);
+    }
+    for group in groups.iter().filter(|group| group.file_path.is_none()) {
+        for member in &group.members {
+            let tensor = &tensors[*member];
+            let length = usize::try_from(tensor.bytes)
+                .map_err(|_| ServiceError::Execution("staged tensor is too large".to_string()))?;
+            let mut bytes = vec![0u8; length];
+            model
+                .read_tensor_bytes(&tensor.name, 0, &mut bytes)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            host.write_host(host_offsets[*member], &bytes)
+                .map_err(|error| ServiceError::Execution(error.to_string()))?;
+            fallback_tensors += 1;
         }
     }
     let read_ns = crate::inference_service::duration_ns(read_started.elapsed());
@@ -500,6 +623,9 @@ pub fn read_tensors_into_host(
         bytes_read: total,
         read_groups: groups.len() as u64,
         coalesced_groups,
+        read_requests,
+        read_concurrency: concurrency as u32,
+        max_outstanding_bytes: peak_outstanding,
         read_ns,
         prepare_ns: read_ns,
         pinned_capacity: capacity,
@@ -555,5 +681,63 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(offsets, vec![0, 10]);
         assert!(groups[1].file_path.is_none());
+    }
+}
+
+#[cfg(test)]
+mod parallel_read_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn bounded_parallel_reads_are_byte_exact_and_respect_byte_limit() {
+        let engine = match Engine::new(0) {
+            Ok(engine) => engine,
+            Err(crate::staging::StagingError::Unsupported(_)) => {
+                println!("SKIP: CUDA driver unavailable");
+                return;
+            }
+            Err(error) => panic!("unexpected engine error: {error}"),
+        };
+        let path =
+            std::env::temp_dir().join(format!("ramforge-parallel-read-{}.bin", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let payload: Vec<u8> = (0..4096u64)
+            .map(|i| (i.wrapping_mul(7) & 0xff) as u8)
+            .collect();
+        file.write_all(&payload).unwrap();
+        file.flush().unwrap();
+        let host = engine.allocate(MemoryType::PinnedHost, 4096).unwrap();
+        let groups = vec![
+            ReadGroup {
+                file_path: Some(path.to_string_lossy().into_owned()),
+                file_offset: 0,
+                bytes: 2048,
+                members: vec![0],
+                host_offset: 0,
+            },
+            ReadGroup {
+                file_path: Some(path.to_string_lossy().into_owned()),
+                file_offset: 2048,
+                bytes: 2048,
+                members: vec![1],
+                host_offset: 2048,
+            },
+        ];
+        let (requests, peak) = read_file_groups(&host, &groups, 2, 2048).unwrap();
+        assert_eq!(requests, 2);
+        assert_eq!(peak, 2048, "byte limit must prevent both groups in flight");
+        let mut output = vec![0u8; 4096];
+        host.read_host(0, &mut output).unwrap();
+        assert_eq!(output, payload);
+        let mut host = host;
+        host.release().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 }

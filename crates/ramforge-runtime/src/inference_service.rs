@@ -27,7 +27,7 @@ use crate::staging::{Engine, StagingError};
 use crate::staging_plan::{StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest};
 use ramforge_core::{discover_model_set, Tokenizer};
 
-pub const INFERENCE_SERVICE_API_VERSION: u32 = 4;
+pub const INFERENCE_SERVICE_API_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +159,17 @@ struct PendingPipeline {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefetchStatus {
+    pub prepared: u64,
+    pub committed: u64,
+    pub aborted: u64,
+    pub bytes_prefetched: u64,
+    pub bytes_committed: u64,
+    pub bytes_wasted: u64,
+    pub hit_rate_permille: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceStatus {
     pub api_version: u32,
     pub state: ServiceState,
@@ -181,6 +192,7 @@ pub struct ServiceStatus {
     pub staging_plan: Option<StagingPlan>,
     pub staging_lifecycle: Option<StagingLifecycleStatus>,
     pub host_staging: HostStagingStatus,
+    pub prefetch: PrefetchStatus,
     pub pipeline_pending: bool,
     pub model_instance_id: Option<u64>,
     pub context_id: Option<u64>,
@@ -312,8 +324,16 @@ pub struct InferenceService {
     host_staging_mode: HostStagingMode,
     read_batching: ReadBatching,
     host_read_async: bool,
+    storage_concurrency: usize,
+    storage_max_outstanding_bytes: u64,
     pinned_pool: PinnedPool,
     last_host_staging: Option<HostStagingReport>,
+    prefetch_prepared: u64,
+    prefetch_committed: u64,
+    prefetch_aborted: u64,
+    prefetch_bytes: u64,
+    prefetch_committed_bytes: u64,
+    prefetch_wasted_bytes: u64,
     tensor_mappings: Option<HashMap<String, forge_core::TensorMappingInfo>>,
     pending_pipeline: Option<PendingPipeline>,
 }
@@ -338,8 +358,16 @@ impl InferenceService {
             host_staging_mode: HostStagingMode::Copy,
             read_batching: ReadBatching::Coalesced,
             host_read_async: false,
+            storage_concurrency: 1,
+            storage_max_outstanding_bytes: 0,
             pinned_pool: PinnedPool::new(0),
             last_host_staging: None,
+            prefetch_prepared: 0,
+            prefetch_committed: 0,
+            prefetch_aborted: 0,
+            prefetch_bytes: 0,
+            prefetch_committed_bytes: 0,
+            prefetch_wasted_bytes: 0,
             tensor_mappings: None,
             pending_pipeline: None,
         })
@@ -390,6 +418,12 @@ impl InferenceService {
 
     pub fn with_async_host_read(mut self, enabled: bool) -> Self {
         self.host_read_async = enabled;
+        self
+    }
+
+    pub fn with_storage_pipeline(mut self, concurrency: usize, max_outstanding_bytes: u64) -> Self {
+        self.storage_concurrency = concurrency.max(1);
+        self.storage_max_outstanding_bytes = max_outstanding_bytes;
         self
     }
 
@@ -485,6 +519,17 @@ impl InferenceService {
                 batching: self.read_batching,
                 last: self.last_host_staging.clone(),
                 pool: self.pinned_pool.stats(),
+            },
+            prefetch: PrefetchStatus {
+                prepared: self.prefetch_prepared,
+                committed: self.prefetch_committed,
+                aborted: self.prefetch_aborted,
+                bytes_prefetched: self.prefetch_bytes,
+                bytes_committed: self.prefetch_committed_bytes,
+                bytes_wasted: self.prefetch_wasted_bytes,
+                hit_rate_permille: (self.prefetch_prepared > 0).then(|| {
+                    ((self.prefetch_committed.saturating_mul(1000)) / self.prefetch_prepared) as u32
+                }),
             },
             pipeline_pending: self.pending_pipeline.is_some(),
             model_instance_id: model_id,
@@ -753,6 +798,8 @@ impl InferenceService {
                 mappings,
                 mode,
                 batching,
+                self.storage_concurrency,
+                self.storage_max_outstanding_bytes,
                 *layer,
             )?;
             if let Some(total) = aggregate.as_mut() {
@@ -892,14 +939,20 @@ impl InferenceService {
                 .info()
                 .map_err(|error| ServiceError::Execution(error.to_string()))?
                 .capacity;
-            let job =
-                match crate::host_staging::HostReadJob::prepare(model, &tensors, mappings, host) {
-                    Ok(job) => job,
-                    Err(error) => {
-                        let _ = session.discard_pending_cuda();
-                        return Err(error);
-                    }
-                };
+            let job = match crate::host_staging::HostReadJob::prepare(
+                model,
+                &tensors,
+                mappings,
+                host,
+                self.storage_concurrency,
+                self.storage_max_outstanding_bytes,
+            ) {
+                Ok(job) => job,
+                Err(error) => {
+                    let _ = session.discard_pending_cuda();
+                    return Err(error);
+                }
+            };
             let report = HostStagingReport {
                 mode: HostStagingMode::Direct,
                 batching: ReadBatching::Coalesced,
@@ -907,6 +960,9 @@ impl InferenceService {
                 bytes_read: total,
                 read_groups: 0,
                 coalesced_groups: 0,
+                read_requests: 0,
+                read_concurrency: self.storage_concurrency as u32,
+                max_outstanding_bytes: 0,
                 read_ns: 0,
                 prepare_ns: duration_ns(prepare_started.elapsed()),
                 pinned_capacity: capacity,
@@ -915,6 +971,8 @@ impl InferenceService {
             };
             plan.host_staging = Some(report.clone());
             self.last_host_staging = Some(report.clone());
+            self.prefetch_prepared += 1;
+            self.prefetch_bytes = self.prefetch_bytes.saturating_add(total);
             self.pending_pipeline = Some(PendingPipeline {
                 plan: plan.clone(),
                 layers: plan.accepted_layers.clone(),
@@ -937,6 +995,8 @@ impl InferenceService {
             self.host_staging_mode,
             self.read_batching,
             mappings,
+            self.storage_concurrency,
+            self.storage_max_outstanding_bytes,
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -966,6 +1026,8 @@ impl InferenceService {
         let host_staging = host_report;
         plan.host_staging = Some(host_staging.clone());
         self.last_host_staging = Some(host_staging.clone());
+        self.prefetch_prepared += 1;
+        self.prefetch_bytes = self.prefetch_bytes.saturating_add(total);
         self.pending_pipeline = Some(PendingPipeline {
             plan: plan.clone(),
             layers: plan.accepted_layers.clone(),
@@ -1092,6 +1154,10 @@ impl InferenceService {
         self.staged_layers = layers.clone();
         self.staging_status = statuses;
         self.staging_plan = Some(pending.plan.clone());
+        self.prefetch_committed += 1;
+        self.prefetch_committed_bytes = self
+            .prefetch_committed_bytes
+            .saturating_add(host_staging.bytes_read);
         Ok(PipelineCommitReport {
             layers,
             transfer_bytes: transfer.bytes,
@@ -1122,6 +1188,10 @@ impl InferenceService {
         if let Some(engine) = self.staging_engine.as_ref() {
             let _ = engine.wait();
         }
+        self.prefetch_aborted += 1;
+        self.prefetch_wasted_bytes = self
+            .prefetch_wasted_bytes
+            .saturating_add(pending.host_staging.bytes_read);
         if let Some(job) = pending.read_job.take() {
             match job.finish() {
                 Ok((host, _, _, _)) => self.pinned_pool.release(host),
@@ -1243,7 +1313,16 @@ impl InferenceService {
             if failure.is_none() {
                 for layer in &plan.newly_staged_layers {
                     match stage_layer_data(
-                        model, session, engine, pool, mappings, mode, batching, *layer,
+                        model,
+                        session,
+                        engine,
+                        pool,
+                        mappings,
+                        mode,
+                        batching,
+                        self.storage_concurrency,
+                        self.storage_max_outstanding_bytes,
+                        *layer,
                     ) {
                         Ok((_, report)) => {
                             if let Some(total) = host_aggregate.as_mut() {
@@ -1284,7 +1363,16 @@ impl InferenceService {
                             continue;
                         }
                         if let Err(error) = stage_layer_data(
-                            model, session, engine, pool, mappings, mode, batching, *layer,
+                            model,
+                            session,
+                            engine,
+                            pool,
+                            mappings,
+                            mode,
+                            batching,
+                            self.storage_concurrency,
+                            self.storage_max_outstanding_bytes,
+                            *layer,
                         ) {
                             rollback_errors.push(format!("restage layer {layer}: {error}"));
                         }
@@ -1938,6 +2026,8 @@ fn stage_layer_data(
     mappings: &HashMap<String, forge_core::TensorMappingInfo>,
     mode: HostStagingMode,
     batching: ReadBatching,
+    concurrency: usize,
+    max_outstanding_bytes: u64,
     layer: u32,
 ) -> Result<(StagedLayerStatus, HostStagingReport), ServiceError> {
     #[cfg(debug_assertions)]
@@ -1975,7 +2065,14 @@ fn stage_layer_data(
     let prepare_started = Instant::now();
     let (host, pinned_reused) = pool.acquire(engine, total)?;
     let (offsets, mut report) = match crate::host_staging::read_tensors_into_host(
-        model, &tensors, &host, mode, batching, mappings,
+        model,
+        &tensors,
+        &host,
+        mode,
+        batching,
+        mappings,
+        concurrency,
+        max_outstanding_bytes,
     ) {
         Ok(result) => result,
         Err(error) => {

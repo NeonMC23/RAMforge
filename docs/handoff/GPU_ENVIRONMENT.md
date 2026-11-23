@@ -329,6 +329,29 @@ Qwen2.5-7B, four layers (560,023,552 B), warm page cache:
 - Split GGUF: layers 20–23 read directly (3 groups, 560,496,640 B) and
   generated coherent text; direct bytes matched model reads for two shard files.
 
+## Bounded storage concurrency and prefetch
+
+Qwen four-layer read time, warm cache, one cycle per configuration:
+
+| Batching | c=1 | c=2 | c=4 |
+|---|---|---|---|
+| Coalesced | 59.9 ms | 61.0 ms | 83.5 ms |
+| Per-tensor | 67.9 ms | 67.1 ms | 59.9 ms |
+
+Concurrency does not help coalesced reads and can hurt. Per-tensor c=4 improves
+that path but is still no better than coalesced c=1. Default: coalesced,
+concurrency 1. Outstanding-byte limits are enforced; the unit test verifies a
+2048-byte limit prevents two 2048-byte groups from being in flight together.
+
+Predictive prefetch is application-level (known next selection). SmolLM2:
+three prefetch/commit cycles, 15,040,512 bytes prefetched and committed, zero
+wasted, 1000 permille hit rate. Abort test: one abort + one commit yields
+500 permille with non-zero wasted bytes.
+
+`io_uring` was rejected: runtime libraries exist and the sysctl is enabled, but
+no development headers are installed and the coalesced pread path already
+saturates the warm-cache workload. No dependency was added.
+
 ## Reproduction
 
 ```sh

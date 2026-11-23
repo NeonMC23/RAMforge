@@ -781,10 +781,69 @@ This does not change graph consumption: the prepared bytes are copied into the
 same pending CUDA tensors and committed through the existing invalidation and
 corruption-controlled path.
 
+## Bounded storage pipeline and prediction
+
+### Storage backend decision
+
+The target has NVMe storage and `io_uring` runtime libraries, but no liburing
+development headers. A raw-syscall io_uring backend was not added: the validated
+coalesced `pread` path already reads Qwen layer data at roughly 8 GB/s from a
+warm page cache, and no evidence showed syscall overhead as the limiter. The
+fallback remains explicit and portable.
+
+### Bounded multi-request reads
+
+`read_file_groups` supports bounded parallel workers with:
+
+- configurable concurrency;
+- a maximum outstanding-byte limit, enforced with a condition variable;
+- deterministic queue order and error propagation;
+- a single-group admission exception when no other request is active;
+- file descriptors cached per worker;
+- exact disjoint host offsets.
+
+Measured Qwen four-layer reads (warm cache, one cycle each):
+
+| Batching | Concurrency 1 | 2 | 4 |
+|---|---|---|---|
+| Coalesced | 59.9 ms | 61.0 ms | 83.5 ms |
+| Per-tensor | 67.9 ms | 67.1 ms | 59.9 ms |
+
+Coalesced reads do not benefit from more concurrency; 2–4 workers add
+contention. Per-tensor concurrency 4 improves that path, but remains no better
+than coalesced concurrency 1. The default stays coalesced with concurrency 1;
+advanced users may raise concurrency. A unit test verifies byte-exact output
+and that a 2048-byte outstanding limit prevents two 2048-byte groups from being
+in flight simultaneously.
+
+### Predictive prefetch
+
+Prediction is application-level and explicit: pipeline mode prepares the known
+next selection in the pending slot while the current selection generates. No
+fabricated per-layer execution-order signal is used. The prefetch window is one
+complete pending selection, bounded by the existing active/pending VRAM budget.
+
+`status.prefetch` reports prepared/committed/aborted counts, prefetched,
+committed and wasted bytes, and hit-rate permille. A three-cycle SmolLM2 run
+prefetched and committed 15,040,512 bytes with no waste. Aborting a prepared
+selection records wasted bytes and lowers the hit rate; the integration test
+asserts one abort plus one commit yields 500 permille.
+
+### Resource bounds
+
+- Storage concurrency and outstanding bytes are explicit.
+- Pinned memory is bounded by the pinned-pool limit.
+- Active and pending VRAM remain bounded by the effective staged budget.
+- Backpressure is provided by worker count, outstanding-byte waiting and pinned
+  acquisition; no unbounded queue exists.
+- Cancellation waits for in-flight `pread` workers; buffers are recycled only
+  after join.
+
 ## Decision
 
-**HOST STAGING PIPELINE OPTIMIZED — DIRECT COALESCED PINNED READS AND ASYNC HOST
-READ OVERLAP MEASURED — ~7% END-TO-END QWEN IMPROVEMENT.**
+**BOUNDED STORAGE PIPELINE IMPLEMENTED — COALESCED PRE-READ REMAINS BEST —
+PREDICTIVE PREFETCH ACCOUNTED — ~7% END-TO-END QWEN IMPROVEMENT FROM HOST-READ
+OVERLAP.**
 
 - Direct-to-pinned reads eliminate the pageable intermediate copy.
 - Coalesced GGUF ranges reduce read calls and read time.
@@ -792,6 +851,8 @@ READ OVERLAP MEASURED — ~7% END-TO-END QWEN IMPROVEMENT.**
 - Cached tensor mappings remove a recurring ~100 ms preparation cost.
 - Async host reads hide file-to-pinned work under generation.
 - Split GGUF direct reads and real graph consumption are verified.
+- Parallel per-tensor reads help only marginally; coalesced sequential remains
+  the default.
 - Transfer/compute overlap remains slower than synchronous on this hardware.
 
 - Calibration measures pinned/pageable bandwidth, latency, chunking and

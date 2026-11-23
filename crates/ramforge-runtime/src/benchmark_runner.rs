@@ -16,7 +16,7 @@ use crate::inference_service::{
 };
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 12;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
@@ -136,6 +136,8 @@ pub struct BenchmarkConfig {
     pub host_staging_mode: crate::host_staging::HostStagingMode,
     pub read_batching: crate::host_staging::ReadBatching,
     pub pinned_pool_bytes: u64,
+    pub storage_concurrency: usize,
+    pub storage_max_outstanding_bytes: u64,
 }
 
 impl Default for BenchmarkConfig {
@@ -153,6 +155,8 @@ impl Default for BenchmarkConfig {
             host_staging_mode: crate::host_staging::HostStagingMode::Copy,
             read_batching: crate::host_staging::ReadBatching::Coalesced,
             pinned_pool_bytes: 0,
+            storage_concurrency: 1,
+            storage_max_outstanding_bytes: 0,
         }
     }
 }
@@ -201,6 +205,10 @@ pub fn run_benchmark(
             config.host_staging_mode,
             config.read_batching,
             config.pinned_pool_bytes,
+        )
+        .with_storage_pipeline(
+            config.storage_concurrency,
+            config.storage_max_outstanding_bytes,
         )
         .with_staging_request(staging_request);
     let load_started = Instant::now();
@@ -402,6 +410,8 @@ mod tests {
             host_staging_mode: crate::host_staging::HostStagingMode::Copy,
             read_batching: crate::host_staging::ReadBatching::Coalesced,
             pinned_pool_bytes: 0,
+            storage_concurrency: 1,
+            storage_max_outstanding_bytes: 0,
         }
         .validate()
         .is_err());
@@ -418,6 +428,8 @@ mod tests {
             host_staging_mode: crate::host_staging::HostStagingMode::Copy,
             read_batching: crate::host_staging::ReadBatching::Coalesced,
             pinned_pool_bytes: 0,
+            storage_concurrency: 1,
+            storage_max_outstanding_bytes: 0,
         }
         .validate()
         .is_err());

@@ -492,6 +492,10 @@ fn async_host_read_abort_and_commit_preserve_lifecycle() {
     assert!(!generate(&mut service).is_empty());
     let commit = service.commit_staged_pipeline().expect("commit host read");
     assert!(commit.host_staging.bytes_read > 0);
+    let prefetch = service.status().prefetch;
+    assert_eq!(prefetch.committed, 1);
+    assert_eq!(prefetch.aborted, 1);
+    assert_eq!(prefetch.hit_rate_permille, Some(500));
     let resident: Vec<u32> = service
         .status()
         .staged_layers

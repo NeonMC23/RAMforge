@@ -249,6 +249,9 @@ facts; budget planning remains RAMforge policy.
 - `--read-batching tensor|coalesced`: coalesce exact-adjacent tensor ranges in
   the same GGUF file (direct mode);
 - `--pinned-pool SIZE`: bounded reusable pinned host memory (`0` disables);
+- `--storage-concurrency N`: bounded parallel storage reads (default 1);
+- `--storage-max-bytes SIZE`: maximum outstanding read bytes (`0` = bounded by
+  concurrency only);
 - `--host-read-async`: pipeline mode only; read file-to-pinned data on a worker
   thread while the active selection generates.
 
@@ -258,9 +261,17 @@ partial read never reaches commit. The worker owns the pinned buffer until join;
 abort and unload wait before recycling it.
 
 `status.host_staging` reports mode, batching, bytes read, read groups,
-coalesced groups, read/prepare durations, pinned capacity/reuse and pool
-allocation/reuse/peak/idle bytes. Plan `host_staging` reports the same for the
-prepared selection.
+coalesced groups, read requests, concurrency, peak outstanding bytes,
+read/prepare durations, pinned capacity/reuse and pool allocation/reuse/peak/
+idle bytes. Plan `host_staging` reports the same for the prepared selection.
+`status.prefetch` reports prepared/committed/aborted counts, prefetched/
+committed/wasted bytes and hit rate in permille.
+
+Storage backend is positional `pread`. `io_uring` runtime libraries exist on the
+target, but development headers are absent and no measured benefit justified a
+raw-syscall backend; the fallback is explicit. Parallelism is bounded by request
+count, outstanding bytes and pinned capacity. Coalesced reads remain the default
+because bounded parallel per-tensor reads did not beat coalesced reads.
 
 ### Pipelined replacement
 
