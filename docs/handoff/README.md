@@ -2,6 +2,8 @@
 
 This directory is the transfer package for a new developer or agent arriving without the prior conversation. It documents the repository as it exists, separates verified facts from investigation records and proposals, and identifies the planned replacement numerical core as **ForgeCore**.
 
+> **Latest audit (2026-11-25):** [AUDIT_2026-11-25.md](AUDIT_2026-11-25.md) is the current evidence-driven assessment of capacity, throughput, overflow behavior, forgeCORE/native capability gaps, and the prioritized engineering roadmap. Where older documents disagree with it, prefer the audit's measured findings and verified commit pins.
+
 ## Reading order
 
 1. [PROJECT_STATE.md](PROJECT_STATE.md) — what exists, what is supported, and the current conclusion.
