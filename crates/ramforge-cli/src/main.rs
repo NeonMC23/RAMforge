@@ -122,9 +122,7 @@ impl ContextArgs {
             offload_kqv: Some(!self.no_kv_offload),
             op_offload: Some(!self.no_op_offload),
         };
-        config
-            .validate()
-            .map_err(|error| anyhow::anyhow!(error))?;
+        config.validate().map_err(|error| anyhow::anyhow!(error))?;
         Ok(config)
     }
 }
@@ -467,11 +465,15 @@ enum Commands {
         #[arg(long)]
         staged_auto: bool,
 
+        /// Dense residency policy: off or auto (enable bounded staging when the model exceeds RAM)
+        #[arg(long, default_value = "off")]
+        residency: String,
+
         /// Safety margin subtracted from observed free VRAM (default 256M)
         #[arg(long)]
         staged_margin: Option<String>,
 
-        /// Automatic residency ordering: ascending, smallest-first, resident-first
+        /// Automatic residency ordering: ascending, smallest-first, largest-first, resident-first
         #[arg(long = "selection-policy")]
         selection_policy: Option<String>,
 
@@ -602,7 +604,7 @@ enum Commands {
         #[arg(long)]
         strategy: Option<String>,
 
-        /// Automatic residency ordering: ascending, smallest-first, resident-first
+        /// Automatic residency ordering: ascending, smallest-first, largest-first, resident-first
         #[arg(long = "selection-policy")]
         selection_policy: Option<String>,
 
@@ -1173,6 +1175,7 @@ fn main() {
             staged_layers,
             staged_budget,
             staged_auto,
+            residency,
             staged_margin,
             selection_policy,
             host_staging,
@@ -1199,6 +1202,7 @@ fn main() {
                 staged_layers,
                 staged_budget,
                 staged_auto,
+                residency,
                 staged_margin,
                 selection_policy,
                 host_staging,
@@ -1732,9 +1736,10 @@ fn parse_selection_policy(value: &str) -> anyhow::Result<ramforge_runtime::Selec
     match value {
         "ascending" => Ok(ramforge_runtime::SelectionPolicy::Ascending),
         "smallest-first" => Ok(ramforge_runtime::SelectionPolicy::SmallestFirst),
+        "largest-first" => Ok(ramforge_runtime::SelectionPolicy::LargestFirst),
         "resident-first" => Ok(ramforge_runtime::SelectionPolicy::ResidentFirst),
         other => Err(anyhow::anyhow!(
-            "unknown selection policy '{other}' (ascending, smallest-first, resident-first)"
+            "unknown selection policy '{other}' (ascending, smallest-first, largest-first, resident-first)"
         )),
     }
 }
@@ -2510,6 +2515,7 @@ fn run_throughput_benchmark(
     staged_layers: Vec<u32>,
     staged_budget: Option<String>,
     staged_auto: bool,
+    residency: String,
     staged_margin: Option<String>,
     selection_policy: Option<String>,
     host_staging: Option<String>,
@@ -2553,6 +2559,47 @@ fn run_throughput_benchmark(
         },
         ..MachineProfileConfig::default()
     });
+    let mut staged_auto = staged_auto;
+    match residency.to_ascii_lowercase().as_str() {
+        "off" => {}
+        "auto" => {
+            let model_bytes = model_set.total_file_bytes();
+            let budget = ram_bytes.or_else(|| {
+                machine.memory.os_available_bytes.as_ref().copied()
+            });
+            let Some(budget) = budget else {
+                return Err(anyhow::anyhow!(
+                    "--residency auto requires --ram or observable system memory"
+                ));
+            };
+            let decision = ramforge_runtime::decide_dense_residency(
+                model_bytes,
+                budget,
+                machine.backend_inventory.gpu_offload_available,
+            );
+            if !decision.feasible {
+                return Err(anyhow::anyhow!(
+                    "--residency auto: {} (model {}, RAM budget {})",
+                    decision.reason,
+                    format_bytes(model_bytes),
+                    format_bytes(budget)
+                ));
+            }
+            staged_auto = decision.stage_layers;
+            eprintln!(
+                "Residency auto: model {} / RAM budget {}; stage_layers={} ({})",
+                format_bytes(model_bytes),
+                format_bytes(budget),
+                decision.stage_layers,
+                decision.reason
+            );
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown --residency '{other}' (expected off or auto)"
+            ))
+        }
+    }
     let plan = RuntimePlan::resolve_with_context(
         &machine,
         &requirements,
@@ -2678,15 +2725,39 @@ fn run_throughput_benchmark(
             report.context_setup_major_faults,
             report.context_setup_minor_faults,
         );
+        println!(
+            "mapping: mapped={:?} resident_before/load/after={:?}/{:?}/{:?} pss_after={:?}",
+            report.mapping_mapped_bytes,
+            report.mapping_resident_bytes_before,
+            report.mapping_resident_bytes_after_load,
+            report.mapping_resident_bytes_after_generation,
+            report.mapping_pss_bytes_after_generation,
+        );
         for run in &report.runs_detail {
             println!(
-                "run {}: storage_read={:?} bytes rchar={:?} bytes faults={:?}/{:?}",
+                "run {}: storage_read={:?} bytes rchar={:?} bytes faults={:?}/{:?} pss={:?} pss_file={:?} anon={:?} swap={:?}",
                 run.index,
                 run.storage_read_bytes,
                 run.rchar_bytes,
                 run.major_faults,
                 run.minor_faults,
+                run.pss_bytes,
+                run.pss_file_bytes,
+                run.anonymous_bytes,
+                run.swap_bytes,
             );
+            for token in &run.token_io {
+                println!(
+                    "  token {:?} {}: read={:?} rchar={:?} faults={:?}/{:?} elapsed_ms={:.1}",
+                    token.phase,
+                    token.token_index,
+                    token.storage_read_bytes,
+                    token.rchar_bytes,
+                    token.major_faults,
+                    token.minor_faults,
+                    token.elapsed_ns as f64 / 1e6,
+                );
+            }
         }
         println!(
             "condition={} ({})",
@@ -3562,10 +3633,10 @@ fn run_plan(
         ramforge_runtime::plan::plan_model(&gguf, ram_bytes).map_err(|e| anyhow::anyhow!(e))?;
 
     let context_tokens = context.unwrap_or(2048);
-    let kv_type_k = ramforge_runtime::KvCacheType::parse(&kv_type_k)
-        .map_err(|error| anyhow::anyhow!(error))?;
-    let kv_type_v = ramforge_runtime::KvCacheType::parse(&kv_type_v)
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let kv_type_k =
+        ramforge_runtime::KvCacheType::parse(&kv_type_k).map_err(|error| anyhow::anyhow!(error))?;
+    let kv_type_v =
+        ramforge_runtime::KvCacheType::parse(&kv_type_v).map_err(|error| anyhow::anyhow!(error))?;
     let mut requirements = model_requirements(
         &gguf,
         ModelRequirementConfig {
@@ -4416,8 +4487,8 @@ fn run_forgecore_inference(
     // device before parsing/loading so an unavailable request fails directly;
     // RAMforge does not implicitly switch devices or backends.
     let registry = DeviceRegistry::discover();
-    let execution =
-        ExecutionConfig::new(device, threads as usize, None, false).map_err(|error| anyhow::anyhow!(error))?;
+    let execution = ExecutionConfig::new(device, threads as usize, None, false)
+        .map_err(|error| anyhow::anyhow!(error))?;
     let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
     let primary_path = model_set.primary_path().to_path_buf();
     let shard_paths: Vec<PathBuf> = model_set
@@ -4908,9 +4979,7 @@ fn run_forgecore_inference(
         .info()
         .architecture
         .unwrap_or_else(|| "unknown".to_string());
-    if architecture.contains("deepseek")
-        && context_config.kv_type_k != context_config.kv_type_v
-    {
+    if architecture.contains("deepseek") && context_config.kv_type_k != context_config.kv_type_v {
         return Err(anyhow::anyhow!(
             "MLA architectures require matching K and V cache types; got {:?} and {:?}",
             context_config.kv_type_k,
@@ -4974,9 +5043,7 @@ fn run_forgecore_inference(
         .open_context(ForgeCoreContextOptions {
             n_ctx: Some(requested_ctx),
             n_threads: threads as usize,
-            n_threads_batch: context_config
-                .threads_batch
-                .map(|value| value as usize),
+            n_threads_batch: context_config.threads_batch.map(|value| value as usize),
             n_batch: context_config.batch_tokens,
             n_ubatch: context_config.ubatch_tokens,
             n_seq_max: context_config.sequence_max,

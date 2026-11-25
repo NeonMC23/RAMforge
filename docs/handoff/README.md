@@ -8,6 +8,8 @@ This directory is the transfer package for a new developer or agent arriving wit
 
 > **MoE routing milestone (2026-11-25):** [MOE_EXPERT_RESIDENCY_2026-11-25.md](MOE_EXPERT_RESIDENCY_2026-11-25.md) documents verified read-only CPU expert-routing observation, measured DeepSeek2 expert locality, per-layer expert accounting, cache/prefetch simulations, the exact expert-granularity blocker, and the native capability proposal.
 
+> **Dense overflow milestone (2026-11-25):** [DENSE_OVERFLOW_2026-11-25.md](DENSE_OVERFLOW_2026-11-25.md) measures the 32B dense storage-bound baseline, adds per-token storage/fault and PSS/mapping instrumentation, introduces the `--residency auto` bounded staging policy, and reports +24.8% decode / 13-32% fewer reads along with the negative experiments.
+
 ## Reading order
 
 1. [PROJECT_STATE.md](PROJECT_STATE.md) — what exists, what is supported, and the current conclusion.

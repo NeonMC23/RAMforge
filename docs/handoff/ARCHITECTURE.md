@@ -2,7 +2,7 @@
 
 This document describes the code that exists now. The legacy RAMforge executor remains the historical in-process CPU path. The explicit `forgecore` backend delegates model execution to the pinned llama.cpp/ggml tree through forgeCORE, and RAMforge owns the surrounding policy, accounting, admission, lifecycle, reporting, and CLI behavior. CPU, GPU, and hybrid placement are implemented and confirmed by native readback; intra-decode page eviction remains unimplemented.
 
-> **Updated 2026-11-25:** context configuration now forwards KV dtypes, flash attention, batch/micro-batch, sequences, and offload flags; dynamic staging can be combined with static GPU offload. See [INFERENCE_CORE_OPTIMIZATION_2026-11-25.md](INFERENCE_CORE_OPTIMIZATION_2026-11-25.md). Read-only CPU expert-routing observation is available through the existing graph callback; see [MOE_EXPERT_RESIDENCY_2026-11-25.md](MOE_EXPERT_RESIDENCY_2026-11-25.md). Statements later in this document that describe the adapter as CPU-only are historical.
+> **Updated 2026-11-25:** context configuration now forwards KV dtypes, flash attention, batch/micro-batch, sequences, and offload flags; dynamic staging can be combined with static GPU offload. See [INFERENCE_CORE_OPTIMIZATION_2026-11-25.md](INFERENCE_CORE_OPTIMIZATION_2026-11-25.md). Read-only CPU expert-routing observation is available through the existing graph callback; see [MOE_EXPERT_RESIDENCY_2026-11-25.md](MOE_EXPERT_RESIDENCY_2026-11-25.md). Dense `--residency auto`, per-token I/O, and PSS/mapping instrumentation are documented in [DENSE_OVERFLOW_2026-11-25.md](DENSE_OVERFLOW_2026-11-25.md). Statements later in this document that describe the adapter as CPU-only are historical.
 
 ## System flow
 

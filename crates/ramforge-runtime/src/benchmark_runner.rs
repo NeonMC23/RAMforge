@@ -11,14 +11,15 @@ use serde::{Deserialize, Serialize};
 use crate::gpu_observability::GpuObservability;
 use crate::inference_service::StagedLayerStatus;
 use crate::inference_service::{
-    GenerationOptions, InferenceService, ServiceError, StagingLifecycleStatus,
+    GenerationOptions, InferenceService, ServiceError, StagingLifecycleStatus, TokenIo,
     INFERENCE_SERVICE_API_VERSION,
 };
 use crate::memory_report::process_io;
+use crate::page_residency::model_mapping_residency;
 use crate::residency_engine::process_faults;
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 17;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 18;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
@@ -39,6 +40,12 @@ pub struct BenchmarkRun {
     pub read_syscalls: Option<u64>,
     pub major_faults: Option<u64>,
     pub minor_faults: Option<u64>,
+    pub pss_bytes: Option<u64>,
+    pub pss_file_bytes: Option<u64>,
+    pub pss_anon_bytes: Option<u64>,
+    pub anonymous_bytes: Option<u64>,
+    pub swap_bytes: Option<u64>,
+    pub token_io: Vec<TokenIo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,6 +93,13 @@ pub struct BenchmarkReport {
     pub context_setup_rchar_bytes: Option<u64>,
     pub context_setup_major_faults: Option<u64>,
     pub context_setup_minor_faults: Option<u64>,
+    /// Model-mapping residency from `/proc/self/smaps`; `rss` includes shared
+    /// file pages, `pss` apportions them. Not RAMforge-controlled residency.
+    pub mapping_mapped_bytes: Option<u64>,
+    pub mapping_resident_bytes_before: Option<u64>,
+    pub mapping_resident_bytes_after_load: Option<u64>,
+    pub mapping_resident_bytes_after_generation: Option<u64>,
+    pub mapping_pss_bytes_after_generation: Option<u64>,
     pub runs_detail: Vec<BenchmarkRun>,
     pub median_generation_tokens_per_second: f64,
     pub min_generation_tokens_per_second: f64,
@@ -207,6 +221,8 @@ pub fn run_benchmark(
     let plan_snapshot = plan.clone();
     let device_id = plan_snapshot.effective.device_id.clone();
     let requested_gpu_layers = plan_snapshot.requested_gpu_layers;
+    let model_path_for_mapping = std::path::PathBuf::from(&plan.model_path);
+    let mapping_before = model_mapping_residency(&model_path_for_mapping);
     let free_before = device_free_bytes(&device_id);
     let staging_request = crate::staging_plan::StagingRequest {
         layers: config.staged_layers.clone(),
@@ -231,6 +247,7 @@ pub fn run_benchmark(
     service.load()?;
     let model_load_ns = duration_ns(load_started.elapsed());
     let load_status = service.status();
+    let mapping_after_load = model_mapping_residency(&model_path_for_mapping);
     let free_after_load = device_free_bytes(&device_id);
     let options = GenerationOptions {
         prompt: config.prompt.clone(),
@@ -251,9 +268,8 @@ pub fn run_benchmark(
     context_ns.push(duration_ns(context_started.elapsed()));
     let io_after_setup = process_io();
     let (minor_after_setup, major_after_setup) = process_faults();
-    let counter_delta = |before: Option<u64>, after: Option<u64>| {
-        Some(after?.saturating_sub(before?))
-    };
+    let counter_delta =
+        |before: Option<u64>, after: Option<u64>| Some(after?.saturating_sub(before?));
     let context_setup_read_bytes = counter_delta(
         io_before_setup.as_ref().map(|io| io.read_bytes),
         io_after_setup.as_ref().map(|io| io.read_bytes),
@@ -293,9 +309,16 @@ pub fn run_benchmark(
             read_syscalls: report.stats.read_syscalls,
             major_faults: report.stats.major_faults,
             minor_faults: report.stats.minor_faults,
+            pss_bytes: report.stats.pss_bytes,
+            pss_file_bytes: report.stats.pss_file_bytes,
+            pss_anon_bytes: report.stats.pss_anon_bytes,
+            anonymous_bytes: report.stats.anonymous_bytes,
+            swap_bytes: report.stats.swap_bytes,
+            token_io: report.stats.token_io,
         });
     }
     let memory_after_generation = Some(service.memory_observability()?);
+    let mapping_after_generation = model_mapping_residency(&model_path_for_mapping);
     let status_after_generation = service.status();
     let staged_layers = status_after_generation.staged_layers;
     let staging_plan = status_after_generation.staging_plan;
@@ -363,6 +386,15 @@ pub fn run_benchmark(
         context_setup_rchar_bytes,
         context_setup_major_faults,
         context_setup_minor_faults,
+        mapping_mapped_bytes: mapping_after_generation.as_ref().map(|value| value.mapped_bytes),
+        mapping_resident_bytes_before: mapping_before.as_ref().map(|value| value.rss_bytes),
+        mapping_resident_bytes_after_load: mapping_after_load.as_ref().map(|value| value.rss_bytes),
+        mapping_resident_bytes_after_generation: mapping_after_generation
+            .as_ref()
+            .map(|value| value.rss_bytes),
+        mapping_pss_bytes_after_generation: mapping_after_generation
+            .as_ref()
+            .map(|value| value.pss_bytes),
         median_decode_tokens_per_second: if decode_rates.is_empty() {
             None
         } else {

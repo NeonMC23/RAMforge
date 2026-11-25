@@ -20,6 +20,7 @@ pub mod backend;
 pub mod benchmark_runner;
 pub mod capacity;
 pub mod context_config;
+pub mod dense_residency;
 pub mod host_staging;
 pub mod hw_calibration;
 pub mod cgroup;
@@ -101,6 +102,7 @@ pub use benchmark_runner::{
     run_benchmark, BenchmarkConfig, BenchmarkReport, BenchmarkRun, BENCHMARK_SCHEMA_VERSION,
 };
 pub use context_config::{ContextConfig, FlashAttentionMode, KvCacheType};
+pub use dense_residency::{decide_dense_residency, DenseResidencyDecision};
 pub use capacity::{expert_accounting, ExpertAccounting};
 pub use calibration_compatibility::{
     CalibrationCompatibility, CompatibilityClass, CompatibilityTarget, DimensionResult,

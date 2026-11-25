@@ -13,7 +13,49 @@ pub enum SelectionPolicy {
     #[default]
     Ascending,
     SmallestFirst,
+    LargestFirst,
     ResidentFirst,
+}
+
+/// Deterministic candidate ordering for automatic staging.
+///
+/// `size` is the native staged-layer byte size when known. `resident` reports
+/// whether the layer is already staged in the current context. Unknown sizes
+/// sort after known sizes for smallest-first and before known sizes for
+/// largest-first only when the value is actually unknown; this function never
+/// invents a size.
+pub fn order_candidate_layers<F, G>(
+    policy: SelectionPolicy,
+    layers: Vec<u32>,
+    mut size: F,
+    resident: G,
+) -> Vec<u32>
+where
+    F: FnMut(u32) -> Option<u64>,
+    G: Fn(u32) -> bool,
+{
+    let mut ordered = layers;
+    match policy {
+        SelectionPolicy::Ascending => {}
+        SelectionPolicy::SmallestFirst => {
+            ordered.sort_by_key(|layer| (size(*layer).unwrap_or(u64::MAX), *layer));
+        }
+        SelectionPolicy::LargestFirst => {
+            ordered.sort_by_key(|layer| {
+                (std::cmp::Reverse(size(*layer).unwrap_or(0)), *layer)
+            });
+        }
+        SelectionPolicy::ResidentFirst => {
+            ordered.sort_by_key(|layer| {
+                (
+                    !resident(*layer),
+                    size(*layer).unwrap_or(u64::MAX),
+                    *layer,
+                )
+            });
+        }
+    }
+    ordered
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,5 +148,67 @@ pub struct StagingPlan {
 impl StagingPlan {
     pub fn to_json(&self) -> Result<serde_json::Value, String> {
         serde_json::to_value(self).map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn size(layer: u32) -> Option<u64> {
+        Some(match layer {
+            0 => 100,
+            1 => 300,
+            2 => 200,
+            _ => 50,
+        })
+    }
+
+    #[test]
+    fn policies_order_layers_deterministically() {
+        let layers = vec![0, 1, 2];
+        assert_eq!(
+            order_candidate_layers(SelectionPolicy::Ascending, layers.clone(), size, |_| false),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            order_candidate_layers(
+                SelectionPolicy::SmallestFirst,
+                layers.clone(),
+                size,
+                |_| false
+            ),
+            vec![0, 2, 1]
+        );
+        assert_eq!(
+            order_candidate_layers(
+                SelectionPolicy::LargestFirst,
+                layers.clone(),
+                size,
+                |_| false
+            ),
+            vec![1, 2, 0]
+        );
+        assert_eq!(
+            order_candidate_layers(
+                SelectionPolicy::ResidentFirst,
+                layers,
+                size,
+                |layer| layer == 2
+            ),
+            vec![2, 0, 1]
+        );
+    }
+
+    #[test]
+    fn unknown_sizes_do_not_claim_a_measurement() {
+        let ordered = order_candidate_layers(
+            SelectionPolicy::SmallestFirst,
+            vec![0, 1, 2],
+            |layer| (layer != 1).then_some(10),
+            |_| false,
+        );
+        // Known layers first, unknown last, stable by layer id.
+        assert_eq!(ordered, vec![0, 2, 1]);
     }
 }

@@ -269,6 +269,60 @@ pub fn process_io() -> Option<ProcessIo> {
     None
 }
 
+/// Resident/PSS split from `/proc/self/smaps_rollup`.
+///
+/// `rss` includes shared file pages; `pss` apportions them. `pss_file` is the
+/// file-backed share when the kernel reports it. These are process-wide values,
+/// not RAMforge-managed bytes or model-only residency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessMemorySplit {
+    pub rss_bytes: u64,
+    pub pss_bytes: u64,
+    pub pss_file_bytes: Option<u64>,
+    pub pss_anon_bytes: Option<u64>,
+    pub anonymous_bytes: u64,
+    pub swap_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_memory_split() -> Option<ProcessMemorySplit> {
+    let text = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    Some(parse_smaps_rollup(&text))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_smaps_rollup(text: &str) -> ProcessMemorySplit {
+    let mut split = ProcessMemorySplit::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        let Some(kib) = value.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(kib) = kib.parse::<u64>() else {
+            continue;
+        };
+        let bytes = kib.saturating_mul(1024);
+        match key {
+            "Rss" => split.rss_bytes = bytes,
+            "Pss" => split.pss_bytes = bytes,
+            "Pss_File" => split.pss_file_bytes = Some(bytes),
+            "Pss_Anon" => split.pss_anon_bytes = Some(bytes),
+            "Anonymous" => split.anonymous_bytes = bytes,
+            "Swap" => split.swap_bytes = bytes,
+            _ => {}
+        }
+    }
+    split
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_memory_split() -> Option<ProcessMemorySplit> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn system_memory() -> (Option<u64>, Option<u64>) {
     let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
@@ -373,5 +427,32 @@ mod tests {
         assert_eq!(report.logical_model_exceeds_budget(), None);
         assert_eq!(report.rss_delta_after_load_bytes(), None);
         assert_eq!(report.rss_delta_after_decode_bytes(), None);
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod smaps_tests {
+    use super::*;
+
+    #[test]
+    fn parses_rollup_fields_in_kib() {
+        let split = parse_smaps_rollup(
+            "Rss:                 100 kB\nPss:                  80 kB\nPss_File:             60 kB\nPss_Anon:             20 kB\nAnonymous:            30 kB\nSwap:                  4 kB\n",
+        );
+        assert_eq!(split.rss_bytes, 100 * 1024);
+        assert_eq!(split.pss_bytes, 80 * 1024);
+        assert_eq!(split.pss_file_bytes, Some(60 * 1024));
+        assert_eq!(split.pss_anon_bytes, Some(20 * 1024));
+        assert_eq!(split.anonymous_bytes, 30 * 1024);
+        assert_eq!(split.swap_bytes, 4 * 1024);
+    }
+
+    #[test]
+    fn missing_fields_remain_zero_or_unknown() {
+        let split = parse_smaps_rollup("Rss: 1 kB\n");
+        assert_eq!(split.rss_bytes, 1024);
+        assert_eq!(split.pss_bytes, 0);
+        assert_eq!(split.pss_file_bytes, None);
     }
 }

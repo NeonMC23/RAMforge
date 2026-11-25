@@ -15,19 +15,19 @@ use crate::context_config::{FlashAttentionMode, KvCacheType};
 use crate::forgecore::{
     ForgeCoreContextOptions, ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession,
 };
-use crate::ExpertRoutingOptions;
 use crate::gpu_observability::{
     collect_observability, GpuObservability, StagingCounters, StagingObservation, StagingState,
 };
 use crate::host_staging::{
     HostStagingMode, HostStagingReport, HostStagingStatus, PinnedPool, ReadBatching,
 };
-use crate::memory_report::{process_io, process_rss};
+use crate::memory_report::{process_io, process_memory_split, process_rss, ProcessIo};
 use crate::residency_engine::process_faults;
 use crate::runtime_plan::RuntimePlan;
 use crate::sampling::Sampler;
 use crate::staging::{Engine, StagingError};
 use crate::staging_plan::{StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest};
+use crate::ExpertRoutingOptions;
 use ramforge_core::{discover_model_set, Tokenizer};
 
 pub const INFERENCE_SERVICE_API_VERSION: u32 = 7;
@@ -255,6 +255,26 @@ impl Default for GenerationOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenPhase {
+    Prompt,
+    Decode,
+}
+
+/// Incremental I/O and fault cost for one native decode call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenIo {
+    pub phase: TokenPhase,
+    pub token_index: u32,
+    pub elapsed_ns: u64,
+    pub storage_read_bytes: Option<u64>,
+    pub rchar_bytes: Option<u64>,
+    pub read_syscalls: Option<u64>,
+    pub major_faults: Option<u64>,
+    pub minor_faults: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationStats {
     pub prompt_tokens: u64,
@@ -276,6 +296,12 @@ pub struct GenerationStats {
     pub read_syscalls: Option<u64>,
     pub major_faults: Option<u64>,
     pub minor_faults: Option<u64>,
+    pub pss_bytes: Option<u64>,
+    pub pss_file_bytes: Option<u64>,
+    pub pss_anon_bytes: Option<u64>,
+    pub anonymous_bytes: Option<u64>,
+    pub swap_bytes: Option<u64>,
+    pub token_io: Vec<TokenIo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -584,10 +610,11 @@ impl InferenceService {
                 .session
                 .as_ref()
                 .map(|session| session.context_options().flash_attn.label().to_string()),
-            kv_types_native_readback: self
-                .session
-                .as_ref()
-                .map(|session| session.effective_context_configuration().kv_types_native_readback),
+            kv_types_native_readback: self.session.as_ref().map(|session| {
+                session
+                    .effective_context_configuration()
+                    .kv_types_native_readback
+            }),
             architecture: self.plan.architecture.clone(),
             execution_mode: self.plan.effective.execution_mode,
             device_id: self.plan.effective.device_id.clone(),
@@ -1846,33 +1873,17 @@ impl InferenceService {
         };
 
         let candidates: Vec<u32> = if request.auto {
-            let mut ordered: Vec<u32> = (0..layer_count)
+            let ordered: Vec<u32> = (0..layer_count)
                 // Static GPU placement already owns these layers; staging them
                 // would allocate a duplicate device copy and waste VRAM.
                 .filter(|layer| session.model().layer_is_cpu(*layer).unwrap_or(true))
                 .collect();
-            match self.selection_policy {
-                crate::staging_plan::SelectionPolicy::Ascending => {}
-                crate::staging_plan::SelectionPolicy::SmallestFirst => {
-                    ordered.sort_by_key(|layer| {
-                        (
-                            session.staged_layer_bytes(*layer).unwrap_or(u64::MAX),
-                            *layer,
-                        )
-                    });
-                }
-                crate::staging_plan::SelectionPolicy::ResidentFirst => {
-                    ordered.sort_by_key(|layer| {
-                        let resident = current_layers.contains(layer);
-                        (
-                            !resident,
-                            session.staged_layer_bytes(*layer).unwrap_or(u64::MAX),
-                            *layer,
-                        )
-                    });
-                }
-            }
-            ordered
+            crate::staging_plan::order_candidate_layers(
+                self.selection_policy,
+                ordered,
+                |layer| session.staged_layer_bytes(layer).ok(),
+                |layer| current_layers.contains(&layer),
+            )
         } else {
             for layer in &request.layers {
                 if !session.model().layer_is_cpu(*layer).unwrap_or(true) {
@@ -2198,7 +2209,10 @@ impl InferenceService {
         let rss_before = process_rss();
         let io_before = process_io();
         let (minor_faults_before, major_faults_before) = process_faults();
+        let mut token_io = Vec::new();
         let prompt_started = Instant::now();
+        let prompt_io_before = process_io();
+        let prompt_faults_before = process_faults();
         let mut logits = match session.decode_tokens(&prompt_tokens, 0) {
             Ok(logits) => logits,
             Err(error) => {
@@ -2208,6 +2222,15 @@ impl InferenceService {
         };
         session.synchronize();
         let prompt_ns = duration_ns(prompt_started.elapsed());
+        token_io.push(token_io_sample(
+            TokenPhase::Prompt,
+            0,
+            prompt_started.elapsed(),
+            prompt_io_before,
+            process_io(),
+            prompt_faults_before,
+            process_faults(),
+        ));
         let sampler = Sampler::new(options.temperature, options.top_k, options.top_p);
         let eos = tokenizer.eos_id;
         let mut decoder = tokenizer.decoder();
@@ -2264,6 +2287,9 @@ impl InferenceService {
                 stop_reason = "cancelled";
                 break;
             }
+            let decode_io_before = process_io();
+            let decode_faults_before = process_faults();
+            let decode_token_started = Instant::now();
             logits = match session.decode_tokens(&[next], next_position) {
                 Ok(logits) => logits,
                 Err(error) => {
@@ -2272,6 +2298,15 @@ impl InferenceService {
                 }
             };
             session.synchronize();
+            token_io.push(token_io_sample(
+                TokenPhase::Decode,
+                token_ids.len() as u32,
+                decode_token_started.elapsed(),
+                decode_io_before,
+                process_io(),
+                decode_faults_before,
+                process_faults(),
+            ));
         }
         text.push_str(&decoder.finish());
         let total_ns = duration_ns(prompt_started.elapsed());
@@ -2280,9 +2315,9 @@ impl InferenceService {
         let decode_tokens = generated.saturating_sub(1);
         let io_after = process_io();
         let (minor_faults_after, major_faults_after) = process_faults();
-        let counter_delta = |before: Option<u64>, after: Option<u64>| {
-            Some(after?.saturating_sub(before?))
-        };
+        let memory_split = process_memory_split();
+        let counter_delta =
+            |before: Option<u64>, after: Option<u64>| Some(after?.saturating_sub(before?));
         let stats = GenerationStats {
             prompt_tokens: prompt_tokens.len() as u64,
             generated_tokens: generated,
@@ -2310,6 +2345,12 @@ impl InferenceService {
             ),
             major_faults: counter_delta(major_faults_before, major_faults_after),
             minor_faults: counter_delta(minor_faults_before, minor_faults_after),
+            pss_bytes: memory_split.map(|split| split.pss_bytes),
+            pss_file_bytes: memory_split.and_then(|split| split.pss_file_bytes),
+            pss_anon_bytes: memory_split.and_then(|split| split.pss_anon_bytes),
+            anonymous_bytes: memory_split.map(|split| split.anonymous_bytes),
+            swap_bytes: memory_split.map(|split| split.swap_bytes),
+            token_io,
         };
         let report = GenerationReport {
             text,
@@ -2471,6 +2512,37 @@ fn stage_layer_data(
 
 pub(crate) fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn token_io_sample(
+    phase: TokenPhase,
+    token_index: u32,
+    elapsed: Duration,
+    io_before: Option<ProcessIo>,
+    io_after: Option<ProcessIo>,
+    faults_before: (Option<u64>, Option<u64>),
+    faults_after: (Option<u64>, Option<u64>),
+) -> TokenIo {
+    let delta = |before: Option<u64>, after: Option<u64>| Some(after?.saturating_sub(before?));
+    TokenIo {
+        phase,
+        token_index,
+        elapsed_ns: duration_ns(elapsed),
+        storage_read_bytes: delta(
+            io_before.as_ref().map(|io| io.read_bytes),
+            io_after.as_ref().map(|io| io.read_bytes),
+        ),
+        rchar_bytes: delta(
+            io_before.as_ref().map(|io| io.rchar_bytes),
+            io_after.as_ref().map(|io| io.rchar_bytes),
+        ),
+        read_syscalls: delta(
+            io_before.as_ref().map(|io| io.read_syscalls),
+            io_after.as_ref().map(|io| io.read_syscalls),
+        ),
+        major_faults: delta(faults_before.1, faults_after.1),
+        minor_faults: delta(faults_before.0, faults_after.0),
+    }
 }
 
 fn rate(tokens: u64, ns: u64) -> f64 {
