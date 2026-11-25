@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use ramforge_core::GgufModel;
 
+use crate::context_config::KvCacheType;
+
 pub const MODEL_REQUIREMENTS_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +148,88 @@ pub struct ModelRequirements {
 }
 
 impl ModelRequirements {
+    /// Recompute the KV estimate for a selected cache dtype.
+    ///
+    /// The base estimate in [`model_requirements`] keeps the historical
+    /// F16-per-element assumption. This method replaces it with exact
+    /// per-type block accounting when architecture metadata is available and
+    /// refreshes the dependent sums. It never claims a native allocation.
+    pub fn apply_kv_cache_type(&mut self, kv_type: KvCacheType) -> Result<(), String> {
+        self.apply_kv_cache_types(kv_type, kv_type)
+    }
+
+    /// Recompute the KV estimate with independent K and V cache dtypes.
+    pub fn apply_kv_cache_types(
+        &mut self,
+        kv_type_k: KvCacheType,
+        kv_type_v: KvCacheType,
+    ) -> Result<(), String> {
+        let architecture = self
+            .architecture_info
+            .as_ref()
+            .ok_or_else(|| "architecture metadata is unavailable; cannot size KV".to_string())?;
+        let layers = architecture
+            .layer_count
+            .ok_or_else(|| "layer count is unavailable; cannot size KV".to_string())?;
+        let kv_heads = architecture
+            .head_count_kv
+            .ok_or_else(|| "KV head count is unavailable; cannot size KV".to_string())?;
+        let heads = architecture
+            .head_count
+            .ok_or_else(|| "head count is unavailable; cannot derive head dimension".to_string())?;
+        let embedding = architecture
+            .embedding_length
+            .ok_or_else(|| "embedding length is unavailable; cannot derive head dimension".to_string())?;
+        if heads == 0 || embedding % heads != 0 {
+            return Err("embedding length is not divisible by head count".to_string());
+        }
+        let head_dim = embedding / heads;
+        let context = u64::from(self.context_tokens);
+        let k_bytes = kv_type_k
+            .cache_side_bytes(layers, kv_heads, head_dim, context)
+            .ok_or_else(|| "K cache byte accounting overflowed".to_string())?;
+        let v_bytes = kv_type_v
+            .cache_side_bytes(layers, kv_heads, head_dim, context)
+            .ok_or_else(|| "V cache byte accounting overflowed".to_string())?;
+        let bytes = k_bytes
+            .checked_add(v_bytes)
+            .ok_or_else(|| "KV byte accounting overflowed".to_string())?;
+        let assumption = format!(
+            "KV estimate uses {} K / {} V block accounting: {} layers, {} KV heads, head dimension {}, {} context tokens; batch traffic is not included",
+            kv_type_k.label(),
+            kv_type_v.label(),
+            layers,
+            kv_heads,
+            head_dim,
+            self.context_tokens
+        );
+        self.assumptions
+            .retain(|value| {
+                !value.starts_with("KV estimate ") && !value.starts_with("MLA architectures")
+            });
+        self.assumptions.push(assumption);
+        if self
+            .architecture
+            .as_deref()
+            .is_some_and(|architecture| architecture.contains("deepseek"))
+        {
+            self.assumptions.push(
+                "MLA architectures may allocate additional compressed/rope KV state beyond the head-count formula; treat this estimate as a lower bound and prefer native context readback"
+                    .to_string(),
+            );
+        }
+        self.kv_cache_bytes =
+            RequirementBytes::estimated(bytes, "architecture-derived KV cache estimate");
+        self.resident_weights_plus_kv_bytes = self
+            .fully_resident_weight_bytes
+            .checked_add(&self.kv_cache_bytes);
+        self.mapped_weights_plus_kv_bytes = RequirementBytes::estimated(
+            bytes,
+            "mapped weights are not assumed resident; only the KV estimate is included",
+        );
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for requirement in [
             &self.file_bytes,
@@ -390,6 +474,41 @@ mod tests {
         );
         values.insert("general.file_type".to_string(), MetadataValue::UInt32(12));
         values
+    }
+
+    #[test]
+    fn kv_cache_type_recomputes_exact_block_accounting() {
+        let model = model(
+            vec![tensor("a", Some(1000)), tensor("b", Some(24))],
+            metadata(),
+        );
+        let mut requirements = model_requirements(
+            &model,
+            ModelRequirementConfig {
+                context_tokens: 512,
+                batch_tokens: 1,
+                kv_bytes_per_element: 2,
+            },
+        );
+        requirements
+            .apply_kv_cache_type(KvCacheType::Q8_0)
+            .expect("q8 accounting");
+        // 2 layers * 2 K/V * 2 kv heads * 1 block per 32-wide head * 34 B * 512 tokens
+        assert_eq!(requirements.kv_cache_bytes.bytes, Some(139_264));
+        assert!(requirements
+            .assumptions
+            .iter()
+            .any(|value| value.contains("q8_0 K / q8_0 V block accounting")));
+
+        requirements
+            .apply_kv_cache_type(KvCacheType::Q4_0)
+            .expect("q4 accounting");
+        // 2 layers * 2 K/V * 2 kv heads * 1 block * 18 B * 512 tokens
+        assert_eq!(requirements.kv_cache_bytes.bytes, Some(73_728));
+        assert!(!requirements
+            .assumptions
+            .iter()
+            .any(|value| value.contains("q8_0 K / q8_0 V block accounting")));
     }
 
     #[test]

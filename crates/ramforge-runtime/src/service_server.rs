@@ -155,7 +155,7 @@ pub fn serve_stdio(mut service: InferenceService) -> Result<(), ServiceServerErr
                 let (feasibility, requirements_note) =
                     match ramforge_core::discover_model_set(Path::new(&plan.model_path)) {
                         Ok(set) => {
-                            let requirements = model_requirements(
+                            let mut requirements = model_requirements(
                                 &set.merged_model(),
                                 ModelRequirementConfig {
                                     context_tokens: plan.effective.context_tokens,
@@ -163,6 +163,16 @@ pub fn serve_stdio(mut service: InferenceService) -> Result<(), ServiceServerErr
                                     kv_bytes_per_element: 2,
                                 },
                             );
+                            if let (Ok(kv_k), Ok(kv_v)) = (
+                                crate::context_config::KvCacheType::parse(
+                                    &plan.effective.kv_type_k,
+                                ),
+                                crate::context_config::KvCacheType::parse(
+                                    &plan.effective.kv_type_v,
+                                ),
+                            ) {
+                                let _ = requirements.apply_kv_cache_types(kv_k, kv_v);
+                            }
                             (
                                 Some(evaluate_hierarchy_feasibility(
                                     &machine,
@@ -186,7 +196,7 @@ pub fn serve_stdio(mut service: InferenceService) -> Result<(), ServiceServerErr
                         "placement": placement,
                         "feasibility": feasibility,
                         "requirements_note": requirements_note,
-                        "note": "fresh OS observation; not a snapshot captured at model load and does not include the original RAM budget; KV uses an f16 assumption",
+                        "note": "fresh OS observation; not a snapshot captured at model load and does not include the original RAM budget; KV uses the planned dtype-aware estimate",
                     }),
                 )?;
             }

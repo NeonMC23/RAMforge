@@ -7,14 +7,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::context_config::ContextConfig;
 use crate::machine_profile::MachineProfile;
 use crate::model_requirements::ModelRequirements;
 
-pub const RUNTIME_PLAN_SCHEMA_VERSION: u32 = 2;
+pub const RUNTIME_PLAN_SCHEMA_VERSION: u32 = 3;
 
-/// Execution mode represented by a plan. Only `Cpu` is applied by the
-/// current adapter; GPU modes are planning-only and are rejected by the
-/// service until a physical backend and placement readback are validated.
+/// Execution mode represented by a plan. CPU, GPU, and hybrid placement are
+/// forwarded to native; the service confirms effective placement by readback
+/// after load and never falls back silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
@@ -35,10 +36,17 @@ pub enum RuntimeProfileKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FieldStatus {
+    /// The value is forwarded and has a native readback or direct effect.
     Applied,
+    /// The value was requested but constrained by model or machine limits.
     Constrained,
+    /// The value is forwarded but has no native getter at the pinned revision.
+    Forwarded,
+    /// The value is planning-only and not applied by the executor.
     Advisory,
+    /// The value cannot be applied at all.
     Unsupported,
+    /// The value is unknown because the required observation is unavailable.
     Unknown,
 }
 
@@ -67,6 +75,9 @@ pub struct EffectiveRuntimeConfig {
     pub weight_repacking: bool,
     pub kv_type_k: String,
     pub kv_type_v: String,
+    pub flash_attn: String,
+    pub offload_kqv: bool,
+    pub op_offload: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +126,9 @@ impl RuntimePlan {
         if self.effective.batch_tokens > self.effective.context_tokens {
             return Err("effective batch exceeds effective context".to_string());
         }
+        if self.effective.ubatch_tokens > self.effective.batch_tokens {
+            return Err("effective micro-batch exceeds effective batch".to_string());
+        }
         if self.effective.sequence_max == 0 {
             return Err("effective sequence count must be greater than zero".to_string());
         }
@@ -162,9 +176,30 @@ impl RuntimePlan {
         profile: RuntimeProfileKind,
         custom: &CustomRuntimeRequest,
     ) -> Result<Self, String> {
+        Self::resolve_with_context(
+            machine,
+            requirements,
+            model_path,
+            profile,
+            custom,
+            &ContextConfig::default(),
+        )
+    }
+
+    /// Resolve a plan with explicit context settings (KV dtype, flash
+    /// attention, batch, micro-batch, sequences, offload).
+    pub fn resolve_with_context(
+        machine: &MachineProfile,
+        requirements: &ModelRequirements,
+        model_path: &str,
+        profile: RuntimeProfileKind,
+        custom: &CustomRuntimeRequest,
+        context_config: &ContextConfig,
+    ) -> Result<Self, String> {
         if model_path.is_empty() {
             return Err("model path is empty".to_string());
         }
+        context_config.validate()?;
         let available = machine
             .cpu
             .available_threads
@@ -198,8 +233,18 @@ impl RuntimePlan {
         let context = model_max
             .map(|max| requested_context.min(max))
             .unwrap_or(requested_context);
-        let requested_batch = custom.batch_tokens.unwrap_or(1).max(1);
+        let requested_batch = context_config
+            .batch_tokens
+            .or(custom.batch_tokens)
+            .unwrap_or_else(|| context.min(2048))
+            .max(1);
         let batch = requested_batch.min(context);
+        let requested_ubatch = context_config
+            .ubatch_tokens
+            .unwrap_or_else(|| batch.min(512))
+            .max(1);
+        let ubatch = requested_ubatch.min(batch);
+        let sequence_max = context_config.sequence_max.unwrap_or(1);
         let requested_threads = custom.threads.unwrap_or(match profile {
             RuntimeProfileKind::MaximumPerformance => physical,
             RuntimeProfileKind::Balanced => physical,
@@ -207,7 +252,24 @@ impl RuntimePlan {
             RuntimeProfileKind::Custom => physical,
         });
         let threads = requested_threads.min(available).max(1);
-        let threads_batch = threads;
+        let requested_threads_batch = context_config.threads_batch.unwrap_or(threads).max(1);
+        let threads_batch = requested_threads_batch.min(available).max(1);
+        let kv_type_k = context_config.kv_type_k.unwrap_or_default();
+        let kv_type_v = context_config.kv_type_v.unwrap_or(kv_type_k);
+        if requirements
+            .architecture
+            .as_deref()
+            .is_some_and(|architecture| architecture.contains("deepseek"))
+            && kv_type_k != kv_type_v
+        {
+            return Err(
+                "MLA architectures require matching K and V cache types; set both to the same dtype"
+                    .to_string(),
+            );
+        }
+        let flash_attn = context_config.flash_attn.unwrap_or_default();
+        let offload_kqv = context_config.offload_kqv.unwrap_or(true);
+        let op_offload = context_config.op_offload.unwrap_or(true);
         let load_mode = custom.load_mode.clone().unwrap_or_else(|| match profile {
             RuntimeProfileKind::MaximumPerformance => "mmap".to_string(),
             RuntimeProfileKind::Balanced => "mmap".to_string(),
@@ -282,11 +344,7 @@ impl RuntimePlan {
         };
 
         let mut fields = Vec::new();
-        let gpu_status = if execution_mode == ExecutionMode::Cpu {
-            FieldStatus::Applied
-        } else {
-            FieldStatus::Advisory
-        };
+        let gpu_status = FieldStatus::Applied;
         push(
             &mut fields,
             "backend",
@@ -297,14 +355,10 @@ impl RuntimePlan {
                 ExecutionMode::Gpu => "gpu".to_string(),
                 ExecutionMode::Hybrid => "hybrid".to_string(),
             }),
-            if execution_mode == ExecutionMode::Cpu {
-                Some("the verified ForgeCore adapter executes CPU only".to_string())
-            } else {
-                Some(
-                    "GPU plan is advisory; the service has no physically validated GPU load path"
-                        .to_string(),
-                )
-            },
+            Some(
+                "forwarded to forgeCORE; effective placement is confirmed by native readback after load"
+                    .to_string(),
+            ),
         );
         push(
             &mut fields,
@@ -347,7 +401,31 @@ impl RuntimePlan {
             },
             Some(requested_batch.to_string()),
             Some(batch.to_string()),
-            (batch != requested_batch).then(|| "batch clamped to context".to_string()),
+            (batch != requested_batch)
+                .then(|| "batch clamped to context".to_string())
+                .or_else(|| Some("forwarded; native readback after load".to_string())),
+        );
+        push(
+            &mut fields,
+            "ubatch_tokens",
+            if ubatch == requested_ubatch {
+                FieldStatus::Applied
+            } else {
+                FieldStatus::Constrained
+            },
+            Some(requested_ubatch.to_string()),
+            Some(ubatch.to_string()),
+            (ubatch != requested_ubatch)
+                .then(|| "micro-batch clamped to batch".to_string())
+                .or_else(|| Some("forwarded; native readback after load".to_string())),
+        );
+        push(
+            &mut fields,
+            "sequence_max",
+            FieldStatus::Applied,
+            Some(sequence_max.to_string()),
+            Some(sequence_max.to_string()),
+            Some("forwarded; native readback after load".to_string()),
         );
         push(
             &mut fields,
@@ -361,6 +439,19 @@ impl RuntimePlan {
             Some(threads.to_string()),
             (threads != requested_threads)
                 .then(|| "thread count exceeds process-visible CPUs".to_string()),
+        );
+        push(
+            &mut fields,
+            "threads_batch",
+            if threads_batch == requested_threads_batch {
+                FieldStatus::Applied
+            } else {
+                FieldStatus::Constrained
+            },
+            Some(requested_threads_batch.to_string()),
+            Some(threads_batch.to_string()),
+            (threads_batch != requested_threads_batch)
+                .then(|| "batch thread count exceeds process-visible CPUs".to_string()),
         );
         push(
             &mut fields,
@@ -388,11 +479,49 @@ impl RuntimePlan {
         );
         push(
             &mut fields,
-            "kv_type",
-            FieldStatus::Unknown,
-            Some("f16".to_string()),
-            Some("f16".to_string()),
-            Some("adapter default; native effective KV type getter unavailable".to_string()),
+            "kv_type_k",
+            FieldStatus::Forwarded,
+            Some(kv_type_k.label().to_string()),
+            Some(kv_type_k.label().to_string()),
+            Some(
+                "forwarded to the native context; no native KV dtype getter at the pinned revision"
+                    .to_string(),
+            ),
+        );
+        push(
+            &mut fields,
+            "kv_type_v",
+            FieldStatus::Forwarded,
+            Some(kv_type_v.label().to_string()),
+            Some(kv_type_v.label().to_string()),
+            Some(
+                "forwarded to the native context; no native KV dtype getter at the pinned revision"
+                    .to_string(),
+            ),
+        );
+        push(
+            &mut fields,
+            "flash_attn",
+            FieldStatus::Forwarded,
+            Some(flash_attn.label().to_string()),
+            Some(flash_attn.label().to_string()),
+            Some("forwarded to the native context; resolved mode is backend-owned".to_string()),
+        );
+        push(
+            &mut fields,
+            "offload_kqv",
+            FieldStatus::Applied,
+            Some(offload_kqv.to_string()),
+            Some(offload_kqv.to_string()),
+            None,
+        );
+        push(
+            &mut fields,
+            "op_offload",
+            FieldStatus::Applied,
+            Some(op_offload.to_string()),
+            Some(op_offload.to_string()),
+            None,
         );
         let mut warnings = Vec::new();
         if machine.cpu.hardware_physical_cores.as_ref().is_none() {
@@ -431,14 +560,17 @@ impl RuntimePlan {
                 gpu_layers,
                 context_tokens: context,
                 batch_tokens: batch,
-                ubatch_tokens: context,
-                sequence_max: 1,
+                ubatch_tokens: ubatch,
+                sequence_max,
                 threads,
                 threads_batch,
                 load_mode,
                 weight_repacking,
-                kv_type_k: "f16".to_string(),
-                kv_type_v: "f16".to_string(),
+                kv_type_k: kv_type_k.label().to_string(),
+                kv_type_v: kv_type_v.label().to_string(),
+                flash_attn: flash_attn.label().to_string(),
+                offload_kqv,
+                op_offload,
             },
             fields,
             warnings,
@@ -558,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_gpu_plan_is_advisory_and_marks_layers_unconfirmed() {
+    fn synthetic_gpu_plan_marks_layers_for_native_confirmation() {
         let mut machine = collect_machine_profile(&MachineProfileConfig::default());
         machine.backend_inventory.gpu_offload_available = true;
         machine
@@ -628,11 +760,85 @@ mod tests {
         assert!(plan
             .fields
             .iter()
-            .any(|field| { field.field == "gpu_layers" && field.status == FieldStatus::Advisory }));
-        assert!(plan
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("native effective placement")));
+            .any(|field| { field.field == "gpu_layers" && field.status == FieldStatus::Applied }));
+        assert!(plan.warnings.iter().any(|warning| {
+            warning.contains("native effective placement must be confirmed after load")
+        }));
+    }
+
+    #[test]
+    fn context_overrides_are_applied_and_reported() {
+        let machine = collect_machine_profile(&MachineProfileConfig::default());
+        let plan = RuntimePlan::resolve_with_context(
+            &machine,
+            &requirements(Some(8192)),
+            "/m",
+            RuntimeProfileKind::Custom,
+            &CustomRuntimeRequest {
+                context_tokens: Some(4096),
+                threads: Some(2),
+                ..CustomRuntimeRequest::default()
+            },
+            &ContextConfig {
+                kv_type_k: Some(crate::context_config::KvCacheType::Q8_0),
+                kv_type_v: Some(crate::context_config::KvCacheType::Q8_0),
+                flash_attn: Some(crate::context_config::FlashAttentionMode::Enabled),
+                batch_tokens: Some(256),
+                ubatch_tokens: Some(64),
+                sequence_max: Some(2),
+                ..ContextConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.effective.batch_tokens, 256);
+        assert_eq!(plan.effective.ubatch_tokens, 64);
+        assert_eq!(plan.effective.sequence_max, 2);
+        assert_eq!(plan.effective.kv_type_k, "q8_0");
+        assert_eq!(plan.effective.kv_type_v, "q8_0");
+        assert_eq!(plan.effective.flash_attn, "enabled");
+        assert!(plan.fields.iter().any(|field| {
+            field.field == "kv_type_k" && field.status == FieldStatus::Forwarded
+        }));
+    }
+
+    #[test]
+    fn invalid_context_override_is_rejected_before_execution() {
+        let machine = collect_machine_profile(&MachineProfileConfig::default());
+        let error = RuntimePlan::resolve_with_context(
+            &machine,
+            &requirements(Some(4096)),
+            "/m",
+            RuntimeProfileKind::Custom,
+            &CustomRuntimeRequest::default(),
+            &ContextConfig {
+                batch_tokens: Some(32),
+                ubatch_tokens: Some(64),
+                ..ContextConfig::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("micro-batch"));
+    }
+
+    #[test]
+    fn mla_architecture_rejects_mismatched_kv_types() {
+        let machine = collect_machine_profile(&MachineProfileConfig::default());
+        let mut requirements = requirements(Some(4096));
+        requirements.architecture = Some("deepseek2".to_string());
+        let error = RuntimePlan::resolve_with_context(
+            &machine,
+            &requirements,
+            "/m",
+            RuntimeProfileKind::Custom,
+            &CustomRuntimeRequest::default(),
+            &ContextConfig {
+                kv_type_k: Some(crate::context_config::KvCacheType::Q8_0),
+                kv_type_v: Some(crate::context_config::KvCacheType::F16),
+                ..ContextConfig::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("MLA"));
     }
 
     #[test]

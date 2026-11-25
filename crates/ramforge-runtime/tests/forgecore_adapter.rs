@@ -106,7 +106,7 @@ fn forgecore_adapter_translates_model_batch_and_decode_errors() {
         .open_context(ForgeCoreContextOptions {
             n_ctx: None,
             n_threads: 0,
-            trace_max_events: None,
+            ..ForgeCoreContextOptions::default()
         })
         .unwrap_err();
     assert!(matches!(
@@ -136,7 +136,7 @@ fn forgecore_adapter_translates_model_batch_and_decode_errors() {
         .open_context(ForgeCoreContextOptions {
             n_ctx: Some(1),
             n_threads: 1,
-            trace_max_events: None,
+            ..ForgeCoreContextOptions::default()
         })
         .expect("one-token context");
     constrained
@@ -308,4 +308,62 @@ fn forgecore_gptneox_generates_tokens_through_the_adapter() {
     }
     assert_eq!(generated.len(), 4);
     println!("forgecore gptneox generated ids: {generated:?}");
+}
+
+#[test]
+#[ignore = "requires FORGE_DEEPSEEK_MODEL=<deepseek2 gguf>; opt-in real-model MoE test"]
+fn forgecore_deepseek2_generates_with_quantized_kv_and_explicit_batch() {
+    let Ok(path) = std::env::var("FORGE_DEEPSEEK_MODEL") else {
+        println!("SKIP: FORGE_DEEPSEEK_MODEL not set (opt-in DeepSeek2 fixture)");
+        return;
+    };
+    let path = PathBuf::from(path);
+    let model = ForgeCoreModel::load(&path).expect("DeepSeek2 fixture must load");
+    let metadata = model.metadata().clone();
+    assert!(
+        metadata
+            .description
+            .to_ascii_lowercase()
+            .contains("deepseek2"),
+        "fixture must be a DeepSeek2 model, got: {}",
+        metadata.description
+    );
+    assert!(metadata.layer_count > 0);
+    assert!(metadata.vocab_size > 0);
+
+    let mut session = model
+        .open_context(ForgeCoreContextOptions {
+            n_ctx: Some(256),
+            n_threads: 6,
+            n_batch: Some(64),
+            n_ubatch: Some(64),
+            kv_type_k: ramforge_runtime::KvCacheType::Q8_0,
+            kv_type_v: ramforge_runtime::KvCacheType::Q8_0,
+            ..ForgeCoreContextOptions::default()
+        })
+        .expect("DeepSeek2 context");
+    let effective = session.effective_context_configuration();
+    assert_eq!(effective.effective_batch_tokens, 64);
+    assert_eq!(effective.effective_ubatch_tokens, 64);
+    assert!(effective.effective_context_tokens >= 256);
+    assert!(!effective.kv_types_native_readback);
+
+    let mut logits = session
+        .decode_tokens(&[1, 5, 9], 0)
+        .expect("DeepSeek2 prompt decode");
+    assert!(logits.values().iter().all(|value| value.is_finite()));
+    for position in 3..7u32 {
+        let best = logits
+            .values()
+            .iter()
+            .enumerate()
+            .skip(1)
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index as u32)
+            .expect("non-empty logits");
+        logits = session
+            .decode_token(best, position)
+            .expect("DeepSeek2 generated-token decode");
+    }
+    assert_eq!(logits.values().len(), metadata.vocab_size as usize);
 }

@@ -4,6 +4,8 @@ This directory is the transfer package for a new developer or agent arriving wit
 
 > **Latest audit (2026-11-25):** [AUDIT_2026-11-25.md](AUDIT_2026-11-25.md) is the current evidence-driven assessment of capacity, throughput, overflow behavior, forgeCORE/native capability gaps, and the prioritized engineering roadmap. Where older documents disagree with it, prefer the audit's measured findings and verified commit pins.
 
+> **Execution-core milestone (2026-11-25):** [INFERENCE_CORE_OPTIMIZATION_2026-11-25.md](INFERENCE_CORE_OPTIMIZATION_2026-11-25.md) records the implemented DeepSeek2 support, KV dtype/batch/flash forwarding, CLI threading fix, combined static-offload plus dynamic-staging mode, benchmark session reuse, and per-run storage/fault instrumentation, with before/after measurements.
+
 ## Reading order
 
 1. [PROJECT_STATE.md](PROJECT_STATE.md) — what exists, what is supported, and the current conclusion.

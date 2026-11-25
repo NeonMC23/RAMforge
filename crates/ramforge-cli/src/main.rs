@@ -60,11 +60,109 @@ struct Cli {
     command: Commands,
 }
 
+/// Context settings shared by commands that open a native context.
+#[derive(clap::Args, Debug, Clone)]
+struct ContextArgs {
+    /// CPU threads (0 = physical cores)
+    #[arg(long, default_value_t = 0)]
+    threads: u32,
+
+    /// Logical batch size (default: native, up to context)
+    #[arg(long)]
+    batch: Option<u32>,
+
+    /// Physical micro-batch size (default: native, up to batch)
+    #[arg(long)]
+    ubatch: Option<u32>,
+
+    /// K cache type: f32, f16, q8_0, q4_0
+    #[arg(long, default_value = "f16")]
+    kv_type_k: String,
+
+    /// V cache type: f32, f16, q8_0, q4_0
+    #[arg(long, default_value = "f16")]
+    kv_type_v: String,
+
+    /// Flash attention: auto, on, off
+    #[arg(long, default_value = "auto")]
+    flash_attn: String,
+
+    /// Maximum distinct sequences (1-256)
+    #[arg(long)]
+    sequence_max: Option<u32>,
+
+    /// Disable KQV/KV buffer GPU offload
+    #[arg(long)]
+    no_kv_offload: bool,
+
+    /// Disable scheduler operator offload
+    #[arg(long)]
+    no_op_offload: bool,
+}
+
+impl ContextArgs {
+    fn config(&self) -> anyhow::Result<ramforge_runtime::ContextConfig> {
+        let config = ramforge_runtime::ContextConfig {
+            kv_type_k: Some(
+                ramforge_runtime::KvCacheType::parse(&self.kv_type_k)
+                    .map_err(|error| anyhow::anyhow!(error))?,
+            ),
+            kv_type_v: Some(
+                ramforge_runtime::KvCacheType::parse(&self.kv_type_v)
+                    .map_err(|error| anyhow::anyhow!(error))?,
+            ),
+            flash_attn: Some(
+                ramforge_runtime::FlashAttentionMode::parse(&self.flash_attn)
+                    .map_err(|error| anyhow::anyhow!(error))?,
+            ),
+            batch_tokens: self.batch,
+            ubatch_tokens: self.ubatch,
+            sequence_max: self.sequence_max,
+            threads_batch: None,
+            offload_kqv: Some(!self.no_kv_offload),
+            op_offload: Some(!self.no_op_offload),
+        };
+        config
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(config)
+    }
+}
+
+/// Resolve `0` to the machine's physical-core count, matching the runtime
+/// plan default. The logical count is the fallback when topology is unknown.
+fn resolve_thread_count(requested: u32) -> anyhow::Result<u32> {
+    if requested > 0 {
+        return Ok(requested);
+    }
+    let machine = collect_machine_profile(&MachineProfileConfig::default());
+    let available = machine
+        .cpu
+        .available_threads
+        .as_ref()
+        .copied()
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .and_then(|value| u32::try_from(value.get()).ok())
+        })
+        .unwrap_or(1)
+        .max(1);
+    let physical = machine
+        .cpu
+        .hardware_physical_cores
+        .as_ref()
+        .copied()
+        .unwrap_or(available)
+        .clamp(1, available);
+    Ok(physical)
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum InferenceBackend {
     /// Existing RAMforge custom CPU engine; retained as the default reference path.
     Legacy,
-    /// ForgeCore/libllama model/context/batch/decode/logits path (CPU in the current RAMforge adapter).
+    /// ForgeCore/libllama model/context/batch/decode/logits path; CPU, GPU, or hybrid placement via --device/--gpu-layers.
     #[value(name = "forgecore", alias = "forge-core")]
     ForgeCore,
 }
@@ -123,6 +221,18 @@ enum Commands {
         /// RAM budget (e.g. 8G, 8GiB, 8192M, 512MiB)
         #[arg(long)]
         ram: String,
+
+        /// Context length used for KV accounting (default: 2048)
+        #[arg(long)]
+        context: Option<u32>,
+
+        /// K cache type for KV accounting: f32, f16, q8_0, q4_0
+        #[arg(long, default_value = "f16")]
+        kv_type_k: String,
+
+        /// V cache type for KV accounting: f32, f16, q8_0, q4_0
+        #[arg(long, default_value = "f16")]
+        kv_type_v: String,
 
         /// Output in JSON format
         #[arg(long)]
@@ -266,9 +376,8 @@ enum Commands {
         #[arg(long, default_value_t = 256)]
         context: u32,
 
-        /// CPU threads (0 = profile-selected)
-        #[arg(long, default_value_t = 0)]
-        threads: u32,
+        #[command(flatten)]
+        context_args: ContextArgs,
 
         /// Execution device: cpu, auto, or a discovered device id
         #[arg(long, default_value = "cpu")]
@@ -335,9 +444,8 @@ enum Commands {
         #[arg(long, default_value_t = 256)]
         context: u32,
 
-        /// CPU threads (0 = profile-selected)
-        #[arg(long, default_value_t = 0)]
-        threads: u32,
+        #[command(flatten)]
+        context_args: ContextArgs,
 
         /// Execution device: cpu, auto, or a discovered device id
         #[arg(long, default_value = "cpu")]
@@ -445,6 +553,10 @@ enum Commands {
         /// Execution device for the staged context (CPU plan plus CUDA staging backend)
         #[arg(long, default_value = "cpu")]
         device: String,
+
+        /// Requested static GPU-offloaded layers combined with dynamic staging (0 = CPU)
+        #[arg(long, default_value_t = 0)]
+        gpu_layers: u32,
 
         /// Initial explicit staged layer set (repeatable)
         #[arg(long = "staged-layer", value_name = "N")]
@@ -705,9 +817,16 @@ enum Commands {
         #[arg(long, default_value = "cpu")]
         device: String,
 
-        /// Context length override in tokens (ForgeCore only; default: model training context)
+        /// Requested static GPU-offloaded layers (0 = CPU)
+        #[arg(long, default_value_t = 0)]
+        gpu_layers: u32,
+
+        /// Context length override in tokens (ForgeCore only; default: min(training context, 4096))
         #[arg(long)]
         ctx: Option<u32>,
+
+        #[command(flatten)]
+        context_args: ContextArgs,
 
         /// Disable llama.cpp CPU weight repacking; keeps quantized weights in the file-backed mapping
         #[arg(long)]
@@ -903,8 +1022,15 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Plan { model, ram, json } => {
-            if let Err(e) = run_plan(model, ram, json) {
+        Commands::Plan {
+            model,
+            ram,
+            context,
+            kv_type_k,
+            kv_type_v,
+            json,
+        } => {
+            if let Err(e) = run_plan(model, ram, context, kv_type_k, kv_type_v, json) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -991,7 +1117,7 @@ fn main() {
             profile,
             ram,
             context,
-            threads,
+            context_args,
             device,
             gpu_layers,
             staged_layers,
@@ -1006,7 +1132,7 @@ fn main() {
                 profile,
                 ram,
                 context,
-                threads,
+                context_args,
                 device,
                 gpu_layers,
                 staged_layers,
@@ -1029,7 +1155,7 @@ fn main() {
             runs,
             warmup,
             context,
-            threads,
+            context_args,
             device,
             gpu_layers,
             staged_layers,
@@ -1055,7 +1181,7 @@ fn main() {
                 runs,
                 warmup,
                 context,
-                threads,
+                context_args,
                 device,
                 gpu_layers,
                 staged_layers,
@@ -1095,6 +1221,7 @@ fn main() {
             context,
             threads,
             device,
+            gpu_layers,
             staged_layers,
             replace_layers,
             staged_budget,
@@ -1130,6 +1257,7 @@ fn main() {
                 context,
                 threads,
                 device,
+                gpu_layers,
                 staged_layers,
                 replace_layers,
                 staged_budget,
@@ -1243,7 +1371,9 @@ fn main() {
             system,
             backend,
             device,
+            gpu_layers,
             ctx,
+            context_args,
             no_repack,
             no_prefetch,
             release_mapping_pages,
@@ -1324,7 +1454,9 @@ fn main() {
                 system,
                 backend,
                 device,
+                gpu_layers,
                 ctx,
+                context_args,
                 no_repack,
                 no_prefetch,
                 release_mapping_pages,
@@ -1693,6 +1825,7 @@ fn run_staging_cycle(
     context: u32,
     threads: u32,
     device: String,
+    gpu_layers: u32,
     staged_layers: Vec<u32>,
     replace_layers: Vec<u32>,
     staged_budget: Option<String>,
@@ -1770,7 +1903,7 @@ fn run_staging_cycle(
             ),
             no_repack: Some(no_repack),
             device: Some(device),
-            gpu_layers: Some(0),
+            gpu_layers: Some(gpu_layers),
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;
@@ -2241,7 +2374,7 @@ fn run_service_stdio(
     profile: String,
     ram: Option<String>,
     context: u32,
-    threads: u32,
+    context_args: ContextArgs,
     device: String,
     gpu_layers: u32,
     staged_layers: Vec<u32>,
@@ -2256,9 +2389,11 @@ fn run_service_stdio(
         .map(parse_memory_size)
         .transpose()
         .map_err(|error| anyhow::anyhow!("invalid --ram: {error}"))?;
+    let context_config = context_args.config()?;
+    let threads = resolve_thread_count(context_args.threads)?;
     let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
     let gguf = model_set.merged_model();
-    let requirements = model_requirements(
+    let mut requirements = model_requirements(
         &gguf,
         ModelRequirementConfig {
             context_tokens: context,
@@ -2266,24 +2401,30 @@ fn run_service_stdio(
             kv_bytes_per_element: 2,
         },
     );
+    requirements
+        .apply_kv_cache_types(
+            context_config.kv_type_k.unwrap_or_default(),
+            context_config.kv_type_v.unwrap_or_default(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
     let machine = collect_machine_profile(&MachineProfileConfig {
         model_path: Some(model_path.clone()),
         ram_budget_bytes: ram_bytes,
         cpu: CpuRuntimeSettings {
-            selected_threads: (threads != 0).then_some(threads),
+            selected_threads: Some(threads),
             user_thread_limit: None,
         },
         ..MachineProfileConfig::default()
     });
-    let plan = RuntimePlan::resolve(
+    let plan = RuntimePlan::resolve_with_context(
         &machine,
         &requirements,
         model_path.to_string_lossy().as_ref(),
         parse_runtime_profile(&profile)?,
         &ramforge_runtime::CustomRuntimeRequest {
             context_tokens: Some(context),
-            batch_tokens: Some(1),
-            threads: (threads != 0).then_some(threads),
+            batch_tokens: context_config.batch_tokens,
+            threads: Some(threads),
             load_mode: Some(
                 if no_prefetch {
                     "mmap-no-prefetch"
@@ -2296,6 +2437,7 @@ fn run_service_stdio(
             device: Some(device),
             gpu_layers: Some(gpu_layers),
         },
+        &context_config,
     )
     .map_err(|error| anyhow::anyhow!(error))?;
     let staged_budget_bytes = staged_budget
@@ -2344,7 +2486,7 @@ fn run_throughput_benchmark(
     runs: u32,
     warmup: u32,
     context: u32,
-    threads: u32,
+    context_args: ContextArgs,
     device: String,
     gpu_layers: u32,
     staged_layers: Vec<u32>,
@@ -2366,9 +2508,11 @@ fn run_throughput_benchmark(
         .map(parse_memory_size)
         .transpose()
         .map_err(|error| anyhow::anyhow!("invalid --ram: {error}"))?;
+    let context_config = context_args.config()?;
+    let threads = resolve_thread_count(context_args.threads)?;
     let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
     let gguf = model_set.merged_model();
-    let requirements = model_requirements(
+    let mut requirements = model_requirements(
         &gguf,
         ModelRequirementConfig {
             context_tokens: context,
@@ -2376,24 +2520,30 @@ fn run_throughput_benchmark(
             kv_bytes_per_element: 2,
         },
     );
+    requirements
+        .apply_kv_cache_types(
+            context_config.kv_type_k.unwrap_or_default(),
+            context_config.kv_type_v.unwrap_or_default(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
     let machine = collect_machine_profile(&MachineProfileConfig {
         model_path: Some(model_path.clone()),
         ram_budget_bytes: ram_bytes,
         cpu: CpuRuntimeSettings {
-            selected_threads: (threads != 0).then_some(threads),
+            selected_threads: Some(threads),
             user_thread_limit: None,
         },
         ..MachineProfileConfig::default()
     });
-    let plan = RuntimePlan::resolve(
+    let plan = RuntimePlan::resolve_with_context(
         &machine,
         &requirements,
         model_path.to_string_lossy().as_ref(),
         parse_runtime_profile(&profile)?,
         &ramforge_runtime::CustomRuntimeRequest {
             context_tokens: Some(context),
-            batch_tokens: Some(1),
-            threads: (threads != 0).then_some(threads),
+            batch_tokens: context_config.batch_tokens,
+            threads: Some(threads),
             load_mode: Some(
                 if no_prefetch {
                     "mmap-no-prefetch"
@@ -2406,6 +2556,7 @@ fn run_throughput_benchmark(
             device: Some(device),
             gpu_layers: Some(gpu_layers),
         },
+        &context_config,
     )
     .map_err(|error| anyhow::anyhow!(error))?;
     let staged_budget_bytes = staged_budget
@@ -2500,6 +2651,25 @@ fn run_throughput_benchmark(
             report.median_context_create_ns,
             report.model_load_ns
         );
+        println!(
+            "context reuse: created_once={} reused_generations={} setup_read={:?} bytes setup_rchar={:?} bytes setup_faults={:?}/{:?}",
+            report.context_create_ns.len(),
+            report.context_reuse_count,
+            report.context_setup_read_bytes,
+            report.context_setup_rchar_bytes,
+            report.context_setup_major_faults,
+            report.context_setup_minor_faults,
+        );
+        for run in &report.runs_detail {
+            println!(
+                "run {}: storage_read={:?} bytes rchar={:?} bytes faults={:?}/{:?}",
+                run.index,
+                run.storage_read_bytes,
+                run.rchar_bytes,
+                run.major_faults,
+                run.minor_faults,
+            );
+        }
         println!(
             "condition={} ({})",
             report.condition,
@@ -2765,7 +2935,7 @@ fn run_calibration(
         .open_context(ForgeCoreContextOptions {
             n_ctx: Some(context),
             n_threads: threads,
-            trace_max_events: None,
+            ..ForgeCoreContextOptions::default()
         })
         .map_err(|error| anyhow::anyhow!(error))?;
     recorder.set_context_id(
@@ -3356,7 +3526,14 @@ fn run_machine(
     Ok(())
 }
 
-fn run_plan(model_path: PathBuf, ram_str: String, json_output: bool) -> anyhow::Result<()> {
+fn run_plan(
+    model_path: PathBuf,
+    ram_str: String,
+    context: Option<u32>,
+    kv_type_k: String,
+    kv_type_v: String,
+    json_output: bool,
+) -> anyhow::Result<()> {
     let ram_bytes = parse_memory_size(&ram_str)
         .map_err(|e| anyhow::anyhow!("invalid --ram '{}': {}", ram_str, e))?;
 
@@ -3366,10 +3543,52 @@ fn run_plan(model_path: PathBuf, ram_str: String, json_output: bool) -> anyhow::
     let plan =
         ramforge_runtime::plan::plan_model(&gguf, ram_bytes).map_err(|e| anyhow::anyhow!(e))?;
 
+    let context_tokens = context.unwrap_or(2048);
+    let kv_type_k = ramforge_runtime::KvCacheType::parse(&kv_type_k)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let kv_type_v = ramforge_runtime::KvCacheType::parse(&kv_type_v)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let mut requirements = model_requirements(
+        &gguf,
+        ModelRequirementConfig {
+            context_tokens,
+            batch_tokens: 1,
+            kv_bytes_per_element: 2,
+        },
+    );
+    requirements
+        .apply_kv_cache_types(kv_type_k, kv_type_v)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let expert = ramforge_runtime::expert_accounting(&gguf);
+
     if json_output {
-        output_plan_json(&plan, &gguf)?;
+        output_plan_json(&plan, &gguf, Some(&requirements), Some(&expert))?;
     } else {
         output_plan_human(&plan, &gguf, &ram_str);
+        println!(
+            "KV capacity: type={}/{} context={} estimated={} bytes (block accounting; not a native allocation)",
+            kv_type_k.label(),
+            kv_type_v.label(),
+            context_tokens,
+            requirements
+                .kv_cache_bytes
+                .bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        if expert.routed_expert_bytes > 0 {
+            println!(
+                "Expert capacity: total={} routed={} shared={} other={} active_routed_estimate={} (metadata only; not residency)",
+                expert.total_tensor_bytes,
+                expert.routed_expert_bytes,
+                expert.shared_expert_bytes,
+                expert.other_tensor_bytes,
+                expert
+                    .estimated_active_expert_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
     }
 
     Ok(())
@@ -3426,7 +3645,9 @@ fn run_inference(
     system: Option<String>,
     backend: InferenceBackend,
     device: String,
+    gpu_layers: u32,
     ctx: Option<u32>,
+    context_args: ContextArgs,
     no_repack: bool,
     no_prefetch: bool,
     release_mapping_pages: bool,
@@ -3573,9 +3794,27 @@ fn run_inference(
         ));
     }
     parse_sampling_strategy(&node_dispatch_sample_strategy)?;
-    let device_selection = device
-        .parse::<DeviceSelection>()
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let device_selection = if matches!(
+        device.to_ascii_lowercase().as_str(),
+        "auto" | "gpu" | "cuda"
+    ) {
+        let registry = DeviceRegistry::discover();
+        let gpu = registry
+            .devices()
+            .iter()
+            .find(|candidate| !candidate.is_cpu() && candidate.selectable)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--device '{}' requested but no selectable GPU device was enumerated",
+                    device
+                )
+            })?;
+        DeviceSelection::by_id(gpu.id.clone())
+    } else {
+        device
+            .parse::<DeviceSelection>()
+            .map_err(|error| anyhow::anyhow!(error))?
+    };
 
     let residency_requested = residency_policy != ResidencyPolicyArg::Off
         || residency_target_bytes.is_some()
@@ -3616,7 +3855,9 @@ fn run_inference(
             chat,
             system,
             device_selection.clone(),
+            gpu_layers,
             ctx,
+            context_args.clone(),
             no_repack,
             no_prefetch,
             release_mapping_pages,
@@ -3661,6 +3902,21 @@ fn run_inference(
         return Err(anyhow::anyhow!(
             "--device '{}' is only supported with --backend forgecore; legacy execution remains CPU-only",
             device
+        ));
+    }
+    if context_args.threads != 0
+        || context_args.batch.is_some()
+        || context_args.ubatch.is_some()
+        || context_args.sequence_max.is_some()
+        || context_args.no_kv_offload
+        || context_args.no_op_offload
+        || context_args.kv_type_k != "f16"
+        || context_args.kv_type_v != "f16"
+        || context_args.flash_attn != "auto"
+        || gpu_layers != 0
+    {
+        return Err(anyhow::anyhow!(
+            "context configuration (--threads/--batch/--ubatch/--kv-type-*/--flash-attn/--sequence-max/offload flags) is only supported with --backend forgecore"
         ));
     }
     if ctx.is_some() {
@@ -3957,7 +4213,9 @@ fn run_forgecore_inference(
     chat: bool,
     system: Option<String>,
     device: DeviceSelection,
+    gpu_layers: u32,
     ctx: Option<u32>,
+    context_args: ContextArgs,
     no_repack: bool,
     no_prefetch: bool,
     release_mapping_pages: bool,
@@ -4002,6 +4260,8 @@ fn run_forgecore_inference(
     } else {
         parse_sampling_strategy(&node_dispatch_sample_strategy)?
     };
+    let threads = resolve_thread_count(context_args.threads)?;
+    let context_config = context_args.config()?;
     let run_started = Instant::now();
     let model_load_started = Instant::now();
     let rss_before_load = process_rss();
@@ -4014,7 +4274,7 @@ fn run_forgecore_inference(
     // RAMforge does not implicitly switch devices or backends.
     let registry = DeviceRegistry::discover();
     let execution =
-        ExecutionConfig::new(device, 1, None, false).map_err(|error| anyhow::anyhow!(error))?;
+        ExecutionConfig::new(device, threads as usize, None, false).map_err(|error| anyhow::anyhow!(error))?;
     let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
     let primary_path = model_set.primary_path().to_path_buf();
     let shard_paths: Vec<PathBuf> = model_set
@@ -4043,8 +4303,15 @@ fn run_forgecore_inference(
     let mut model_options = ForgeCoreModelOptions {
         check_tensors: execution.check_tensors,
         use_extra_bufts: !no_repack,
+        gpu_layers,
         ..ForgeCoreModelOptions::default()
     };
+    if gpu_layers > 0 {
+        let selected = execution
+            .resolve(&registry)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        model_options.gpu_device_index = selected.info().registry_index;
+    }
     if no_prefetch {
         model_options = model_options.with_no_prefetch();
     }
@@ -4498,6 +4765,15 @@ fn run_forgecore_inference(
         .info()
         .architecture
         .unwrap_or_else(|| "unknown".to_string());
+    if architecture.contains("deepseek")
+        && context_config.kv_type_k != context_config.kv_type_v
+    {
+        return Err(anyhow::anyhow!(
+            "MLA architectures require matching K and V cache types; got {:?} and {:?}",
+            context_config.kv_type_k,
+            context_config.kv_type_v
+        ));
+    }
     let architecture_support = ramforge_runtime::support::model_execution_support(&gguf);
     let raw_prompt = prompt;
     let prompt = prepare_prompt(&gguf, raw_prompt.clone(), chat, system)?;
@@ -4520,13 +4796,52 @@ fn run_forgecore_inference(
         ));
     }
 
+    let requested_ctx = ctx.unwrap_or_else(|| {
+        let training = model.metadata().context_length;
+        let default = training.min(4096).max(1);
+        eprintln!(
+            "Context: no --ctx supplied; using {default} tokens (model training context {training}); pass --ctx to override"
+        );
+        default
+    });
     let mut session = model
         .open_context(ForgeCoreContextOptions {
-            n_ctx: ctx,
-            n_threads: 1,
+            n_ctx: Some(requested_ctx),
+            n_threads: threads as usize,
+            n_threads_batch: context_config
+                .threads_batch
+                .map(|value| value as usize),
+            n_batch: context_config.batch_tokens,
+            n_ubatch: context_config.ubatch_tokens,
+            n_seq_max: context_config.sequence_max,
+            kv_type_k: context_config.kv_type_k.unwrap_or_default(),
+            kv_type_v: context_config.kv_type_v.unwrap_or_default(),
+            flash_attn: context_config.flash_attn.unwrap_or_default(),
+            offload_kqv: context_config.offload_kqv,
+            op_offload: context_config.op_offload,
             trace_max_events: graph_trace.then_some(graph_trace_events),
         })
         .map_err(|error| anyhow::anyhow!(error))?;
+    let effective_context = session.effective_context_configuration();
+    eprintln!(
+        "Context configuration: requested ctx={:?} batch={:?} ubatch={:?} sequences={:?} kv={}/{} flash={}",
+        Some(requested_ctx),
+        context_config.batch_tokens,
+        context_config.ubatch_tokens,
+        context_config.sequence_max,
+        effective_context.requested.kv_type_k.label(),
+        effective_context.requested.kv_type_v.label(),
+        effective_context.requested.flash_attn.label(),
+    );
+    eprintln!(
+        "Effective native context: ctx={} batch={} ubatch={} sequences={} threads={}/{}",
+        effective_context.effective_context_tokens,
+        effective_context.effective_batch_tokens,
+        effective_context.effective_ubatch_tokens,
+        effective_context.effective_sequence_max,
+        effective_context.effective_threads,
+        effective_context.effective_threads_batch,
+    );
     if node_dispatch_observe {
         session
             .set_node_dispatch_observer(Some(NodeDispatchOptions {
@@ -7521,6 +7836,8 @@ fn output_json(
 fn output_plan_json(
     plan: &ramforge_runtime::plan::PlanResult,
     model: &GgufModel,
+    requirements: Option<&ramforge_runtime::model_requirements::ModelRequirements>,
+    expert: Option<&ramforge_runtime::ExpertAccounting>,
 ) -> anyhow::Result<()> {
     use serde_json::json;
 
@@ -7586,6 +7903,14 @@ fn output_plan_json(
             "file_backed_needed": plan.file_backed_needed,
         },
         "execution_preflight": execution_preflight,
+        "kv_capacity": requirements.map(|requirements| json!({
+            "context_tokens": requirements.context_tokens,
+            "estimated_bytes": requirements.kv_cache_bytes.bytes,
+            "certainty": requirements.kv_cache_bytes.certainty,
+            "assumptions": requirements.assumptions,
+            "scope": "metadata-derived estimate; not a native allocation or a reduction in weight bytes",
+        })),
+        "expert_capacity": expert,
         "cache": {
             "capacity": plan.cache_capacity,
             "policy": "LRU",

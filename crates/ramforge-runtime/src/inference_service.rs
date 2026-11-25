@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context_config::{FlashAttentionMode, KvCacheType};
 use crate::forgecore::{
     ForgeCoreContextOptions, ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession,
 };
@@ -20,7 +21,8 @@ use crate::gpu_observability::{
 use crate::host_staging::{
     HostStagingMode, HostStagingReport, HostStagingStatus, PinnedPool, ReadBatching,
 };
-use crate::memory_report::process_rss;
+use crate::memory_report::{process_io, process_rss};
+use crate::residency_engine::process_faults;
 use crate::runtime_plan::RuntimePlan;
 use crate::sampling::Sampler;
 use crate::staging::{Engine, StagingError};
@@ -205,6 +207,12 @@ pub struct ServiceStatus {
     pub effective_threads: Option<u32>,
     pub effective_threads_batch: Option<u32>,
     pub effective_sequence_max: Option<u32>,
+    /// Requested KV/flash values forwarded to the native context. Native KV
+    /// dtype getters are unavailable at the pinned revision.
+    pub requested_kv_type_k: Option<String>,
+    pub requested_kv_type_v: Option<String>,
+    pub requested_flash_attn: Option<String>,
+    pub kv_types_native_readback: Option<bool>,
     pub architecture: Option<crate::model_architecture::ModelArchitecture>,
     pub execution_mode: crate::runtime_plan::ExecutionMode,
     pub device_id: String,
@@ -260,6 +268,13 @@ pub struct GenerationStats {
     pub stop_reason: String,
     pub rss_before_bytes: Option<u64>,
     pub rss_after_bytes: Option<u64>,
+    /// Storage bytes actually fetched during prompt processing and decode.
+    /// This excludes page-cache hits; `rchar_bytes` includes them.
+    pub storage_read_bytes: Option<u64>,
+    pub rchar_bytes: Option<u64>,
+    pub read_syscalls: Option<u64>,
+    pub major_faults: Option<u64>,
+    pub minor_faults: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -534,6 +549,22 @@ impl InferenceService {
                 .session
                 .as_ref()
                 .map(ForgeCoreSession::effective_sequence_max),
+            requested_kv_type_k: self
+                .session
+                .as_ref()
+                .map(|session| session.context_options().kv_type_k.label().to_string()),
+            requested_kv_type_v: self
+                .session
+                .as_ref()
+                .map(|session| session.context_options().kv_type_v.label().to_string()),
+            requested_flash_attn: self
+                .session
+                .as_ref()
+                .map(|session| session.context_options().flash_attn.label().to_string()),
+            kv_types_native_readback: self
+                .session
+                .as_ref()
+                .map(|session| session.effective_context_configuration().kv_types_native_readback),
             architecture: self.plan.architecture.clone(),
             execution_mode: self.plan.effective.execution_mode,
             device_id: self.plan.effective.device_id.clone(),
@@ -666,12 +697,6 @@ impl InferenceService {
         let mut staging_engine = None;
         let mut extra_device_index = None;
         if !self.staging_request.layers.is_empty() || self.staging_request.auto {
-            if self.plan.effective.execution_mode != crate::runtime_plan::ExecutionMode::Cpu {
-                return Err(ServiceError::UnsupportedExecution(
-                    "staged layers require a CPU plan; GPU/hybrid plans use normal placement"
-                        .to_string(),
-                ));
-            }
             let gpu = registry
                 .devices()
                 .iter()
@@ -739,6 +764,22 @@ impl InferenceService {
         Ok(())
     }
 
+    /// Reuse the current context when it is already ready. Context creation
+    /// allocates KV/compute buffers and re-stages configured layers; repeated
+    /// generation requests must not pay that cost when the plan is unchanged.
+    pub fn ensure_session(&mut self) -> Result<(), ServiceError> {
+        if self.session.is_some() {
+            if self.state == ServiceState::Ready {
+                return Ok(());
+            }
+            return Err(ServiceError::InvalidState {
+                expected: "ready".to_string(),
+                actual: self.state,
+            });
+        }
+        self.create_session()
+    }
+
     /// Create the single reusable context for this service.
     pub fn create_session(&mut self) -> Result<(), ServiceError> {
         if self.state != ServiceState::ModelLoaded && self.state != ServiceState::Ready {
@@ -764,6 +805,18 @@ impl InferenceService {
             .open_context(ForgeCoreContextOptions {
                 n_ctx: Some(self.plan.effective.context_tokens),
                 n_threads: self.plan.effective.threads as usize,
+                n_threads_batch: Some(self.plan.effective.threads_batch as usize),
+                n_batch: Some(self.plan.effective.batch_tokens),
+                n_ubatch: Some(self.plan.effective.ubatch_tokens),
+                n_seq_max: Some(self.plan.effective.sequence_max),
+                kv_type_k: KvCacheType::parse(&self.plan.effective.kv_type_k)
+                    .map_err(ServiceError::Configuration)?,
+                kv_type_v: KvCacheType::parse(&self.plan.effective.kv_type_v)
+                    .map_err(ServiceError::Configuration)?,
+                flash_attn: FlashAttentionMode::parse(&self.plan.effective.flash_attn)
+                    .map_err(ServiceError::Configuration)?,
+                offload_kqv: Some(self.plan.effective.offload_kqv),
+                op_offload: Some(self.plan.effective.op_offload),
                 trace_max_events: None,
             })
             .map_err(|error| ServiceError::Context(error.to_string()))?;
@@ -1769,7 +1822,11 @@ impl InferenceService {
         };
 
         let candidates: Vec<u32> = if request.auto {
-            let mut ordered: Vec<u32> = (0..layer_count).collect();
+            let mut ordered: Vec<u32> = (0..layer_count)
+                // Static GPU placement already owns these layers; staging them
+                // would allocate a duplicate device copy and waste VRAM.
+                .filter(|layer| session.model().layer_is_cpu(*layer).unwrap_or(true))
+                .collect();
             match self.selection_policy {
                 crate::staging_plan::SelectionPolicy::Ascending => {}
                 crate::staging_plan::SelectionPolicy::SmallestFirst => {
@@ -1793,6 +1850,13 @@ impl InferenceService {
             }
             ordered
         } else {
+            for layer in &request.layers {
+                if !session.model().layer_is_cpu(*layer).unwrap_or(true) {
+                    return Err(ServiceError::Configuration(format!(
+                        "layer {layer} is already offloaded by static GPU placement; staging it would duplicate device residency"
+                    )));
+                }
+            }
             request.layers.clone()
         };
         let mut layers = Vec::new();
@@ -2108,6 +2172,8 @@ impl InferenceService {
         session.clear_kv();
         self.state = ServiceState::Generating;
         let rss_before = process_rss();
+        let io_before = process_io();
+        let (minor_faults_before, major_faults_before) = process_faults();
         let prompt_started = Instant::now();
         let mut logits = match session.decode_tokens(&prompt_tokens, 0) {
             Ok(logits) => logits,
@@ -2188,6 +2254,11 @@ impl InferenceService {
         let decode_ns = decode_started.map(|started| duration_ns(started.elapsed()));
         let generated = token_ids.len() as u64;
         let decode_tokens = generated.saturating_sub(1);
+        let io_after = process_io();
+        let (minor_faults_after, major_faults_after) = process_faults();
+        let counter_delta = |before: Option<u64>, after: Option<u64>| {
+            Some(after?.saturating_sub(before?))
+        };
         let stats = GenerationStats {
             prompt_tokens: prompt_tokens.len() as u64,
             generated_tokens: generated,
@@ -2201,6 +2272,20 @@ impl InferenceService {
             stop_reason: stop_reason.to_string(),
             rss_before_bytes: rss_before,
             rss_after_bytes: process_rss(),
+            storage_read_bytes: counter_delta(
+                io_before.as_ref().map(|io| io.read_bytes),
+                io_after.as_ref().map(|io| io.read_bytes),
+            ),
+            rchar_bytes: counter_delta(
+                io_before.as_ref().map(|io| io.rchar_bytes),
+                io_after.as_ref().map(|io| io.rchar_bytes),
+            ),
+            read_syscalls: counter_delta(
+                io_before.as_ref().map(|io| io.read_syscalls),
+                io_after.as_ref().map(|io| io.read_syscalls),
+            ),
+            major_faults: counter_delta(major_faults_before, major_faults_after),
+            minor_faults: counter_delta(minor_faults_before, minor_faults_after),
         };
         let report = GenerationReport {
             text,

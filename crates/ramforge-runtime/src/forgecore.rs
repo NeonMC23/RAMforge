@@ -12,12 +12,13 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use forge_core::{
-    BatchBuilder, Context, ContextLifetimeState, ContextTraceOptions, GpuLayers, Model,
-    ModelLifetimeState, ModelLoadMode, ModelOptions, NodeDispatchEvent, NodeDispatchOptions,
-    NodeDispatchSummary, PageReleaseResult, ResidencyError, SplitMode, TensorMappingInfo,
-    TraceEvent, TraceSummary,
+    BatchBuilder, Context, ContextLifetimeState, ContextTraceOptions, DType, FlashAttnType,
+    GpuLayers, Model, ModelLifetimeState, ModelLoadMode, ModelOptions, NodeDispatchEvent,
+    NodeDispatchOptions, NodeDispatchSummary, PageReleaseResult, ResidencyError, SplitMode,
+    TensorMappingInfo, TraceEvent, TraceSummary,
 };
 
+use crate::context_config::{FlashAttentionMode, KvCacheType};
 use crate::execution::{
     CapabilityState, DeviceInfo, DeviceRegistry, DeviceSelection, DeviceSelectionError,
     ExecutionConfig, ExecutionConfigError,
@@ -67,7 +68,7 @@ fn map_residency_error(error: ResidencyError) -> ForgeCoreAdapterError {
     ForgeCoreAdapterError::Residency(error.to_string())
 }
 
-/// CPU model-loading options exposed by the RAMforge adapter.
+/// Model-loading options exposed by the RAMforge adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForgeCoreModelOptions {
     /// Ask libllama to validate tensor payloads while loading.
@@ -159,11 +160,9 @@ impl ForgeCoreModelMetadata {
 
 /// RAMforge-owned handle for one ForgeCore/libllama model.
 ///
-/// RAMforge intentionally binds the current ForgeCore model/context path to
-/// CPU for this refresh. The selected device is still retained explicitly so
-/// diagnostics and future safe extensions cannot confuse selection with
-/// residency. Cloning this wrapper only shares ForgeCore's native model; it
-/// does not copy weights.
+/// The selected device is retained explicitly so diagnostics cannot confuse
+/// selection with residency. Cloning this wrapper only shares ForgeCore's
+/// native model; it does not copy weights.
 #[derive(Debug, Clone)]
 pub struct ForgeCoreModel {
     model: Model,
@@ -179,7 +178,7 @@ impl ForgeCoreModel {
         Self::load_with_options(path, ForgeCoreModelOptions::default())
     }
 
-    /// Load a model through ForgeCore with the adapter's CPU-only options.
+    /// Load a model through ForgeCore with the adapter's default options.
     pub fn load_with_options(
         path: impl AsRef<Path>,
         options: ForgeCoreModelOptions,
@@ -193,10 +192,8 @@ impl ForgeCoreModel {
         Self::load_native(path, options, execution, selected.info().clone())
     }
 
-    /// Load using an explicit static device selection. RAMforge's current
-    /// adapter intentionally enables only CPU model execution; non-CPU
-    /// selections fail explicitly rather than being initialized and silently
-    /// run on CPU.
+    /// Load using an explicit static device selection. A non-selectable device
+    /// fails explicitly rather than being initialized and silently run on CPU.
     pub fn load_for_execution(
         path: impl AsRef<Path>,
         execution: ExecutionConfig,
@@ -214,7 +211,7 @@ impl ForgeCoreModel {
         )
     }
 
-    /// Load with explicit CPU adapter options while keeping the same device
+    /// Load with explicit adapter options while keeping the same device
     /// validation as [`Self::load_for_execution`].
     pub fn load_for_execution_with_options(
         path: impl AsRef<Path>,
@@ -409,6 +406,14 @@ impl ForgeCoreModel {
             .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
     }
 
+    /// Whether the native model placed this transformer layer on CPU.
+    pub fn layer_is_cpu(&self, layer: u32) -> Result<bool, ForgeCoreAdapterError> {
+        self.model
+            .layer_device_type(layer)
+            .map(|device| matches!(device, forge_core::DeviceType::Cpu))
+            .map_err(|error| ForgeCoreAdapterError::Model(error.to_string()))
+    }
+
     /// Read a bounded byte range from a named model tensor. The caller must
     /// ensure no context is executing (this wrapper is quiescence-checked by
     /// the caller; the native read mutates no tensor storage).
@@ -501,19 +506,19 @@ impl ForgeCoreModel {
         self.open_context(ForgeCoreContextOptions {
             n_ctx: self.execution.context_length,
             n_threads: self.execution.cpu_thread_count,
-            trace_max_events: None,
+            ..ForgeCoreContextOptions::default()
         })
     }
 
-    /// Open a single CPU context. The returned session owns a shared model
-    /// handle, so its lifetime is independent of this wrapper value.
+    /// Open a context. The returned session owns a shared model handle, so its
+    /// lifetime is independent of this wrapper value.
     pub fn open_context(
         &self,
         options: ForgeCoreContextOptions,
     ) -> Result<ForgeCoreSession, ForgeCoreAdapterError> {
         options.validate()?;
         // ContextOptions is non-exhaustive in current ForgeCore: start from
-        // its verified defaults and override only RAMforge-owned CPU fields.
+        // its verified defaults and override every RAMforge-owned field.
         let mut context_options = forge_core::ContextOptions::default();
         context_options.n_ctx = options.n_ctx.unwrap_or(0);
         context_options.n_threads = u32::try_from(options.n_threads).map_err(|_| {
@@ -522,6 +527,31 @@ impl ForgeCoreModel {
                 options.n_threads
             ))
         })?;
+        if let Some(threads_batch) = options.n_threads_batch {
+            context_options.n_threads_batch = u32::try_from(threads_batch).map_err(|_| {
+                ForgeCoreAdapterError::Configuration(
+                    "batch thread count exceeds ForgeCore's u32 limit".to_string(),
+                )
+            })?;
+        }
+        if let Some(batch) = options.n_batch {
+            context_options.n_batch = batch;
+        }
+        if let Some(ubatch) = options.n_ubatch {
+            context_options.n_ubatch = ubatch;
+        }
+        if let Some(sequences) = options.n_seq_max {
+            context_options.n_seq_max = sequences;
+        }
+        if let Some(offload) = options.offload_kqv {
+            context_options.offload_kqv = offload;
+        }
+        if let Some(offload) = options.op_offload {
+            context_options.op_offload = offload;
+        }
+        context_options.type_k = native_kv_type(options.kv_type_k);
+        context_options.type_v = native_kv_type(options.kv_type_v);
+        context_options.flash_attn = native_flash_attention(options.flash_attn);
         context_options.trace = options
             .trace_max_events
             .map(|max_events| ContextTraceOptions { max_events });
@@ -536,7 +566,13 @@ impl ForgeCoreModel {
     }
 }
 
-/// Context options accepted by the current CPU adapter.
+/// Context options accepted by the RAMforge adapter.
+///
+/// `None` on an optional field preserves ForgeCore's verified default. Fields
+/// are validated here before any native call and then forwarded explicitly;
+/// the adapter never reports a requested value as effective without native
+/// readback (batch, micro-batch, sequences, and threads are readable, KV
+/// dtypes are not at the pinned revision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForgeCoreContextOptions {
     /// `None` selects the model's training context length. `Some(value)`
@@ -544,6 +580,24 @@ pub struct ForgeCoreContextOptions {
     pub n_ctx: Option<u32>,
     /// CPU worker count forwarded to ForgeCore/libllama.
     pub n_threads: usize,
+    /// Batch worker count. `None` follows `n_threads` natively.
+    pub n_threads_batch: Option<usize>,
+    /// Logical batch size. `None` preserves the native default.
+    pub n_batch: Option<u32>,
+    /// Physical micro-batch size. `None` preserves the native default.
+    pub n_ubatch: Option<u32>,
+    /// Maximum distinct sequences. `None` preserves the native default.
+    pub n_seq_max: Option<u32>,
+    /// K cache element type.
+    pub kv_type_k: KvCacheType,
+    /// V cache element type.
+    pub kv_type_v: KvCacheType,
+    /// Flash-attention selection.
+    pub flash_attn: FlashAttentionMode,
+    /// Permit KQV/KV buffers on a GPU. `None` preserves the native default.
+    pub offload_kqv: Option<bool>,
+    /// Permit scheduler op offload. `None` preserves the native default.
+    pub op_offload: Option<bool>,
     /// Opt-in bounded scheduler eval trace size. `None` preserves the plain
     /// decode path with no callback installed.
     pub trace_max_events: Option<usize>,
@@ -554,6 +608,15 @@ impl Default for ForgeCoreContextOptions {
         Self {
             n_ctx: None,
             n_threads: 1,
+            n_threads_batch: None,
+            n_batch: None,
+            n_ubatch: None,
+            n_seq_max: None,
+            kv_type_k: KvCacheType::F16,
+            kv_type_v: KvCacheType::F16,
+            flash_attn: FlashAttentionMode::Auto,
+            offload_kqv: None,
+            op_offload: None,
             trace_max_events: None,
         }
     }
@@ -572,6 +635,42 @@ impl ForgeCoreContextOptions {
                 self.n_threads
             )));
         }
+        if let Some(threads) = self.n_threads_batch {
+            if threads == 0 || threads > u32::MAX as usize {
+                return Err(ForgeCoreAdapterError::Configuration(
+                    "batch thread count must be between 1 and u32::MAX".to_string(),
+                ));
+            }
+        }
+        if self.n_batch == Some(0) {
+            return Err(ForgeCoreAdapterError::Configuration(
+                "batch tokens must be greater than zero".to_string(),
+            ));
+        }
+        if self.n_ubatch == Some(0) {
+            return Err(ForgeCoreAdapterError::Configuration(
+                "micro-batch tokens must be greater than zero".to_string(),
+            ));
+        }
+        if let (Some(batch), Some(ubatch)) = (self.n_batch, self.n_ubatch) {
+            if ubatch > batch {
+                return Err(ForgeCoreAdapterError::Configuration(format!(
+                    "micro-batch {ubatch} exceeds batch {batch}"
+                )));
+            }
+        }
+        if let Some(sequences) = self.n_seq_max {
+            if sequences == 0 || sequences > 256 {
+                return Err(ForgeCoreAdapterError::Configuration(
+                    "sequence count must be between 1 and 256".to_string(),
+                ));
+            }
+        }
+        if self.kv_type_v.is_quantized() && self.flash_attn == FlashAttentionMode::Disabled {
+            return Err(ForgeCoreAdapterError::Configuration(
+                "a quantized V cache requires flash attention".to_string(),
+            ));
+        }
         if self.n_ctx == Some(0) {
             return Err(ForgeCoreAdapterError::Configuration(
                 "explicit context length must be greater than zero".to_string(),
@@ -584,6 +683,39 @@ impl ForgeCoreContextOptions {
         }
         Ok(())
     }
+}
+
+fn native_kv_type(value: KvCacheType) -> DType {
+    match value {
+        KvCacheType::F32 => DType::F32,
+        KvCacheType::F16 => DType::F16,
+        KvCacheType::Q8_0 => DType::Q8_0,
+        KvCacheType::Q4_0 => DType::Q4_0,
+    }
+}
+
+fn native_flash_attention(value: FlashAttentionMode) -> FlashAttnType {
+    match value {
+        FlashAttentionMode::Auto => FlashAttnType::Auto,
+        FlashAttentionMode::Enabled => FlashAttnType::Enabled,
+        FlashAttentionMode::Disabled => FlashAttnType::Disabled,
+    }
+}
+
+/// Requested context settings plus native readback for this live session.
+///
+/// KV dtypes have no native getter at the pinned revision, so they are
+/// reported as requested-and-forwarded rather than independently verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgeCoreContextConfiguration {
+    pub requested: ForgeCoreContextOptions,
+    pub effective_context_tokens: u32,
+    pub effective_batch_tokens: u32,
+    pub effective_ubatch_tokens: u32,
+    pub effective_sequence_max: u32,
+    pub effective_threads: u32,
+    pub effective_threads_batch: u32,
+    pub kv_types_native_readback: bool,
 }
 
 /// Owned logits returned by a ForgeCore decode.
@@ -634,6 +766,20 @@ impl ForgeCoreSession {
 
     pub fn context_options(&self) -> ForgeCoreContextOptions {
         self.options
+    }
+
+    /// Requested settings plus native readback for this live session.
+    pub fn effective_context_configuration(&self) -> ForgeCoreContextConfiguration {
+        ForgeCoreContextConfiguration {
+            requested: self.options,
+            effective_context_tokens: self.context.n_ctx(),
+            effective_batch_tokens: self.context.n_batch(),
+            effective_ubatch_tokens: self.context.n_ubatch(),
+            effective_sequence_max: self.context.n_seq_max(),
+            effective_threads: self.context.n_threads(),
+            effective_threads_batch: self.context.n_threads_batch(),
+            kv_types_native_readback: false,
+        }
     }
 
     /// Clear the KV cache while keeping the context and any staged layer
@@ -908,9 +1054,15 @@ impl ForgeCoreSession {
     /// Build one token batch, decode it through ForgeCore, and copy the
     /// logits for the final token in the batch back to RAMforge.
     ///
-    /// `start_position` is a llama sequence position, not a token ID. The
-    /// adapter intentionally does not maintain or invent KV/residency policy;
-    /// callers provide positions and ForgeCore validates native context state.
+    /// `start_position` is a llama sequence position, not a token ID. When the
+    /// input exceeds the effective native batch limit, the adapter splits it
+    /// into position-contiguous chunks and returns the logits of the final
+    /// chunk. That keeps small configured batches usable for prompt
+    /// processing without silently ignoring the limit.
+    ///
+    /// The adapter intentionally does not maintain or invent KV/residency
+    /// policy; callers provide positions and ForgeCore validates native
+    /// context state.
     pub fn decode_tokens(
         &mut self,
         tokens: &[u32],
@@ -922,6 +1074,35 @@ impl ForgeCoreSession {
             ));
         }
 
+        let batch_limit = usize::try_from(self.context.n_batch()).unwrap_or(1).max(1);
+        if tokens.len() <= batch_limit {
+            return self.decode_chunk(tokens, start_position);
+        }
+
+        let mut offset = 0usize;
+        let mut last = None;
+        while offset < tokens.len() {
+            let end = offset.saturating_add(batch_limit).min(tokens.len());
+            let position = u32::try_from(offset)
+                .ok()
+                .and_then(|offset| start_position.checked_add(offset))
+                .ok_or_else(|| {
+                    ForgeCoreAdapterError::Batch("token position overflows u32".to_string())
+                })?;
+            last = Some(self.decode_chunk(&tokens[offset..end], position)?);
+            offset = end;
+        }
+        last.ok_or_else(|| {
+            ForgeCoreAdapterError::Batch("token batch produced no decoded chunk".to_string())
+        })
+    }
+
+    fn decode_chunk(
+        &mut self,
+        tokens: &[u32],
+        start_position: u32,
+    ) -> Result<ForgeCoreLogits, ForgeCoreAdapterError> {
+        debug_assert!(!tokens.is_empty());
         let mut builder = BatchBuilder::new(self.model.metadata.vocab_size);
         for (offset, &token) in tokens.iter().enumerate() {
             let offset = u32::try_from(offset).map_err(|_| {
@@ -1055,7 +1236,7 @@ mod tests {
             ForgeCoreContextOptions {
                 n_ctx: None,
                 n_threads: 0,
-                trace_max_events: None,
+                ..ForgeCoreContextOptions::default()
             }
             .validate()
             .unwrap_err(),
@@ -1066,7 +1247,7 @@ mod tests {
         assert!(ForgeCoreContextOptions {
             n_ctx: Some(0),
             n_threads: 1,
-            trace_max_events: None,
+            ..ForgeCoreContextOptions::default()
         }
         .validate()
         .is_err());

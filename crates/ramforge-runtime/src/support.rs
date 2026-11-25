@@ -82,6 +82,16 @@ pub const ARCHITECTURES: &[ArchitectureCapability] = &[
         notes: "GPT-NeoX/Pythia parallel-residual transformer; executed through forgeCORE/libllama (use --backend forgecore)",
     },
     ArchitectureCapability {
+        name: "deepseek2",
+        aliases: &["deepseek_v2", "deepseek-v2"],
+        inspect: true,
+        plan: true,
+        tokenizer: "bpe",
+        legacy_run: RunSupport::NotYet,
+        forgecore_run: RunSupport::Supported,
+        notes: "DeepSeek-V2/Coder-V2 MoE transformer; executed through forgeCORE/libllama (use --backend forgecore); validated on the 15.7B/64-expert Q4_K_M model",
+    },
+    ArchitectureCapability {
         name: "mistral",
         aliases: &[],
         inspect: true,
@@ -447,6 +457,25 @@ mod tests {
         // The message must still contain the phrase handled by the smoke
         // harness's unsupported-architecture classifier.
         assert!(error.contains("not supported by RAMforge's legacy executor"));
+    }
+
+    #[test]
+    fn test_deepseek2_is_validated_on_forgecore_only() {
+        let capability = architecture_capability("deepseek2").unwrap();
+        assert!(capability.inspect);
+        assert!(capability.plan);
+        assert_eq!(capability.legacy_run, RunSupport::NotYet);
+        assert_eq!(capability.forgecore_run, RunSupport::Supported);
+        assert!(forgecore_execution_architectures().contains(&"deepseek2"));
+
+        let model = model_with_tensor_type("deepseek2", GgmlType::Q4_K);
+        let support = model_execution_support(&model);
+        assert!(!support.is_legacy_supported());
+        assert!(support.is_forgecore_supported());
+
+        let error = ensure_execution_supported("deepseek2").unwrap_err();
+        assert!(error.contains("forgeCORE/libllama"));
+        assert!(error.contains("--backend forgecore"));
     }
 
     #[test]

@@ -727,3 +727,92 @@ fn standby_cache_makes_alternating_transitions_zero_read() {
     assert!(status.staging_lifecycle.expect("lifecycle").standby_hits >= 1);
     assert!(!generate(&mut service).is_empty());
 }
+
+fn hybrid_plan(path: &std::path::Path) -> RuntimePlan {
+    let model_set = discover_model_set(path).expect("model set");
+    let gguf = model_set.merged_model();
+    let requirements = model_requirements(
+        &gguf,
+        ModelRequirementConfig {
+            context_tokens: 128,
+            batch_tokens: 1,
+            kv_bytes_per_element: 2,
+        },
+    );
+    let machine = collect_machine_profile(&MachineProfileConfig {
+        model_path: Some(path.to_path_buf()),
+        ram_budget_bytes: Some(4 * 1024 * 1024 * 1024),
+        cpu: CpuRuntimeSettings {
+            selected_threads: Some(4),
+            user_thread_limit: None,
+        },
+        ..MachineProfileConfig::default()
+    });
+    RuntimePlan::resolve_with_context(
+        &machine,
+        &requirements,
+        path.to_string_lossy().as_ref(),
+        RuntimeProfileKind::Balanced,
+        &CustomRuntimeRequest {
+            context_tokens: Some(128),
+            batch_tokens: Some(64),
+            threads: Some(4),
+            load_mode: Some("mmap-no-prefetch".to_string()),
+            no_repack: Some(true),
+            device: Some("auto".to_string()),
+            gpu_layers: Some(4),
+        },
+        &Default::default(),
+    )
+    .expect("hybrid runtime plan")
+}
+
+#[test]
+#[ignore = "requires FORGE_TEST_MODEL, a CUDA build, and a physical GPU"]
+fn hybrid_plan_combines_static_offload_with_cpu_layer_staging() {
+    let _guard = env_lock();
+    let Some(path) = fixture() else {
+        return;
+    };
+    let model_set = discover_model_set(&path).expect("model set");
+    let gguf = model_set.merged_model();
+    let layer_count = gguf.info().block_count.expect("layer count");
+    let plan = hybrid_plan(&path);
+    assert!(matches!(
+        plan.effective.execution_mode,
+        ramforge_runtime::runtime_plan::ExecutionMode::Hybrid
+            | ramforge_runtime::runtime_plan::ExecutionMode::Gpu
+    ));
+
+    let mut service = InferenceService::new(plan)
+        .expect("service")
+        .with_staging_request(StagingRequest {
+            layers: vec![0],
+            budget_bytes: Some(1024 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        });
+    service.load().expect("load");
+    service.create_session().expect("hybrid session");
+    let staged: Vec<u32> = service
+        .status()
+        .staged_layers
+        .iter()
+        .map(|layer| layer.layer)
+        .collect();
+    assert_eq!(staged, vec![0]);
+    assert!(!generate(&mut service).is_empty());
+
+    // A statically offloaded layer must be rejected instead of duplicated.
+    let mut duplicate = InferenceService::new(hybrid_plan(&path))
+        .expect("service")
+        .with_staging_request(StagingRequest {
+            layers: vec![u32::try_from(layer_count.saturating_sub(1)).unwrap_or(u32::MAX)],
+            budget_bytes: Some(1024 * 1024 * 1024),
+            auto: false,
+            safety_margin_bytes: DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+        });
+    duplicate.load().expect("load");
+    let error = duplicate.create_session().expect_err("duplicate staging");
+    assert!(error.to_string().contains("already offloaded"));
+}

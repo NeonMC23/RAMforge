@@ -7,6 +7,7 @@ use ramforge_core::{
     memory::MemoryBudget,
     resource::{ByteMeasurement, ResourceBudgets},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::cgroup::CgroupStats;
 use crate::execution::DeviceInfo;
@@ -221,6 +222,50 @@ pub fn process_rss_peak() -> Option<u64> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn process_rss_peak() -> Option<u64> {
+    None
+}
+
+/// Process-wide I/O counters from `/proc/self/io`.
+///
+/// `read_bytes` counts bytes fetched from storage; `rchar` counts bytes read
+/// through read-like syscalls, including page-cache hits. The difference is
+/// useful evidence for residency, not a per-tensor attribution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIo {
+    pub rchar_bytes: u64,
+    pub wchar_bytes: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub read_syscalls: u64,
+    pub write_syscalls: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_io() -> Option<ProcessIo> {
+    let text = std::fs::read_to_string("/proc/self/io").ok()?;
+    let mut io = ProcessIo::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(value) = value.trim().parse::<u64>() else {
+            continue;
+        };
+        match key {
+            "rchar" => io.rchar_bytes = value,
+            "wchar" => io.wchar_bytes = value,
+            "read_bytes" => io.read_bytes = value,
+            "write_bytes" => io.write_bytes = value,
+            "syscr" => io.read_syscalls = value,
+            "syscw" => io.write_syscalls = value,
+            _ => {}
+        }
+    }
+    Some(io)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_io() -> Option<ProcessIo> {
     None
 }
 

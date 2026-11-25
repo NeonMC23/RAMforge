@@ -18,6 +18,8 @@
 pub(crate) mod accounting;
 pub mod backend;
 pub mod benchmark_runner;
+pub mod capacity;
+pub mod context_config;
 pub mod host_staging;
 pub mod hw_calibration;
 pub mod cgroup;
@@ -85,8 +87,8 @@ pub use crate::execution::{
     DeviceSelectionError, ExecutionConfig, ExecutionConfigError, SelectedDevice,
 };
 pub use crate::forgecore::{
-    ForgeCoreAdapterError, ForgeCoreContextOptions, ForgeCoreLogits, ForgeCoreModel,
-    ForgeCoreModelMetadata, ForgeCoreModelOptions, ForgeCoreSession,
+    ForgeCoreAdapterError, ForgeCoreContextConfiguration, ForgeCoreContextOptions, ForgeCoreLogits,
+    ForgeCoreModel, ForgeCoreModelMetadata, ForgeCoreModelOptions, ForgeCoreSession,
 };
 pub use forge_core::{
     NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSource,
@@ -96,6 +98,8 @@ pub use forge_core::{
 pub use benchmark_runner::{
     run_benchmark, BenchmarkConfig, BenchmarkReport, BenchmarkRun, BENCHMARK_SCHEMA_VERSION,
 };
+pub use context_config::{ContextConfig, FlashAttentionMode, KvCacheType};
+pub use capacity::{expert_accounting, ExpertAccounting};
 pub use calibration_compatibility::{
     CalibrationCompatibility, CompatibilityClass, CompatibilityTarget, DimensionResult,
     DimensionStatus, EvidenceUse, CALIBRATION_COMPATIBILITY_SCHEMA_VERSION,

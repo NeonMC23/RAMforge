@@ -1,5 +1,7 @@
 # Project state
 
+> **Updated 2026-11-25:** this snapshot predates the execution-core milestone. CPU/GPU/hybrid placement, DeepSeek2 MoE execution, KV dtype forwarding, and combined static-offload plus dynamic staging are now implemented and measured. See [INFERENCE_CORE_OPTIMIZATION_2026-11-25.md](INFERENCE_CORE_OPTIMIZATION_2026-11-25.md). Later statements here that describe GPU or MoE execution as unimplemented are historical.
+
 **As-of date:** 2026-10-30.<br>
 **Repository:** RAMforge workspace at the handoff source checkout.<br>
 **Status labels:** see [README.md](README.md).

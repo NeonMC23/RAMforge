@@ -14,9 +14,11 @@ use crate::inference_service::{
     GenerationOptions, InferenceService, ServiceError, StagingLifecycleStatus,
     INFERENCE_SERVICE_API_VERSION,
 };
+use crate::memory_report::process_io;
+use crate::residency_engine::process_faults;
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 15;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 17;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
@@ -32,6 +34,11 @@ pub struct BenchmarkRun {
     pub stop_reason: String,
     pub rss_before_bytes: Option<u64>,
     pub rss_after_bytes: Option<u64>,
+    pub storage_read_bytes: Option<u64>,
+    pub rchar_bytes: Option<u64>,
+    pub read_syscalls: Option<u64>,
+    pub major_faults: Option<u64>,
+    pub minor_faults: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,6 +77,15 @@ pub struct BenchmarkReport {
     pub staging_plan: Option<crate::staging_plan::StagingPlan>,
     pub staging_lifecycle: Option<StagingLifecycleStatus>,
     pub context_create_ns: Vec<u64>,
+    /// Measured runs that reused the already-created context instead of
+    /// reopening it (and re-staging layers) for every run.
+    pub context_reuse_count: u32,
+    /// Storage I/O and fault cost of the one-time context setup, including
+    /// configured layer staging. Zero when the model is already page-cache hot.
+    pub context_setup_read_bytes: Option<u64>,
+    pub context_setup_rchar_bytes: Option<u64>,
+    pub context_setup_major_faults: Option<u64>,
+    pub context_setup_minor_faults: Option<u64>,
     pub runs_detail: Vec<BenchmarkRun>,
     pub median_generation_tokens_per_second: f64,
     pub min_generation_tokens_per_second: f64,
@@ -224,19 +240,41 @@ pub fn run_benchmark(
         top_p: None,
     };
     let cancel = AtomicBool::new(false);
+    // Create once and reuse: generation clears only the KV cache. Reopening
+    // the context per run would reallocate KV/compute buffers and re-stage
+    // configured layers, measuring setup work rather than steady-state decode.
+    let mut context_ns = Vec::new();
+    let io_before_setup = process_io();
+    let (minor_before_setup, major_before_setup) = process_faults();
+    let context_started = Instant::now();
+    service.ensure_session()?;
+    context_ns.push(duration_ns(context_started.elapsed()));
+    let io_after_setup = process_io();
+    let (minor_after_setup, major_after_setup) = process_faults();
+    let counter_delta = |before: Option<u64>, after: Option<u64>| {
+        Some(after?.saturating_sub(before?))
+    };
+    let context_setup_read_bytes = counter_delta(
+        io_before_setup.as_ref().map(|io| io.read_bytes),
+        io_after_setup.as_ref().map(|io| io.read_bytes),
+    );
+    let context_setup_rchar_bytes = counter_delta(
+        io_before_setup.as_ref().map(|io| io.rchar_bytes),
+        io_after_setup.as_ref().map(|io| io.rchar_bytes),
+    );
+    let context_setup_major_faults = counter_delta(major_before_setup, major_after_setup);
+    let context_setup_minor_faults = counter_delta(minor_before_setup, minor_after_setup);
+    let mut context_reuse_count = 0u32;
     for _ in 0..config.warmup_runs {
-        service.create_session()?;
         let _ = service.generate(&options, &cancel, |_| Ok(()))?;
+        context_reuse_count = context_reuse_count.saturating_add(1);
     }
     let free_after_warmup = device_free_bytes(&device_id);
     let memory_after_warmup = Some(service.memory_observability()?);
     let mut runs = Vec::with_capacity(config.runs as usize);
-    let mut context_ns = Vec::with_capacity(config.runs as usize);
     for index in 0..config.runs {
-        let started = Instant::now();
-        service.create_session()?;
-        context_ns.push(duration_ns(started.elapsed()));
         let report = service.generate(&options, &cancel, |_| Ok(()))?;
+        context_reuse_count = context_reuse_count.saturating_add(1);
         runs.push(BenchmarkRun {
             index,
             generated_tokens: report.stats.generated_tokens,
@@ -250,6 +288,11 @@ pub fn run_benchmark(
             stop_reason: report.stats.stop_reason,
             rss_before_bytes: report.stats.rss_before_bytes,
             rss_after_bytes: report.stats.rss_after_bytes,
+            storage_read_bytes: report.stats.storage_read_bytes,
+            rchar_bytes: report.stats.rchar_bytes,
+            read_syscalls: report.stats.read_syscalls,
+            major_faults: report.stats.major_faults,
+            minor_faults: report.stats.minor_faults,
         });
     }
     let memory_after_generation = Some(service.memory_observability()?);
@@ -315,6 +358,11 @@ pub fn run_benchmark(
         staging_lifecycle,
         median_context_create_ns: median_u64(&mut context_ns.clone()),
         context_create_ns: context_ns,
+        context_reuse_count,
+        context_setup_read_bytes,
+        context_setup_rchar_bytes,
+        context_setup_major_faults,
+        context_setup_minor_faults,
         median_decode_tokens_per_second: if decode_rates.is_empty() {
             None
         } else {
@@ -342,7 +390,10 @@ pub fn run_benchmark(
         limitations: vec![
             "Single-machine warm observation; no cold-cache claim.".to_string(),
             "Model load is measured once and excluded from generation rate.".to_string(),
-            "Context creation is measured separately and included in no generation rate."
+            "The context is created once before warmup and reused; generation clears only the KV cache."
+                .to_string(),
+            "Context creation is measured once and included in no generation rate.".to_string(),
+            "Storage read bytes come from /proc/self/io and include prompt processing plus decode; page-cache hits are not storage reads."
                 .to_string(),
             "No GPU or synthetic throughput is claimed.".to_string(),
         ],
