@@ -842,6 +842,22 @@ enum Commands {
         #[arg(long, default_value_t = 65536, requires = "routing_observe")]
         routing_max_observations: usize,
 
+        /// Draft model for greedy speculative decoding (compatible tokenizer)
+        #[arg(long, value_name = "PATH")]
+        draft_model: Option<PathBuf>,
+
+        /// Maximum draft tokens per speculative round
+        #[arg(long, default_value_t = 4, requires = "draft_model")]
+        draft_tokens: u32,
+
+        /// Draft-model CPU threads (default: target threads)
+        #[arg(long, requires = "draft_model")]
+        draft_threads: Option<u32>,
+
+        /// Write speculative statistics JSON to PATH
+        #[arg(long, value_name = "PATH", requires = "draft_model")]
+        speculative_report: Option<PathBuf>,
+
         /// Disable llama.cpp CPU weight repacking; keeps quantized weights in the file-backed mapping
         #[arg(long)]
         no_repack: bool,
@@ -1393,6 +1409,10 @@ fn main() {
             routing_observe,
             routing_report,
             routing_max_observations,
+            draft_model,
+            draft_tokens,
+            draft_threads,
+            speculative_report,
             no_repack,
             no_prefetch,
             release_mapping_pages,
@@ -1479,6 +1499,10 @@ fn main() {
                 routing_observe,
                 routing_report,
                 routing_max_observations,
+                draft_model,
+                draft_tokens,
+                draft_threads,
+                speculative_report,
                 no_repack,
                 no_prefetch,
                 release_mapping_pages,
@@ -3854,6 +3878,10 @@ fn run_inference(
     routing_observe: bool,
     routing_report: Option<PathBuf>,
     routing_max_observations: usize,
+    draft_model: Option<PathBuf>,
+    draft_tokens: u32,
+    draft_threads: Option<u32>,
+    speculative_report: Option<PathBuf>,
     no_repack: bool,
     no_prefetch: bool,
     release_mapping_pages: bool,
@@ -4067,6 +4095,10 @@ fn run_inference(
             routing_observe,
             routing_report.clone(),
             routing_max_observations,
+            draft_model,
+            draft_tokens,
+            draft_threads,
+            speculative_report,
             no_repack,
             no_prefetch,
             release_mapping_pages,
@@ -4125,6 +4157,7 @@ fn run_inference(
         || gpu_layers != 0
         || routing_observe
         || routing_report.is_some()
+        || draft_model.is_some()
     {
         return Err(anyhow::anyhow!(
             "context configuration (--threads/--batch/--ubatch/--kv-type-*/--flash-attn/--sequence-max/offload flags) is only supported with --backend forgecore"
@@ -4416,6 +4449,222 @@ fn decode_with_residency(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_speculative_inference(
+    target_model: &ramforge_runtime::ForgeCoreModel,
+    target_gguf: &GgufModel,
+    tokenizer: &Tokenizer,
+    prompt_tokens: &[u32],
+    draft_path: &std::path::Path,
+    draft_tokens: u32,
+    draft_threads: u32,
+    context_tokens: u32,
+    target_threads: u32,
+    context_config: ramforge_runtime::ContextConfig,
+    max_tokens: usize,
+    no_repack: bool,
+    no_prefetch: bool,
+    report_path: Option<&std::path::Path>,
+    profile: bool,
+) -> anyhow::Result<()> {
+    if draft_tokens == 0 {
+        return Err(anyhow::anyhow!("--draft-tokens must be greater than zero"));
+    }
+    if max_tokens == 0 {
+        return Err(anyhow::anyhow!("--max-tokens must be greater than zero"));
+    }
+    if let Some(batch) = context_config.batch_tokens {
+        if batch < draft_tokens.saturating_add(1) {
+            return Err(anyhow::anyhow!(
+                "--batch {} is smaller than draft length {} plus the pending token",
+                batch,
+                draft_tokens
+            ));
+        }
+    }
+    let draft_set = discover_model_set(draft_path).map_err(|error| anyhow::anyhow!(error))?;
+    let draft_gguf = draft_set.merged_model();
+    ramforge_runtime::draft_vocabulary_compatible(&draft_gguf, target_gguf)
+        .map_err(|error| anyhow::anyhow!("draft compatibility: {error}"))?;
+    let mut draft_options = ForgeCoreModelOptions {
+        use_extra_bufts: !no_repack,
+        ..ForgeCoreModelOptions::default()
+    };
+    if no_prefetch {
+        draft_options = draft_options.with_no_prefetch();
+    }
+    let draft_model = ForgeCoreModel::load_with_options(draft_path, draft_options)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let target_session = target_model
+        .open_context(ForgeCoreContextOptions {
+            n_ctx: Some(context_tokens),
+            n_threads: target_threads as usize,
+            n_threads_batch: Some(target_threads as usize),
+            n_batch: context_config.batch_tokens,
+            n_ubatch: context_config.ubatch_tokens,
+            n_seq_max: Some(1),
+            n_outputs_max: Some(draft_tokens + 1),
+            n_outputs_max_per_seq: Some(draft_tokens + 1),
+            kv_type_k: context_config.kv_type_k.unwrap_or_default(),
+            kv_type_v: context_config.kv_type_v.unwrap_or_default(),
+            flash_attn: context_config.flash_attn.unwrap_or_default(),
+            offload_kqv: context_config.offload_kqv,
+            op_offload: context_config.op_offload,
+            trace_max_events: None,
+            routing: None,
+        })
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let mut target_session = target_session;
+    let mut draft_session = draft_model
+        .open_context(ForgeCoreContextOptions {
+            n_ctx: Some(context_tokens),
+            n_threads: draft_threads as usize,
+            n_threads_batch: Some(draft_threads as usize),
+            n_batch: Some(draft_tokens + 1),
+            n_ubatch: Some(draft_tokens + 1),
+            n_seq_max: Some(1),
+            n_outputs_max: Some(draft_tokens + 1),
+            n_outputs_max_per_seq: Some(draft_tokens + 1),
+            kv_type_k: ramforge_runtime::KvCacheType::F16,
+            kv_type_v: ramforge_runtime::KvCacheType::F16,
+            flash_attn: ramforge_runtime::FlashAttentionMode::Auto,
+            offload_kqv: Some(true),
+            op_offload: Some(true),
+            trace_max_events: None,
+            routing: None,
+        })
+        .map_err(|error| anyhow::anyhow!(error))?;
+    if tokenizer.vocab_size() != target_model.metadata().vocab_size as usize {
+        return Err(anyhow::anyhow!(
+            "target tokenizer vocabulary {} does not match native vocabulary {}",
+            tokenizer.vocab_size(),
+            target_model.metadata().vocab_size
+        ));
+    }
+    let io_before = ramforge_runtime::memory_report::process_io();
+    let faults_before = process_faults();
+    let generation_started = Instant::now();
+    let mut decoder = tokenizer.decoder();
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "Assistant: ")?;
+    stdout.flush()?;
+    let mut text = String::new();
+    let output = ramforge_runtime::generate_speculative(
+        &mut target_session,
+        &mut draft_session,
+        prompt_tokens,
+        ramforge_runtime::SpeculativeConfig {
+            max_draft_tokens: draft_tokens,
+            max_tokens: u32::try_from(max_tokens).unwrap_or(u32::MAX),
+        },
+        tokenizer.eos_id,
+        |token| {
+            let piece = decoder.push(token);
+            if !piece.is_empty() {
+                text.push_str(&piece);
+                write!(stdout, "{piece}")
+                    .and_then(|_| stdout.flush())
+                    .map_err(|error| {
+                        ramforge_runtime::ForgeCoreAdapterError::Decode(error.to_string())
+                    })?;
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    let trailing = decoder.finish();
+    if !trailing.is_empty() {
+        text.push_str(&trailing);
+        write!(stdout, "{trailing}")?;
+    }
+    writeln!(stdout)?;
+    stdout.flush()?;
+    let total_ns = generation_started.elapsed().as_nanos() as u64;
+    let io_after = ramforge_runtime::memory_report::process_io();
+    let faults_after = process_faults();
+    let delta = |before: Option<u64>, after: Option<u64>| {
+        Some(after?.saturating_sub(before?))
+    };
+    let storage_read = delta(
+        io_before.as_ref().map(|io| io.read_bytes),
+        io_after.as_ref().map(|io| io.read_bytes),
+    );
+    let rchar = delta(
+        io_before.as_ref().map(|io| io.rchar_bytes),
+        io_after.as_ref().map(|io| io.rchar_bytes),
+    );
+    let major = delta(faults_before.1, faults_after.1);
+    let minor = delta(faults_before.0, faults_after.0);
+    let stats = &output.stats;
+    let rate = if total_ns == 0 {
+        0.0
+    } else {
+        output.token_ids.len() as f64 * 1e9 / total_ns as f64
+    };
+    eprintln!("Generated {} tokens (speculative greedy)", output.token_ids.len());
+    eprintln!(
+        "Speculative: rounds={} draft_generated={} target_evaluated={} accepted={} rejected={} fallback={} acceptance_bps={} avg_accepted_x100={}",
+        stats.rounds,
+        stats.draft_tokens_generated,
+        stats.target_positions_evaluated,
+        stats.accepted_tokens,
+        stats.rejected_tokens,
+        stats.fallback_tokens,
+        stats.acceptance_rate_bps,
+        stats.avg_accepted_per_round_x100
+    );
+    eprintln!(
+        "Speculative timing: total_ms={:.1} target_forwards={} target_ms={:.1} draft_ms={:.1} ttft_ms={:.1} tok/s={:.3}",
+        total_ns as f64 / 1e6,
+        stats.target_forwards,
+        stats.target_forward_ns as f64 / 1e6,
+        stats.draft_forward_ns as f64 / 1e6,
+        stats.first_token_ns.unwrap_or(0) as f64 / 1e6,
+        rate
+    );
+    eprintln!(
+        "Speculative I/O: storage_read_MB={:.1} rchar_MB={:.1} major_faults={:?} minor_faults={:?}",
+        storage_read.unwrap_or(0) as f64 / 1e6,
+        rchar.unwrap_or(0) as f64 / 1e6,
+        major,
+        minor
+    );
+    if profile {
+        eprintln!(
+            "Speculative profile: prompt_ms={:.1} emitted={} target_positions={}",
+            stats.prompt_ns as f64 / 1e6,
+            stats.emitted_tokens,
+            stats.target_positions_evaluated
+        );
+    }
+    if let Some(path) = report_path {
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "mode": "greedy_speculative",
+            "target_model": target_model.path(),
+            "draft_model": draft_path,
+            "draft_tokens": draft_tokens,
+            "max_tokens": max_tokens,
+            "context_tokens": context_tokens,
+            "stats": stats,
+            "output_token_ids": output.token_ids,
+            "storage_read_bytes": storage_read,
+            "rchar_bytes": rchar,
+            "major_faults": major,
+            "minor_faults": minor,
+            "total_ns": total_ns,
+            "notes": [
+                "Greedy-only speculative decoding; temperature/top-k/top-p are rejected.",
+                "Draft vocabulary must be an exact prefix of the target vocabulary.",
+                "Target storage reads include both models and process-wide I/O."
+            ]
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+        eprintln!("Speculative report written: {}", path.display());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_forgecore_inference(
     model_path: PathBuf,
     ram_str: String,
@@ -4430,6 +4679,10 @@ fn run_forgecore_inference(
     routing_observe: bool,
     routing_report: Option<PathBuf>,
     routing_max_observations: usize,
+    draft_model: Option<PathBuf>,
+    draft_tokens: u32,
+    draft_threads: Option<u32>,
+    speculative_report: Option<PathBuf>,
     no_repack: bool,
     no_prefetch: bool,
     release_mapping_pages: bool,
@@ -5039,6 +5292,43 @@ fn run_forgecore_inference(
         );
         default
     });
+    if let Some(draft_path) = draft_model.as_ref() {
+        if routing_observe {
+            return Err(anyhow::anyhow!(
+                "--draft-model and --routing-observe are mutually exclusive in this path"
+            ));
+        }
+        if gpu_layers != 0 {
+            return Err(anyhow::anyhow!(
+                "speculative decoding currently requires CPU target execution; static GPU placement measured slower with draft verification and is not supported in this milestone"
+            ));
+        }
+        if draft_tokens > 64 {
+            return Err(anyhow::anyhow!("--draft-tokens must be at most 64"));
+        }
+        if temperature > 0.0 || top_k.is_some() || top_p.is_some() {
+            return Err(anyhow::anyhow!(
+                "speculative decoding is currently greedy-only: use --temperature 0 without --top-k/--top-p"
+            ));
+        }
+        return run_speculative_inference(
+            &model,
+            &gguf,
+            &tokenizer,
+            &prompt_tokens,
+            draft_path,
+            draft_tokens,
+            draft_threads.unwrap_or(threads),
+            requested_ctx,
+            threads,
+            context_config,
+            max_tokens,
+            no_repack,
+            no_prefetch,
+            speculative_report.as_deref(),
+            profile,
+        );
+    }
     let mut session = model
         .open_context(ForgeCoreContextOptions {
             n_ctx: Some(requested_ctx),
@@ -5047,6 +5337,8 @@ fn run_forgecore_inference(
             n_batch: context_config.batch_tokens,
             n_ubatch: context_config.ubatch_tokens,
             n_seq_max: context_config.sequence_max,
+            n_outputs_max: None,
+            n_outputs_max_per_seq: None,
             kv_type_k: context_config.kv_type_k.unwrap_or_default(),
             kv_type_v: context_config.kv_type_v.unwrap_or_default(),
             flash_attn: context_config.flash_attn.unwrap_or_default(),

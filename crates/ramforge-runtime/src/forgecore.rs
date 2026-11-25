@@ -544,6 +544,12 @@ impl ForgeCoreModel {
         if let Some(sequences) = options.n_seq_max {
             context_options.n_seq_max = sequences;
         }
+        if let Some(outputs) = options.n_outputs_max {
+            context_options.n_outputs_max = outputs;
+        }
+        if let Some(outputs) = options.n_outputs_max_per_seq {
+            context_options.n_outputs_max_per_seq = outputs;
+        }
         if let Some(offload) = options.offload_kqv {
             context_options.offload_kqv = offload;
         }
@@ -590,6 +596,11 @@ pub struct ForgeCoreContextOptions {
     pub n_ubatch: Option<u32>,
     /// Maximum distinct sequences. `None` preserves the native default.
     pub n_seq_max: Option<u32>,
+    /// Graph-sizing hint: maximum outputs per micro-batch.
+    pub n_outputs_max: Option<u32>,
+    /// Graph-sizing hint: maximum outputs per sequence. Multi-token
+    /// verification requires this to be at least the batch length.
+    pub n_outputs_max_per_seq: Option<u32>,
     /// K cache element type.
     pub kv_type_k: KvCacheType,
     /// V cache element type.
@@ -616,6 +627,8 @@ impl Default for ForgeCoreContextOptions {
             n_batch: None,
             n_ubatch: None,
             n_seq_max: None,
+            n_outputs_max: None,
+            n_outputs_max_per_seq: None,
             kv_type_k: KvCacheType::F16,
             kv_type_v: KvCacheType::F16,
             flash_attn: FlashAttentionMode::Auto,
@@ -1149,6 +1162,72 @@ impl ForgeCoreSession {
             .decode(&batch)
             .map_err(|error| ForgeCoreAdapterError::Decode(error.to_string()))?;
         self.logits(token_index)
+    }
+
+    /// Decode a multi-token batch and return logits for every position.
+    ///
+    /// Intended for speculative verification: the batch must fit in one native
+    /// `n_batch` and the context must be opened with
+    /// `n_outputs_max_per_seq >= tokens.len()`. No chunking is performed because
+    /// a chunked verification would defeat the single-pass weight reuse.
+    pub fn decode_tokens_all_logits(
+        &mut self,
+        tokens: &[u32],
+        start_position: u32,
+    ) -> Result<Vec<ForgeCoreLogits>, ForgeCoreAdapterError> {
+        if tokens.is_empty() {
+            return Err(ForgeCoreAdapterError::Batch(
+                "at least one token is required".to_string(),
+            ));
+        }
+        let batch_limit = usize::try_from(self.context.n_batch()).unwrap_or(1).max(1);
+        if tokens.len() > batch_limit {
+            return Err(ForgeCoreAdapterError::Batch(format!(
+                "verification batch {} exceeds native n_batch {batch_limit}",
+                tokens.len()
+            )));
+        }
+        let mut builder = BatchBuilder::new(self.model.metadata.vocab_size);
+        for (offset, &token) in tokens.iter().enumerate() {
+            let offset = u32::try_from(offset).map_err(|_| {
+                ForgeCoreAdapterError::Batch("batch offset exceeds u32".to_string())
+            })?;
+            let position = start_position.checked_add(offset).ok_or_else(|| {
+                ForgeCoreAdapterError::Batch("token position overflows u32".to_string())
+            })?;
+            builder
+                .push(token, position, true)
+                .map_err(|error| ForgeCoreAdapterError::Batch(error.to_string()))?;
+        }
+        let batch = builder
+            .build()
+            .map_err(|error| ForgeCoreAdapterError::Batch(error.to_string()))?;
+        self.context
+            .decode(&batch)
+            .map_err(|error| ForgeCoreAdapterError::Decode(error.to_string()))?;
+        let mut logits = Vec::with_capacity(tokens.len());
+        for index in 0..tokens.len() {
+            let index = u32::try_from(index)
+                .map_err(|_| ForgeCoreAdapterError::Logits("index exceeds u32".to_string()))?;
+            logits.push(self.logits(index)?);
+        }
+        Ok(logits)
+    }
+
+    /// Remove KV cells in `[start, end)` for one sequence. `end = None` removes
+    /// the tail. Caller must not have an active graph on this context.
+    pub fn remove_kv_range(
+        &mut self,
+        seq: u32,
+        start: u32,
+        end: Option<u32>,
+    ) -> Result<(), ForgeCoreAdapterError> {
+        let mut memory = self.context.memory().ok_or_else(|| {
+            ForgeCoreAdapterError::Context("context has no memory object".to_string())
+        })?;
+        memory
+            .remove_range(seq, start, end)
+            .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))
     }
 
     /// Copy logits for a position in the most recently decoded batch.

@@ -859,6 +859,8 @@ impl InferenceService {
                 n_batch: Some(self.plan.effective.batch_tokens),
                 n_ubatch: Some(self.plan.effective.ubatch_tokens),
                 n_seq_max: Some(self.plan.effective.sequence_max),
+                n_outputs_max: None,
+                n_outputs_max_per_seq: None,
                 kv_type_k: KvCacheType::parse(&self.plan.effective.kv_type_k)
                     .map_err(ServiceError::Configuration)?,
                 kv_type_v: KvCacheType::parse(&self.plan.effective.kv_type_v)

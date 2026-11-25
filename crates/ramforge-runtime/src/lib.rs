@@ -76,6 +76,7 @@ pub mod scheduler_policy;
 pub mod sampling;
 pub mod service_server;
 pub mod simd;
+pub mod speculative;
 pub mod staging_plan;
 pub mod streaming_model;
 pub mod support;
@@ -199,6 +200,10 @@ pub use residency_prediction::{
 };
 pub use scheduler_policy::{
     AdaptiveController, DecisionConfidence, DecisionContext, StrategyDecision, TransferStrategy,
+};
+pub use speculative::{
+    draft_vocabulary_compatible, generate_speculative, SpeculativeConfig, SpeculativeOutput,
+    SpeculativeRound, SpeculativeStats,
 };
 pub use staging_plan::{
     SelectionPolicy, StagingLayerPlan, StagingPlan, StagingPlanState, StagingRequest,

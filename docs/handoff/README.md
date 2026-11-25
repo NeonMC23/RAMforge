@@ -10,6 +10,8 @@ This directory is the transfer package for a new developer or agent arriving wit
 
 > **Dense overflow milestone (2026-11-25):** [DENSE_OVERFLOW_2026-11-25.md](DENSE_OVERFLOW_2026-11-25.md) measures the 32B dense storage-bound baseline, adds per-token storage/fault and PSS/mapping instrumentation, introduces the `--residency auto` bounded staging policy, and reports +24.8% decode / 13-32% fewer reads along with the negative experiments.
 
+> **Speculative decoding milestone (2026-11-25):** [SPECULATIVE_DECODING_2026-11-25.md](SPECULATIVE_DECODING_2026-11-25.md) proves multi-token target verification, validates 1.5B/7B Qwen draft vocabulary compatibility, implements greedy speculative decoding with exact KV rollback, and reports 1.69-1.97x on 8 tokens and 2.94x on a controlled 16-token run, with byte-identical output.
+
 ## Reading order
 
 1. [PROJECT_STATE.md](PROJECT_STATE.md) — what exists, what is supported, and the current conclusion.
