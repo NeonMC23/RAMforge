@@ -12,7 +12,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use forge_core::{
-    BatchBuilder, Context, ContextLifetimeState, ContextTraceOptions, DType, FlashAttnType,
+    BatchBuilder, Context, ContextLifetimeState, ContextTraceOptions, DType,
+    ExpertRoutingObservation, ExpertRoutingOptions, ExpertRoutingSummary, FlashAttnType,
     GpuLayers, Model, ModelLifetimeState, ModelLoadMode, ModelOptions, NodeDispatchEvent,
     NodeDispatchOptions, NodeDispatchSummary, PageReleaseResult, ResidencyError, SplitMode,
     TensorMappingInfo, TraceEvent, TraceSummary,
@@ -555,6 +556,7 @@ impl ForgeCoreModel {
         context_options.trace = options
             .trace_max_events
             .map(|max_events| ContextTraceOptions { max_events });
+        context_options.routing = options.routing;
         let context = Context::open(&self.model, &context_options)
             .map_err(|error| ForgeCoreAdapterError::Context(error.to_string()))?;
 
@@ -601,6 +603,8 @@ pub struct ForgeCoreContextOptions {
     /// Opt-in bounded scheduler eval trace size. `None` preserves the plain
     /// decode path with no callback installed.
     pub trace_max_events: Option<usize>,
+    /// Opt-in read-only expert-routing observation. CPU model execution only.
+    pub routing: Option<ExpertRoutingOptions>,
 }
 
 impl Default for ForgeCoreContextOptions {
@@ -618,6 +622,7 @@ impl Default for ForgeCoreContextOptions {
             offload_kqv: None,
             op_offload: None,
             trace_max_events: None,
+            routing: None,
         }
     }
 }
@@ -1045,6 +1050,24 @@ impl ForgeCoreSession {
 
     pub fn clear_trace(&self) {
         self.context.clear_trace();
+    }
+
+    /// Copy retained expert-routing observations. Empty unless observation was
+    /// enabled at context open.
+    pub fn routing_observations(&self) -> Vec<ExpertRoutingObservation> {
+        self.context.routing_observations()
+    }
+
+    pub fn take_routing_observations(&self) -> Vec<ExpertRoutingObservation> {
+        self.context.take_routing_observations()
+    }
+
+    pub fn clear_routing_observations(&self) {
+        self.context.clear_routing_observations();
+    }
+
+    pub fn routing_summary(&self) -> Option<ExpertRoutingSummary> {
+        self.context.routing_summary()
     }
 
     pub fn vocab_size(&self) -> u32 {

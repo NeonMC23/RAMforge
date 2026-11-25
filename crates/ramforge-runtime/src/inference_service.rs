@@ -15,6 +15,7 @@ use crate::context_config::{FlashAttentionMode, KvCacheType};
 use crate::forgecore::{
     ForgeCoreContextOptions, ForgeCoreModel, ForgeCoreModelOptions, ForgeCoreSession,
 };
+use crate::ExpertRoutingOptions;
 use crate::gpu_observability::{
     collect_observability, GpuObservability, StagingCounters, StagingObservation, StagingState,
 };
@@ -380,6 +381,7 @@ pub struct InferenceService {
     prefetch_standby_bytes: u64,
     tensor_mappings: Option<HashMap<String, forge_core::TensorMappingInfo>>,
     pending_pipeline: Option<PendingPipeline>,
+    routing_options: Option<ExpertRoutingOptions>,
 }
 
 impl InferenceService {
@@ -418,6 +420,7 @@ impl InferenceService {
             prefetch_standby_bytes: 0,
             tensor_mappings: None,
             pending_pipeline: None,
+            routing_options: None,
         })
     }
 
@@ -507,6 +510,26 @@ impl InferenceService {
         self.staged_layers = request.layers.clone();
         self.staging_request = request;
         self
+    }
+
+    /// Enable read-only expert-routing observation for subsequent sessions.
+    /// Requires a CPU plan; the native context rejects GPU execution.
+    pub fn with_routing_observation(mut self, options: ExpertRoutingOptions) -> Self {
+        self.routing_options = Some(options);
+        self
+    }
+
+    pub fn routing_observations(&self) -> Vec<crate::ExpertRoutingObservation> {
+        self.session
+            .as_ref()
+            .map(|session| session.routing_observations())
+            .unwrap_or_default()
+    }
+
+    pub fn routing_summary(&self) -> Option<crate::ExpertRoutingSummary> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.routing_summary())
     }
 
     pub fn staged_layers(&self) -> &[u32] {
@@ -818,6 +841,7 @@ impl InferenceService {
                 offload_kqv: Some(self.plan.effective.offload_kqv),
                 op_offload: Some(self.plan.effective.op_offload),
                 trace_max_events: None,
+                routing: self.routing_options,
             })
             .map_err(|error| ServiceError::Context(error.to_string()))?;
         let effective_context = session.context_length();

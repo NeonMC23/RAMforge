@@ -6,6 +6,8 @@ This directory is the transfer package for a new developer or agent arriving wit
 
 > **Execution-core milestone (2026-11-25):** [INFERENCE_CORE_OPTIMIZATION_2026-11-25.md](INFERENCE_CORE_OPTIMIZATION_2026-11-25.md) records the implemented DeepSeek2 support, KV dtype/batch/flash forwarding, CLI threading fix, combined static-offload plus dynamic-staging mode, benchmark session reuse, and per-run storage/fault instrumentation, with before/after measurements.
 
+> **MoE routing milestone (2026-11-25):** [MOE_EXPERT_RESIDENCY_2026-11-25.md](MOE_EXPERT_RESIDENCY_2026-11-25.md) documents verified read-only CPU expert-routing observation, measured DeepSeek2 expert locality, per-layer expert accounting, cache/prefetch simulations, the exact expert-granularity blocker, and the native capability proposal.
+
 ## Reading order
 
 1. [PROJECT_STATE.md](PROJECT_STATE.md) — what exists, what is supported, and the current conclusion.

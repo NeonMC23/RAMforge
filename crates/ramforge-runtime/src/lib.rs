@@ -47,6 +47,7 @@ pub mod machine_profile;
 pub mod model_architecture;
 pub mod model_executor;
 pub mod model_requirements;
+pub mod moe_routing;
 pub mod model_storage;
 pub mod observation_contract;
 pub mod ops;
@@ -91,9 +92,10 @@ pub use crate::forgecore::{
     ForgeCoreModel, ForgeCoreModelMetadata, ForgeCoreModelOptions, ForgeCoreSession,
 };
 pub use forge_core::{
-    NodeDispatchBackend, NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSource,
-    NodeDispatchSummary, NodeSamplingStrategy, PageReleaseResult, PageSample, PageSampleStatus,
-    TensorMappingInfo, MAX_NODE_DISPATCH_EVENTS,
+    ExpertRoutingObservation, ExpertRoutingOptions, ExpertRoutingSummary, NodeDispatchBackend,
+    NodeDispatchEvent, NodeDispatchOptions, NodeDispatchSource, NodeDispatchSummary,
+    NodeSamplingStrategy, PageReleaseResult, PageSample, PageSampleStatus, TensorMappingInfo,
+    MAX_NODE_DISPATCH_EVENTS,
 };
 pub use benchmark_runner::{
     run_benchmark, BenchmarkConfig, BenchmarkReport, BenchmarkRun, BENCHMARK_SCHEMA_VERSION,
@@ -130,6 +132,11 @@ pub use memory_hierarchy::{
     PlacementState, MEMORY_HIERARCHY_SCHEMA_VERSION,
 };
 pub use model_architecture::{inspect_architecture, ArchitectureKind, ModelArchitecture};
+pub use moe_routing::{
+    aggregate_routing, expert_byte_ranges, expert_layout, ExpertByteRange, ExpertLayerLayout,
+    ExpertLayout, LayerRoutingReport, PrefetchAssessment, ResidencySimulation, RoutingAggregate,
+    RoutingObservationRecord, SimulationPolicy, MOE_ROUTING_SCHEMA_VERSION,
+};
 pub use model_storage::{
     assess_storage, copy_model_verified, CopyReport, DestinationAssessment, StorageRecommendation,
     MODEL_STORAGE_SCHEMA_VERSION,

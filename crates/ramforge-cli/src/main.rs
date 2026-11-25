@@ -828,6 +828,18 @@ enum Commands {
         #[command(flatten)]
         context_args: ContextArgs,
 
+        /// Observe per-token MoE expert routing (read-only; CPU execution only)
+        #[arg(long)]
+        routing_observe: bool,
+
+        /// Write the routing aggregate and observations as JSON to PATH
+        #[arg(long, value_name = "PATH", requires = "routing_observe")]
+        routing_report: Option<PathBuf>,
+
+        /// Maximum retained routing observations
+        #[arg(long, default_value_t = 65536, requires = "routing_observe")]
+        routing_max_observations: usize,
+
         /// Disable llama.cpp CPU weight repacking; keeps quantized weights in the file-backed mapping
         #[arg(long)]
         no_repack: bool,
@@ -1374,6 +1386,9 @@ fn main() {
             gpu_layers,
             ctx,
             context_args,
+            routing_observe,
+            routing_report,
+            routing_max_observations,
             no_repack,
             no_prefetch,
             release_mapping_pages,
@@ -1457,6 +1472,9 @@ fn main() {
                 gpu_layers,
                 ctx,
                 context_args,
+                routing_observe,
+                routing_report,
+                routing_max_observations,
                 no_repack,
                 no_prefetch,
                 release_mapping_pages,
@@ -3560,9 +3578,16 @@ fn run_plan(
         .apply_kv_cache_types(kv_type_k, kv_type_v)
         .map_err(|error| anyhow::anyhow!(error))?;
     let expert = ramforge_runtime::expert_accounting(&gguf);
+    let expert_layout = ramforge_runtime::expert_layout(&gguf);
 
     if json_output {
-        output_plan_json(&plan, &gguf, Some(&requirements), Some(&expert))?;
+        output_plan_json(
+            &plan,
+            &gguf,
+            Some(&requirements),
+            Some(&expert),
+            Some(&expert_layout),
+        )?;
     } else {
         output_plan_human(&plan, &gguf, &ram_str);
         println!(
@@ -3591,6 +3616,113 @@ fn run_plan(
         }
     }
 
+    Ok(())
+}
+
+fn emit_routing_report(
+    gguf: &GgufModel,
+    native_model: &ramforge_runtime::ForgeCoreModel,
+    observations: &[ramforge_runtime::ExpertRoutingObservation],
+    summary: Option<ramforge_runtime::ExpertRoutingSummary>,
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let layout = ramforge_runtime::expert_layout(gguf);
+    let capacities = [64u32, 128, 256, 512, 1024];
+    let aggregate = ramforge_runtime::aggregate_routing(observations, Some(&layout), &capacities);
+    if let Some(summary) = summary {
+        eprintln!(
+            "Routing summary: observations={} retained={} dropped={} complete_decode={} partial={} invalid={}",
+            summary.observations,
+            summary.retained_observations,
+            summary.dropped_observations,
+            summary.complete_decode_observations,
+            summary.partial_observations,
+            summary.invalid_indices
+        );
+    }
+    if let Some(aggregate) = &aggregate {
+        eprintln!(
+            "Routing locality: complete_decode={} layers={} unique_experts={} consecutive_overlap={:?} mean_reuse_distance={:?}",
+            aggregate.complete_decode_observations,
+            aggregate.layers.len(),
+            aggregate.unique_experts,
+            aggregate.consecutive_overlap_bps,
+            aggregate.mean_reuse_distance
+        );
+        for layer in aggregate.layers.iter().take(3) {
+            eprintln!(
+                "  layer {}: observations={} unique={} overlap_bps={:?} per_expert_bytes={:?} top={:?}",
+                layer.layer,
+                layer.observations,
+                layer.unique_experts,
+                layer.consecutive_overlap_bps,
+                layer.per_expert_bytes,
+                layer.top_experts.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+        for simulation in &aggregate.simulations {
+            eprintln!(
+                "  simulation {:?} capacity_slots={} hit_rate_bps={} hits={} misses={} avoided_bytes={}",
+                simulation.policy,
+                simulation.capacity_slots,
+                simulation.hit_rate_bps,
+                simulation.hits,
+                simulation.misses,
+                simulation.avoided_transfer_bytes
+            );
+        }
+        if let Some(prefetch) = &aggregate.prefetch {
+            eprintln!(
+                "Prefetch assessment: previous_active={} bytes reuse_bps={:?} used={:?} wasted={:?} feasible={}",
+                prefetch.previous_token_active_set_bytes,
+                prefetch.expected_reuse_bps,
+                prefetch.expected_used_bytes,
+                prefetch.expected_wasted_bytes,
+                prefetch.feasible
+            );
+        }
+    } else {
+        eprintln!(
+            "Routing locality: no complete single-token observations were captured; prompt-only or too few tokens"
+        );
+    }
+    if let Some(path) = path {
+        let records: Vec<ramforge_runtime::RoutingObservationRecord> = observations
+            .iter()
+            .map(ramforge_runtime::RoutingObservationRecord::from)
+            .collect();
+        let sample_expert_ranges = aggregate.as_ref().and_then(|aggregate| {
+            let layer = aggregate.layers.first()?;
+            let expert = layer.top_experts.first()?.0;
+            let mappings = native_model.tensor_mappings().ok()?;
+            ramforge_runtime::expert_byte_ranges(gguf, &mappings, layer.layer, &[expert]).ok()
+        });
+        let output = serde_json::json!({
+            "schema_version": 1,
+            "scope": "read-only CPU ffn_moe_topk observation; no native execution change",
+            "summary": summary.map(|summary| serde_json::json!({
+                "executions": summary.executions,
+                "observations": summary.observations,
+                "dropped_observations": summary.dropped_observations,
+                "max_observations": summary.max_observations,
+                "retained_observations": summary.retained_observations,
+                "complete_decode_observations": summary.complete_decode_observations,
+                "partial_observations": summary.partial_observations,
+                "invalid_indices": summary.invalid_indices,
+            })),
+            "layout": layout,
+            "aggregate": aggregate,
+            "sample_expert_ranges": sample_expert_ranges,
+            "observations": records,
+            "limitations": [
+                "Only single-token decode observations are complete; prompt processing copies the first token row only.",
+                "Cache simulations are theoretical and do not move data or prove expert residency.",
+                "Native kv/ffn_moe_topk readback is CPU-only in this prototype."
+            ],
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&output)?)?;
+        eprintln!("Routing report written: {}", path.display());
+    }
     Ok(())
 }
 
@@ -3648,6 +3780,9 @@ fn run_inference(
     gpu_layers: u32,
     ctx: Option<u32>,
     context_args: ContextArgs,
+    routing_observe: bool,
+    routing_report: Option<PathBuf>,
+    routing_max_observations: usize,
     no_repack: bool,
     no_prefetch: bool,
     release_mapping_pages: bool,
@@ -3858,6 +3993,9 @@ fn run_inference(
             gpu_layers,
             ctx,
             context_args.clone(),
+            routing_observe,
+            routing_report.clone(),
+            routing_max_observations,
             no_repack,
             no_prefetch,
             release_mapping_pages,
@@ -3914,6 +4052,8 @@ fn run_inference(
         || context_args.kv_type_v != "f16"
         || context_args.flash_attn != "auto"
         || gpu_layers != 0
+        || routing_observe
+        || routing_report.is_some()
     {
         return Err(anyhow::anyhow!(
             "context configuration (--threads/--batch/--ubatch/--kv-type-*/--flash-attn/--sequence-max/offload flags) is only supported with --backend forgecore"
@@ -4216,6 +4356,9 @@ fn run_forgecore_inference(
     gpu_layers: u32,
     ctx: Option<u32>,
     context_args: ContextArgs,
+    routing_observe: bool,
+    routing_report: Option<PathBuf>,
+    routing_max_observations: usize,
     no_repack: bool,
     no_prefetch: bool,
     release_mapping_pages: bool,
@@ -4774,6 +4917,29 @@ fn run_forgecore_inference(
             context_config.kv_type_v
         ));
     }
+    let routing_options = if routing_observe {
+        if gpu_layers != 0 {
+            return Err(anyhow::anyhow!(
+                "expert routing observation currently requires CPU execution; remove --gpu-layers"
+            ));
+        }
+        let info = gguf.info();
+        let expert_count = info.expert_count.ok_or_else(|| {
+            anyhow::anyhow!("--routing-observe requires GGUF expert_count metadata")
+        })?;
+        let expert_used_count = info.expert_used_count.ok_or_else(|| {
+            anyhow::anyhow!("--routing-observe requires GGUF expert_used_count metadata")
+        })?;
+        Some(ramforge_runtime::ExpertRoutingOptions {
+            max_observations: routing_max_observations,
+            expert_count: u32::try_from(expert_count)
+                .map_err(|_| anyhow::anyhow!("expert_count exceeds u32"))?,
+            expert_used_count: u32::try_from(expert_used_count)
+                .map_err(|_| anyhow::anyhow!("expert_used_count exceeds u32"))?,
+        })
+    } else {
+        None
+    };
     let architecture_support = ramforge_runtime::support::model_execution_support(&gguf);
     let raw_prompt = prompt;
     let prompt = prepare_prompt(&gguf, raw_prompt.clone(), chat, system)?;
@@ -4798,7 +4964,7 @@ fn run_forgecore_inference(
 
     let requested_ctx = ctx.unwrap_or_else(|| {
         let training = model.metadata().context_length;
-        let default = training.min(4096).max(1);
+        let default = training.clamp(1, 4096);
         eprintln!(
             "Context: no --ctx supplied; using {default} tokens (model training context {training}); pass --ctx to override"
         );
@@ -4820,6 +4986,7 @@ fn run_forgecore_inference(
             offload_kqv: context_config.offload_kqv,
             op_offload: context_config.op_offload,
             trace_max_events: graph_trace.then_some(graph_trace_events),
+            routing: routing_options,
         })
         .map_err(|error| anyhow::anyhow!(error))?;
     let effective_context = session.effective_context_configuration();
@@ -5063,6 +5230,17 @@ fn run_forgecore_inference(
             .unwrap_or_else(|| "<unavailable>".to_string()),
         context_length
     );
+    if routing_observe {
+        let observations = session.routing_observations();
+        let summary = session.routing_summary();
+        emit_routing_report(
+            &gguf,
+            &model,
+            &observations,
+            summary,
+            routing_report.as_deref(),
+        )?;
+    }
     if verbose {
         eprintln!(
             "ForgeCore session: context_length={} vocab={} CPU threads={}",
@@ -7838,6 +8016,7 @@ fn output_plan_json(
     model: &GgufModel,
     requirements: Option<&ramforge_runtime::model_requirements::ModelRequirements>,
     expert: Option<&ramforge_runtime::ExpertAccounting>,
+    expert_layout: Option<&ramforge_runtime::ExpertLayout>,
 ) -> anyhow::Result<()> {
     use serde_json::json;
 
@@ -7911,6 +8090,7 @@ fn output_plan_json(
             "scope": "metadata-derived estimate; not a native allocation or a reduction in weight bytes",
         })),
         "expert_capacity": expert,
+        "expert_layout": expert_layout,
         "cache": {
             "capacity": plan.cache_capacity,
             "policy": "LRU",

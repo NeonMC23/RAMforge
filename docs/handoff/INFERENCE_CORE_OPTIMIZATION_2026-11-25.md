@@ -328,3 +328,8 @@ No Context Engine, agent orchestration, autonomous indexing, vector database,
 multi-model router, new service, competing tensor engine, direct llama FFI in
 RAMforge, direct `forge-sys` dependency, native llama.cpp modification, or
 destructive cache management was introduced.
+
+**Follow-up:** [MOE_EXPERT_RESIDENCY_2026-11-25.md](MOE_EXPERT_RESIDENCY_2026-11-25.md)
+implements read-only CPU expert-routing observation and measures DeepSeek2
+expert locality. It confirms that this milestone's ~1.73 GB active estimate is
+per-token, not a workload working set.
