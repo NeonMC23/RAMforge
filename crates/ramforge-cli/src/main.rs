@@ -236,6 +236,38 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Recommend an execution configuration from model, hardware, and measured profiles
+    Recommend {
+        /// Path to the GGUF model file
+        model: PathBuf,
+
+        /// Planning RAM budget (default: observed available memory)
+        #[arg(long)]
+        ram: Option<String>,
+
+        /// Context length for the recommendation
+        #[arg(long, default_value_t = 256)]
+        context: u32,
+
+        #[command(flatten)]
+        context_args: ContextArgs,
+
+        /// Optional compatible draft model
+        #[arg(long, value_name = "PATH")]
+        draft_model: Option<PathBuf>,
+
+        /// Candidate draft length for the recommendation
+        #[arg(long, default_value_t = 8, requires = "draft_model")]
+        draft_tokens: u32,
+
+        /// Optional performance profile store to consult
+        #[arg(long, value_name = "PATH")]
+        performance_profile: Option<PathBuf>,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Show explicit architecture, tokenizer, and quantization capabilities
     Support,
     /// Run a controlled lifecycle calibration and compare estimates to observations
@@ -480,6 +512,10 @@ enum Commands {
         /// Draft-model CPU threads (default: target threads)
         #[arg(long, requires = "draft_model")]
         draft_threads: Option<u32>,
+
+        /// Append this benchmark's measured identity and result to a performance profile store
+        #[arg(long, value_name = "PATH")]
+        performance_profile: Option<PathBuf>,
 
         /// Safety margin subtracted from observed free VRAM (default 256M)
         #[arg(long)]
@@ -1077,6 +1113,30 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Recommend {
+            model,
+            ram,
+            context,
+            context_args,
+            draft_model,
+            draft_tokens,
+            performance_profile,
+            json,
+        } => {
+            if let Err(error) = run_recommend(
+                model,
+                ram,
+                context,
+                context_args,
+                draft_model,
+                draft_tokens,
+                performance_profile,
+                json,
+            ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Support => output_support(),
         Commands::Calibrate {
             model,
@@ -1207,6 +1267,7 @@ fn main() {
             draft_model,
             draft_tokens,
             draft_threads,
+            performance_profile,
             staged_margin,
             selection_policy,
             host_staging,
@@ -1237,6 +1298,7 @@ fn main() {
                 draft_model,
                 draft_tokens,
                 draft_threads,
+                performance_profile,
                 staged_margin,
                 selection_policy,
                 host_staging,
@@ -2561,6 +2623,7 @@ fn run_throughput_benchmark(
     draft_model: Option<PathBuf>,
     draft_tokens: u32,
     draft_threads: Option<u32>,
+    performance_profile: Option<PathBuf>,
     staged_margin: Option<String>,
     selection_policy: Option<String>,
     host_staging: Option<String>,
@@ -2712,6 +2775,7 @@ fn run_throughput_benchmark(
         })
         .transpose()?
         .unwrap_or(0);
+    let draft_path_for_profile = draft_model.clone();
     let report = run_benchmark(
         plan,
         BenchmarkConfig {
@@ -2735,6 +2799,35 @@ fn run_throughput_benchmark(
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;
+    if let Some(path) = performance_profile.as_ref() {
+        let profile = ramforge_runtime::model_profile(&gguf);
+        let hardware = ramforge_runtime::hardware_profile(&machine);
+        let residency_label = if staged_auto {
+            "staged"
+        } else {
+            residency.as_str()
+        };
+        let mut workload = ramforge_runtime::workload_from_plan(
+            &report.plan,
+            residency_label,
+            draft_path_for_profile.as_ref().map(|_| draft_tokens),
+            Some(report.max_tokens),
+            ram_bytes,
+        );
+        if let Some(draft_path) = draft_path_for_profile.as_ref() {
+            let draft_set =
+                discover_model_set(draft_path).map_err(|error| anyhow::anyhow!(error))?;
+            workload.draft_model_fingerprint =
+                ramforge_runtime::model_profile(&draft_set.merged_model()).fingerprint;
+        }
+        let identity = ramforge_runtime::performance_identity(&profile, &hardware, &workload);
+        let record = ramforge_runtime::PerformanceRecord::from_benchmark(identity, &report);
+        let mut store = ramforge_runtime::PerformanceProfileStore::load(path)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        store.insert(record);
+        store.save(path).map_err(|error| anyhow::anyhow!(error))?;
+        eprintln!("Performance profile updated: {}", path.display());
+    }
     if json {
         let report_json = report.to_json().map_err(|error| anyhow::anyhow!(error))?;
         println!("{}", serde_json::to_string_pretty(&report_json)?);
@@ -3677,6 +3770,164 @@ fn run_machine(
             );
         }
         println!("{}", comparison.note);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_recommend(
+    model_path: PathBuf,
+    ram_str: Option<String>,
+    context: u32,
+    context_args: ContextArgs,
+    draft_model: Option<PathBuf>,
+    draft_tokens: u32,
+    performance_profile: Option<PathBuf>,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let ram_bytes = ram_str
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --ram: {error}"))?;
+    let context_config = context_args.config()?;
+    let threads = resolve_thread_count(context_args.threads)?;
+    let model_set = discover_model_set(&model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let gguf = model_set.merged_model();
+    let profile = ramforge_runtime::model_profile(&gguf);
+    let mut requirements = model_requirements(
+        &gguf,
+        ModelRequirementConfig {
+            context_tokens: context,
+            batch_tokens: context_config.batch_tokens.unwrap_or(64),
+            kv_bytes_per_element: 2,
+        },
+    );
+    if let Err(error) = requirements.apply_kv_cache_types(
+        context_config.kv_type_k.unwrap_or_default(),
+        context_config.kv_type_v.unwrap_or_default(),
+    ) {
+        eprintln!("Warning: KV accounting unavailable: {error}");
+    }
+    let machine = collect_machine_profile(&MachineProfileConfig {
+        model_path: Some(model_path.clone()),
+        ram_budget_bytes: ram_bytes,
+        cpu: CpuRuntimeSettings {
+            selected_threads: Some(threads),
+            user_thread_limit: None,
+        },
+        ..MachineProfileConfig::default()
+    });
+    let plan = RuntimePlan::resolve_with_context(
+        &machine,
+        &requirements,
+        model_path.to_string_lossy().as_ref(),
+        RuntimeProfileKind::MaximumPerformance,
+        &ramforge_runtime::CustomRuntimeRequest {
+            context_tokens: Some(context),
+            batch_tokens: context_config.batch_tokens,
+            threads: Some(threads),
+            load_mode: Some("mmap".to_string()),
+            no_repack: Some(false),
+            device: Some("cpu".to_string()),
+            gpu_layers: Some(0),
+        },
+        &context_config,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    let residency = "auto".to_string();
+    let mut workload = ramforge_runtime::workload_from_plan(
+        &plan,
+        residency,
+        draft_model.as_ref().map(|_| draft_tokens),
+        None,
+        ram_bytes,
+    );
+    let mut draft_compatible = None;
+    if let Some(draft_path) = draft_model.as_ref() {
+        let draft_set = discover_model_set(draft_path).map_err(|error| anyhow::anyhow!(error))?;
+        let draft_gguf = draft_set.merged_model();
+        let compatible = ramforge_runtime::draft_vocabulary_compatible(&draft_gguf, &gguf).is_ok();
+        draft_compatible = Some(compatible);
+        workload.draft_model_fingerprint = ramforge_runtime::model_profile(&draft_gguf).fingerprint;
+    }
+    let hardware = ramforge_runtime::hardware_profile(&machine);
+    let measured = if let Some(path) = performance_profile.as_ref() {
+        let store = ramforge_runtime::PerformanceProfileStore::load(path)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        store
+            .best_for_model_hardware(profile.fingerprint.as_deref(), &hardware.fingerprint)
+            .cloned()
+    } else {
+        None
+    };
+    let recommendation = ramforge_runtime::recommend(
+        &profile,
+        &hardware,
+        &workload,
+        draft_compatible,
+        measured.as_ref(),
+    );
+    if json_output {
+        let output = serde_json::json!({
+            "model_profile": profile,
+            "hardware_profile": hardware,
+            "workload_profile": workload,
+            "recommendation": recommendation,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "Model: {} ({:?}, {:?}), parameters={:?}, file={}",
+            profile.architecture.as_deref().unwrap_or("unknown"),
+            profile.kind,
+            profile.quantization,
+            profile.parameters,
+            format_bytes(profile.file_bytes)
+        );
+        println!(
+            "Hardware: {:?} {}C/{}T, RAM={}, GPUs={}",
+            hardware.cpu_model,
+            hardware.physical_cores.unwrap_or(0),
+            hardware.logical_cpus.unwrap_or(0),
+            hardware
+                .total_ram_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown".to_string()),
+            hardware.gpus.len()
+        );
+        println!(
+            "Placement: {} ({} GPU layers) — {}",
+            recommendation.placement.mode,
+            recommendation.placement.gpu_layers,
+            recommendation.placement.reason
+        );
+        println!(
+            "Residency: stage_layers={} budget={:?} — {}",
+            recommendation.residency.stage_layers,
+            recommendation.residency.budget_bytes.map(format_bytes),
+            recommendation.residency.reason
+        );
+        println!(
+            "Speculative: compatible={} recommended={} K={} — {}",
+            recommendation.speculative.draft_compatible,
+            recommendation.speculative.recommended,
+            recommendation.speculative.draft_tokens,
+            recommendation.speculative.reason
+        );
+        if let Some(measured) = recommendation.measured_best.as_ref() {
+            println!(
+                "Measured best: {:.4} tok/s decode={:?} acceptance={:?} condition={}",
+                measured.generation_tokens_per_second,
+                measured.decode_tokens_per_second,
+                measured.acceptance_rate_bps,
+                measured.condition
+            );
+        }
+        println!("Evidence: {}", recommendation.evidence_quality);
+        for note in &recommendation.notes {
+            println!("  note: {note}");
+        }
     }
     Ok(())
 }
@@ -8402,6 +8653,7 @@ fn output_json(
         "forgecore_execution_supported": model_support.is_forgecore_supported(),
         "unsupported_tensor_formats": model_support.unsupported_tensor_formats,
         "total_tensor_bytes": model.total_tensor_bytes(),
+        "profile": ramforge_runtime::model_profile(model),
         "tensors": tensors_json,
         "tensors_truncated": model.tensors.len() > max_tensors,
         "total_tensors": model.tensors.len(),

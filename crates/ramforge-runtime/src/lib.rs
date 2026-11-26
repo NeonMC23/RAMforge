@@ -63,6 +63,13 @@ pub mod planner;
 pub mod prediction;
 pub mod prediction_planner;
 pub mod prediction_sim;
+pub mod profiling;
+pub use profiling::{
+    hardware_profile, model_profile, performance_identity, recommend, workload_from_plan,
+    AdaptiveRecommendation, HardwareProfile, MeasuredSummary, ModelProfile, PerformanceIdentity,
+    PerformanceProfileStore, PerformanceRecord, PlacementAdvice, QuantizationBucket,
+    ResidencyAdvice, SpeculativeAdvice, WorkloadProfile, PROFILING_SCHEMA_VERSION,
+};
 pub mod profile;
 pub mod residency;
 pub mod residency_engine;

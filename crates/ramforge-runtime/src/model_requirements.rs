@@ -399,23 +399,47 @@ fn kv_cache_requirement(
     RequirementBytes::estimated(bytes, "architecture-derived KV cache estimate")
 }
 
-fn quantization_label(file_type: u32) -> String {
+pub fn quantization_label(file_type: u32) -> String {
     match file_type {
-        0 => "all-f32".to_string(),
-        1 => "mostly-f16".to_string(),
-        2 => "mostly-q4_0".to_string(),
-        3 => "mostly-q4_1".to_string(),
-        7 => "mostly-q8_0".to_string(),
-        8 => "mostly-q5_0".to_string(),
-        9 => "mostly-q5_1".to_string(),
-        10 => "mostly-q2_k".to_string(),
-        11 => "mostly-q3_k".to_string(),
-        12 => "mostly-q4_k".to_string(),
-        13 => "mostly-q5_k".to_string(),
-        14 => "mostly-q6_k".to_string(),
-        15 => "mostly-q8_k".to_string(),
-        other => format!("unknown-file-type-{other}"),
+        0 => "all-f32",
+        1 => "mostly-f16",
+        2 => "mostly-q4_0",
+        3 => "mostly-q4_1",
+        7 => "mostly-q8_0",
+        8 => "mostly-q5_0",
+        9 => "mostly-q5_1",
+        10 => "mostly-q2_k",
+        11 => "mostly-q3_k_s",
+        12 => "mostly-q3_k_m",
+        13 => "mostly-q3_k_l",
+        14 => "mostly-q4_k_s",
+        15 => "mostly-q4_k_m",
+        16 => "mostly-q5_k_s",
+        17 => "mostly-q5_k_m",
+        18 => "mostly-q6_k",
+        19 => "mostly-iq2_xxs",
+        20 => "mostly-iq2_xs",
+        21 => "mostly-q2_k_s",
+        22 => "mostly-iq3_xs",
+        23 => "mostly-iq3_xxs",
+        24 => "mostly-iq1_s",
+        25 => "mostly-iq4_nl",
+        26 => "mostly-iq3_s",
+        27 => "mostly-iq3_m",
+        28 => "mostly-iq2_s",
+        29 => "mostly-iq2_m",
+        30 => "mostly-iq4_xs",
+        31 => "mostly-iq1_m",
+        32 => "mostly-bf16",
+        36 => "mostly-tq1_0",
+        37 => "mostly-tq2_0",
+        38 => "mostly-mxfp4_moe",
+        39 => "mostly-nvfp4",
+        40 => "mostly-q1_0",
+        41 => "mostly-q2_0",
+        other => return format!("unknown-file-type-{other}"),
     }
+    .to_string()
 }
 
 #[cfg(test)]
