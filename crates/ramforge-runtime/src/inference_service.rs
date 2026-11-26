@@ -223,6 +223,8 @@ pub struct ServiceStatus {
     pub cpu_transformer_layers: Option<u32>,
     pub output_device_type: Option<String>,
     pub staged_layers: Vec<StagedLayerStatus>,
+    pub draft_model: Option<String>,
+    pub draft_tokens: Option<u32>,
     pub staging_plan: Option<StagingPlan>,
     pub staging_lifecycle: Option<StagingLifecycleStatus>,
     pub host_staging: HostStagingStatus,
@@ -314,6 +316,8 @@ pub struct GenerationReport {
     pub effective_ubatch_tokens: u32,
     pub effective_threads: u32,
     pub effective_sequence_max: u32,
+    /// Present only for greedy speculative generation.
+    pub speculative: Option<crate::SpeculativeStats>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,6 +412,11 @@ pub struct InferenceService {
     tensor_mappings: Option<HashMap<String, forge_core::TensorMappingInfo>>,
     pending_pipeline: Option<PendingPipeline>,
     routing_options: Option<ExpertRoutingOptions>,
+    draft_path: Option<PathBuf>,
+    draft_model: Option<ForgeCoreModel>,
+    draft_session: Option<ForgeCoreSession>,
+    draft_tokens: u32,
+    draft_threads: u32,
 }
 
 impl InferenceService {
@@ -447,6 +456,11 @@ impl InferenceService {
             tensor_mappings: None,
             pending_pipeline: None,
             routing_options: None,
+            draft_path: None,
+            draft_model: None,
+            draft_session: None,
+            draft_tokens: 0,
+            draft_threads: 0,
         })
     }
 
@@ -535,6 +549,19 @@ impl InferenceService {
         request.layers.dedup();
         self.staged_layers = request.layers.clone();
         self.staging_request = request;
+        self
+    }
+
+    /// Enable greedy speculative decoding with a compatible local draft.
+    pub fn with_speculative_draft(
+        mut self,
+        path: PathBuf,
+        draft_tokens: u32,
+        draft_threads: u32,
+    ) -> Self {
+        self.draft_path = Some(path);
+        self.draft_tokens = draft_tokens;
+        self.draft_threads = draft_threads;
         self
     }
 
@@ -636,6 +663,11 @@ impl InferenceService {
                 .as_ref()
                 .map(|model| model.metadata().output_device_type.clone()),
             staged_layers: self.current_staged_status(),
+            draft_model: self
+                .draft_model
+                .as_ref()
+                .map(|model| model.path().display().to_string()),
+            draft_tokens: self.draft_model.as_ref().map(|_| self.draft_tokens),
             staging_plan: self.staging_plan.clone(),
             staging_lifecycle: self.staging_lifecycle(),
             host_staging: HostStagingStatus {
@@ -806,8 +838,35 @@ impl InferenceService {
                 self.plan.effective.gpu_layers
             ));
         }
+        let draft_model = if let Some(draft_path) = self.draft_path.as_ref() {
+            let draft_set = discover_model_set(draft_path)
+                .map_err(|error| ServiceError::Model(error.to_string()))?;
+            let draft_gguf = draft_set.merged_model();
+            crate::speculative::draft_vocabulary_compatible(&draft_gguf, &gguf)
+                .map_err(ServiceError::Model)?;
+            let mut draft_options = ForgeCoreModelOptions {
+                use_extra_bufts: self.plan.effective.weight_repacking,
+                ..ForgeCoreModelOptions::default()
+            };
+            if self.plan.effective.load_mode == "mmap-no-prefetch" {
+                draft_options = draft_options.with_no_prefetch();
+            }
+            Some(
+                ForgeCoreModel::load_with_options(draft_path, draft_options)
+                    .map_err(|error| ServiceError::Model(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        if self.draft_tokens == 0 {
+            self.draft_tokens = 4;
+        }
+        if self.draft_threads == 0 {
+            self.draft_threads = self.plan.effective.threads;
+        }
         self.tokenizer = Some(tokenizer);
         self.model = Some(model);
+        self.draft_model = draft_model;
         self.staging_engine = staging_engine;
         self.staging_status.clear();
         self.state = ServiceState::ModelLoaded;
@@ -844,6 +903,11 @@ impl InferenceService {
         // Drop the previous context before opening the replacement so two
         // contexts are not held simultaneously during a benchmark reset.
         self.session = None;
+        self.draft_session = None;
+        let speculative_outputs = self
+            .draft_model
+            .as_ref()
+            .map(|_| self.draft_tokens.saturating_add(1));
         let model = self
             .model
             .as_ref()
@@ -859,8 +923,8 @@ impl InferenceService {
                 n_batch: Some(self.plan.effective.batch_tokens),
                 n_ubatch: Some(self.plan.effective.ubatch_tokens),
                 n_seq_max: Some(self.plan.effective.sequence_max),
-                n_outputs_max: None,
-                n_outputs_max_per_seq: None,
+                n_outputs_max: speculative_outputs,
+                n_outputs_max_per_seq: speculative_outputs,
                 kv_type_k: KvCacheType::parse(&self.plan.effective.kv_type_k)
                     .map_err(ServiceError::Configuration)?,
                 kv_type_v: KvCacheType::parse(&self.plan.effective.kv_type_v)
@@ -905,6 +969,33 @@ impl InferenceService {
             self.session = None;
             self.state = ServiceState::ModelLoaded;
             return Err(error);
+        }
+        if let Some(draft_model) = self.draft_model.as_ref() {
+            let draft_session = draft_model.open_context(ForgeCoreContextOptions {
+                n_ctx: Some(self.plan.effective.context_tokens),
+                n_threads: self.draft_threads as usize,
+                n_threads_batch: Some(self.draft_threads as usize),
+                n_batch: Some(self.draft_tokens.saturating_add(1)),
+                n_ubatch: Some(self.draft_tokens.saturating_add(1)),
+                n_seq_max: Some(1),
+                n_outputs_max: Some(self.draft_tokens.saturating_add(1)),
+                n_outputs_max_per_seq: Some(self.draft_tokens.saturating_add(1)),
+                kv_type_k: KvCacheType::F16,
+                kv_type_v: KvCacheType::F16,
+                flash_attn: FlashAttentionMode::Auto,
+                offload_kqv: Some(true),
+                op_offload: Some(true),
+                trace_max_events: None,
+                routing: None,
+            });
+            match draft_session {
+                Ok(session) => self.draft_session = Some(session),
+                Err(error) => {
+                    self.session = None;
+                    self.state = ServiceState::ModelLoaded;
+                    return Err(ServiceError::Context(error.to_string()));
+                }
+            }
         }
         Ok(())
     }
@@ -2363,6 +2454,7 @@ impl InferenceService {
             effective_ubatch_tokens: session.effective_ubatch_tokens(),
             effective_threads: session.effective_threads(),
             effective_sequence_max: session.effective_sequence_max(),
+            speculative: None,
         };
         self.state = ServiceState::Ready;
         if stop_reason == "cancelled" {
@@ -2371,12 +2463,213 @@ impl InferenceService {
         Ok(report)
     }
 
+    /// Greedy speculative generation using the loaded target and draft.
+    pub fn generate_speculative<F>(
+        &mut self,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+        mut sink: F,
+    ) -> Result<GenerationReport, ServiceError>
+    where
+        F: FnMut(&str) -> Result<(), String>,
+    {
+        if self.state != ServiceState::Ready {
+            return Err(ServiceError::InvalidState {
+                expected: "ready".to_string(),
+                actual: self.state,
+            });
+        }
+        if options.temperature > 0.0 || options.top_k.is_some() || options.top_p.is_some() {
+            return Err(ServiceError::Configuration(
+                "speculative decoding is greedy-only: temperature must be 0 and top-k/top-p unset"
+                    .to_string(),
+            ));
+        }
+        if options.prompt.is_empty() {
+            return Err(ServiceError::Configuration("prompt is empty".to_string()));
+        }
+        if self.draft_session.is_none() {
+            return Err(ServiceError::Configuration(
+                "no speculative draft session is loaded".to_string(),
+            ));
+        }
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "tokenizer loaded".to_string(),
+                actual: self.state,
+            })?;
+        let prompt_tokens = tokenizer.encode(&options.prompt, true);
+        if prompt_tokens.is_empty() {
+            return Err(ServiceError::Tokenizer(
+                "prompt tokenization produced no tokens".to_string(),
+            ));
+        }
+        let eos = tokenizer.eos_id;
+        let mut decoder = tokenizer.decoder();
+        if prompt_tokens.len() >= self.plan.effective.context_tokens as usize {
+            return Err(ServiceError::Configuration(format!(
+                "prompt has {} tokens but context length is {}",
+                prompt_tokens.len(),
+                self.plan.effective.context_tokens
+            )));
+        }
+        let draft_tokens = self.draft_tokens.max(1);
+        let effective = self.session.as_ref().map(|session| {
+            (
+                session.context_length(),
+                session.effective_batch_tokens(),
+                session.effective_ubatch_tokens(),
+                session.effective_threads(),
+                session.effective_sequence_max(),
+            )
+        });
+        let target = self
+            .session
+            .as_mut()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "session ready".to_string(),
+                actual: self.state,
+            })?;
+        let draft = self
+            .draft_session
+            .as_mut()
+            .ok_or_else(|| ServiceError::InvalidState {
+                expected: "draft session ready".to_string(),
+                actual: self.state,
+            })?;
+        target.clear_kv();
+        draft.clear_kv();
+        self.state = ServiceState::Generating;
+        let rss_before = process_rss();
+        let io_before = process_io();
+        let (minor_before, major_before) = process_faults();
+        let started = Instant::now();
+        let mut text = String::new();
+        let mut sink_error: Option<String> = None;
+        let mut cancelled = false;
+        let result = crate::speculative::generate_speculative(
+            target,
+            draft,
+            &prompt_tokens,
+            crate::SpeculativeConfig {
+                max_draft_tokens: draft_tokens,
+                max_tokens: options.max_tokens,
+            },
+            eos,
+            |token| {
+                if cancel.load(Ordering::Relaxed) {
+                    cancelled = true;
+                    return Err(crate::ForgeCoreAdapterError::Decode(
+                        "cancelled".to_string(),
+                    ));
+                }
+                let piece = decoder.push(token);
+                if !piece.is_empty() {
+                    text.push_str(&piece);
+                    if let Err(error) = sink(&piece) {
+                        sink_error = Some(error.clone());
+                        return Err(crate::ForgeCoreAdapterError::Decode(error));
+                    }
+                }
+                Ok(())
+            },
+        );
+        let trailing = decoder.finish();
+        if !trailing.is_empty() {
+            text.push_str(&trailing);
+            let _ = sink(&trailing);
+        }
+        let total_ns = started.elapsed().as_nanos() as u64;
+        self.state = ServiceState::Ready;
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                if cancelled {
+                    return Err(ServiceError::Cancelled);
+                }
+                if let Some(error) = sink_error {
+                    return Err(ServiceError::Sink(error));
+                }
+                return Err(ServiceError::Execution(error.to_string()));
+            }
+        };
+        let io_after = process_io();
+        let (minor_after, major_after) = process_faults();
+        let memory_split = process_memory_split();
+        let delta = |before: Option<u64>, after: Option<u64>| Some(after?.saturating_sub(before?));
+        let spec_stats = &output.stats;
+        let prompt_ns = spec_stats.prompt_ns;
+        let first_token_ns = spec_stats.first_token_ns;
+        let decode_ns = first_token_ns.map(|first| total_ns.saturating_sub(first));
+        let generated = output.token_ids.len() as u64;
+        let generation = GenerationStats {
+            prompt_tokens: prompt_tokens.len() as u64,
+            generated_tokens: generated,
+            prompt_processing_ns: prompt_ns,
+            time_to_first_token_ns: first_token_ns,
+            decode_ns,
+            total_generation_ns: total_ns,
+            prompt_tokens_per_second: rate(prompt_tokens.len() as u64, prompt_ns),
+            decode_tokens_per_second: decode_ns.map(|ns| rate(generated.saturating_sub(1), ns)),
+            generation_tokens_per_second: rate(generated, total_ns),
+            stop_reason: spec_stats.stop_reason.clone(),
+            rss_before_bytes: rss_before,
+            rss_after_bytes: process_rss(),
+            storage_read_bytes: delta(
+                io_before.as_ref().map(|io| io.read_bytes),
+                io_after.as_ref().map(|io| io.read_bytes),
+            ),
+            rchar_bytes: delta(
+                io_before.as_ref().map(|io| io.rchar_bytes),
+                io_after.as_ref().map(|io| io.rchar_bytes),
+            ),
+            read_syscalls: delta(
+                io_before.as_ref().map(|io| io.read_syscalls),
+                io_after.as_ref().map(|io| io.read_syscalls),
+            ),
+            major_faults: delta(major_before, major_after),
+            minor_faults: delta(minor_before, minor_after),
+            pss_bytes: memory_split.map(|split| split.pss_bytes),
+            pss_file_bytes: memory_split.and_then(|split| split.pss_file_bytes),
+            pss_anon_bytes: memory_split.and_then(|split| split.pss_anon_bytes),
+            anonymous_bytes: memory_split.map(|split| split.anonymous_bytes),
+            swap_bytes: memory_split.map(|split| split.swap_bytes),
+            token_io: Vec::new(),
+        };
+        let report = GenerationReport {
+            text,
+            token_ids: output.token_ids,
+            stats: generation,
+            effective_context_tokens: effective
+                .map(|value| value.0)
+                .unwrap_or(self.plan.effective.context_tokens),
+            effective_batch_tokens: effective
+                .map(|value| value.1)
+                .unwrap_or(self.plan.effective.batch_tokens),
+            effective_ubatch_tokens: effective
+                .map(|value| value.2)
+                .unwrap_or(self.plan.effective.ubatch_tokens),
+            effective_threads: effective
+                .map(|value| value.3)
+                .unwrap_or(self.plan.effective.threads),
+            effective_sequence_max: effective
+                .map(|value| value.4)
+                .unwrap_or(self.plan.effective.sequence_max),
+            speculative: Some(output.stats),
+        };
+        Ok(report)
+    }
+
     /// Drop the context and model; the service can be loaded again.
     pub fn unload(&mut self) {
         let _ = self.abort_staged_pipeline();
         self.pinned_pool.clear();
         self.session = None;
+        self.draft_session = None;
         self.model = None;
+        self.draft_model = None;
         self.tokenizer = None;
         self.staging_status.clear();
         self.staging_plan = None;

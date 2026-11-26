@@ -19,7 +19,7 @@ use crate::page_residency::model_mapping_residency;
 use crate::residency_engine::process_faults;
 use crate::runtime_plan::RuntimePlan;
 
-pub const BENCHMARK_SCHEMA_VERSION: u32 = 18;
+pub const BENCHMARK_SCHEMA_VERSION: u32 = 21;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
@@ -46,6 +46,8 @@ pub struct BenchmarkRun {
     pub anonymous_bytes: Option<u64>,
     pub swap_bytes: Option<u64>,
     pub token_io: Vec<TokenIo>,
+    pub speculative: Option<crate::SpeculativeStats>,
+    pub output_token_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,6 +56,9 @@ pub struct BenchmarkReport {
     pub api_version: u32,
     pub profile: String,
     pub model_path: String,
+    /// Draft model used for greedy speculative decoding, if any.
+    pub draft_model: Option<String>,
+    pub draft_tokens: Option<u32>,
     /// Exact resolved plan, including requested/effective field statuses.
     pub plan: RuntimePlan,
     pub prompt: String,
@@ -168,6 +173,9 @@ pub struct BenchmarkConfig {
     pub pinned_pool_bytes: u64,
     pub storage_concurrency: usize,
     pub storage_max_outstanding_bytes: u64,
+    pub draft_model: Option<std::path::PathBuf>,
+    pub draft_tokens: u32,
+    pub draft_threads: u32,
 }
 
 impl Default for BenchmarkConfig {
@@ -187,6 +195,9 @@ impl Default for BenchmarkConfig {
             pinned_pool_bytes: 0,
             storage_concurrency: 1,
             storage_max_outstanding_bytes: 0,
+            draft_model: None,
+            draft_tokens: 4,
+            draft_threads: 0,
         }
     }
 }
@@ -243,6 +254,17 @@ pub fn run_benchmark(
             config.storage_max_outstanding_bytes,
         )
         .with_staging_request(staging_request);
+    if let Some(draft_model) = config.draft_model.clone() {
+        service = service.with_speculative_draft(
+            draft_model,
+            config.draft_tokens,
+            if config.draft_threads == 0 {
+                plan_snapshot.effective.threads
+            } else {
+                config.draft_threads
+            },
+        );
+    }
     let load_started = Instant::now();
     service.load()?;
     let model_load_ns = duration_ns(load_started.elapsed());
@@ -282,14 +304,22 @@ pub fn run_benchmark(
     let context_setup_minor_faults = counter_delta(minor_before_setup, minor_after_setup);
     let mut context_reuse_count = 0u32;
     for _ in 0..config.warmup_runs {
-        let _ = service.generate(&options, &cancel, |_| Ok(()))?;
+        if config.draft_model.is_some() {
+            let _ = service.generate_speculative(&options, &cancel, |_| Ok(()))?;
+        } else {
+            let _ = service.generate(&options, &cancel, |_| Ok(()))?;
+        }
         context_reuse_count = context_reuse_count.saturating_add(1);
     }
     let free_after_warmup = device_free_bytes(&device_id);
     let memory_after_warmup = Some(service.memory_observability()?);
     let mut runs = Vec::with_capacity(config.runs as usize);
     for index in 0..config.runs {
-        let report = service.generate(&options, &cancel, |_| Ok(()))?;
+        let report = if config.draft_model.is_some() {
+            service.generate_speculative(&options, &cancel, |_| Ok(()))?
+        } else {
+            service.generate(&options, &cancel, |_| Ok(()))?
+        };
         context_reuse_count = context_reuse_count.saturating_add(1);
         runs.push(BenchmarkRun {
             index,
@@ -315,6 +345,8 @@ pub fn run_benchmark(
             anonymous_bytes: report.stats.anonymous_bytes,
             swap_bytes: report.stats.swap_bytes,
             token_io: report.stats.token_io,
+            speculative: report.speculative,
+            output_token_ids: report.token_ids,
         });
     }
     let memory_after_generation = Some(service.memory_observability()?);
@@ -357,6 +389,8 @@ pub fn run_benchmark(
         api_version: INFERENCE_SERVICE_API_VERSION,
         profile,
         model_path,
+        draft_model: config.draft_model.as_ref().map(|path| path.display().to_string()),
+        draft_tokens: config.draft_model.as_ref().map(|_| config.draft_tokens),
         plan: plan_snapshot,
         prompt: config.prompt,
         max_tokens: config.max_tokens,
@@ -495,6 +529,9 @@ mod tests {
             pinned_pool_bytes: 0,
             storage_concurrency: 1,
             storage_max_outstanding_bytes: 0,
+            draft_model: None,
+            draft_tokens: 4,
+            draft_threads: 0,
         }
         .validate()
         .is_err());
@@ -513,6 +550,9 @@ mod tests {
             pinned_pool_bytes: 0,
             storage_concurrency: 1,
             storage_max_outstanding_bytes: 0,
+            draft_model: None,
+            draft_tokens: 4,
+            draft_threads: 0,
         }
         .validate()
         .is_err());

@@ -469,6 +469,18 @@ enum Commands {
         #[arg(long, default_value = "off")]
         residency: String,
 
+        /// Draft model for greedy speculative decoding
+        #[arg(long, value_name = "PATH")]
+        draft_model: Option<PathBuf>,
+
+        /// Maximum draft tokens per speculative round
+        #[arg(long, default_value_t = 4, requires = "draft_model")]
+        draft_tokens: u32,
+
+        /// Draft-model CPU threads (default: target threads)
+        #[arg(long, requires = "draft_model")]
+        draft_threads: Option<u32>,
+
         /// Safety margin subtracted from observed free VRAM (default 256M)
         #[arg(long)]
         staged_margin: Option<String>,
@@ -1192,6 +1204,9 @@ fn main() {
             staged_budget,
             staged_auto,
             residency,
+            draft_model,
+            draft_tokens,
+            draft_threads,
             staged_margin,
             selection_policy,
             host_staging,
@@ -1219,6 +1234,9 @@ fn main() {
                 staged_budget,
                 staged_auto,
                 residency,
+                draft_model,
+                draft_tokens,
+                draft_threads,
                 staged_margin,
                 selection_policy,
                 host_staging,
@@ -2540,6 +2558,9 @@ fn run_throughput_benchmark(
     staged_budget: Option<String>,
     staged_auto: bool,
     residency: String,
+    draft_model: Option<PathBuf>,
+    draft_tokens: u32,
+    draft_threads: Option<u32>,
     staged_margin: Option<String>,
     selection_policy: Option<String>,
     host_staging: Option<String>,
@@ -2708,6 +2729,9 @@ fn run_throughput_benchmark(
             pinned_pool_bytes,
             storage_concurrency,
             storage_max_outstanding_bytes,
+            draft_model,
+            draft_tokens,
+            draft_threads: draft_threads.unwrap_or(0),
         },
     )
     .map_err(|error| anyhow::anyhow!(error))?;
@@ -2749,6 +2773,24 @@ fn run_throughput_benchmark(
             report.context_setup_major_faults,
             report.context_setup_minor_faults,
         );
+        if let Some(speculative) = report
+            .runs_detail
+            .last()
+            .and_then(|run| run.speculative.as_ref())
+        {
+            println!(
+                "speculative: rounds={} drafts={} accepted={} rejected={} fallback={} acceptance_bps={} target_forwards={} target_ms={:.1} draft_ms={:.1}",
+                speculative.rounds,
+                speculative.draft_tokens_generated,
+                speculative.accepted_tokens,
+                speculative.rejected_tokens,
+                speculative.fallback_tokens,
+                speculative.acceptance_rate_bps,
+                speculative.target_forwards,
+                speculative.target_forward_ns as f64 / 1e6,
+                speculative.draft_forward_ns as f64 / 1e6,
+            );
+        }
         println!(
             "mapping: mapped={:?} resident_before/load/after={:?}/{:?}/{:?} pss_after={:?}",
             report.mapping_mapped_bytes,

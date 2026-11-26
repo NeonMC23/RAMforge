@@ -164,6 +164,9 @@ pub fn run_profile_optimization(
                     pinned_pool_bytes: 0,
                     storage_concurrency: 1,
                     storage_max_outstanding_bytes: 0,
+                    draft_model: None,
+                    draft_tokens: 4,
+                    draft_threads: 0,
                 },
             ) {
                 Ok(benchmark) => measurements.push(ProfileMeasurement {
