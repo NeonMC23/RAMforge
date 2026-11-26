@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use ramforge_core::GgufModel;
 
+use crate::adaptive::environment::ExecutionEnvironment;
 use crate::benchmark_runner::BenchmarkReport;
 use crate::capacity::expert_accounting;
 use crate::machine_profile::MachineProfile;
@@ -20,7 +21,10 @@ use crate::model_requirements::{model_file_fingerprint, quantization_label};
 use crate::runtime_plan::RuntimePlan;
 use crate::support::model_execution_support;
 
-pub const PROFILING_SCHEMA_VERSION: u32 = 1;
+/// Current schema. Record schemas 1 and 2 parse, but only records with the
+/// current schema are reusable through exact identity matching.
+pub const PROFILING_SCHEMA_VERSION: u32 = 2;
+const LEGACY_PROFILING_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantizationBucket {
@@ -151,6 +155,10 @@ pub struct HardwareProfile {
     pub backends: Vec<String>,
     pub storage_kind: Option<String>,
     pub storage_read_bytes_per_second: Option<u64>,
+    /// Observed cgroup memory limit, when available. Not enforcement.
+    pub cgroup_limit_bytes: Option<u64>,
+    /// Software identity that participates in the hardware fingerprint.
+    pub execution_environment: ExecutionEnvironment,
     pub notes: Vec<String>,
 }
 
@@ -188,6 +196,8 @@ pub fn hardware_profile(machine: &MachineProfile) -> HardwareProfile {
     let physical_cores = machine.cpu.hardware_physical_cores.as_ref().copied();
     let logical_cpus = machine.cpu.hardware_logical_cpus.as_ref().copied();
     let total_ram = machine.memory.physical_total_bytes.as_ref().copied();
+    let cgroup_limit_bytes = machine.memory.cgroup.limit_bytes.as_ref().copied();
+    let execution_environment = ExecutionEnvironment::collect(machine);
     let mut identity = String::new();
     for part in [
         cpu_model.clone().unwrap_or_default(),
@@ -203,6 +213,7 @@ pub fn hardware_profile(machine: &MachineProfile) -> HardwareProfile {
             .collect::<Vec<_>>()
             .join(","),
         backends.join(","),
+        execution_environment.fingerprint.clone(),
     ] {
         identity.push_str(&part);
         identity.push('\u{1f}');
@@ -221,6 +232,8 @@ pub fn hardware_profile(machine: &MachineProfile) -> HardwareProfile {
         backends,
         storage_kind,
         storage_read_bytes_per_second: storage_bps,
+        cgroup_limit_bytes,
+        execution_environment,
         notes: machine.limitations.clone(),
     }
 }
@@ -438,14 +451,19 @@ impl PerformanceProfileStore {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         let temp = path.with_extension("tmp");
-        let text = serde_json::to_string_pretty(self).map_err(|error| error.to_string())?;
+        let mut snapshot = self.clone();
+        snapshot.schema_version = PROFILING_SCHEMA_VERSION;
+        let text = serde_json::to_string_pretty(&snapshot).map_err(|error| error.to_string())?;
         std::fs::write(&temp, text).map_err(|error| error.to_string())?;
         std::fs::rename(&temp, path).map_err(|error| error.to_string())?;
         Ok(())
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != PROFILING_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            LEGACY_PROFILING_SCHEMA_VERSION | PROFILING_SCHEMA_VERSION
+        ) {
             return Err(format!(
                 "unsupported performance profile schema {}",
                 self.schema_version
@@ -555,7 +573,13 @@ pub fn recommend(
         .ram_budget_bytes
         .or(hardware.total_ram_bytes)
         .unwrap_or(0);
-    let model_fits_ram = ram_budget > 0 && model.file_bytes <= ram_budget;
+    // File size alone is not runtime memory: backend/context buffers need
+    // headroom too. KV cache is still not included here because the
+    // recommendation API only receives model-level facts; the resource budget
+    // adds KV and reports the remaining uncertainty.
+    const PLANNING_OVERHEAD_BYTES: u64 = 512 * 1024 * 1024;
+    let resident_requirement = model.file_bytes.saturating_add(PLANNING_OVERHEAD_BYTES);
+    let model_fits_ram = ram_budget > 0 && resident_requirement <= ram_budget;
     let gpu = hardware.gpu_available();
     let free_vram = hardware.max_free_vram_bytes().unwrap_or(0);
     let safety = 256 * 1024 * 1024u64;
@@ -595,7 +619,8 @@ pub fn recommend(
             PlacementAdvice {
                 mode: "cpu".to_string(),
                 gpu_layers: 0,
-                reason: "model fits the planning RAM budget".to_string(),
+                reason: "model plus a conservative runtime overhead fits the planning RAM budget"
+                    .to_string(),
             },
             ResidencyAdvice {
                 stage_layers: false,
@@ -688,7 +713,7 @@ pub fn now_unix_ms() -> Option<u64> {
         .map(|duration| duration.as_millis() as u64)
 }
 
-fn fnv_hex(bytes: &[u8]) -> String {
+pub(crate) fn fnv_hex(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -795,9 +820,24 @@ mod tests {
             .any(|note| note.contains("active-expert")));
     }
 
+    fn test_environment() -> ExecutionEnvironment {
+        ExecutionEnvironment {
+            schema_version: 1,
+            os: "linux".to_string(),
+            kernel: None,
+            ramforge_version: "0.1.0".to_string(),
+            native_contract_version: 1,
+            native_revision: None,
+            backend_build: "cpu".to_string(),
+            gpu_driver_version: None,
+            cpu_feature_fingerprint: None,
+            fingerprint: "0000000000000000".to_string(),
+        }
+    }
+
     fn gpu_hardware() -> HardwareProfile {
         HardwareProfile {
-            schema_version: 1,
+            schema_version: 2,
             fingerprint: "hw-gpu".to_string(),
             cpu_model: Some("cpu".to_string()),
             physical_cores: Some(6),
@@ -817,6 +857,8 @@ mod tests {
             backends: vec!["cuda".to_string(), "cpu".to_string()],
             storage_kind: Some("nvme".to_string()),
             storage_read_bytes_per_second: None,
+            cgroup_limit_bytes: None,
+            execution_environment: test_environment(),
             notes: Vec::new(),
         }
     }
@@ -857,7 +899,7 @@ mod tests {
         let mut profile = model_profile(&dense());
         profile.fingerprint = Some("model".to_string());
         let hardware = HardwareProfile {
-            schema_version: 1,
+            schema_version: 2,
             fingerprint: "hw".to_string(),
             cpu_model: Some("cpu".to_string()),
             physical_cores: Some(4),
@@ -870,6 +912,8 @@ mod tests {
             backends: vec!["cpu".to_string()],
             storage_kind: None,
             storage_read_bytes_per_second: None,
+            cgroup_limit_bytes: None,
+            execution_environment: test_environment(),
             notes: Vec::new(),
         };
         let workload = WorkloadProfile {
@@ -921,7 +965,7 @@ mod tests {
     fn recommendation_does_not_stage_when_model_fits() {
         let model = model_profile(&dense());
         let hardware = HardwareProfile {
-            schema_version: 1,
+            schema_version: 2,
             fingerprint: "hw".to_string(),
             cpu_model: Some("cpu".to_string()),
             physical_cores: Some(4),
@@ -934,6 +978,8 @@ mod tests {
             backends: vec!["cpu".to_string()],
             storage_kind: Some("nvme".to_string()),
             storage_read_bytes_per_second: None,
+            cgroup_limit_bytes: None,
+            execution_environment: test_environment(),
             notes: Vec::new(),
         };
         let workload = WorkloadProfile {

@@ -10,6 +10,8 @@ This directory is the transfer package for a new developer or agent arriving wit
 
 > **Dense overflow milestone (2026-11-25):** [DENSE_OVERFLOW_2026-11-25.md](DENSE_OVERFLOW_2026-11-25.md) measures the 32B dense storage-bound baseline, adds per-token storage/fault and PSS/mapping instrumentation, introduces the `--residency auto` bounded staging policy, and reports +24.8% decode / 13-32% fewer reads along with the negative experiments.
 
+> **Adaptive inference and resource management (2026-11-26):** [ADAPTIVE_2026-11-26.md](ADAPTIVE_2026-11-26.md) integrates feature-level compatibility, conservative resource admission, bounded multi-objective calibration, environment-aware performance invalidation, and confirmed `adaptive-plan` / `adaptive-apply` execution plans with native readback and applied/verified field states.
+
 > **Model-agnostic profiling foundation (2026-11-26):** [PROFILING_2026-11-26.md](PROFILING_2026-11-26.md) adds structured model/hardware/workload profiles, exact performance-profile identity and persistence, and an advisory `ramforge recommend` path validated across Qwen2, Llama, GPT-NeoX, and DeepSeek2 metadata.
 
 > **Overnight 32B campaign (2026-11-26):** [OVERNIGHT_32B_CAMPAIGN_2026-11-26.md](OVERNIGHT_32B_CAMPAIGN_2026-11-26.md) integrates speculative decoding into the inference service and benchmark path, combines it with `--residency auto`, and measures 16-token generation improving from 0.2145 to **0.554 tok/s (2.58x)** with identical token IDs and storage reads falling from 132.6 GB to 53.3 GB.

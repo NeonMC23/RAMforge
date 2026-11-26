@@ -63,6 +63,21 @@ pub mod planner;
 pub mod prediction;
 pub mod prediction_planner;
 pub mod prediction_sim;
+pub mod adaptive;
+pub use adaptive::{
+    applied_report_from_observation, assess_budget, baseline_strategy, build_calibration_report,
+    build_plan, compare_experiments, environment_changes, generate_candidates, record_invalidation,
+    resolve_compatibility, revalidate_plan, select_best, AdaptivePlan, AdaptiveStrategy,
+    AppliedPlanReport, BestSelection, BudgetClass, BudgetComponent, CalibrationExperiment,
+    CalibrationReport, CandidateComparison, CandidateLimits, CandidateSet, CandidateStatus,
+    CompatibilityReport, CompatibilityRequest, Evidence, EvidenceSource, ExecutionEnvironment,
+    ExecutionFeature, ExperimentStatus, FeatureSupport, FieldObservation, FieldState, Invalidation,
+    InvalidationReason, MeasurementSummary, ObjectivePreference, PlanDecision, PlanStatus,
+    PlanValidation, ResourceBudget, RuntimeObservation, StrategyAxis, StrategyCandidate,
+    SupportClass, ADAPTIVE_PLAN_SCHEMA_VERSION, ADAPTIVE_SCHEMA_VERSION,
+    CAPABILITY_SCHEMA_VERSION, EXECUTION_ENVIRONMENT_SCHEMA_VERSION,
+    RESOURCE_BUDGET_SCHEMA_VERSION,
+};
 pub mod profiling;
 pub use profiling::{
     hardware_profile, model_profile, performance_identity, recommend, workload_from_plan,

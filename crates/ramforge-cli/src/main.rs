@@ -268,6 +268,150 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Build an explainable adaptive execution plan (never applied automatically)
+    #[command(name = "adaptive-plan")]
+    AdaptivePlan {
+        /// Path to the GGUF model file
+        model: PathBuf,
+
+        /// Planning RAM budget (default: observed available memory)
+        #[arg(long)]
+        ram: Option<String>,
+
+        /// Context length for the plan
+        #[arg(long, default_value_t = 256)]
+        context: u32,
+
+        #[command(flatten)]
+        context_args: ContextArgs,
+
+        /// Optional compatible draft model
+        #[arg(long, value_name = "PATH")]
+        draft_model: Option<PathBuf>,
+
+        /// Candidate draft length for the plan
+        #[arg(long, default_value_t = 8, requires = "draft_model")]
+        draft_tokens: u32,
+
+        /// Optional performance profile store
+        #[arg(long, value_name = "PATH")]
+        performance_profile: Option<PathBuf>,
+
+        /// Prompt used by the plan's verification workload
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+
+        /// Generated tokens for plan verification
+        #[arg(long, default_value_t = 4)]
+        max_tokens: u32,
+
+        /// Measured runs for plan verification
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+
+        /// Warmup runs for plan verification
+        #[arg(long, default_value_t = 0)]
+        warmup: u32,
+
+        /// Write the plan JSON to this path
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a bounded, explainable calibration sweep and persist measured evidence
+    #[command(name = "adaptive-calibrate")]
+    AdaptiveCalibrate {
+        /// Path to the GGUF model file
+        model: PathBuf,
+
+        /// Planning RAM budget (default: observed available memory)
+        #[arg(long)]
+        ram: Option<String>,
+
+        /// Context length for every candidate
+        #[arg(long, default_value_t = 256)]
+        context: u32,
+
+        #[command(flatten)]
+        context_args: ContextArgs,
+
+        /// Optional compatible draft model
+        #[arg(long, value_name = "PATH")]
+        draft_model: Option<PathBuf>,
+
+        /// Candidate draft lengths are generated automatically
+        #[arg(long, default_value_t = 8, requires = "draft_model")]
+        draft_tokens: u32,
+
+        /// Append completed measurements to this performance profile store
+        #[arg(long, value_name = "PATH")]
+        performance_profile: Option<PathBuf>,
+
+        /// Write the calibration report JSON to this path
+        #[arg(long, value_name = "PATH")]
+        report: Option<PathBuf>,
+
+        /// Objective preference: throughput, balanced, latency, memory
+        #[arg(long, default_value = "balanced")]
+        preference: String,
+
+        /// Maximum candidates generated
+        #[arg(long, default_value_t = 8)]
+        max_candidates: usize,
+
+        /// Maximum experiments executed (bounded)
+        #[arg(long, default_value_t = 3)]
+        max_experiments: usize,
+
+        /// Generated tokens per measured run
+        #[arg(long, default_value_t = 4)]
+        max_tokens: u32,
+
+        /// Measured runs per candidate
+        #[arg(long, default_value_t = 2)]
+        runs: u32,
+
+        /// Warmup runs per candidate
+        #[arg(long, default_value_t = 1)]
+        warmup: u32,
+
+        /// Prompt used for every candidate
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+
+        /// Allow candidates whose advisory budget is classified risky
+        #[arg(long)]
+        allow_risky: bool,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Confirm, apply, and verify a saved adaptive plan
+    #[command(name = "adaptive-apply")]
+    AdaptiveApply {
+        /// Plan JSON produced by adaptive-plan
+        plan: PathBuf,
+
+        /// Explicit confirmation is mandatory
+        #[arg(long)]
+        confirm: bool,
+
+        /// Override the plan's performance profile store
+        #[arg(long, value_name = "PATH")]
+        performance_profile: Option<PathBuf>,
+
+        /// Write the applied/verified report JSON to this path
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Show explicit architecture, tokenizer, and quantization capabilities
     Support,
     /// Run a controlled lifecycle calibration and compare estimates to observations
@@ -1133,6 +1277,96 @@ fn main() {
                 performance_profile,
                 json,
             ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::AdaptivePlan {
+            model,
+            ram,
+            context,
+            context_args,
+            draft_model,
+            draft_tokens,
+            performance_profile,
+            prompt,
+            max_tokens,
+            runs,
+            warmup,
+            output,
+            json,
+        } => {
+            if let Err(error) = run_adaptive_plan(
+                model,
+                ram,
+                context,
+                context_args,
+                draft_model,
+                draft_tokens,
+                performance_profile,
+                prompt,
+                max_tokens,
+                runs,
+                warmup,
+                output,
+                json,
+            ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::AdaptiveCalibrate {
+            model,
+            ram,
+            context,
+            context_args,
+            draft_model,
+            draft_tokens,
+            performance_profile,
+            report,
+            preference,
+            max_candidates,
+            max_experiments,
+            max_tokens,
+            runs,
+            warmup,
+            prompt,
+            allow_risky,
+            json,
+        } => {
+            if let Err(error) = run_adaptive_calibrate(
+                model,
+                ram,
+                context,
+                context_args,
+                draft_model,
+                draft_tokens,
+                performance_profile,
+                report,
+                preference,
+                max_candidates,
+                max_experiments,
+                max_tokens,
+                runs,
+                warmup,
+                prompt,
+                allow_risky,
+                json,
+            ) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::AdaptiveApply {
+            plan,
+            confirm,
+            performance_profile,
+            output,
+            json,
+        } => {
+            if let Err(error) =
+                run_adaptive_apply(plan, confirm, performance_profile, output, json)
+            {
                 eprintln!("Error: {error}");
                 std::process::exit(1);
             }
@@ -3844,11 +4078,13 @@ fn run_recommend(
         ram_bytes,
     );
     let mut draft_compatible = None;
+    let mut draft_bytes = None;
     if let Some(draft_path) = draft_model.as_ref() {
         let draft_set = discover_model_set(draft_path).map_err(|error| anyhow::anyhow!(error))?;
         let draft_gguf = draft_set.merged_model();
         let compatible = ramforge_runtime::draft_vocabulary_compatible(&draft_gguf, &gguf).is_ok();
         draft_compatible = Some(compatible);
+        draft_bytes = Some(draft_gguf.file_size);
         workload.draft_model_fingerprint = ramforge_runtime::model_profile(&draft_gguf).fingerprint;
     }
     let hardware = ramforge_runtime::hardware_profile(&machine);
@@ -3868,11 +4104,38 @@ fn run_recommend(
         draft_compatible,
         measured.as_ref(),
     );
+    let environment = ramforge_runtime::ExecutionEnvironment::collect(&machine);
+    let mut budget_workload = workload.clone();
+    budget_workload.gpu_layers = recommendation.placement.gpu_layers;
+    budget_workload.residency = if recommendation.residency.stage_layers {
+        "staged".to_string()
+    } else {
+        "off".to_string()
+    };
+    let budget = ramforge_runtime::assess_budget(
+        &profile,
+        &hardware,
+        &budget_workload,
+        Some(&requirements),
+        draft_bytes,
+    );
+    let mut compatibility_request =
+        ramforge_runtime::CompatibilityRequest::from_workload(&budget_workload, draft_compatible);
+    compatibility_request.speculative = recommendation.speculative.recommended;
+    let compatibility = ramforge_runtime::resolve_compatibility(
+        &profile,
+        &hardware,
+        &budget_workload,
+        &compatibility_request,
+    );
     if json_output {
         let output = serde_json::json!({
             "model_profile": profile,
             "hardware_profile": hardware,
+            "execution_environment": environment,
             "workload_profile": workload,
+            "resource_budget": budget,
+            "compatibility": compatibility,
             "recommendation": recommendation,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -3924,10 +4187,917 @@ fn run_recommend(
                 measured.condition
             );
         }
+        println!(
+            "Budget: {} (advisory, enforced={}); host_required={:?} vram_required={:?}",
+            budget.admission.label(),
+            budget.enforceable,
+            budget.host_required_bytes,
+            budget.vram_required_bytes
+        );
+        println!("Compatibility: {}", compatibility.overall.label());
+        println!(
+            "Environment: ramforge={} native_contract={} driver={:?}",
+            environment.ramforge_version,
+            environment.native_contract_version,
+            environment.gpu_driver_version
+        );
         println!("Evidence: {}", recommendation.evidence_quality);
         for note in &recommendation.notes {
             println!("  note: {note}");
         }
+    }
+    Ok(())
+}
+
+struct AdaptiveInputs {
+    gguf: GgufModel,
+    model: ramforge_runtime::ModelProfile,
+    machine: ramforge_runtime::MachineProfile,
+    hardware: ramforge_runtime::HardwareProfile,
+    environment: ramforge_runtime::ExecutionEnvironment,
+    requirements: ramforge_runtime::model_requirements::ModelRequirements,
+    ram_budget_bytes: Option<u64>,
+    draft_path: Option<PathBuf>,
+    draft_fingerprint: Option<String>,
+    draft_bytes: Option<u64>,
+    draft_compatible: Option<bool>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_adaptive_inputs(
+    model_path: &PathBuf,
+    ram_budget_bytes: Option<u64>,
+    context: u32,
+    batch_tokens: u32,
+    threads: u32,
+    context_config: &ramforge_runtime::ContextConfig,
+    draft_model: Option<&PathBuf>,
+) -> anyhow::Result<AdaptiveInputs> {
+    let model_set = discover_model_set(model_path).map_err(|error| anyhow::anyhow!(error))?;
+    let gguf = model_set.merged_model();
+    let model = ramforge_runtime::model_profile(&gguf);
+    let machine = collect_machine_profile(&MachineProfileConfig {
+        model_path: Some(model_path.clone()),
+        ram_budget_bytes,
+        cpu: CpuRuntimeSettings {
+            selected_threads: Some(threads),
+            user_thread_limit: None,
+        },
+        ..MachineProfileConfig::default()
+    });
+    let hardware = ramforge_runtime::hardware_profile(&machine);
+    let environment = ramforge_runtime::ExecutionEnvironment::collect(&machine);
+    let mut requirements = model_requirements(
+        &gguf,
+        ModelRequirementConfig {
+            context_tokens: context,
+            batch_tokens,
+            kv_bytes_per_element: 2,
+        },
+    );
+    if let Err(error) = requirements.apply_kv_cache_types(
+        context_config.kv_type_k.unwrap_or_default(),
+        context_config.kv_type_v.unwrap_or_default(),
+    ) {
+        eprintln!("Warning: KV accounting unavailable: {error}");
+    }
+    let mut draft_path = None;
+    let mut draft_fingerprint = None;
+    let mut draft_bytes = None;
+    let mut draft_compatible = None;
+    if let Some(path) = draft_model {
+        let draft_set = discover_model_set(path).map_err(|error| anyhow::anyhow!(error))?;
+        let draft_gguf = draft_set.merged_model();
+        let draft_profile = ramforge_runtime::model_profile(&draft_gguf);
+        draft_path = Some(path.clone());
+        draft_fingerprint = draft_profile.fingerprint;
+        draft_bytes = Some(draft_gguf.file_size);
+        draft_compatible =
+            Some(ramforge_runtime::draft_vocabulary_compatible(&draft_gguf, &gguf).is_ok());
+    }
+    Ok(AdaptiveInputs {
+        gguf,
+        model,
+        machine,
+        hardware,
+        environment,
+        requirements,
+        ram_budget_bytes,
+        draft_path,
+        draft_fingerprint,
+        draft_bytes,
+        draft_compatible,
+    })
+}
+
+fn adaptive_requirements_for_strategy(
+    inputs: &AdaptiveInputs,
+    strategy: &ramforge_runtime::AdaptiveStrategy,
+) -> anyhow::Result<(
+    ramforge_runtime::model_requirements::ModelRequirements,
+    Vec<String>,
+)> {
+    let mut notes = Vec::new();
+    let mut requirements = model_requirements(
+        &inputs.gguf,
+        ModelRequirementConfig {
+            context_tokens: strategy.context_tokens,
+            batch_tokens: strategy.batch_tokens,
+            kv_bytes_per_element: 2,
+        },
+    );
+    let kv_type_k = ramforge_runtime::KvCacheType::parse(&strategy.kv_type_k)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let kv_type_v = ramforge_runtime::KvCacheType::parse(&strategy.kv_type_v)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    if let Err(error) = requirements.apply_kv_cache_types(kv_type_k, kv_type_v) {
+        notes.push(format!(
+            "KV accounting unavailable for this candidate; retaining metadata estimates: {error}"
+        ));
+    }
+    Ok((requirements, notes))
+}
+
+fn adaptive_context_config(
+    base: &ramforge_runtime::ContextConfig,
+    strategy: &ramforge_runtime::AdaptiveStrategy,
+) -> anyhow::Result<ramforge_runtime::ContextConfig> {
+    let mut config = base.clone();
+    config.kv_type_k = Some(
+        ramforge_runtime::KvCacheType::parse(&strategy.kv_type_k)
+            .map_err(|error| anyhow::anyhow!(error))?,
+    );
+    config.kv_type_v = Some(
+        ramforge_runtime::KvCacheType::parse(&strategy.kv_type_v)
+            .map_err(|error| anyhow::anyhow!(error))?,
+    );
+    config.batch_tokens = Some(strategy.batch_tokens);
+    config.ubatch_tokens = Some(strategy.ubatch_tokens);
+    config.validate().map_err(|error| anyhow::anyhow!(error))?;
+    Ok(config)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_adaptive_strategy(
+    inputs: &AdaptiveInputs,
+    strategy: &ramforge_runtime::AdaptiveStrategy,
+    base_context_config: &ramforge_runtime::ContextConfig,
+    prompt: &str,
+    max_tokens: u32,
+    runs: u32,
+    warmup: u32,
+) -> anyhow::Result<(ramforge_runtime::BenchmarkReport, Vec<String>)> {
+    let (requirements, notes) = adaptive_requirements_for_strategy(inputs, strategy)?;
+    let context_config = adaptive_context_config(base_context_config, strategy)?;
+    let device = if strategy.gpu_layers == 0 {
+        "cpu".to_string()
+    } else {
+        strategy.device_id.clone()
+    };
+    let model_path = inputs.model.path.clone().unwrap_or_default();
+    let plan = RuntimePlan::resolve_with_context(
+        &inputs.machine,
+        &requirements,
+        model_path.as_str(),
+        RuntimeProfileKind::MaximumPerformance,
+        &ramforge_runtime::CustomRuntimeRequest {
+            context_tokens: Some(strategy.context_tokens),
+            batch_tokens: Some(strategy.batch_tokens),
+            threads: Some(strategy.threads),
+            load_mode: Some(strategy.load_mode.clone()),
+            no_repack: Some(false),
+            device: Some(device),
+            gpu_layers: Some(strategy.gpu_layers),
+        },
+        &context_config,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    let report = run_benchmark(
+        plan,
+        BenchmarkConfig {
+            runs,
+            warmup_runs: warmup,
+            prompt: prompt.to_string(),
+            max_tokens,
+            staged_layers: strategy.staged_layers.clone(),
+            staged_budget_bytes: strategy.staged_budget_bytes,
+            staged_auto: strategy.staged_auto && strategy.residency != "off",
+            staged_margin_bytes: ramforge_runtime::DEFAULT_STAGING_SAFETY_MARGIN_BYTES,
+            selection_policy: ramforge_runtime::SelectionPolicy::Ascending,
+            host_staging_mode: ramforge_runtime::HostStagingMode::Copy,
+            read_batching: ramforge_runtime::ReadBatching::Coalesced,
+            pinned_pool_bytes: 0,
+            storage_concurrency: 1,
+            storage_max_outstanding_bytes: 0,
+            draft_model: strategy.draft_model_path.as_ref().map(PathBuf::from),
+            draft_tokens: strategy.draft_tokens.unwrap_or(0),
+            draft_threads: 0,
+        },
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    Ok((report, notes))
+}
+
+fn adaptive_residency_label(strategy: &ramforge_runtime::AdaptiveStrategy) -> &str {
+    if strategy.residency == "staged" || (strategy.staged_auto && strategy.residency != "off") {
+        "staged"
+    } else {
+        strategy.residency.as_str()
+    }
+}
+
+fn persist_adaptive_measurement(
+    path: &std::path::Path,
+    inputs: &AdaptiveInputs,
+    strategy: &ramforge_runtime::AdaptiveStrategy,
+    report: &ramforge_runtime::BenchmarkReport,
+) -> anyhow::Result<()> {
+    let mut workload = ramforge_runtime::workload_from_plan(
+        &report.plan,
+        adaptive_residency_label(strategy),
+        strategy.draft_tokens,
+        Some(report.max_tokens),
+        inputs.ram_budget_bytes,
+    );
+    workload.draft_model_fingerprint = inputs.draft_fingerprint.clone();
+    let identity =
+        ramforge_runtime::performance_identity(&inputs.model, &inputs.hardware, &workload);
+    let record = ramforge_runtime::PerformanceRecord::from_benchmark(identity, report);
+    let mut store = ramforge_runtime::PerformanceProfileStore::load(path)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    store.insert(record);
+    store.save(path).map_err(|error| anyhow::anyhow!(error))?;
+    Ok(())
+}
+
+fn adaptive_preliminary_workload(
+    inputs: &AdaptiveInputs,
+    context_config: &ramforge_runtime::ContextConfig,
+    max_tokens: u32,
+) -> anyhow::Result<ramforge_runtime::WorkloadProfile> {
+    let plan = RuntimePlan::resolve_with_context(
+        &inputs.machine,
+        &inputs.requirements,
+        inputs
+            .model
+            .path
+            .as_deref()
+            .unwrap_or_default()
+            .to_string()
+            .as_str(),
+        RuntimeProfileKind::MaximumPerformance,
+        &ramforge_runtime::CustomRuntimeRequest {
+            context_tokens: Some(inputs.requirements.context_tokens),
+            batch_tokens: Some(inputs.requirements.batch_tokens),
+            threads: None,
+            load_mode: Some("mmap".to_string()),
+            no_repack: Some(false),
+            device: Some("cpu".to_string()),
+            gpu_layers: Some(0),
+        },
+        context_config,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    let mut workload = ramforge_runtime::workload_from_plan(
+        &plan,
+        "off",
+        inputs.draft_path.as_ref().map(|_| 8),
+        Some(max_tokens),
+        inputs.ram_budget_bytes,
+    );
+    workload.draft_model_fingerprint = inputs.draft_fingerprint.clone();
+    Ok(workload)
+}
+
+fn adaptive_strategy_from_recommendation(
+    recommendation: &ramforge_runtime::AdaptiveRecommendation,
+    inputs: &AdaptiveInputs,
+    workload: &ramforge_runtime::WorkloadProfile,
+    draft_tokens: u32,
+) -> ramforge_runtime::AdaptiveStrategy {
+    let mode = recommendation.placement.mode.as_str();
+    let staged = recommendation.residency.stage_layers;
+    let gpu_layers = if staged {
+        0
+    } else {
+        recommendation.placement.gpu_layers
+    };
+    let device_id = if gpu_layers > 0 {
+        inputs
+            .hardware
+            .gpus
+            .iter()
+            .find(|gpu| gpu.selectable)
+            .map(|gpu| gpu.id.clone())
+            .unwrap_or_else(|| "auto".to_string())
+    } else {
+        "cpu".to_string()
+    };
+    let mut strategy = ramforge_runtime::baseline_strategy(workload);
+    strategy.label = "recommended".to_string();
+    strategy.execution_mode = if staged {
+        "hybrid".to_string()
+    } else {
+        mode.to_string()
+    };
+    strategy.device_id = device_id;
+    strategy.gpu_layers = gpu_layers;
+    strategy.residency = if staged {
+        "staged".to_string()
+    } else {
+        "off".to_string()
+    };
+    strategy.staged_auto = staged;
+    strategy.speculative = recommendation.speculative.recommended;
+    strategy.draft_tokens = strategy
+        .speculative
+        .then_some(recommendation.speculative.draft_tokens.max(draft_tokens));
+    strategy.draft_model_path = strategy
+        .speculative
+        .then(|| {
+            inputs
+                .draft_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+        })
+        .flatten();
+    strategy = strategy.with_identity();
+    strategy
+}
+
+fn parse_objective_preference(
+    value: &str,
+) -> anyhow::Result<ramforge_runtime::ObjectivePreference> {
+    match value.to_ascii_lowercase().as_str() {
+        "throughput" => Ok(ramforge_runtime::ObjectivePreference::Throughput),
+        "balanced" => Ok(ramforge_runtime::ObjectivePreference::Balanced),
+        "latency" => Ok(ramforge_runtime::ObjectivePreference::Latency),
+        "memory" => Ok(ramforge_runtime::ObjectivePreference::Memory),
+        other => Err(anyhow::anyhow!(
+            "unknown preference '{other}' (expected throughput, balanced, latency, or memory)"
+        )),
+    }
+}
+
+fn adaptive_recommendation(
+    inputs: &AdaptiveInputs,
+    workload: &ramforge_runtime::WorkloadProfile,
+    performance_profile: Option<&PathBuf>,
+) -> anyhow::Result<ramforge_runtime::AdaptiveRecommendation> {
+    let measured = if let Some(path) = performance_profile {
+        let store = ramforge_runtime::PerformanceProfileStore::load(path)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        store
+            .best_for_model_hardware(
+                inputs.model.fingerprint.as_deref(),
+                &inputs.hardware.fingerprint,
+            )
+            .cloned()
+    } else {
+        None
+    };
+    Ok(ramforge_runtime::recommend(
+        &inputs.model,
+        &inputs.hardware,
+        workload,
+        inputs.draft_compatible,
+        measured.as_ref(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_adaptive_plan(
+    model_path: PathBuf,
+    ram_str: Option<String>,
+    context: u32,
+    context_args: ContextArgs,
+    draft_model: Option<PathBuf>,
+    draft_tokens: u32,
+    performance_profile: Option<PathBuf>,
+    prompt: String,
+    max_tokens: u32,
+    runs: u32,
+    warmup: u32,
+    output: Option<PathBuf>,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    if runs == 0 {
+        return Err(anyhow::anyhow!("--runs must be greater than zero"));
+    }
+    let ram_bytes = ram_str
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --ram: {error}"))?;
+    let context_config = context_args.config()?;
+    let threads = resolve_thread_count(context_args.threads)?;
+    let batch = context_config.batch_tokens.unwrap_or(64).max(1);
+    let inputs = collect_adaptive_inputs(
+        &model_path,
+        ram_bytes,
+        context,
+        batch,
+        threads,
+        &context_config,
+        draft_model.as_ref(),
+    )?;
+    let preliminary = adaptive_preliminary_workload(&inputs, &context_config, max_tokens)?;
+    let recommendation =
+        adaptive_recommendation(&inputs, &preliminary, performance_profile.as_ref())?;
+    let strategy =
+        adaptive_strategy_from_recommendation(&recommendation, &inputs, &preliminary, draft_tokens);
+    strategy
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let (requirements, kv_notes) = adaptive_requirements_for_strategy(&inputs, &strategy)?;
+    let effective_context_config = adaptive_context_config(&context_config, &strategy)?;
+    let device = if strategy.gpu_layers == 0 {
+        "cpu".to_string()
+    } else {
+        strategy.device_id.clone()
+    };
+    let resolved = RuntimePlan::resolve_with_context(
+        &inputs.machine,
+        &requirements,
+        model_path.to_string_lossy().as_ref(),
+        RuntimeProfileKind::MaximumPerformance,
+        &ramforge_runtime::CustomRuntimeRequest {
+            context_tokens: Some(strategy.context_tokens),
+            batch_tokens: Some(strategy.batch_tokens),
+            threads: Some(strategy.threads),
+            load_mode: Some(strategy.load_mode.clone()),
+            no_repack: Some(false),
+            device: Some(device),
+            gpu_layers: Some(strategy.gpu_layers),
+        },
+        &effective_context_config,
+    )
+    .map_err(|error| anyhow::anyhow!(error))?;
+    let mut workload = ramforge_runtime::workload_from_plan(
+        &resolved,
+        adaptive_residency_label(&strategy),
+        strategy.draft_tokens,
+        Some(max_tokens),
+        ram_bytes,
+    );
+    workload.draft_model_fingerprint = inputs.draft_fingerprint.clone();
+    let budget = ramforge_runtime::assess_budget(
+        &inputs.model,
+        &inputs.hardware,
+        &workload,
+        Some(&requirements),
+        inputs.draft_bytes,
+    );
+    let request =
+        ramforge_runtime::CompatibilityRequest::from_workload(&workload, inputs.draft_compatible);
+    let compatibility = ramforge_runtime::resolve_compatibility(
+        &inputs.model,
+        &inputs.hardware,
+        &workload,
+        &request,
+    );
+    let mut plan = ramforge_runtime::build_plan(
+        &inputs.model,
+        &inputs.hardware,
+        &inputs.environment,
+        &workload,
+        &strategy,
+        &budget,
+        &compatibility,
+        inputs
+            .draft_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        inputs.draft_fingerprint.clone(),
+        performance_profile
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        prompt,
+        max_tokens,
+        runs,
+        warmup,
+    );
+    plan.unknowns.extend(kv_notes);
+    plan.validate().map_err(|error| anyhow::anyhow!(error))?;
+    if let Some(path) = output.as_ref() {
+        let text = serde_json::to_string_pretty(&plan)?;
+        std::fs::write(path, text).map_err(|error| anyhow::anyhow!(error))?;
+        eprintln!("Adaptive plan written: {}", path.display());
+    }
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        println!(
+            "Plan {} ({}) for {}",
+            plan.plan_id,
+            plan.status.label(),
+            plan.model_path
+        );
+        println!(
+            "Strategy: {} mode={} device={} gpu_layers={} threads={} kv={}/{} residency={}",
+            strategy.label,
+            strategy.execution_mode,
+            strategy.device_id,
+            strategy.gpu_layers,
+            strategy.threads,
+            strategy.kv_type_k,
+            strategy.kv_type_v,
+            strategy.residency
+        );
+        println!(
+            "Budget: {} (advisory, enforced={}); host_required={:?} vram_required={:?}",
+            budget.admission.label(),
+            budget.enforceable,
+            budget.host_required_bytes,
+            budget.vram_required_bytes
+        );
+        println!("Compatibility: {}", compatibility.overall.label());
+        for decision in &plan.decisions {
+            println!(
+                "  {} = {} [{}] {}",
+                decision.decision, decision.value, decision.confidence, decision.explanation
+            );
+        }
+        println!(
+            "Speculative: {}",
+            if strategy.speculative {
+                format!("greedy K={}", strategy.draft_tokens.unwrap_or(0))
+            } else {
+                "off".to_string()
+            }
+        );
+        for risk in &plan.risks {
+            println!("  risk: {risk}");
+        }
+        println!(
+            "Confirmation required. Apply with: ramforge adaptive-apply <plan.json> --confirm"
+        );
+        println!(
+            "Verification workload: runs={} warmup={} max_tokens={}",
+            plan.runs, plan.warmup_runs, plan.max_tokens
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_adaptive_calibrate(
+    model_path: PathBuf,
+    ram_str: Option<String>,
+    context: u32,
+    context_args: ContextArgs,
+    draft_model: Option<PathBuf>,
+    draft_tokens: u32,
+    performance_profile: Option<PathBuf>,
+    report_path: Option<PathBuf>,
+    preference: String,
+    max_candidates: usize,
+    max_experiments: usize,
+    max_tokens: u32,
+    runs: u32,
+    warmup: u32,
+    prompt: String,
+    allow_risky: bool,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    if runs == 0 {
+        return Err(anyhow::anyhow!("--runs must be greater than zero"));
+    }
+    let preference = parse_objective_preference(&preference)?;
+    let ram_bytes = ram_str
+        .as_deref()
+        .map(parse_memory_size)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --ram: {error}"))?;
+    let context_config = context_args.config()?;
+    let threads = resolve_thread_count(context_args.threads)?;
+    let batch = context_config.batch_tokens.unwrap_or(64).max(1);
+    let inputs = collect_adaptive_inputs(
+        &model_path,
+        ram_bytes,
+        context,
+        batch,
+        threads,
+        &context_config,
+        draft_model.as_ref(),
+    )?;
+    let preliminary = adaptive_preliminary_workload(&inputs, &context_config, max_tokens)?;
+    let recommendation =
+        adaptive_recommendation(&inputs, &preliminary, performance_profile.as_ref())?;
+    let baseline =
+        adaptive_strategy_from_recommendation(&recommendation, &inputs, &preliminary, draft_tokens);
+    let limits = ramforge_runtime::CandidateLimits {
+        max_candidates,
+        max_experiments,
+        min_runs_for_selection: 2,
+        min_improvement_bps: 500,
+        max_variability_bps: 1_000,
+    };
+    limits.validate().map_err(|error| anyhow::anyhow!(error))?;
+    let candidate_set = ramforge_runtime::generate_candidates(
+        &inputs.model,
+        &inputs.hardware,
+        &preliminary,
+        &baseline,
+        Some(&inputs.requirements),
+        inputs.draft_compatible,
+        inputs.draft_bytes,
+        &limits,
+    );
+    if candidate_set.candidates.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no calibration candidates were generated: {}",
+            candidate_set.notes.join("; ")
+        ));
+    }
+
+    let mut experiments = Vec::new();
+    let mut executed = 0usize;
+    let mut persistence_notes = Vec::new();
+    for candidate in &candidate_set.candidates {
+        let status = match &candidate.status {
+            ramforge_runtime::CandidateStatus::Eligible => None,
+            ramforge_runtime::CandidateStatus::EligibleWithRisk { reason } => {
+                if allow_risky {
+                    None
+                } else {
+                    Some((
+                        ramforge_runtime::ExperimentStatus::Rejected,
+                        format!("risky candidate rejected without --allow-risky: {reason}"),
+                    ))
+                }
+            }
+            ramforge_runtime::CandidateStatus::Unsupported { reason } => Some((
+                ramforge_runtime::ExperimentStatus::Unsupported,
+                reason.clone(),
+            )),
+            ramforge_runtime::CandidateStatus::Rejected { reason } => {
+                Some((ramforge_runtime::ExperimentStatus::Rejected, reason.clone()))
+            }
+            ramforge_runtime::CandidateStatus::InsufficientInformation { reason } => {
+                Some((ramforge_runtime::ExperimentStatus::Rejected, reason.clone()))
+            }
+        };
+        if let Some((experiment_status, reason)) = status {
+            experiments.push(ramforge_runtime::CalibrationExperiment::not_run(
+                candidate.strategy.clone(),
+                experiment_status,
+                reason,
+            ));
+            continue;
+        }
+        if executed >= max_experiments {
+            experiments.push(ramforge_runtime::CalibrationExperiment::not_run(
+                candidate.strategy.clone(),
+                ramforge_runtime::ExperimentStatus::Interrupted,
+                "experiment budget exhausted",
+            ));
+            continue;
+        }
+        executed += 1;
+        eprintln!(
+            "Calibrating {}/{}: {}",
+            executed, max_experiments, candidate.strategy.label
+        );
+        match execute_adaptive_strategy(
+            &inputs,
+            &candidate.strategy,
+            &context_config,
+            &prompt,
+            max_tokens,
+            runs,
+            warmup,
+        ) {
+            Ok((report, notes)) => {
+                if let Some(path) = performance_profile.as_ref() {
+                    if let Err(error) =
+                        persist_adaptive_measurement(path, &inputs, &candidate.strategy, &report)
+                    {
+                        persistence_notes.push(format!(
+                            "performance record for {} was not persisted: {error}",
+                            candidate.strategy.label
+                        ));
+                    }
+                }
+                let mut experiment = ramforge_runtime::CalibrationExperiment::completed(
+                    candidate.strategy.clone(),
+                    &report,
+                );
+                experiment.notes.extend(notes);
+                experiments.push(experiment);
+            }
+            Err(error) => {
+                experiments.push(ramforge_runtime::CalibrationExperiment::not_run(
+                    candidate.strategy.clone(),
+                    ramforge_runtime::ExperimentStatus::Failed,
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+
+    let mut report = ramforge_runtime::build_calibration_report(
+        &inputs.model,
+        &inputs.hardware,
+        inputs.environment.fingerprint.clone(),
+        &candidate_set.baseline_id,
+        experiments,
+        preference,
+        limits,
+    );
+    report.notes.extend(candidate_set.notes);
+    report.notes.extend(persistence_notes);
+    report.validate().map_err(|error| anyhow::anyhow!(error))?;
+    if let Some(path) = report_path.as_ref() {
+        let text = serde_json::to_string_pretty(&report)?;
+        std::fs::write(path, text).map_err(|error| anyhow::anyhow!(error))?;
+        eprintln!("Calibration report written: {}", path.display());
+    }
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Calibration: model={:?} hardware={} environment={} preference={}",
+            report.model_fingerprint,
+            report.hardware_fingerprint,
+            report.environment_fingerprint,
+            report.preference.label()
+        );
+        for experiment in &report.experiments {
+            match &experiment.measurement {
+                Some(measurement) => println!(
+                    "  {:<28} {:?} {:.4} tok/s runs={} variability={:?} bps condition={}",
+                    experiment.strategy.label,
+                    experiment.status,
+                    measurement.generation_tokens_per_second,
+                    measurement.runs,
+                    measurement.variability_bps,
+                    measurement.condition
+                ),
+                None => println!(
+                    "  {:<28} {:?} {}",
+                    experiment.strategy.label,
+                    experiment.status,
+                    experiment.error.clone().unwrap_or_default()
+                ),
+            }
+        }
+        match &report.best {
+            Some(best) => {
+                println!(
+                    "Best: {} confidence={} improvement={} bps",
+                    best.strategy_id, best.confidence, best.improvement_bps
+                );
+                for tradeoff in &best.tradeoffs {
+                    println!("  tradeoff: {tradeoff}");
+                }
+            }
+            None => println!("Best: none (inconclusive or no valid candidate)"),
+        }
+        for note in &report.notes {
+            println!("  note: {note}");
+        }
+        println!(
+            "Results are scoped to this model, environment, and workload; nothing is applied automatically."
+        );
+    }
+    Ok(())
+}
+
+fn run_adaptive_apply(
+    plan_path: PathBuf,
+    confirm: bool,
+    performance_profile: Option<PathBuf>,
+    output: Option<PathBuf>,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    if !confirm {
+        return Err(anyhow::anyhow!(
+            "explicit confirmation is required: re-run with --confirm after inspecting the plan"
+        ));
+    }
+    let text = std::fs::read_to_string(&plan_path)
+        .map_err(|error| anyhow::anyhow!("cannot read plan: {error}"))?;
+    let plan: ramforge_runtime::AdaptivePlan = serde_json::from_str(&text)
+        .map_err(|error| anyhow::anyhow!("cannot parse plan: {error}"))?;
+    plan.validate().map_err(|error| anyhow::anyhow!(error))?;
+    let model_path = PathBuf::from(&plan.model_path);
+    let ram_bytes = plan.workload.ram_budget_bytes;
+    let context = plan.strategy.context_tokens;
+    let batch = plan.strategy.batch_tokens;
+    let context_config = ramforge_runtime::ContextConfig {
+        kv_type_k: Some(
+            ramforge_runtime::KvCacheType::parse(&plan.strategy.kv_type_k)
+                .map_err(|error| anyhow::anyhow!(error))?,
+        ),
+        kv_type_v: Some(
+            ramforge_runtime::KvCacheType::parse(&plan.strategy.kv_type_v)
+                .map_err(|error| anyhow::anyhow!(error))?,
+        ),
+        flash_attn: None,
+        batch_tokens: Some(plan.strategy.batch_tokens),
+        ubatch_tokens: Some(plan.strategy.ubatch_tokens),
+        sequence_max: Some(plan.workload.sequence_max),
+        threads_batch: None,
+        offload_kqv: None,
+        op_offload: None,
+    };
+    let draft_model = plan.draft_model_path.as_ref().map(PathBuf::from);
+    let inputs = collect_adaptive_inputs(
+        &model_path,
+        ram_bytes,
+        context,
+        batch,
+        plan.strategy.threads,
+        &context_config,
+        draft_model.as_ref(),
+    )?;
+    let validation = ramforge_runtime::revalidate_plan(
+        &plan,
+        &inputs.model,
+        &inputs.hardware,
+        &inputs.environment,
+    );
+    if !validation.valid {
+        return Err(anyhow::anyhow!(
+            "plan is stale or invalid; refusing to apply: {}",
+            validation.reasons.join("; ")
+        ));
+    }
+    let request = ramforge_runtime::CompatibilityRequest::from_workload(
+        &plan.workload,
+        inputs.draft_compatible,
+    );
+    let compatibility = ramforge_runtime::resolve_compatibility(
+        &inputs.model,
+        &inputs.hardware,
+        &plan.workload,
+        &request,
+    );
+    if compatibility.overall == ramforge_runtime::SupportClass::Unsupported {
+        return Err(anyhow::anyhow!(
+            "plan is not supported in the current environment: {}",
+            compatibility.reasons.join("; ")
+        ));
+    }
+
+    let (report, execution_notes) = execute_adaptive_strategy(
+        &inputs,
+        &plan.strategy,
+        &context_config,
+        &plan.prompt,
+        plan.max_tokens,
+        plan.runs,
+        plan.warmup_runs,
+    )?;
+    let observation = ramforge_runtime::RuntimeObservation::from_benchmark(&report);
+    let applied = ramforge_runtime::applied_report_from_observation(&plan, &observation);
+    let store_path = performance_profile
+        .clone()
+        .or_else(|| plan.performance_profile.as_ref().map(PathBuf::from));
+    if let Some(path) = store_path.as_ref() {
+        if let Err(error) = persist_adaptive_measurement(path, &inputs, &plan.strategy, &report) {
+            eprintln!("Warning: measured record was not persisted: {error}");
+        }
+    }
+    if let Some(path) = output.as_ref() {
+        let text = serde_json::to_string_pretty(&applied)?;
+        std::fs::write(path, text).map_err(|error| anyhow::anyhow!(error))?;
+        eprintln!("Applied-plan report written: {}", path.display());
+    }
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&applied)?);
+    } else {
+        println!(
+            "Applied plan {}: status={}",
+            applied.plan_id,
+            applied.status.label()
+        );
+        for field in &applied.fields {
+            println!(
+                "  {:<18} requested={:<20} effective={:?} state={:?}",
+                field.field, field.requested, field.effective, field.state
+            );
+        }
+        if let Some(measurement) = applied.measurement.as_ref() {
+            println!(
+                "Measured: {:.4} tok/s TTFT={:?} acceptance={:?} bps",
+                measurement.generation_tokens_per_second,
+                measurement.time_to_first_token_ns,
+                measurement.acceptance_rate_bps
+            );
+        }
+        for note in execution_notes.iter().chain(applied.notes.iter()) {
+            println!("  note: {note}");
+        }
+        for limitation in &applied.limitations {
+            println!("  limitation: {limitation}");
+        }
+    }
+    if applied.status == ramforge_runtime::PlanStatus::Rejected {
+        return Err(anyhow::anyhow!(
+            "plan application was rejected by runtime readback"
+        ));
     }
     Ok(())
 }

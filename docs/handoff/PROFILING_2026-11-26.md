@@ -173,8 +173,10 @@ hybrid staging rather than failing or inventing a KV estimate.
   optimizer.
 - `best_for_model_hardware` intentionally ignores workload differences for
   advice; exact reuse still requires full identity equality.
-- Hardware fingerprint does not include driver version explicitly (device/backend
-  identity is included); a future schema should add driver/runtime version.
+- Hardware fingerprint composition was extended in the follow-up adaptive
+  milestone: it now includes the execution environment (RAMforge version, native
+  contract, registered backends, GPU driver, CPU feature identity). See
+  `ADAPTIVE_2026-11-26.md`.
 - Performance records are per exact workload; cross-model reuse is never
   automatic.
 - Storage bandwidth is included only when `MachineProfile` performed a benchmark.
