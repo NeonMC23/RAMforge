@@ -45,6 +45,8 @@ pub struct AdaptiveStrategy {
     pub kv_type_k: String,
     pub kv_type_v: String,
     pub load_mode: String,
+    /// Keep quantized weights in the file mapping instead of repacking.
+    pub no_repack: bool,
     /// `off`, `auto`, or `staged`.
     pub residency: String,
     pub staged_auto: bool,
@@ -58,7 +60,7 @@ pub struct AdaptiveStrategy {
 impl AdaptiveStrategy {
     pub fn key(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.execution_mode,
             self.device_id,
             self.gpu_layers,
@@ -69,6 +71,7 @@ impl AdaptiveStrategy {
             self.kv_type_k,
             self.kv_type_v,
             self.load_mode,
+            self.no_repack,
             self.residency,
             self.staged_auto,
             self.draft_tokens.unwrap_or(0),
@@ -212,6 +215,7 @@ pub fn baseline_strategy(workload: &WorkloadProfile) -> AdaptiveStrategy {
         kv_type_k: workload.kv_type_k.clone(),
         kv_type_v: workload.kv_type_v.clone(),
         load_mode: workload.load_mode.clone(),
+        no_repack: workload.no_repack,
         residency: workload.residency.clone(),
         staged_auto: workload.residency == "auto" || workload.residency == "staged",
         staged_layers: Vec::new(),
@@ -234,6 +238,7 @@ fn strategy_workload(base: &WorkloadProfile, strategy: &AdaptiveStrategy) -> Wor
     workload.kv_type_k = strategy.kv_type_k.clone();
     workload.kv_type_v = strategy.kv_type_v.clone();
     workload.load_mode = strategy.load_mode.clone();
+    workload.no_repack = strategy.no_repack;
     workload.device_id = strategy.device_id.clone();
     workload.residency = strategy.residency.clone();
     workload.draft_tokens = strategy.draft_tokens;
@@ -358,7 +363,16 @@ pub fn generate_candidates(
     // historically measured general win when the target is oversized.
     if draft_compatible == Some(true) && baseline.is_cpu_target() {
         if let Some(draft_path) = baseline.draft_model_path.clone() {
-            for draft_tokens in [4u32, 8, 12] {
+            let k_values: &[u32] = if baseline.residency == "staged"
+                && draft_bytes.unwrap_or(u64::MAX) <= 2 * 1024 * 1024 * 1024
+            {
+                &[16, 20, 24, 32]
+            } else if baseline.residency == "staged" {
+                &[16, 20, 24, 28]
+            } else {
+                &[4, 8, 12, 16]
+            };
+            for draft_tokens in k_values.iter().copied() {
                 let mut strategy = baseline.clone();
                 strategy.label = format!("speculative-k{draft_tokens}");
                 strategy.axis = StrategyAxis::Speculative;
@@ -450,6 +464,14 @@ pub struct MeasurementSummary {
     pub time_to_first_token_ns: Option<u64>,
     pub pss_bytes: Option<u64>,
     pub acceptance_rate_bps: Option<u32>,
+    #[serde(default)]
+    pub target_forward_ns: Option<u64>,
+    #[serde(default)]
+    pub draft_forward_ns: Option<u64>,
+    #[serde(default)]
+    pub cpu_busy_bps: Option<u32>,
+    #[serde(default)]
+    pub staged_vram_bytes: Option<u64>,
     pub runs: u32,
     pub condition: String,
     pub variability_bps: Option<u32>,
@@ -482,6 +504,25 @@ impl MeasurementSummary {
                 .last()
                 .and_then(|run| run.speculative.as_ref())
                 .map(|stats| stats.acceptance_rate_bps),
+            target_forward_ns: report
+                .runs_detail
+                .last()
+                .and_then(|run| run.speculative.as_ref())
+                .map(|stats| stats.target_forward_ns),
+            draft_forward_ns: report
+                .runs_detail
+                .last()
+                .and_then(|run| run.speculative.as_ref())
+                .map(|stats| stats.draft_forward_ns),
+            cpu_busy_bps: report
+                .runs_detail
+                .last()
+                .and_then(|run| run.cpu.as_ref())
+                .map(|cpu| cpu.busy_bps),
+            staged_vram_bytes: report
+                .staging_lifecycle
+                .as_ref()
+                .map(|lifecycle| lifecycle.resident_bytes),
             runs: report.runs,
             condition: report.condition.clone(),
             variability_bps,
@@ -1004,6 +1045,7 @@ mod tests {
             kv_type_k: "f16".to_string(),
             kv_type_v: "f16".to_string(),
             load_mode: "mmap".to_string(),
+            no_repack: false,
             backend: "cpu".to_string(),
             device_id: "cpu".to_string(),
             residency: "off".to_string(),
@@ -1031,6 +1073,7 @@ mod tests {
                 kv_type_k: "f16".to_string(),
                 kv_type_v: "f16".to_string(),
                 load_mode: "mmap".to_string(),
+                no_repack: false,
                 residency: "off".to_string(),
                 staged_auto: false,
                 staged_layers: Vec::new(),
@@ -1049,6 +1092,10 @@ mod tests {
                 time_to_first_token_ns: Some(ttft),
                 pss_bytes: Some(1 << 30),
                 acceptance_rate_bps: None,
+                target_forward_ns: None,
+                draft_forward_ns: None,
+                cpu_busy_bps: None,
+                staged_vram_bytes: None,
                 runs: 2,
                 condition: "warm".to_string(),
                 variability_bps: Some(500),

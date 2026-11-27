@@ -23,8 +23,8 @@ use crate::support::model_execution_support;
 
 /// Current schema. Record schemas 1 and 2 parse, but only records with the
 /// current schema are reusable through exact identity matching.
-pub const PROFILING_SCHEMA_VERSION: u32 = 2;
-const LEGACY_PROFILING_SCHEMA_VERSION: u32 = 1;
+pub const PROFILING_SCHEMA_VERSION: u32 = 3;
+const LEGACY_PROFILING_SCHEMA_VERSIONS: [u32; 2] = [1, 2];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuantizationBucket {
@@ -259,6 +259,10 @@ pub struct WorkloadProfile {
     pub kv_type_k: String,
     pub kv_type_v: String,
     pub load_mode: String,
+    /// True when the runtime is asked to keep quantized weights in the
+    /// file-backed mapping instead of repacking them.
+    #[serde(default)]
+    pub no_repack: bool,
     pub backend: String,
     pub device_id: String,
     pub residency: String,
@@ -285,6 +289,7 @@ pub fn workload_from_plan(
         kv_type_k: plan.effective.kv_type_k.clone(),
         kv_type_v: plan.effective.kv_type_v.clone(),
         load_mode: plan.effective.load_mode.clone(),
+        no_repack: !plan.effective.weight_repacking,
         backend: plan.effective.backend.clone(),
         device_id: plan.effective.device_id.clone(),
         residency: residency.into(),
@@ -314,7 +319,7 @@ impl PerformanceIdentity {
 
     pub fn key(&self) -> String {
         let mut text = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.model_fingerprint.as_deref().unwrap_or(""),
             self.architecture.as_deref().unwrap_or(""),
             self.quantization.as_deref().unwrap_or(""),
@@ -330,6 +335,7 @@ impl PerformanceIdentity {
             self.workload.kv_type_k,
             self.workload.kv_type_v,
             self.workload.load_mode,
+            self.workload.no_repack,
             self.workload.residency,
             self.workload.draft_tokens.unwrap_or(0),
             self.workload
@@ -375,6 +381,18 @@ pub struct PerformanceRecord {
     pub acceptance_rate_bps: Option<u32>,
     pub storage_read_bytes: Option<u64>,
     pub pss_bytes: Option<u64>,
+    /// Time spent in target verification forwards, when speculative.
+    #[serde(default)]
+    pub target_forward_ns: Option<u64>,
+    /// Time spent generating draft candidates, when speculative.
+    #[serde(default)]
+    pub draft_forward_ns: Option<u64>,
+    /// Whole-machine CPU busy percentage during the measured run.
+    #[serde(default)]
+    pub cpu_busy_bps: Option<u32>,
+    /// Native staged-layer resident bytes after generation.
+    #[serde(default)]
+    pub staged_vram_bytes: Option<u64>,
     pub condition: String,
     pub limitations: Vec<String>,
 }
@@ -399,6 +417,13 @@ impl PerformanceRecord {
             acceptance_rate_bps: speculative.map(|stats| stats.acceptance_rate_bps),
             storage_read_bytes: last.and_then(|run| run.storage_read_bytes),
             pss_bytes: last.and_then(|run| run.pss_bytes),
+            target_forward_ns: speculative.map(|stats| stats.target_forward_ns),
+            draft_forward_ns: speculative.map(|stats| stats.draft_forward_ns),
+            cpu_busy_bps: last.and_then(|run| run.cpu.as_ref().map(|cpu| cpu.busy_bps)),
+            staged_vram_bytes: report
+                .staging_lifecycle
+                .as_ref()
+                .map(|lifecycle| lifecycle.resident_bytes),
             condition: report.condition.clone(),
             limitations: report.limitations.clone(),
         }
@@ -460,10 +485,9 @@ impl PerformanceProfileStore {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if !matches!(
-            self.schema_version,
-            LEGACY_PROFILING_SCHEMA_VERSION | PROFILING_SCHEMA_VERSION
-        ) {
+        if self.schema_version != PROFILING_SCHEMA_VERSION
+            && !LEGACY_PROFILING_SCHEMA_VERSIONS.contains(&self.schema_version)
+        {
             return Err(format!(
                 "unsupported performance profile schema {}",
                 self.schema_version
@@ -879,6 +903,7 @@ mod tests {
             kv_type_k: "q8_0".to_string(),
             kv_type_v: "q8_0".to_string(),
             load_mode: "mmap".to_string(),
+            no_repack: false,
             backend: "cpu".to_string(),
             device_id: "cpu".to_string(),
             residency: "auto".to_string(),
@@ -926,6 +951,7 @@ mod tests {
             kv_type_k: "f16".to_string(),
             kv_type_v: "f16".to_string(),
             load_mode: "mmap".to_string(),
+            no_repack: false,
             backend: "cpu".to_string(),
             device_id: "cpu".to_string(),
             residency: "off".to_string(),
@@ -952,6 +978,10 @@ mod tests {
             acceptance_rate_bps: None,
             storage_read_bytes: None,
             pss_bytes: None,
+            target_forward_ns: None,
+            draft_forward_ns: None,
+            cpu_busy_bps: None,
+            staged_vram_bytes: None,
             condition: "warm".to_string(),
             limitations: Vec::new(),
         });
@@ -992,6 +1022,7 @@ mod tests {
             kv_type_k: "f16".to_string(),
             kv_type_v: "f16".to_string(),
             load_mode: "mmap".to_string(),
+            no_repack: false,
             backend: "cpu".to_string(),
             device_id: "cpu".to_string(),
             residency: "auto".to_string(),
@@ -1029,6 +1060,7 @@ mod tests {
                     kv_type_k: "q8_0".to_string(),
                     kv_type_v: "q8_0".to_string(),
                     load_mode: "mmap".to_string(),
+                    no_repack: false,
                     backend: "cpu".to_string(),
                     device_id: "cpu".to_string(),
                     residency: "auto".to_string(),
@@ -1052,6 +1084,10 @@ mod tests {
             acceptance_rate_bps: None,
             storage_read_bytes: None,
             pss_bytes: None,
+            target_forward_ns: None,
+            draft_forward_ns: None,
+            cpu_busy_bps: None,
+            staged_vram_bytes: None,
             condition: "warm".to_string(),
             limitations: vec!["short-run".to_string()],
         };

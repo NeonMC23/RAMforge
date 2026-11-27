@@ -21,6 +21,17 @@ use crate::runtime_plan::RuntimePlan;
 
 pub const BENCHMARK_SCHEMA_VERSION: u32 = 21;
 
+/// Whole-machine CPU utilization over one measured generation. This is not
+/// RAMforge-only CPU time and not per-core utilization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CpuUtilization {
+    pub busy_bps: u32,
+    pub user_bps: u32,
+    pub system_bps: u32,
+    pub iowait_bps: u32,
+    pub idle_bps: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkRun {
     pub index: u32,
@@ -48,6 +59,10 @@ pub struct BenchmarkRun {
     pub token_io: Vec<TokenIo>,
     pub speculative: Option<crate::SpeculativeStats>,
     pub output_token_ids: Vec<u32>,
+    /// Whole-machine CPU utilization during this run, when `/proc/stat` is
+    /// available.
+    #[serde(default)]
+    pub cpu: Option<CpuUtilization>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +132,9 @@ pub struct BenchmarkReport {
     pub median_decode_tokens_per_second: Option<f64>,
     pub median_time_to_first_token_ns: Option<u64>,
     pub median_context_create_ns: u64,
+    /// Median whole-machine CPU busy percentage (basis points) across runs.
+    #[serde(default)]
+    pub median_cpu_busy_bps: Option<u32>,
     pub condition: String,
     pub limitations: Vec<String>,
 }
@@ -315,12 +333,14 @@ pub fn run_benchmark(
     let memory_after_warmup = Some(service.memory_observability()?);
     let mut runs = Vec::with_capacity(config.runs as usize);
     for index in 0..config.runs {
+        let cpu_before = read_cpu_times();
         let report = if config.draft_model.is_some() {
             service.generate_speculative(&options, &cancel, |_| Ok(()))?
         } else {
             service.generate(&options, &cancel, |_| Ok(()))?
         };
         context_reuse_count = context_reuse_count.saturating_add(1);
+        let cpu_after = read_cpu_times();
         runs.push(BenchmarkRun {
             index,
             generated_tokens: report.stats.generated_tokens,
@@ -347,6 +367,10 @@ pub fn run_benchmark(
             token_io: report.stats.token_io,
             speculative: report.speculative,
             output_token_ids: report.token_ids,
+            cpu: match (cpu_before, cpu_after) {
+                (Some(before), Some(after)) => cpu_utilization(before, after),
+                _ => None,
+            },
         });
     }
     let memory_after_generation = Some(service.memory_observability()?);
@@ -414,6 +438,12 @@ pub fn run_benchmark(
         staging_plan,
         staging_lifecycle,
         median_context_create_ns: median_u64(&mut context_ns.clone()),
+        median_cpu_busy_bps: median_optional_u32(
+            &runs
+                .iter()
+                .filter_map(|run| run.cpu.as_ref().map(|cpu| cpu.busy_bps))
+                .collect::<Vec<_>>(),
+        ),
         context_create_ns: context_ns,
         context_reuse_count,
         context_setup_read_bytes,
@@ -472,11 +502,102 @@ fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn median_f64(sorted: &[f64]) -> f64 {
-    if sorted.is_empty() {
-        0.0
+#[derive(Debug, Clone, Copy, Default)]
+struct CpuTimes {
+    user: u64,
+    nice: u64,
+    system: u64,
+    idle: u64,
+    iowait: u64,
+    irq: u64,
+    softirq: u64,
+    steal: u64,
+}
+
+impl CpuTimes {
+    fn total(self) -> u64 {
+        self.user
+            .saturating_add(self.nice)
+            .saturating_add(self.system)
+            .saturating_add(self.idle)
+            .saturating_add(self.iowait)
+            .saturating_add(self.irq)
+            .saturating_add(self.softirq)
+            .saturating_add(self.steal)
+    }
+}
+
+fn read_cpu_times() -> Option<CpuTimes> {
+    let text = std::fs::read_to_string("/proc/stat").ok()?;
+    parse_cpu_times(&text)
+}
+
+fn parse_cpu_times(text: &str) -> Option<CpuTimes> {
+    let line = text.lines().find(|line| line.starts_with("cpu "))?;
+    let values: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|value| value.parse().ok())
+        .collect();
+    if values.len() < 8 {
+        return None;
+    }
+    Some(CpuTimes {
+        user: values[0],
+        nice: values[1],
+        system: values[2],
+        idle: values[3],
+        iowait: values[4],
+        irq: values[5],
+        softirq: values[6],
+        steal: values[7],
+    })
+}
+
+fn cpu_utilization(before: CpuTimes, after: CpuTimes) -> Option<CpuUtilization> {
+    let total = after.total().checked_sub(before.total())?;
+    if total == 0 {
+        return None;
+    }
+    let delta = |a: u64, b: u64| b.saturating_sub(a);
+    let user = delta(before.user, after.user) + delta(before.nice, after.nice);
+    let system = delta(before.system, after.system)
+        + delta(before.irq, after.irq)
+        + delta(before.softirq, after.softirq);
+    let idle = delta(before.idle, after.idle);
+    let iowait = delta(before.iowait, after.iowait);
+    let busy = total.saturating_sub(idle).saturating_sub(iowait);
+    let bps = |value: u64| ((value.saturating_mul(10_000)) / total) as u32;
+    Some(CpuUtilization {
+        busy_bps: bps(busy),
+        user_bps: bps(user),
+        system_bps: bps(system),
+        iowait_bps: bps(iowait),
+        idle_bps: bps(idle),
+    })
+}
+
+fn median_optional_u32(values: &[u32]) -> Option<u32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    let len = values.len();
+    Some(if len.is_multiple_of(2) {
+        let low = values[len / 2 - 1];
+        let high = values[len / 2];
+        low / 2 + high / 2 + (low % 2 + high % 2) / 2
     } else {
-        sorted[sorted.len() / 2]
+        values[len / 2]
+    })
+}
+
+fn median_f64(sorted: &[f64]) -> f64 {
+    match sorted.len() {
+        0 => 0.0,
+        len if len.is_multiple_of(2) => (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0,
+        len => sorted[len / 2],
     }
 }
 
@@ -505,7 +626,14 @@ fn median_u64(values: &mut [u64]) -> u64 {
         return 0;
     }
     values.sort_unstable();
-    values[values.len() / 2]
+    let len = values.len();
+    if len.is_multiple_of(2) {
+        let low = values[len / 2 - 1];
+        let high = values[len / 2];
+        low / 2 + high / 2 + (low % 2 + high % 2) / 2
+    } else {
+        values[len / 2]
+    }
 }
 
 #[cfg(test)]
@@ -563,8 +691,11 @@ mod tests {
     fn median_handles_empty_and_ordered_values() {
         assert_eq!(median_f64(&[]), 0.0);
         assert_eq!(median_f64(&[1.0, 2.0, 3.0]), 2.0);
+        assert_eq!(median_f64(&[1.0, 2.0, 3.0, 4.0]), 2.5);
         assert_eq!(median_u64(&mut []), 0);
         assert_eq!(median_u64(&mut [3, 1, 2]), 2);
+        assert_eq!(median_u64(&mut [4, 1, 3, 2]), 2);
+        assert_eq!(median_u64(&mut [1, 4]), 2);
     }
 
     #[test]
@@ -576,5 +707,21 @@ mod tests {
         assert_eq!(percentile_f64(&[7.0], 1, 4), Some(7.0));
         assert_eq!(percentile_f64(&[7.0], 3, 4), Some(7.0));
         assert_eq!(percentile_f64(&[], 1, 4), None);
+    }
+    #[test]
+    fn cpu_utilization_is_derived_from_proc_stat_deltas() {
+        let before = parse_cpu_times("cpu  100 0 50 800 50 0 0 0 0 0\n").unwrap();
+        let after = parse_cpu_times("cpu  200 0 100 900 100 0 0 0 0 0\n").unwrap();
+        let utilization = cpu_utilization(before, after).unwrap();
+        assert_eq!(utilization.user_bps, 3_333);
+        assert_eq!(utilization.system_bps, 1_666);
+        assert_eq!(utilization.iowait_bps, 1_666);
+        assert_eq!(utilization.busy_bps, 5_000);
+    }
+
+    #[test]
+    fn missing_or_malformed_cpu_stat_is_not_invented() {
+        assert!(parse_cpu_times("intr 1 2 3\n").is_none());
+        assert!(parse_cpu_times("cpu 1 2\n").is_none());
     }
 }

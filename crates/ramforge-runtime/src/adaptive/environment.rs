@@ -332,6 +332,7 @@ mod tests {
                     kv_type_k: "f16".to_string(),
                     kv_type_v: "f16".to_string(),
                     load_mode: "mmap".to_string(),
+                    no_repack: false,
                     backend: "cpu".to_string(),
                     device_id: "cpu".to_string(),
                     residency: "off".to_string(),
@@ -355,6 +356,10 @@ mod tests {
             acceptance_rate_bps: None,
             storage_read_bytes: None,
             pss_bytes: None,
+            target_forward_ns: None,
+            draft_forward_ns: None,
+            cpu_busy_bps: None,
+            staged_vram_bytes: None,
             condition: "warm".to_string(),
             limitations: Vec::new(),
         };

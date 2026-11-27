@@ -540,6 +540,7 @@ mod tests {
             kv_type_k: "f16".to_string(),
             kv_type_v: "f16".to_string(),
             load_mode: "mmap".to_string(),
+            no_repack: false,
             backend: "cpu".to_string(),
             device_id: if gpu_layers > 0 { "gpu0" } else { "cpu" }.to_string(),
             residency: if staged { "staged" } else { "off" }.to_string(),

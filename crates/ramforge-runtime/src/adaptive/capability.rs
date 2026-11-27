@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model_architecture::ArchitectureKind;
-use crate::profiling::{HardwareProfile, ModelProfile, WorkloadProfile};
+use crate::profiling::{HardwareProfile, ModelProfile, PerformanceRecord, WorkloadProfile};
 
 pub const CAPABILITY_SCHEMA_VERSION: u32 = 1;
 
@@ -157,6 +157,20 @@ pub fn resolve_compatibility(
     hardware: &HardwareProfile,
     workload: &WorkloadProfile,
     request: &CompatibilityRequest,
+) -> CompatibilityReport {
+    resolve_compatibility_with_evidence(model, hardware, workload, request, None)
+}
+
+/// Evidence-aware resolution. A persisted record that matches the model and
+/// hardware fingerprint upgrades "unvalidated" claims to "limited" and names
+/// the measurement; it never claims the recorded workload matches the current
+/// one.
+pub fn resolve_compatibility_with_evidence(
+    model: &ModelProfile,
+    hardware: &HardwareProfile,
+    workload: &WorkloadProfile,
+    request: &CompatibilityRequest,
+    measured: Option<&PerformanceRecord>,
 ) -> CompatibilityReport {
     let mut features = Vec::new();
     let mut reasons = Vec::new();
@@ -391,6 +405,31 @@ pub fn resolve_compatibility(
         }
     }
 
+    if let Some(record) = measured {
+        let matching = record.identity.model_fingerprint == model.fingerprint
+            && record.identity.hardware_fingerprint == hardware.fingerprint;
+        if matching {
+            for feature in features.iter_mut() {
+                if feature.class != SupportClass::SupportedUnvalidated {
+                    continue;
+                }
+                if matches!(
+                    feature.feature,
+                    ExecutionFeature::GpuOffload
+                        | ExecutionFeature::StagedResidency
+                        | ExecutionFeature::MoeExecution
+                ) {
+                    feature.class = SupportClass::SupportedWithLimitations;
+                    feature.detail = format!(
+                        "{}; a measured record exists for this model and hardware (workload may differ)",
+                        feature.detail
+                    );
+                    feature.provenance.push(EvidenceSource::MeasuredProfile);
+                }
+            }
+        }
+    }
+
     let overall = features
         .iter()
         .map(|feature| feature.class)
@@ -528,6 +567,7 @@ mod tests {
             kv_type_k: "f16".to_string(),
             kv_type_v: "f16".to_string(),
             load_mode: "mmap".to_string(),
+            no_repack: false,
             backend: "cpu".to_string(),
             device_id: if gpu_layers > 0 { "gpu0" } else { "cpu" }.to_string(),
             residency: if staged { "staged" } else { "off" }.to_string(),
@@ -583,6 +623,62 @@ mod tests {
         r.sampling_greedy = false;
         let report = resolve_compatibility(&m, &h, &w, &r);
         assert_eq!(report.overall, SupportClass::Unsupported);
+    }
+
+    #[test]
+    fn measured_record_upgrades_unvalidated_gpu_claim() {
+        let model = model(ArchitectureKind::Dense, true);
+        let hardware = hardware(true);
+        let workload = workload(10, false, false);
+        let request = request(&workload, None);
+        let baseline = resolve_compatibility(&model, &hardware, &workload, &request);
+        assert_eq!(baseline.overall, SupportClass::SupportedUnvalidated);
+
+        let record = crate::profiling::PerformanceRecord {
+            identity: crate::profiling::PerformanceIdentity {
+                model_fingerprint: model.fingerprint.clone(),
+                architecture: model.architecture.clone(),
+                quantization: model.quantization.clone(),
+                hardware_fingerprint: hardware.fingerprint.clone(),
+                backend: "gpu".to_string(),
+                device_id: "gpu0".to_string(),
+                workload: workload.clone(),
+                runtime_schema: crate::profiling::PROFILING_SCHEMA_VERSION,
+            },
+            captured_at_unix_ms: Some(1),
+            generation_tokens_per_second: 10.0,
+            decode_tokens_per_second: None,
+            prompt_tokens_per_second: None,
+            time_to_first_token_ns: None,
+            total_generation_ns: 1,
+            emitted_tokens: 4,
+            target_forwards: None,
+            accepted_tokens: None,
+            draft_tokens_generated: None,
+            acceptance_rate_bps: None,
+            storage_read_bytes: None,
+            pss_bytes: None,
+            target_forward_ns: None,
+            draft_forward_ns: None,
+            cpu_busy_bps: None,
+            staged_vram_bytes: None,
+            condition: "warm".to_string(),
+            limitations: Vec::new(),
+        };
+        let report = resolve_compatibility_with_evidence(
+            &model,
+            &hardware,
+            &workload,
+            &request,
+            Some(&record),
+        );
+        assert_eq!(report.overall, SupportClass::SupportedWithLimitations);
+        assert!(report.features.iter().any(|feature| {
+            feature.feature == ExecutionFeature::GpuOffload
+                && feature
+                    .provenance
+                    .contains(&EvidenceSource::MeasuredProfile)
+        }));
     }
 
     #[test]

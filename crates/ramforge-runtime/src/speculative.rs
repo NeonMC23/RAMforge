@@ -56,6 +56,13 @@ pub struct SpeculativeStats {
     pub total_ns: u64,
     pub stop_reason: String,
     pub rounds_detail: Vec<SpeculativeRound>,
+    /// Number of candidate positions tested at each draft index. Length is
+    /// `max_draft_tokens`; late rounds may test fewer.
+    #[serde(default)]
+    pub position_attempts: Vec<u64>,
+    /// Number of candidates accepted at each draft index.
+    #[serde(default)]
+    pub position_accepts: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +212,8 @@ where
         total_ns: 0,
         stop_reason: String::new(),
         rounds_detail: Vec::new(),
+        position_attempts: vec![0; config.max_draft_tokens as usize],
+        position_accepts: vec![0; config.max_draft_tokens as usize],
     };
 
     let mut target_position = prompt_tokens.len() as u32;
@@ -324,6 +333,17 @@ where
             prompt_values,
             &verified_values,
         );
+
+        for (position, _) in candidates.iter().enumerate() {
+            if let Some(attempts) = stats.position_attempts.get_mut(position) {
+                *attempts += 1;
+            }
+            if position < accepted as usize {
+                if let Some(accepts) = stats.position_accepts.get_mut(position) {
+                    *accepts += 1;
+                }
+            }
+        }
 
         let mut round_stop = false;
         for &token in &candidates[..accepted as usize] {

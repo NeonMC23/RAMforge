@@ -289,8 +289,8 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         draft_model: Option<PathBuf>,
 
-        /// Candidate draft length for the plan
-        #[arg(long, default_value_t = 8, requires = "draft_model")]
+        /// Candidate draft length for the plan (0 = automatic)
+        #[arg(long, default_value_t = 0, requires = "draft_model")]
         draft_tokens: u32,
 
         /// Optional performance profile store
@@ -342,8 +342,8 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         draft_model: Option<PathBuf>,
 
-        /// Candidate draft lengths are generated automatically
-        #[arg(long, default_value_t = 8, requires = "draft_model")]
+        /// Candidate draft length (0 = automatic; calibration sweeps K)
+        #[arg(long, default_value_t = 0, requires = "draft_model")]
         draft_tokens: u32,
 
         /// Append completed measurements to this performance profile store
@@ -2886,12 +2886,14 @@ fn run_throughput_benchmark(
             kv_bytes_per_element: 2,
         },
     );
-    requirements
-        .apply_kv_cache_types(
-            context_config.kv_type_k.unwrap_or_default(),
-            context_config.kv_type_v.unwrap_or_default(),
-        )
-        .map_err(|error| anyhow::anyhow!(error))?;
+    if let Err(error) = requirements.apply_kv_cache_types(
+        context_config.kv_type_k.unwrap_or_default(),
+        context_config.kv_type_v.unwrap_or_default(),
+    ) {
+        eprintln!(
+            "Warning: KV accounting unavailable for this model; retaining metadata estimates: {error}"
+        );
+    }
     let machine = collect_machine_profile(&MachineProfileConfig {
         model_path: Some(model_path.clone()),
         ram_budget_bytes: ram_bytes,
@@ -3100,6 +3102,7 @@ fn run_throughput_benchmark(
             report.context_setup_major_faults,
             report.context_setup_minor_faults,
         );
+        println!("cpu: median_busy_bps={:?}", report.median_cpu_busy_bps);
         if let Some(speculative) = report
             .runs_detail
             .last()
@@ -3117,6 +3120,21 @@ fn run_throughput_benchmark(
                 speculative.target_forward_ns as f64 / 1e6,
                 speculative.draft_forward_ns as f64 / 1e6,
             );
+            if !speculative.position_attempts.is_empty() {
+                let rates: Vec<String> = speculative
+                    .position_attempts
+                    .iter()
+                    .zip(speculative.position_accepts.iter())
+                    .map(|(attempts, accepts)| {
+                        if *attempts == 0 {
+                            "-".to_string()
+                        } else {
+                            format!("{:.0}%", *accepts as f64 * 100.0 / *attempts as f64)
+                        }
+                    })
+                    .collect();
+                println!("speculative position acceptance: {}", rates.join(" "));
+            }
         }
         println!(
             "mapping: mapped={:?} resident_before/load/after={:?}/{:?}/{:?} pss_after={:?}",
@@ -4122,11 +4140,12 @@ fn run_recommend(
     let mut compatibility_request =
         ramforge_runtime::CompatibilityRequest::from_workload(&budget_workload, draft_compatible);
     compatibility_request.speculative = recommendation.speculative.recommended;
-    let compatibility = ramforge_runtime::resolve_compatibility(
+    let compatibility = ramforge_runtime::resolve_compatibility_with_evidence(
         &profile,
         &hardware,
         &budget_workload,
         &compatibility_request,
+        measured.as_ref(),
     );
     if json_output {
         let output = serde_json::json!({
@@ -4365,7 +4384,7 @@ fn execute_adaptive_strategy(
             batch_tokens: Some(strategy.batch_tokens),
             threads: Some(strategy.threads),
             load_mode: Some(strategy.load_mode.clone()),
-            no_repack: Some(false),
+            no_repack: Some(strategy.no_repack),
             device: Some(device),
             gpu_layers: Some(strategy.gpu_layers),
         },
@@ -4508,6 +4527,15 @@ fn adaptive_strategy_from_recommendation(
         "off".to_string()
     };
     strategy.staged_auto = staged;
+    let constrained = staged
+        || inputs.model.file_bytes.saturating_add(512 * 1024 * 1024)
+            > inputs.hardware.available_ram_bytes.unwrap_or(u64::MAX);
+    strategy.load_mode = if constrained {
+        "mmap-no-prefetch".to_string()
+    } else {
+        "mmap".to_string()
+    };
+    strategy.no_repack = constrained;
     strategy.speculative = recommendation.speculative.recommended;
     strategy.draft_tokens = strategy
         .speculative
@@ -4539,11 +4567,36 @@ fn parse_objective_preference(
     }
 }
 
+fn resolve_adaptive_draft_tokens(
+    requested: u32,
+    staged: bool,
+    draft_bytes: Option<u64>,
+    context: u32,
+) -> u32 {
+    let automatic = if staged {
+        if draft_bytes.unwrap_or(u64::MAX) <= 2 * 1024 * 1024 * 1024 {
+            // Measured on the 32B target under memory pressure: a 1.5B draft
+            // needs K24 to reach three verification rounds for 32 tokens.
+            24
+        } else {
+            // A 7B draft costs more per round and reaches three rounds at K20.
+            20
+        }
+    } else {
+        8
+    };
+    let selected = if requested == 0 { automatic } else { requested };
+    selected.min(63).min(context.saturating_sub(1).max(1))
+}
+
 fn adaptive_recommendation(
     inputs: &AdaptiveInputs,
     workload: &ramforge_runtime::WorkloadProfile,
     performance_profile: Option<&PathBuf>,
-) -> anyhow::Result<ramforge_runtime::AdaptiveRecommendation> {
+) -> anyhow::Result<(
+    ramforge_runtime::AdaptiveRecommendation,
+    Option<ramforge_runtime::PerformanceRecord>,
+)> {
     let measured = if let Some(path) = performance_profile {
         let store = ramforge_runtime::PerformanceProfileStore::load(path)
             .map_err(|error| anyhow::anyhow!(error))?;
@@ -4556,13 +4609,14 @@ fn adaptive_recommendation(
     } else {
         None
     };
-    Ok(ramforge_runtime::recommend(
+    let recommendation = ramforge_runtime::recommend(
         &inputs.model,
         &inputs.hardware,
         workload,
         inputs.draft_compatible,
         measured.as_ref(),
-    ))
+    );
+    Ok((recommendation, measured))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4602,10 +4656,16 @@ fn run_adaptive_plan(
         draft_model.as_ref(),
     )?;
     let preliminary = adaptive_preliminary_workload(&inputs, &context_config, max_tokens)?;
-    let recommendation =
+    let (recommendation, measured) =
         adaptive_recommendation(&inputs, &preliminary, performance_profile.as_ref())?;
+    let resolved_k = resolve_adaptive_draft_tokens(
+        draft_tokens,
+        recommendation.residency.stage_layers,
+        inputs.draft_bytes,
+        context,
+    );
     let strategy =
-        adaptive_strategy_from_recommendation(&recommendation, &inputs, &preliminary, draft_tokens);
+        adaptive_strategy_from_recommendation(&recommendation, &inputs, &preliminary, resolved_k);
     strategy
         .validate()
         .map_err(|error| anyhow::anyhow!(error))?;
@@ -4626,7 +4686,7 @@ fn run_adaptive_plan(
             batch_tokens: Some(strategy.batch_tokens),
             threads: Some(strategy.threads),
             load_mode: Some(strategy.load_mode.clone()),
-            no_repack: Some(false),
+            no_repack: Some(strategy.no_repack),
             device: Some(device),
             gpu_layers: Some(strategy.gpu_layers),
         },
@@ -4650,11 +4710,12 @@ fn run_adaptive_plan(
     );
     let request =
         ramforge_runtime::CompatibilityRequest::from_workload(&workload, inputs.draft_compatible);
-    let compatibility = ramforge_runtime::resolve_compatibility(
+    let compatibility = ramforge_runtime::resolve_compatibility_with_evidence(
         &inputs.model,
         &inputs.hardware,
         &workload,
         &request,
+        measured.as_ref(),
     );
     let mut plan = ramforge_runtime::build_plan(
         &inputs.model,
@@ -4678,6 +4739,25 @@ fn run_adaptive_plan(
         warmup,
     );
     plan.unknowns.extend(kv_notes);
+    if let Some(record) = measured.as_ref() {
+        plan.decisions.push(ramforge_runtime::PlanDecision {
+            decision: "measured-baseline".to_string(),
+            value: format!(
+                "{:.4} tok/s, K={}",
+                record.generation_tokens_per_second,
+                record
+                    .identity
+                    .workload
+                    .draft_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+            evidence: vec![ramforge_runtime::Evidence::Measurement],
+            explanation: "a persisted measurement matches this model and hardware; it informs the plan but does not prove the current workload is optimal"
+                .to_string(),
+            confidence: "measured".to_string(),
+        });
+    }
     plan.validate().map_err(|error| anyhow::anyhow!(error))?;
     if let Some(path) = output.as_ref() {
         let text = serde_json::to_string_pretty(&plan)?;
@@ -4782,10 +4862,16 @@ fn run_adaptive_calibrate(
         draft_model.as_ref(),
     )?;
     let preliminary = adaptive_preliminary_workload(&inputs, &context_config, max_tokens)?;
-    let recommendation =
+    let (recommendation, _measured) =
         adaptive_recommendation(&inputs, &preliminary, performance_profile.as_ref())?;
+    let resolved_k = resolve_adaptive_draft_tokens(
+        draft_tokens,
+        recommendation.residency.stage_layers,
+        inputs.draft_bytes,
+        context,
+    );
     let baseline =
-        adaptive_strategy_from_recommendation(&recommendation, &inputs, &preliminary, draft_tokens);
+        adaptive_strategy_from_recommendation(&recommendation, &inputs, &preliminary, resolved_k);
     let limits = ramforge_runtime::CandidateLimits {
         max_candidates,
         max_experiments,
@@ -5028,11 +5114,27 @@ fn run_adaptive_apply(
         &plan.workload,
         inputs.draft_compatible,
     );
-    let compatibility = ramforge_runtime::resolve_compatibility(
+    let measured = performance_profile
+        .clone()
+        .or_else(|| plan.performance_profile.as_ref().map(PathBuf::from))
+        .and_then(|path| {
+            ramforge_runtime::PerformanceProfileStore::load(&path)
+                .ok()
+                .and_then(|store| {
+                    store
+                        .best_for_model_hardware(
+                            inputs.model.fingerprint.as_deref(),
+                            &inputs.hardware.fingerprint,
+                        )
+                        .cloned()
+                })
+        });
+    let compatibility = ramforge_runtime::resolve_compatibility_with_evidence(
         &inputs.model,
         &inputs.hardware,
         &plan.workload,
         &request,
+        measured.as_ref(),
     );
     if compatibility.overall == ramforge_runtime::SupportClass::Unsupported {
         return Err(anyhow::anyhow!(
@@ -5086,6 +5188,20 @@ fn run_adaptive_apply(
                 measurement.time_to_first_token_ns,
                 measurement.acceptance_rate_bps
             );
+        }
+        if let Some(resources) = applied.resource_comparison.as_ref() {
+            println!(
+                "Resources: host_estimate={:?} observed_pss={:?} error_bps={:?}; vram_estimate={:?} observed={:?} error_bps={:?}",
+                resources.host_estimate_bytes,
+                resources.host_observed_pss_bytes,
+                resources.host_error_bps,
+                resources.vram_estimate_bytes,
+                resources.vram_observed_bytes,
+                resources.vram_error_bps
+            );
+            for note in &resources.notes {
+                println!("  resource note: {note}");
+            }
         }
         for note in execution_notes.iter().chain(applied.notes.iter()) {
             println!("  note: {note}");
@@ -9949,7 +10065,25 @@ fn metadata_value_to_json(v: &ramforge_core::MetadataValue) -> serde_json::Value
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sampling_strategy, NodeSamplingStrategy};
+    use super::{parse_sampling_strategy, resolve_adaptive_draft_tokens, NodeSamplingStrategy};
+
+    #[test]
+    fn adaptive_draft_length_policy_is_bounded_and_environment_aware() {
+        assert_eq!(
+            resolve_adaptive_draft_tokens(0, true, Some(1 << 30), 128),
+            24
+        );
+        assert_eq!(
+            resolve_adaptive_draft_tokens(0, true, Some(5 << 30), 128),
+            20
+        );
+        assert_eq!(
+            resolve_adaptive_draft_tokens(0, false, Some(5 << 30), 128),
+            8
+        );
+        assert_eq!(resolve_adaptive_draft_tokens(8, true, None, 128), 8);
+        assert_eq!(resolve_adaptive_draft_tokens(0, true, None, 8), 7);
+    }
 
     #[test]
     fn sampling_strategy_parser_is_explicit() {

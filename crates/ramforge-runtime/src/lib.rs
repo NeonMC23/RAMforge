@@ -67,13 +67,15 @@ pub mod adaptive;
 pub use adaptive::{
     applied_report_from_observation, assess_budget, baseline_strategy, build_calibration_report,
     build_plan, compare_experiments, environment_changes, generate_candidates, record_invalidation,
-    resolve_compatibility, revalidate_plan, select_best, AdaptivePlan, AdaptiveStrategy,
+    resolve_compatibility, resolve_compatibility_with_evidence, revalidate_plan, select_best,
+    AdaptivePlan, AdaptiveStrategy,
     AppliedPlanReport, BestSelection, BudgetClass, BudgetComponent, CalibrationExperiment,
     CalibrationReport, CandidateComparison, CandidateLimits, CandidateSet, CandidateStatus,
     CompatibilityReport, CompatibilityRequest, Evidence, EvidenceSource, ExecutionEnvironment,
     ExecutionFeature, ExperimentStatus, FeatureSupport, FieldObservation, FieldState, Invalidation,
     InvalidationReason, MeasurementSummary, ObjectivePreference, PlanDecision, PlanStatus,
-    PlanValidation, ResourceBudget, RuntimeObservation, StrategyAxis, StrategyCandidate,
+    PlanValidation, ResourceBudget, ResourceComparison, RuntimeObservation, StrategyAxis,
+    StrategyCandidate,
     SupportClass, ADAPTIVE_PLAN_SCHEMA_VERSION, ADAPTIVE_SCHEMA_VERSION,
     CAPABILITY_SCHEMA_VERSION, EXECUTION_ENVIRONMENT_SCHEMA_VERSION,
     RESOURCE_BUDGET_SCHEMA_VERSION,
@@ -122,7 +124,8 @@ pub use forge_core::{
     MAX_NODE_DISPATCH_EVENTS,
 };
 pub use benchmark_runner::{
-    run_benchmark, BenchmarkConfig, BenchmarkReport, BenchmarkRun, BENCHMARK_SCHEMA_VERSION,
+    run_benchmark, BenchmarkConfig, BenchmarkReport, BenchmarkRun, CpuUtilization,
+    BENCHMARK_SCHEMA_VERSION,
 };
 pub use context_config::{ContextConfig, FlashAttentionMode, KvCacheType};
 pub use dense_residency::{decide_dense_residency, DenseResidencyDecision};

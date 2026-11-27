@@ -207,6 +207,17 @@ pub fn build_plan(
             confidence: "measured-readback-required".to_string(),
         },
         PlanDecision {
+            decision: "memory-policy".to_string(),
+            value: format!("load={} repack={}", strategy.load_mode, !strategy.no_repack),
+            evidence: vec![Evidence::Measurement, Evidence::HeuristicEstimate],
+            explanation: if strategy.no_repack {
+                "repacking and whole-file prefaulting are disabled for a constrained model; measured to reduce PSS and target-forward time on this machine".to_string()
+            } else {
+                "default repacking and prefetch are retained; the model has comfortable memory headroom".to_string()
+            },
+            confidence: "measured-policy".to_string(),
+        },
+        PlanDecision {
             decision: "resource-admission".to_string(),
             value: budget.admission.label().to_string(),
             evidence: vec![Evidence::GgufMetadata, Evidence::MachineObservation],
@@ -363,6 +374,20 @@ pub struct FieldObservation {
     pub evidence: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceComparison {
+    pub host_estimate_bytes: Option<u64>,
+    pub host_observed_pss_bytes: Option<u64>,
+    /// Signed error in basis points relative to the estimate. Negative means
+    /// the estimate was conservative.
+    pub host_error_bps: Option<i64>,
+    pub vram_estimate_bytes: Option<u64>,
+    pub vram_observed_bytes: Option<u64>,
+    pub vram_error_bps: Option<i64>,
+    pub storage_read_bytes: Option<u64>,
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppliedPlanReport {
     pub schema_version: u32,
@@ -374,6 +399,7 @@ pub struct AppliedPlanReport {
     pub environment_fingerprint: String,
     pub fields: Vec<FieldObservation>,
     pub measurement: Option<MeasurementSummary>,
+    pub resource_comparison: Option<ResourceComparison>,
     pub notes: Vec<String>,
     pub limitations: Vec<String>,
 }
@@ -413,6 +439,12 @@ pub struct RuntimeObservation {
     pub draft_model_present: bool,
     pub speculative_observed: bool,
     pub kv_forwarded: bool,
+    #[serde(default)]
+    pub pss_bytes: Option<u64>,
+    #[serde(default)]
+    pub staged_vram_bytes: Option<u64>,
+    #[serde(default)]
+    pub storage_read_bytes: Option<u64>,
     pub warnings: Vec<String>,
 }
 
@@ -439,6 +471,15 @@ impl RuntimeObservation {
             draft_model_present: report.draft_model.is_some(),
             speculative_observed: speculative.is_some(),
             kv_forwarded: true,
+            pss_bytes: report.runs_detail.last().and_then(|run| run.pss_bytes),
+            staged_vram_bytes: report
+                .staging_lifecycle
+                .as_ref()
+                .map(|lifecycle| lifecycle.resident_bytes),
+            storage_read_bytes: report
+                .runs_detail
+                .last()
+                .and_then(|run| run.storage_read_bytes),
             warnings: report.limitations.clone(),
         }
     }
@@ -455,6 +496,16 @@ pub fn applied_report_from_observation(
 
     let mode_state = match observation.effective_execution_mode.as_deref() {
         Some(mode) if mode == strategy.execution_mode => FieldState::Verified,
+        // A staged plan is hybrid in resource terms (CPU target plus GPU
+        // staged layers), while the target runtime plan correctly reports a
+        // CPU execution mode. Both facts must be verified together.
+        Some("cpu")
+            if strategy.execution_mode == "hybrid"
+                && strategy.staged_auto
+                && observation.staged_layer_count > 0 =>
+        {
+            FieldState::Verified
+        }
         Some(_) => FieldState::Applied,
         None => FieldState::Unknown,
     };
@@ -463,7 +514,11 @@ pub fn applied_report_from_observation(
         requested: strategy.execution_mode.clone(),
         effective: observation.effective_execution_mode.clone(),
         state: mode_state,
-        evidence: Some("runtime plan and native device readback".to_string()),
+        evidence: Some(if strategy.execution_mode == "hybrid" {
+            "CPU target plan plus verified staged GPU layers".to_string()
+        } else {
+            "runtime plan and native device readback".to_string()
+        }),
     });
 
     let gpu_state = if strategy.gpu_layers == 0 {
@@ -615,9 +670,57 @@ pub fn applied_report_from_observation(
         time_to_first_token_ns: observation.time_to_first_token_ns,
         pss_bytes: None,
         acceptance_rate_bps: observation.acceptance_rate_bps,
+        target_forward_ns: None,
+        draft_forward_ns: None,
+        cpu_busy_bps: None,
+        staged_vram_bytes: None,
         runs: 1,
         condition: "plan-application-verification".to_string(),
         variability_bps: None,
+    };
+
+    let staged_window = plan
+        .budget
+        .components
+        .iter()
+        .find(|component| component.name == "staged-vram-window")
+        .and_then(|component| component.bytes);
+    let error_bps = |estimate: Option<u64>, observed: Option<u64>| match (estimate, observed) {
+        (Some(estimate), Some(observed)) if estimate > 0 => {
+            Some(((observed as f64 - estimate as f64) / estimate as f64 * 10_000.0).round() as i64)
+        }
+        _ => None,
+    };
+    let host_error_bps = error_bps(plan.budget.host_required_bytes, observation.pss_bytes);
+    let vram_error_bps = error_bps(staged_window, observation.staged_vram_bytes);
+    let mut resource_notes = Vec::new();
+    if host_error_bps.is_some_and(|error| error < -2_000) {
+        resource_notes.push(
+            "host estimate is more than 20% above observed PSS; the budget is conservative"
+                .to_string(),
+        );
+    }
+    if host_error_bps.is_some_and(|error| error > 1_000) {
+        resource_notes.push(
+            "observed PSS exceeded the host estimate; tighten admission or increase overhead"
+                .to_string(),
+        );
+    }
+    if observation.pss_bytes.is_none() {
+        resource_notes.push("PSS was not observed".to_string());
+    }
+    if observation.staged_vram_bytes.is_none() && strategy.staged_auto {
+        resource_notes.push("staged VRAM bytes were not observed".to_string());
+    }
+    let resource_comparison = ResourceComparison {
+        host_estimate_bytes: plan.budget.host_required_bytes,
+        host_observed_pss_bytes: observation.pss_bytes,
+        host_error_bps,
+        vram_estimate_bytes: staged_window,
+        vram_observed_bytes: observation.staged_vram_bytes,
+        vram_error_bps,
+        storage_read_bytes: observation.storage_read_bytes,
+        notes: resource_notes,
     };
 
     AppliedPlanReport {
@@ -630,6 +733,7 @@ pub fn applied_report_from_observation(
         environment_fingerprint: plan.environment.fingerprint.clone(),
         fields,
         measurement: Some(measurement),
+        resource_comparison: Some(resource_comparison),
         notes: observation.warnings.clone(),
         limitations: vec![
             "KV dtype is forwarded-only; the pinned native revision has no getter".to_string(),
@@ -725,6 +829,7 @@ mod tests {
             kv_type_k: "f16".to_string(),
             kv_type_v: "f16".to_string(),
             load_mode: "mmap".to_string(),
+            no_repack: false,
             backend: "cpu".to_string(),
             device_id: "cpu".to_string(),
             residency: "off".to_string(),
@@ -778,6 +883,9 @@ mod tests {
             draft_model_present: false,
             speculative_observed: false,
             kv_forwarded: true,
+            pss_bytes: Some(12 << 30),
+            staged_vram_bytes: Some(3 << 30),
+            storage_read_bytes: Some(64 << 30),
             warnings: Vec::new(),
         }
     }
@@ -830,7 +938,8 @@ mod tests {
 
     #[test]
     fn applied_report_verifies_readback_fields() {
-        let plan = plan();
+        let mut plan = plan();
+        plan.budget.host_required_bytes = Some(10 << 30);
         let report = applied_report_from_observation(&plan, &observation());
         assert_eq!(report.status, PlanStatus::Verified);
         assert!(report
@@ -841,7 +950,29 @@ mod tests {
             .fields
             .iter()
             .any(|field| field.field == "kv_type" && field.state == FieldState::Accepted));
+        let comparison = report.resource_comparison.as_ref().expect("comparison");
+        assert!(comparison.host_error_bps.is_some());
+        assert_eq!(comparison.host_observed_pss_bytes, Some(12 << 30));
         assert!(report.validate().is_ok());
+    }
+
+    #[test]
+    fn staged_hybrid_plan_verifies_cpu_target_plus_gpu_layers() {
+        let mut plan = plan();
+        plan.strategy.execution_mode = "hybrid".to_string();
+        plan.strategy.residency = "staged".to_string();
+        plan.strategy.staged_auto = true;
+        let mut observation = observation();
+        observation.effective_execution_mode = Some("cpu".to_string());
+        observation.staged_layer_count = 11;
+        let report = applied_report_from_observation(&plan, &observation);
+        assert_eq!(report.status, PlanStatus::Verified);
+        assert!(report.fields.iter().any(|field| {
+            field.field == "execution_mode" && field.state == FieldState::Verified
+        }));
+        assert!(report.fields.iter().any(|field| {
+            field.field == "staged_layers" && field.state == FieldState::Verified
+        }));
     }
 
     #[test]

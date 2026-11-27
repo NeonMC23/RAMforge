@@ -12,8 +12,9 @@ pub mod plan;
 pub mod resource;
 
 pub use capability::{
-    resolve_compatibility, CompatibilityReport, CompatibilityRequest, EvidenceSource,
-    ExecutionFeature, FeatureSupport, SupportClass, CAPABILITY_SCHEMA_VERSION,
+    resolve_compatibility, resolve_compatibility_with_evidence, CompatibilityReport,
+    CompatibilityRequest, EvidenceSource, ExecutionFeature, FeatureSupport, SupportClass,
+    CAPABILITY_SCHEMA_VERSION,
 };
 pub use engine::{
     baseline_strategy, build_calibration_report, compare_experiments, generate_candidates,
@@ -29,7 +30,7 @@ pub use environment::{
 pub use plan::{
     applied_report_from_observation, build_plan, revalidate_plan, AdaptivePlan, AppliedPlanReport,
     Evidence, FieldObservation, FieldState, PlanDecision, PlanStatus, PlanValidation,
-    RuntimeObservation, ADAPTIVE_PLAN_SCHEMA_VERSION,
+    ResourceComparison, RuntimeObservation, ADAPTIVE_PLAN_SCHEMA_VERSION,
 };
 pub use resource::{
     assess_budget, BudgetClass, BudgetComponent, ResourceBudget, DEFAULT_RUNTIME_OVERHEAD_BYTES,
